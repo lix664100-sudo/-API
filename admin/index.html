@@ -1,0 +1,1643 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ShareAI API 管理后台</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/antd@5/dist/reset.css" />
+    <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1/dayjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/antd@5/dist/antd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ant-design/icons@5/dist/index.umd.min.js"></script>
+    <style>
+      :root {
+        --page-bg: #f4f6f8;
+        --panel: #ffffff;
+        --panel-soft: #f8fafc;
+        --line: #e4e7ec;
+        --ink: #101828;
+        --muted: #667085;
+        --muted-2: #98a2b3;
+        --brand: #1677ff;
+        --brand-soft: #eaf2ff;
+        --success: #16a34a;
+        --warning: #d97706;
+        --danger: #dc2626;
+        --shadow: 0 18px 45px rgba(16, 24, 40, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-width: 320px;
+        background: var(--page-bg);
+        color: var(--ink);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        min-height: 70px;
+        padding: 0 28px;
+        border-bottom: 1px solid rgba(228, 231, 236, 0.92);
+        background: rgba(255, 255, 255, 0.9);
+        backdrop-filter: blur(18px);
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+      }
+
+      .brand-mark {
+        display: grid;
+        place-items: center;
+        width: 38px;
+        height: 38px;
+        border-radius: 8px;
+        color: #fff;
+        background: #111827;
+        font-weight: 800;
+      }
+
+      .brand-title {
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.2;
+      }
+
+      .brand-subtitle {
+        margin: 3px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .content {
+        width: min(1560px, calc(100% - 32px));
+        margin: 20px auto 34px;
+      }
+
+      .metrics-grid {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+
+      .metric {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-height: 86px;
+        padding: 16px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+
+      .metric-icon {
+        display: grid;
+        place-items: center;
+        flex: 0 0 38px;
+        width: 38px;
+        height: 38px;
+        border-radius: 8px;
+        color: var(--brand);
+        background: var(--brand-soft);
+        font-size: 18px;
+      }
+
+      .metric-label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .metric-value {
+        margin-top: 5px;
+        font-size: 22px;
+        font-weight: 760;
+        line-height: 1;
+      }
+
+      .workspace {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 14px;
+        align-items: start;
+      }
+
+      .panel {
+        min-width: 0;
+        overflow: visible;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+      }
+
+      .panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        min-height: 62px;
+        padding: 16px 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .panel-title {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 760;
+      }
+
+      .panel-desc {
+        margin: 3px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .table-wrap {
+        min-width: 0;
+        overflow: visible;
+        padding: 14px 18px 18px;
+      }
+
+      .filters {
+        display: grid;
+        grid-template-columns: minmax(240px, 1fr) 160px 160px auto;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+
+      .channel-name-cell {
+        min-width: 0;
+      }
+
+      .primary-text {
+        color: var(--ink);
+        font-weight: 720;
+      }
+
+      .secondary-text {
+        margin-top: 3px;
+        color: var(--muted);
+        font-size: 12px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .mono {
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      }
+
+      .detail-body {
+        min-width: 0;
+        overflow: visible;
+        padding: 16px 18px 18px;
+      }
+
+      .detail-hero {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 14px;
+        padding-bottom: 14px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .detail-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        margin: 14px 0;
+      }
+
+      .detail-stat {
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel-soft);
+      }
+
+      .detail-stat-label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .detail-stat-value {
+        margin-top: 4px;
+        font-size: 18px;
+        font-weight: 760;
+      }
+
+      .section-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin: 10px 0 12px;
+      }
+
+      .section-title h3 {
+        margin: 0;
+        font-size: 14px;
+      }
+
+      .operations {
+        margin-top: 14px;
+      }
+
+      .operation-body {
+        min-width: 0;
+        overflow: visible;
+        padding: 14px 18px 18px;
+      }
+
+      .task-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0 12px;
+      }
+
+      .model-route-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .model-route-row {
+        display: grid;
+        gap: 10px;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #f8fafc;
+      }
+
+      .model-route-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .model-route-title {
+        font-size: 13px;
+        font-weight: 760;
+      }
+
+      .model-route-grid {
+        display: grid;
+        grid-template-columns: 1fr 1.2fr 76px;
+        gap: 0 10px;
+      }
+
+      .model-tag-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .code-box {
+        margin: 0;
+        padding: 14px;
+        overflow: visible;
+        border: 1px solid #1f2937;
+        border-radius: 8px;
+        background: #101828;
+        color: #d1fadf;
+        font-size: 12px;
+        line-height: 1.65;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .api-doc-stack {
+        display: grid;
+        gap: 14px;
+      }
+
+      .api-doc-section {
+        display: grid;
+        gap: 10px;
+      }
+
+      .api-doc-title {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 760;
+      }
+
+      .api-doc-copy {
+        margin: -4px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .task-thumb {
+        width: 86px;
+        height: 62px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #f2f4f7;
+      }
+
+      .task-thumb img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .toolbar-note {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .error-text {
+        margin-top: 4px;
+        color: var(--danger);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .task-response {
+        max-width: 680px;
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+      }
+
+      @media (max-width: 1320px) {
+        .metrics-grid {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+
+        .workspace {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 780px) {
+        .topbar {
+          align-items: flex-start;
+          flex-direction: column;
+          padding: 14px 18px;
+        }
+
+        .content {
+          width: min(100% - 20px, 760px);
+          margin-top: 12px;
+        }
+
+        .metrics-grid,
+        .detail-grid,
+        .form-grid,
+        .model-route-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .filters {
+          grid-template-columns: 1fr;
+        }
+
+        .panel-header,
+        .detail-hero {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      const { useEffect, useMemo, useState } = React;
+      const {
+        Alert,
+        Button,
+        Col,
+        ConfigProvider,
+        Empty,
+        Form,
+        Image,
+        Input,
+        InputNumber,
+        message,
+        Modal,
+        Popconfirm,
+        Row,
+        Select,
+        Space,
+        Switch,
+        Table,
+        Tabs,
+        Tag,
+        Tooltip,
+        Typography,
+        Upload
+      } = antd;
+      const Icon = window.icons || {};
+      const h = React.createElement;
+
+      const channelTypeOptions = [
+        { label: "聊天生图", value: "chatplus" },
+        { label: "绘图站", value: "drawing" }
+      ];
+
+      const fallbackModelOptions = [
+        { label: "ChatGPT-Image-2 / 默认", value: 1 },
+        { label: "Nano-Banana-Pro", value: 2 },
+        { label: "Nano-Banana", value: 3 }
+      ];
+
+      const chatModelDefaults = [
+        { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", enabled: true, default: true },
+        { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", enabled: true, default: false },
+        { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", enabled: true, default: false }
+      ];
+
+      const chatStrategyOptions = [
+        { label: "智能随机", value: "balanced" },
+        { label: "空闲优先", value: "idle" },
+        { label: "绘图额度优先", value: "image" },
+        { label: "思考能力优先", value: "thinking" },
+        { label: "低负载优先", value: "speed" }
+      ];
+
+      async function api(path, options = {}) {
+        const isForm = options.body instanceof FormData;
+        const hasBody = options.body !== undefined && options.body !== null;
+        const body = hasBody && !isForm && typeof options.body !== "string" ? JSON.stringify(options.body) : options.body;
+        const response = await fetch(path, {
+          ...options,
+          body,
+          headers: {
+            ...(hasBody && !isForm ? { "content-type": "application/json" } : {}),
+            ...(options.headers || {})
+          }
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok || data?.ok === false) throw new Error(data?.message || "请求失败");
+        return data?.data ?? data;
+      }
+
+      function numberValue(value) {
+        const next = Number(value);
+        return Number.isFinite(next) ? next : 0;
+      }
+
+      function valueText(value) {
+        return value === null || value === undefined || value === "" ? "-" : value;
+      }
+
+      function formatDateTime(value) {
+        if (value === null || value === undefined || value === "") return "-";
+        const date = new Date(value);
+        if (!Number.isFinite(date.getTime())) return value;
+        return date.toLocaleString("zh-CN", {
+          timeZone: "Asia/Shanghai",
+          hour12: false,
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit"
+        }).replace(/\//g, "-");
+      }
+
+      function accountQuotaText(account, channel) {
+        const balance = numberValue(account.balance ?? account.quota);
+        const quota = numberValue(account.quota);
+        if (channel?.type === "chatplus") return account.status === "unknown" ? "-" : `剩余 ${balance}`;
+        return `${quota}/${balance}`;
+      }
+
+      function channelQuotaText(channel, stats = {}) {
+        if (channel?.type === "chatplus") return `剩余 ${numberValue(stats.balance)}`;
+        return `${numberValue(stats.quota)}/${numberValue(stats.balance)}`;
+      }
+
+      function channelTypeName(type) {
+        return channelTypeOptions.find((item) => item.value === type)?.label || type || "-";
+      }
+
+      function channelBaseUrl(channel) {
+        return channel?.settings?.baseUrl || "-";
+      }
+
+      function chatModelKey(value) {
+        return String(value || "").trim().toLowerCase();
+      }
+
+      function chatModelsForChannel(channel) {
+        const settings = channel?.settings || {};
+        const source = Array.isArray(settings.chatModels) && settings.chatModels.length ? settings.chatModels : chatModelDefaults;
+        const defaultKey = chatModelKey(settings.defaultChatModel) || source.find((item) => item.default)?.key || "gpt";
+        return source.map((item, index) => {
+          const fallback = chatModelDefaults[index] || {};
+          const key = chatModelKey(item?.key || fallback.key || `model-${index + 1}`);
+          return {
+            key,
+            name: item?.name || fallback.name || key,
+            carType: item?.carType || fallback.carType || "",
+            model: item?.model || fallback.model || "",
+            strategy: item?.strategy || fallback.strategy || "balanced",
+            enabled: item?.enabled !== false,
+            default: key === defaultKey || item?.default === true
+          };
+        });
+      }
+
+      function chatModelSelectOptions(channel) {
+        return chatModelsForChannel(channel)
+          .filter((item) => item.enabled)
+          .map((item) => ({ label: item.default ? `${item.name} / 默认` : item.name, value: item.key }));
+      }
+
+      function statusInfo(status) {
+        const map = {
+          ok: ["success", "可用"],
+          error: ["error", "异常"],
+          success: ["success", "成功"],
+          failed: ["error", "失败"],
+          cancelled: ["default", "已取消"],
+          processing: ["processing", "处理中"],
+          disabled: ["default", "已停用"],
+          empty: ["warning", "未绑定账号"],
+          unknown: ["default", "未检测"]
+        };
+        return map[status] || ["processing", status || "处理中"];
+      }
+
+      function statusTag(status) {
+        const [color, text] = statusInfo(status);
+        return h(Tag, { color }, text);
+      }
+
+      function taskTypeLabel(type) {
+        const map = {
+          chat: "对话",
+          img2img: "图生图",
+          text2img: "文生图"
+        };
+        return map[type] || type || "-";
+      }
+
+      function formatDuration(ms) {
+        if (!Number.isFinite(ms) || ms < 0) return "-";
+        const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        if (hours) return `${hours}时${minutes}分${seconds}秒`;
+        if (minutes) return `${minutes}分${seconds}秒`;
+        return `${seconds}秒`;
+      }
+
+      function taskDuration(task, now) {
+        const start = Date.parse(task.createdAt || task.raw?.created_at || "");
+        if (!Number.isFinite(start)) return "-";
+        const done = ["success", "failed", "cancelled"].includes(task.status)
+          ? Date.parse(task.completedAt || task.updatedAt || "")
+          : now;
+        if (!Number.isFinite(done)) return "-";
+        const text = formatDuration(done - start);
+        return ["success", "failed", "cancelled"].includes(task.status) ? text : `已耗时 ${text}`;
+      }
+
+      function channelName(config, channelId) {
+        return config?.channels?.find((item) => item.id === channelId)?.name || channelId || "-";
+      }
+
+      function getChannelStatus(channel, relatedAccounts) {
+        if (channel.enabled === false) return "disabled";
+        if (!relatedAccounts.length) return "empty";
+        if (relatedAccounts.some((item) => item.enabled !== false && item.status === "ok")) return "ok";
+        if (relatedAccounts.every((item) => item.status === "error" || item.status === "failed")) return "error";
+        return "unknown";
+      }
+
+      function getChannelStats(channel, accounts) {
+        const related = accounts.filter((item) => item.channelId === channel.id);
+        const enabled = related.filter((item) => item.enabled !== false);
+        return {
+          accountCount: related.length,
+          enabledCount: enabled.length,
+          okCount: related.filter((item) => item.status === "ok").length,
+          quota: related.reduce((sum, item) => sum + numberValue(item.quota), 0),
+          balance: related.reduce((sum, item) => sum + numberValue(item.balance ?? item.quota), 0),
+          status: getChannelStatus(channel, related)
+        };
+      }
+
+      function Dashboard() {
+        const [config, setConfig] = useState(null);
+        const [tasks, setTasks] = useState([]);
+        const [loading, setLoading] = useState(false);
+        const [nowTick, setNowTick] = useState(Date.now());
+        const [chatFileList, setChatFileList] = useState([]);
+        const [editFileList, setEditFileList] = useState([]);
+        const [chatResult, setChatResult] = useState("");
+        const [chatSubmitting, setChatSubmitting] = useState(false);
+        const [drawingModels, setDrawingModels] = useState([]);
+        const [selectedChannelId, setSelectedChannelId] = useState(null);
+        const [searchText, setSearchText] = useState("");
+        const [typeFilter, setTypeFilter] = useState("all");
+        const [statusFilter, setStatusFilter] = useState("all");
+        const [channelModalOpen, setChannelModalOpen] = useState(false);
+        const [accountModalOpen, setAccountModalOpen] = useState(false);
+        const [editingChannel, setEditingChannel] = useState(null);
+        const [editingAccount, setEditingAccount] = useState(null);
+
+        const [chatForm] = Form.useForm();
+        const [editForm] = Form.useForm();
+        const [channelForm] = Form.useForm();
+        const [accountForm] = Form.useForm();
+        const [globalForm] = Form.useForm();
+        const editingChannelType = Form.useWatch("type", channelForm);
+        const selectedChatChannelValue = Form.useWatch("channel", chatForm);
+        const selectedEditChannelValue = Form.useWatch("channel", editForm);
+
+        const channels = config?.channels || [];
+        const accounts = config?.accounts || [];
+        const chatChannels = channels.filter((item) => item.type === "chatplus");
+        const selectedChannel = channels.find((item) => item.id === selectedChannelId) || channels[0] || null;
+        const selectedAccounts = selectedChannel ? accounts.filter((item) => item.channelId === selectedChannel.id) : [];
+
+        const channelOptions = useMemo(() => [
+          { label: "自动选择", value: "auto" },
+          ...channels.map((item) => ({ label: item.name, value: item.id }))
+        ], [channels]);
+
+        const chatChannelOptions = useMemo(() => [
+          { label: "自动选择", value: "auto" },
+          ...chatChannels.map((item) => ({ label: item.name, value: item.id }))
+        ], [chatChannels]);
+
+        const chatTestModelOptions = useMemo(() => {
+          const selected = selectedChatChannelValue && selectedChatChannelValue !== "auto"
+            ? chatChannels.find((item) => item.id === selectedChatChannelValue)
+            : null;
+          const source = selected
+            ? chatModelSelectOptions(selected)
+            : [...new Map(chatChannels.flatMap(chatModelSelectOptions).map((item) => [item.value, item])).values()];
+          return [{ label: "自动使用渠道默认", value: "" }, ...source];
+        }, [chatChannels, selectedChatChannelValue]);
+
+        const drawingModelOptions = useMemo(() => {
+          const items = Array.isArray(drawingModels) && drawingModels.length ? drawingModels : fallbackModelOptions;
+          return items.map((item) => {
+            if (item.label && item.value !== undefined) return item;
+            const value = Number(item.id ?? item.value ?? item.model_id ?? item.modelId);
+            const name = item.name || item.title || item.code || `模型 ${value}`;
+            const code = item.code || item.model || "";
+            return {
+              label: code ? `${name} / ${code}` : name,
+              value
+            };
+          }).filter((item) => Number.isFinite(Number(item.value)));
+        }, [drawingModels]);
+
+        function defaultModelForChannel(channelId, sourceChannels = channels, sourceConfig = config) {
+          const channel = sourceChannels.find((item) => item.id === channelId);
+          return channel?.settings?.defaultModelId || sourceConfig?.defaultModelId || 1;
+        }
+
+        function accountIsCooling(account) {
+          const until = Date.parse(account?.cooldownUntil || "");
+          return Number.isFinite(until) && until > Date.now();
+        }
+
+        function accountCooldownText(account) {
+          const ms = Math.max(0, Date.parse(account?.cooldownUntil || "") - Date.now());
+          return `${Math.max(1, Math.ceil(ms / 60000))} 分钟`;
+        }
+
+        const matchingChatAccounts = useMemo(() => {
+          const chatIds = new Set(chatChannels.map((item) => item.id));
+          return accounts.filter((account) => {
+            if (account.enabled === false || !chatIds.has(account.channelId)) return false;
+            return !selectedChatChannelValue || selectedChatChannelValue === "auto" || account.channelId === selectedChatChannelValue;
+          });
+        }, [accounts, chatChannels, selectedChatChannelValue]);
+
+        const coolingChatAccount = useMemo(() => matchingChatAccounts.find(accountIsCooling) || null, [matchingChatAccounts, nowTick]);
+        const chatSubmitBlocked = matchingChatAccounts.length > 0 && matchingChatAccounts.every(accountIsCooling);
+
+        const channelStats = useMemo(() => {
+          const map = new Map();
+          channels.forEach((channel) => map.set(channel.id, getChannelStats(channel, accounts)));
+          return map;
+        }, [channels, accounts]);
+
+        const filteredChannels = useMemo(() => {
+          const keyword = searchText.trim().toLowerCase();
+          return channels.filter((channel) => {
+            const stats = channelStats.get(channel.id) || {};
+            const haystack = `${channel.name} ${channel.id} ${channelBaseUrl(channel)}`.toLowerCase();
+            const keywordOk = !keyword || haystack.includes(keyword);
+            const typeOk = typeFilter === "all" || channel.type === typeFilter;
+            const statusOk = statusFilter === "all" || stats.status === statusFilter;
+            return keywordOk && typeOk && statusOk;
+          });
+        }, [channels, channelStats, searchText, typeFilter, statusFilter]);
+
+        const totals = useMemo(() => {
+          const enabledChannels = channels.filter((item) => item.enabled !== false).length;
+          const okAccounts = accounts.filter((item) => item.enabled !== false && item.status === "ok").length;
+          const balance = accounts.reduce((sum, item) => sum + numberValue(item.balance ?? item.quota), 0);
+          const successCount = tasks.filter((item) => item.status === "success").length;
+          const failedCount = tasks.filter((item) => item.status === "failed").length;
+          return { enabledChannels, okAccounts, balance, successCount, failedCount };
+        }, [channels, accounts, tasks]);
+
+        async function refresh() {
+          const [nextConfig, taskList, modelData] = await Promise.all([
+            api("/api/config"),
+            api("/api/tasks"),
+            api("/api/models").catch(() => ({ items: [] }))
+          ]);
+          setConfig(nextConfig);
+          setTasks(taskList);
+          setDrawingModels(Array.isArray(modelData?.items) ? modelData.items : []);
+          globalForm.setFieldsValue(nextConfig);
+          const defaultChatChannel = nextConfig.channels?.some((item) => item.id === nextConfig.defaultChannel && item.type === "chatplus")
+            ? nextConfig.defaultChannel
+            : "auto";
+          chatForm.setFieldsValue({
+            channel: defaultChatChannel,
+            model: ""
+          });
+          editForm.setFieldsValue({
+            channel: nextConfig.defaultChannel || "auto",
+            model_id: defaultModelForChannel(nextConfig.defaultChannel, nextConfig.channels || [], nextConfig),
+            ratio_label: nextConfig.defaultRatio || "1:1",
+            image_count: 1
+          });
+        }
+
+        useEffect(() => {
+          refresh().catch((error) => message.error(error.message));
+        }, []);
+
+        useEffect(() => {
+          if (!selectedChannelId && channels[0]) setSelectedChannelId(channels[0].id);
+          if (selectedChannelId && channels.length && !channels.some((item) => item.id === selectedChannelId)) {
+            setSelectedChannelId(channels[0].id);
+          }
+        }, [channels, selectedChannelId]);
+
+        useEffect(() => {
+          const value = chatForm.getFieldValue("model");
+          if (value && !chatTestModelOptions.some((item) => item.value === value)) {
+            chatForm.setFieldValue("model", "");
+          }
+        }, [chatForm, chatTestModelOptions]);
+
+        useEffect(() => {
+          if (!selectedEditChannelValue) return;
+          const nextModel = defaultModelForChannel(selectedEditChannelValue);
+          if (nextModel) editForm.setFieldValue("model_id", nextModel);
+        }, [selectedEditChannelValue, channels, config]);
+
+        useEffect(() => {
+          if (!tasks.some((item) => ["processing", "queued", "pending", "unknown"].includes(item.status))) return undefined;
+          const timer = setInterval(async () => {
+            try {
+              await api("/api/tasks/refresh-processing", { method: "POST", body: {} });
+              const taskList = await api("/api/tasks");
+              setTasks(taskList);
+            } catch (_error) {
+              // 下一轮继续刷新，避免临时网络波动打断页面。
+            }
+          }, 5000);
+          return () => clearInterval(timer);
+        }, [tasks]);
+
+        useEffect(() => {
+          if (!tasks.some((item) => ["processing", "queued", "pending", "unknown"].includes(item.status))) return undefined;
+          const timer = setInterval(() => setNowTick(Date.now()), 1000);
+          return () => clearInterval(timer);
+        }, [tasks]);
+
+        async function saveGlobal(values) {
+          setLoading(true);
+          try {
+            setConfig(await api("/api/config", { method: "POST", body: values }));
+            message.success("设置已保存");
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        async function patchChannel(channel, patch) {
+          try {
+            setConfig(await api(`/api/channels/${channel.id}`, { method: "POST", body: patch }));
+            message.success("渠道已更新");
+          } catch (error) {
+            message.error(error.message);
+          }
+        }
+
+        function openChannelModal(channel) {
+          setEditingChannel(channel || null);
+          channelForm.resetFields();
+          const chatModels = chatModelsForChannel(channel);
+          const defaultChatModel = chatModels.find((item) => item.default)?.key || "gpt";
+          channelForm.setFieldsValue(channel ? {
+            ...channel,
+            settings: {
+              ...(channel.settings || {}),
+              defaultChatModel,
+              chatModels
+            }
+          } : {
+            name: "",
+            type: "drawing",
+            enabled: true,
+            priority: channels.length + 1,
+            settings: { baseUrl: "", defaultModelId: config?.defaultModelId || 1, defaultChatModel: "gpt", chatModels: chatModelDefaults }
+          });
+          setChannelModalOpen(true);
+        }
+
+        async function saveChannel(values) {
+          setLoading(true);
+          try {
+            const beforeIds = new Set(channels.map((item) => item.id));
+            const path = editingChannel ? `/api/channels/${editingChannel.id}` : "/api/channels";
+            const nextConfig = await api(path, { method: "POST", body: values });
+            setConfig(nextConfig);
+            const added = nextConfig.channels.find((item) => !beforeIds.has(item.id));
+            setSelectedChannelId(editingChannel?.id || added?.id || selectedChannelId);
+            setChannelModalOpen(false);
+            setEditingChannel(null);
+            message.success(editingChannel ? "渠道已保存" : "渠道已新增");
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        async function deleteChannel(id) {
+          setLoading(true);
+          try {
+            const nextConfig = await api(`/api/channels/${id}`, { method: "DELETE" });
+            setConfig(nextConfig);
+            setSelectedChannelId(nextConfig.channels[0]?.id || null);
+            message.success("渠道已删除");
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        function openAccountModal(account) {
+          setEditingAccount(account || null);
+          accountForm.resetFields();
+          accountForm.setFieldsValue(account
+            ? { ...account, password: "" }
+            : { channelId: selectedChannel?.id, name: "", username: "", password: "", priority: 1, enabled: true }
+          );
+          setAccountModalOpen(true);
+        }
+
+        async function saveAccount(values) {
+          setLoading(true);
+          try {
+            const channelId = editingAccount?.channelId || values.channelId || selectedChannel?.id;
+            const payload = { ...editingAccount, ...values, channelId };
+            const nextConfig = await api("/api/accounts", { method: "POST", body: payload });
+            setConfig(nextConfig);
+            setSelectedChannelId(channelId || selectedChannelId);
+            setAccountModalOpen(false);
+            setEditingAccount(null);
+            message.success("账号已保存");
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        async function deleteAccount(id) {
+          try {
+            setConfig(await api(`/api/accounts/${id}`, { method: "DELETE" }));
+            message.success("账号已删除");
+          } catch (error) {
+            message.error(error.message);
+          }
+        }
+
+        async function testAccount(id) {
+          setLoading(true);
+          try {
+            await api(`/api/accounts/${id}/test`, { method: "POST" });
+            await refresh();
+            message.success("检测完成");
+          } catch (error) {
+            await refresh().catch(() => {});
+            message.error(error.message);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        async function testChannel(channelId) {
+          const related = accounts.filter((item) => item.channelId === channelId);
+          if (!related.length) {
+            message.warning("这个渠道还没有绑定账号");
+            return;
+          }
+          setLoading(true);
+          let ok = 0;
+          let failed = 0;
+          for (const account of related) {
+            try {
+              await api(`/api/accounts/${account.id}/test`, { method: "POST" });
+              ok += 1;
+            } catch (_error) {
+              failed += 1;
+            }
+          }
+          await refresh().catch(() => {});
+          setLoading(false);
+          message.info(`检测完成：${ok} 个可用，${failed} 个异常`);
+        }
+
+        async function testAll() {
+          setLoading(true);
+          try {
+            await api("/api/accounts/test-all", { method: "POST" });
+            await refresh();
+            message.success("全部账号检测完成");
+          } catch (error) {
+            await refresh().catch(() => {});
+            message.error(error.message);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        async function submitChat(values) {
+          if (chatSubmitting) return;
+          if (chatSubmitBlocked) {
+            message.warning(`聊天账号冷却中，约 ${accountCooldownText(coolingChatAccount)} 后再试`);
+            return;
+          }
+          const text = String(values.message || "").trim();
+          if (!text && !chatFileList.length) {
+            message.warning("请输入对话内容，或上传图片");
+            return;
+          }
+          if (chatFileList.length > 5) {
+            message.warning("对话最多上传 5 张图");
+            return;
+          }
+          setChatSubmitting(true);
+          setLoading(true);
+          try {
+            const headers = { Authorization: `Bearer ${config?.apiKey || ""}` };
+            const body = chatFileList.length
+              ? (() => {
+                  const form = new FormData();
+                  form.append("message", text);
+                  form.append("channel", values.channel || "auto");
+                  if (values.model) form.append("model", values.model);
+                  chatFileList.forEach((file) => form.append("image", file.originFileObj));
+                  return form;
+                })()
+              : {
+                  message: text,
+                  channel: values.channel || "auto",
+                  ...(values.model ? { model: values.model } : {})
+                };
+            const result = await api("/v1/chat/completions?wait=0", { method: "POST", headers, body });
+            if (result.task) {
+              setTasks((current) => [result.task, ...current.filter((item) => String(item.id) !== String(result.task.id))]);
+            }
+            setChatResult("");
+            message.success("对话已提交，任务记录里查看结果和耗时");
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setChatSubmitting(false);
+            setLoading(false);
+          }
+        }
+
+        async function submitEdit(values) {
+          if (!editFileList.length) {
+            message.warning("先上传 1 到 3 张源图");
+            return;
+          }
+          if (editFileList.length > 3) {
+            message.warning("图生图最多上传 3 张源图");
+            return;
+          }
+          setLoading(true);
+          try {
+            const form = new FormData();
+            Object.entries(values).forEach(([key, value]) => form.append(key, value ?? ""));
+            editFileList.forEach((file) => form.append("image", file.originFileObj));
+            const task = await api("/api/draw/edit", { method: "POST", body: form });
+            setTasks((current) => [task, ...current.filter((item) => String(item.id) !== String(task.id))]);
+            message.success(`已提交到 ${task.channelName}，后台生成中`);
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        async function refreshProcessing() {
+          setLoading(true);
+          try {
+            const results = await api("/api/tasks/refresh-processing", { method: "POST", body: {} });
+            await refresh();
+            if (!results.length) message.info("没有需要刷新的任务");
+            else message.success(`已刷新 ${results.length} 个任务`);
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        const publicApiBaseUrl = window.location.origin;
+        const chatApiUrl = `${publicApiBaseUrl}/v1/chat/completions`;
+        const editApiUrl = `${publicApiBaseUrl}/v1/images/edits`;
+
+        async function copyText(text, successText) {
+          try {
+            await navigator.clipboard.writeText(text || "");
+            message.success(successText);
+          } catch (_error) {
+            message.warning("浏览器不允许自动复制，可以手动选中复制");
+          }
+        }
+
+        async function copyApiKey() {
+          await copyText(config?.apiKey || "", "密钥已复制");
+        }
+
+        async function copyPublicApiUrl() {
+          await copyText(publicApiBaseUrl, "中转 API 地址已复制");
+        }
+
+        async function copyChatApiUrl() {
+          await copyText(chatApiUrl, "对话接口已复制");
+        }
+
+        async function copyEditApiUrl() {
+          await copyText(editApiUrl, "图生图接口已复制");
+        }
+
+        const channelColumns = [
+          {
+            title: "渠道",
+            dataIndex: "name",
+            width: 280,
+            render: (_, row) => h("div", { className: "channel-name-cell" }, [
+              h("div", { className: "primary-text", key: "name" }, row.name),
+              h("div", { className: "secondary-text mono", key: "url" }, channelBaseUrl(row))
+            ])
+          },
+          {
+            title: "类型",
+            dataIndex: "type",
+            width: 110,
+            render: (type) => h(Tag, { color: type === "chatplus" ? "blue" : "cyan" }, channelTypeName(type))
+          },
+          {
+            title: "状态",
+            width: 100,
+            render: (_, row) => statusTag(channelStats.get(row.id)?.status)
+          },
+          {
+            title: "账号",
+            width: 118,
+            render: (_, row) => {
+              const stats = channelStats.get(row.id) || {};
+              return h("span", null, `${stats.enabledCount || 0}/${stats.accountCount || 0} 启用`);
+            }
+          },
+          {
+            title: "额度",
+            width: 130,
+            render: (_, row) => {
+              const stats = channelStats.get(row.id) || {};
+              return h("span", null, channelQuotaText(row, stats));
+            }
+          },
+          { title: "优先级", dataIndex: "priority", width: 90 },
+          {
+            title: "启用",
+            dataIndex: "enabled",
+            width: 90,
+            render: (_, row) => h(Switch, {
+              checked: row.enabled !== false,
+              onChange: (checked) => patchChannel(row, { enabled: checked })
+            })
+          },
+          {
+            title: "操作",
+            width: 230,
+            render: (_, row) => h(Space, { size: 6 }, [
+              h(Tooltip, { title: "检测这个渠道下的全部账号", key: "test" },
+                h(Button, { size: "small", icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null, loading, onClick: () => testChannel(row.id) }, "检测")
+              ),
+              h(Button, { size: "small", icon: Icon.EditOutlined ? h(Icon.EditOutlined) : null, onClick: () => openChannelModal(row), key: "edit" }, "编辑"),
+              h(Popconfirm, {
+                key: "delete",
+                title: "删除这个渠道？",
+                description: "删除后，这个渠道下面的账号也会一起删除。",
+                okText: "删除",
+                cancelText: "取消",
+                onConfirm: () => deleteChannel(row.id)
+              }, h(Button, { size: "small", danger: true, icon: Icon.DeleteOutlined ? h(Icon.DeleteOutlined) : null }, "删除"))
+            ])
+          }
+        ];
+
+        const accountColumns = [
+          { title: "账号名称", dataIndex: "name", width: 130 },
+          { title: "登录账号", dataIndex: "username", ellipsis: true },
+          { title: "状态", dataIndex: "status", width: 90, render: statusTag },
+          {
+            title: "额度",
+            width: 130,
+            render: (_, row) => accountQuotaText(row, channels.find((item) => item.id === row.channelId))
+          },
+          { title: "重置/到期", dataIndex: "expireAt", width: 170, render: formatDateTime },
+          {
+            title: "启用",
+            dataIndex: "enabled",
+            width: 80,
+            render: (_, row) => h(Switch, {
+              checked: row.enabled !== false,
+              onChange: (checked) => saveAccount({ ...row, enabled: checked })
+            })
+          },
+          {
+            title: "操作",
+            width: 210,
+            render: (_, row) => h(Space, { size: 6 }, [
+              h(Button, { size: "small", onClick: () => testAccount(row.id), loading, icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null }, "检测"),
+              h(Button, { size: "small", onClick: () => openAccountModal(row), icon: Icon.EditOutlined ? h(Icon.EditOutlined) : null }, "编辑"),
+              h(Popconfirm, { title: "删除这个账号？", okText: "删除", cancelText: "取消", onConfirm: () => deleteAccount(row.id) },
+                h(Button, { size: "small", danger: true, icon: Icon.DeleteOutlined ? h(Icon.DeleteOutlined) : null }, "删除")
+              )
+            ])
+          }
+        ];
+
+        const taskColumns = [
+          {
+            title: "预览",
+            dataIndex: "imageUrls",
+            width: 104,
+            render: (urls, row) => {
+              const previewUrls = urls?.length ? urls : row.inputImageUrls || [];
+              return previewUrls.length
+                ? h(Image, { className: "task-thumb", src: previewUrls[0], preview: { src: previewUrls[0] } })
+                : h("div", { className: "task-thumb" });
+            }
+          },
+          { title: "状态", dataIndex: "status", width: 90, render: statusTag },
+          { title: "类型", dataIndex: "taskType", width: 90, render: taskTypeLabel },
+          { title: "渠道", dataIndex: "channelName", width: 150 },
+          { title: "账号", dataIndex: "accountName", width: 120 },
+          {
+            title: "描述",
+            dataIndex: "prompt",
+            render: (_, row) => h("div", null, [
+              h("div", { className: "primary-text" }, row.prompt || "-"),
+              row.responseText ? h("div", { className: "task-response" }, row.responseText) : null,
+              row.errorMessage ? h("div", { className: "error-text" }, row.errorMessage) : null
+            ])
+          },
+          { title: "耗时", width: 130, render: (_, row) => taskDuration(row, nowTick) },
+          { title: "比例", dataIndex: "ratio", width: 80 },
+          { title: "图片", dataIndex: "imageCount", width: 80 }
+        ];
+
+        const chatApiExample = `curl ${chatApiUrl} \\
+  -H "Authorization: Bearer ${config?.apiKey || "你的API密钥"}" \\
+  -F "message=请理解这张图片里的内容" \\
+  -F "image=@source.png" \\
+  -F "model=gpt" \\
+  -F "channel=auto"`;
+
+        const editApiExample = `curl ${editApiUrl} \\
+  -H "Authorization: Bearer ${config?.apiKey || "你的API密钥"}" \\
+  -F "image=@source-1.png" \\
+  -F "image=@source-2.png" \\
+  -F "prompt=把图片改成电影海报风格" \\
+  -F "channel=auto"`;
+
+        const apiParamRows = [
+          { key: "messages", name: "messages", required: "可选", scene: "对话", desc: "JSON 对话内容，格式和 OpenAI 一样：role + content。" },
+          { key: "message", name: "message", required: "可选", scene: "对话", desc: "简单对话直接传字符串；如果只传图，会默认让 AI 描述图片。" },
+          { key: "prompt", name: "prompt", required: "图生图必填", scene: "图生图", desc: "用户要怎么改图。" },
+          { key: "image", name: "image", required: "按场景", scene: "对话、图生图", desc: "对话最多 5 张；图生图 1 到 3 张；多张图重复传 image 字段。" },
+          { key: "channel", name: "channel", required: "可选", scene: "对话、图生图", desc: "传 auto 自动选择；也可以传渠道 ID；不传就用兜底渠道。" },
+          { key: "model", name: "model", required: "可选", scene: "对话", desc: "传 gpt、grok、gemini；后台会自动去对应列表挑一辆可用车。" },
+          { key: "model_id", name: "model_id", required: "可选", scene: "图生图", desc: "绘图模型；用户传了就用用户的，没传就用渠道默认模型。" },
+          { key: "ratio_label", name: "ratio_label", required: "可选", scene: "图生图", desc: "比如 1:1、16:9、9:16；没传才用兜底比例。" },
+          { key: "image_count", name: "image_count", required: "可选", scene: "图生图", desc: "生成张数；没传才用兜底张数。" },
+          { key: "wait-query", name: "wait=0", required: "可选", scene: "对话、图生图", desc: "写在地址后面，先创建任务，不等待结果：/v1/chat/completions?wait=0。" }
+        ];
+
+        const apiParamColumns = [
+          { title: "参数", dataIndex: "name", width: 130, render: (value) => h(Typography.Text, { code: true }, value) },
+          { title: "是否必填", dataIndex: "required", width: 110 },
+          { title: "适用接口", dataIndex: "scene", width: 140 },
+          { title: "说明", dataIndex: "desc" }
+        ];
+
+        const selectedStats = selectedChannel ? channelStats.get(selectedChannel.id) || {} : {};
+
+        return h("div", null, [
+          h("header", { className: "topbar", key: "topbar" }, [
+            h("div", { className: "brand" }, [
+              h("div", { className: "brand-mark" }, "AI"),
+              h("div", null, [
+                h("h1", { className: "brand-title" }, "ShareAI API 管理后台"),
+                h("p", { className: "brand-subtitle" }, "多渠道绑定、账号检测、统一封装成 API")
+              ])
+            ]),
+            h(Space, { wrap: true }, [
+              h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refresh }, "刷新"),
+              h(Button, { type: "primary", icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null, onClick: testAll, loading }, "检测全部账号")
+            ])
+          ]),
+          h("main", { className: "content" }, [
+            h("section", { className: "metrics-grid", key: "metrics" }, [
+              h("div", { className: "metric" }, [
+                h("div", { className: "metric-icon" }, Icon.BranchesOutlined ? h(Icon.BranchesOutlined) : null),
+                h("div", null, [h("div", { className: "metric-label" }, "渠道总数"), h("div", { className: "metric-value" }, channels.length)])
+              ]),
+              h("div", { className: "metric" }, [
+                h("div", { className: "metric-icon" }, Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null),
+                h("div", null, [h("div", { className: "metric-label" }, "启用渠道"), h("div", { className: "metric-value" }, totals.enabledChannels)])
+              ]),
+              h("div", { className: "metric" }, [
+                h("div", { className: "metric-icon" }, Icon.UserOutlined ? h(Icon.UserOutlined) : null),
+                h("div", null, [h("div", { className: "metric-label" }, "绑定账号"), h("div", { className: "metric-value" }, accounts.length)])
+              ]),
+              h("div", { className: "metric" }, [
+                h("div", { className: "metric-icon" }, Icon.ThunderboltOutlined ? h(Icon.ThunderboltOutlined) : null),
+                h("div", null, [h("div", { className: "metric-label" }, "可用账号"), h("div", { className: "metric-value" }, totals.okAccounts)])
+              ]),
+              h("div", { className: "metric" }, [
+                h("div", { className: "metric-icon" }, Icon.WalletOutlined ? h(Icon.WalletOutlined) : null),
+                h("div", null, [h("div", { className: "metric-label" }, "剩余额度"), h("div", { className: "metric-value" }, totals.balance)])
+              ]),
+              h("div", { className: "metric" }, [
+                h("div", { className: "metric-icon" }, Icon.FileDoneOutlined ? h(Icon.FileDoneOutlined) : null),
+                h("div", null, [h("div", { className: "metric-label" }, "任务总数"), h("div", { className: "metric-value" }, tasks.length)])
+              ])
+            ]),
+            h("section", { className: "workspace", key: "workspace" }, [
+              h("div", { className: "panel" }, [
+                h("div", { className: "panel-header" }, [
+                  h("div", null, [
+                    h("h2", { className: "panel-title" }, "渠道列表"),
+                    h("p", { className: "panel-desc" }, "一个网站渠道一行，账号挂在渠道下面")
+                  ]),
+                  h(Button, { type: "primary", icon: Icon.PlusOutlined ? h(Icon.PlusOutlined) : null, onClick: () => openChannelModal(null) }, "新增渠道")
+                ]),
+                h("div", { className: "table-wrap" }, [
+                  h("div", { className: "filters" }, [
+                    h(Input.Search, { allowClear: true, placeholder: "搜索渠道名称、地址", onSearch: setSearchText, onChange: (event) => setSearchText(event.target.value) }),
+                    h(Select, { value: typeFilter, onChange: setTypeFilter, options: [{ label: "全部类型", value: "all" }, ...channelTypeOptions] }),
+                    h(Select, { value: statusFilter, onChange: setStatusFilter, options: [
+                      { label: "全部状态", value: "all" },
+                      { label: "可用", value: "ok" },
+                      { label: "异常", value: "error" },
+                      { label: "未检测", value: "unknown" },
+                      { label: "未绑账号", value: "empty" },
+                      { label: "已停用", value: "disabled" }
+                    ] }),
+                    h("div", { className: "toolbar-note" }, `当前 ${filteredChannels.length} 个渠道`)
+                  ]),
+                  h(Table, {
+                    rowKey: "id",
+                    columns: channelColumns,
+                    dataSource: filteredChannels,
+                    pagination: { pageSize: 8, showSizeChanger: false },
+                    size: "middle",
+                    onRow: (record) => ({ onClick: () => setSelectedChannelId(record.id) })
+                  })
+                ])
+              ]),
+              h("aside", { className: "panel" }, selectedChannel
+                ? [
+                    h("div", { className: "panel-header", key: "head" }, [
+                      h("div", null, [
+                        h("h2", { className: "panel-title" }, selectedChannel.name),
+                        h("p", { className: "panel-desc mono" }, channelBaseUrl(selectedChannel))
+                      ]),
+                      h(Space, { wrap: true }, [
+                        statusTag(selectedStats.status),
+                        h(Button, { icon: Icon.EditOutlined ? h(Icon.EditOutlined) : null, onClick: () => openChannelModal(selectedChannel) }, "编辑")
+                      ])
+                    ]),
+                    h("div", { className: "detail-body", key: "body" }, [
+                      h("div", { className: "detail-grid" }, [
+                        h("div", { className: "detail-stat" }, [
+                          h("div", { className: "detail-stat-label" }, "渠道类型"),
+                          h("div", { className: "detail-stat-value" }, channelTypeName(selectedChannel.type))
+                        ]),
+                        h("div", { className: "detail-stat" }, [
+                          h("div", { className: "detail-stat-label" }, "启用账号"),
+                          h("div", { className: "detail-stat-value" }, `${selectedStats.enabledCount || 0}/${selectedStats.accountCount || 0}`)
+                        ]),
+                        h("div", { className: "detail-stat" }, [
+                          h("div", { className: "detail-stat-label" }, "余额合计"),
+                          h("div", { className: "detail-stat-value" }, channelQuotaText(selectedChannel, selectedStats))
+                        ])
+                      ]),
+                      selectedChannel.type === "chatplus"
+                        ? h("div", { className: "model-tag-row" }, chatModelsForChannel(selectedChannel).map((item) => h(Tag, { key: item.key, color: item.enabled ? "blue" : "default" }, `${item.name}${item.default ? " / 默认" : ""} / ${chatStrategyOptions.find((option) => option.value === item.strategy)?.label || "智能随机"}`)))
+                        : null,
+                      h("div", { className: "section-title" }, [
+                        h("h3", null, "渠道账号"),
+                        h(Button, { type: "primary", icon: Icon.PlusOutlined ? h(Icon.PlusOutlined) : null, onClick: () => openAccountModal(null), disabled: !channels.length }, "新增账号")
+                      ]),
+                      h(Table, {
+                        rowKey: "id",
+                        columns: accountColumns,
+                        dataSource: selectedAccounts,
+                        pagination: selectedAccounts.length > 5 ? { pageSize: 5 } : false,
+                        size: "small",
+                        locale: { emptyText: "这个渠道还没有绑定账号" }
+                      })
+                    ])
+                  ]
+                : h("div", { className: "detail-body" }, h(Empty, { description: "还没有渠道，先新增一个渠道" }))
+              )
+            ]),
+            h("section", { className: "panel operations", key: "operations" }, [
+              h(Tabs, {
+                items: [
+                  {
+                    key: "tasks",
+                    label: "任务记录",
+                    children: h("div", { className: "operation-body" }, [
+                      h("div", { className: "task-toolbar" }, [
+                        h("span", { className: "toolbar-note" }, "卡在处理中的任务，可以点这里重新查询结果"),
+                        h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refreshProcessing, loading }, "刷新处理中")
+                      ]),
+                      h(Table, {
+                        rowKey: "id",
+                        columns: taskColumns,
+                        dataSource: tasks,
+                        pagination: { pageSize: 8 }
+                      })
+                    ])
+                  },
+                  {
+                    key: "chat",
+                    label: "对话测试",
+                    children: h("div", { className: "operation-body" }, [
+                      h(Form, { layout: "vertical", form: chatForm, onFinish: submitChat }, [
+                        h(Alert, { type: "info", showIcon: true, message: "对话可以只发文字，也可以上传图片让 AI 理解内容，最多 5 张。", style: { marginBottom: 14 } }),
+                        chatSubmitBlocked
+                          ? h(Alert, { type: "warning", showIcon: true, message: `聊天账号冷却中，约 ${accountCooldownText(coolingChatAccount)} 后再试。`, style: { marginBottom: 14 } })
+                          : null,
+                        h("div", { className: "form-grid" }, [
+                          h(Form.Item, { label: "渠道", name: "channel" }, h(Select, { options: chatChannelOptions })),
+                          h(Form.Item, { label: "模型", name: "model" }, h(Select, { options: chatTestModelOptions }))
+                        ]),
+                        h(Form.Item, { label: "图片", extra: "可选，最多 5 张" }, h(Upload, {
+                          accept: "image/*",
+                          maxCount: 5,
+                          multiple: true,
+                          listType: "picture",
+                          fileList: chatFileList,
+                          beforeUpload: () => false,
+                          onChange: ({ fileList: next }) => setChatFileList(next.slice(-5))
+                        }, h(Button, { icon: Icon.UploadOutlined ? h(Icon.UploadOutlined) : null }, "选择图片"))),
+                        h(Form.Item, { label: "对话内容", name: "message" }, h(Input.TextArea, { rows: 4, placeholder: "例如：这张图里有什么？帮我总结重点" })),
+                        h(Button, { type: "primary", htmlType: "submit", loading: chatSubmitting, disabled: chatSubmitBlocked || loading, icon: Icon.SendOutlined ? h(Icon.SendOutlined) : null }, "提交对话")
+                      ]),
+                      chatResult ? h("div", { className: "api-doc-section", style: { marginTop: 16 } }, [
+                        h("h3", { className: "api-doc-title" }, "回复结果"),
+                        h("pre", { className: "code-box" }, chatResult)
+                      ]) : null
+                    ])
+                  },
+                  {
+                    key: "edit",
+                    label: "图生图测试",
+                    children: h("div", { className: "operation-body" }, h(Form, { layout: "vertical", form: editForm, onFinish: submitEdit }, [
+                      h(Alert, { type: "info", showIcon: true, message: "图生图支持 A 渠道和 B 渠道；选择自动时会按优先级提交。", style: { marginBottom: 14 } }),
+                      h("div", { className: "form-grid" }, [
+                        h(Form.Item, { label: "渠道", name: "channel" }, h(Select, { options: channelOptions })),
+                        h(Form.Item, { label: "绘图模型", name: "model_id" }, h(Select, { options: drawingModelOptions }))
+                      ]),
+                      h(Form.Item, { label: "源图", extra: "必填，最多 3 张" }, h(Upload, {
+                        accept: "image/*",
+                        maxCount: 3,
+                        multiple: true,
+                        listType: "picture",
+                        fileList: editFileList,
+                        beforeUpload: () => false,
+                        onChange: ({ fileList: next }) => setEditFileList(next.slice(-3))
+                      }, h(Button, { icon: Icon.UploadOutlined ? h(Icon.UploadOutlined) : null }, "选择图片"))),
+                      h(Form.Item, { label: "改图要求", name: "prompt", rules: [{ required: true, message: "请输入要求" }] }, h(Input.TextArea, { rows: 4, placeholder: "例如：沙滩中间加一个人物" })),
+                      h(Form.Item, { label: "张数", name: "image_count" }, h(InputNumber, { min: 1, max: 3, style: { width: "100%" } })),
+                      h(Button, { type: "primary", htmlType: "submit", loading, icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null }, "提交到后台生成")
+                    ]))
+                  },
+                  {
+                    key: "api",
+                    label: "API 调用",
+                    children: h("div", { className: "operation-body" }, [
+                      h("div", { className: "api-doc-stack" }, [
+                        h(Alert, {
+                          type: "success",
+                          showIcon: true,
+                          message: "用户调用你的中转 API；用户传了参数就用用户的，没传才用后台兜底值。",
+                          style: { marginBottom: 0 }
+                        }),
+                        h("div", { className: "form-grid" }, [
+                          h(Form.Item, { label: "对话接口" }, h(Input, { readOnly: true, value: chatApiUrl, addonAfter: h(Button, { type: "link", size: "small", onClick: copyChatApiUrl }, "复制") })),
+                          h(Form.Item, { label: "图生图接口" }, h(Input, { readOnly: true, value: editApiUrl, addonAfter: h(Button, { type: "link", size: "small", onClick: copyEditApiUrl }, "复制") })),
+                          h(Form.Item, { label: "API 密钥" }, h(Input, { readOnly: true, value: config?.apiKey || "", addonAfter: h(Button, { type: "link", size: "small", onClick: copyApiKey }, "复制") })),
+                          h(Form.Item, { label: "中转 API 地址" }, h(Input, { readOnly: true, value: publicApiBaseUrl, addonAfter: h(Button, { type: "link", size: "small", onClick: copyPublicApiUrl }, "复制") }))
+                        ]),
+                        h("div", { className: "api-doc-section" }, [
+                          h("h3", { className: "api-doc-title" }, "参数说明"),
+                          h("p", { className: "api-doc-copy" }, "这些参数由调用方自己传；后台的兜底参数只在调用方没传时生效。"),
+                          h(Table, {
+                            rowKey: "key",
+                            columns: apiParamColumns,
+                            dataSource: apiParamRows,
+                            pagination: false,
+                            size: "small"
+                          })
+                        ]),
+                        h("div", { className: "api-doc-section" }, [
+                          h("h3", { className: "api-doc-title" }, "对话调用示例"),
+                          h("pre", { className: "code-box" }, chatApiExample)
+                        ]),
+                        h("div", { className: "api-doc-section" }, [
+                          h("h3", { className: "api-doc-title" }, "图生图调用示例"),
+                          h("pre", { className: "code-box" }, editApiExample)
+                        ])
+                      ])
+                    ])
+                  },
+                  {
+                    key: "settings",
+                    label: "API 设置",
+                    children: h("div", { className: "operation-body" }, h(Form, { layout: "vertical", form: globalForm, onFinish: saveGlobal }, [
+                      h("div", { className: "form-grid" }, [
+                        h(Form.Item, { label: "中转 API 地址" }, h(Input, { readOnly: true, value: publicApiBaseUrl, addonAfter: h(Button, { type: "link", size: "small", onClick: copyPublicApiUrl }, "复制") })),
+                        h(Form.Item, { label: "API 密钥", name: "apiKey" }, h(Input, { readOnly: true, addonAfter: h(Button, { type: "link", size: "small", onClick: copyApiKey }, "复制") }))
+                      ]),
+                      h(Alert, {
+                        type: "info",
+                        showIcon: true,
+                        message: "下面是兜底值：用户调用 API 时传了参数就用用户的，没传才用这里的。",
+                        style: { marginBottom: 14 }
+                      }),
+                      h("div", { className: "form-grid" }, [
+                        h(Form.Item, { label: "兜底渠道", name: "defaultChannel" }, h(Select, { options: channelOptions })),
+                        h(Form.Item, { label: "兜底绘图模型", name: "defaultModelId" }, h(Select, { options: drawingModelOptions })),
+                        h(Form.Item, { label: "兜底比例", name: "defaultRatio" }, h(Select, { options: ["1:1", "16:9", "9:16", "4:3", "3:4"].map((value) => ({ label: value, value })) })),
+                        h(Form.Item, { label: "兜底张数", name: "defaultImageCount" }, h(InputNumber, { min: 1, max: 3, style: { width: "100%" } }))
+                      ]),
+                      h("div", { className: "form-grid" }, [
+                        h(Form.Item, { label: "上游主站地址", name: "mainBaseUrl" }, h(Input)),
+                        h(Form.Item, { label: "上游绘图站地址", name: "drawingBaseUrl" }, h(Input))
+                      ]),
+                      h(Button, { type: "primary", htmlType: "submit", loading, icon: Icon.SaveOutlined ? h(Icon.SaveOutlined) : null }, "保存设置")
+                    ]))
+                  }
+                ]
+              })
+            ])
+          ]),
+          h(Modal, {
+            title: editingChannel ? "编辑渠道" : "新增渠道",
+            open: channelModalOpen,
+            onCancel: () => setChannelModalOpen(false),
+            onOk: () => channelForm.submit(),
+            okText: editingChannel ? "保存渠道" : "新增渠道",
+            cancelText: "取消",
+            confirmLoading: loading,
+            width: 640,
+            destroyOnClose: true
+          }, h(Form, { form: channelForm, layout: "vertical", onFinish: saveChannel }, [
+            h("div", { className: "form-grid" }, [
+              h(Form.Item, { label: "渠道名称", name: "name", rules: [{ required: true, message: "请输入渠道名称" }] }, h(Input, { placeholder: "例如：绘图站 1" })),
+              h(Form.Item, { label: "渠道类型", name: "type", rules: [{ required: true, message: "请选择渠道类型" }] }, h(Select, { options: channelTypeOptions })),
+              h(Form.Item, { label: "优先级", name: "priority", rules: [{ required: true, message: "请输入优先级" }] }, h(InputNumber, { min: 1, max: 99, style: { width: "100%" } })),
+              h(Form.Item, { label: "启用", name: "enabled", valuePropName: "checked", initialValue: true }, h(Switch))
+            ]),
+            h(Form.Item, { label: "网站地址", name: ["settings", "baseUrl"], rules: [{ required: true, message: "请输入网站地址" }] }, h(Input, { placeholder: "https://example.com" })),
+            editingChannelType === "chatplus"
+              ? h("div", { className: "api-doc-section" }, [
+                  h(Form.Item, { label: "默认对话模型", name: ["settings", "defaultChatModel"] }, h(Select, { options: chatModelDefaults.map((item) => ({ label: item.name, value: item.key })) })),
+                  h("div", { className: "model-route-list" }, chatModelDefaults.map((item, index) => h("div", { className: "model-route-row", key: item.key }, [
+                    h("div", { className: "model-route-head" }, [
+                      h("div", { className: "model-route-title" }, `${item.name} 入口`),
+                      h(Form.Item, { name: ["settings", "chatModels", index, "enabled"], valuePropName: "checked", noStyle: true }, h(Switch, { checkedChildren: "启用", unCheckedChildren: "停用" }))
+                    ]),
+                    h(Form.Item, { name: ["settings", "chatModels", index, "key"], hidden: true }, h(Input)),
+                    h(Form.Item, { name: ["settings", "chatModels", index, "name"], hidden: true }, h(Input)),
+                    h(Form.Item, { name: ["settings", "chatModels", index, "carType"], hidden: true }, h(Input)),
+                    h("div", { className: "model-route-grid" }, [
+                      h(Form.Item, { label: "挑车策略", name: ["settings", "chatModels", index, "strategy"] }, h(Select, { options: chatStrategyOptions })),
+                      h(Form.Item, { label: "模型代码", name: ["settings", "chatModels", index, "model"] }, h(Input, { placeholder: "不填就用上游默认" })),
+                      h(Form.Item, { label: "调用值" }, h(Typography.Text, { code: true }, item.key))
+                    ])
+                  ])))
+                ])
+              : null
+            ,
+            editingChannelType === "drawing"
+              ? h("div", { className: "api-doc-section" }, [
+                  h(Form.Item, { label: "默认绘图模型", name: ["settings", "defaultModelId"] }, h(Select, { options: drawingModelOptions }))
+                ])
+              : null
+          ])),
+          h(Modal, {
+            title: editingAccount ? "编辑账号" : "新增账号",
+            open: accountModalOpen,
+            onCancel: () => setAccountModalOpen(false),
+            onOk: () => accountForm.submit(),
+            okText: editingAccount ? "保存账号" : "新增账号",
+            cancelText: "取消",
+            confirmLoading: loading,
+            width: 620,
+            destroyOnClose: true
+          }, h(Form, { form: accountForm, layout: "vertical", onFinish: saveAccount }, [
+            h("div", { className: "form-grid" }, [
+              h(Form.Item, { label: "所属渠道", name: "channelId", rules: [{ required: true, message: "请选择渠道" }] }, h(Select, { disabled: true, options: channels.map((item) => ({ label: item.name, value: item.id })) })),
+              h(Form.Item, { label: "账号名称", name: "name", rules: [{ required: true, message: "请输入账号名称" }] }, h(Input, { placeholder: "例如：账号 1" }))
+            ]),
+            h(Form.Item, { label: "登录账号", name: "username", rules: [{ required: true, message: "请输入登录账号" }] }, h(Input)),
+            h(Form.Item, { label: "登录密码", name: "password" }, h(Input.Password, { placeholder: editingAccount?.hasPassword ? "不改密码就留空" : "请输入密码" })),
+            h("div", { className: "form-grid" }, [
+              h(Form.Item, { label: "优先级", name: "priority", initialValue: 1 }, h(InputNumber, { min: 1, max: 99, style: { width: "100%" } })),
+              h(Form.Item, { label: "启用", name: "enabled", valuePropName: "checked", initialValue: true }, h(Switch))
+            ])
+          ]))
+        ]);
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(
+        h(ConfigProvider, {
+          theme: {
+            token: {
+              colorPrimary: "#1677ff",
+              borderRadius: 8,
+              colorBgLayout: "#f4f6f8",
+              fontFamily: "Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif"
+            },
+            components: {
+              Button: { controlHeight: 34 },
+              Input: { controlHeight: 34 },
+              Select: { controlHeight: 34 },
+              Table: { headerBg: "#f8fafc", rowHoverBg: "#f5f9ff" }
+            }
+          }
+        }, h(Dashboard))
+      );
+    </script>
+  </body>
+</html>

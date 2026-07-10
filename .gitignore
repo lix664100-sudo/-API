@@ -1,0 +1,16 @@
+# 依赖与环境配置
+node_modules/
+.env
+.env.*
+!.env.example
+
+# 含有账号、密钥和运行数据的本地文件
+data/
+work/
+outputs/
+
+# 日志与系统文件
+*.log
+npm-debug.log*
+Thumbs.db
+.DS_Store
