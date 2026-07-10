@@ -68,7 +68,7 @@ async function readJson(file, fallback) {
 
 async function writeJson(file, value) {
   await ensureDir();
-  const tempFile = `${file}.${process.pid}.tmp`;
+  const tempFile = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tempFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
   await rename(tempFile, file);
 }

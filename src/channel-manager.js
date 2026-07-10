@@ -5,26 +5,52 @@ import { getTask, listTasks, loadConfig, updateAccountStatus, upsertTask } from 
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
 const MAX_CONCURRENT_CHAT_TASKS = 1;
-const MAX_CONCURRENT_IMAGE_TASKS = 3;
+const MAX_CONCURRENT_DRAWING_TASKS = 3;
+const MAX_CONCURRENT_CHAT_IMAGE_TASKS = 1;
 const chatAccountQueues = new Map();
 const scheduledChatTasks = new Set();
-const activeTaskCounts = { chat: 0, image: 0 };
+const activeTaskCounts = { chat: 0, drawingImage: 0, chatImage: 0 };
 
-function reserveTaskSlot(type) {
-  const max = type === "chat" ? MAX_CONCURRENT_CHAT_TASKS : MAX_CONCURRENT_IMAGE_TASKS;
-  const label = type === "chat" ? "聊天" : "生图";
-  if (activeTaskCounts[type] >= max) {
-    const error = new Error(`${label}任务正在处理中，请稍后再试。`);
-    error.status = 429;
-    throw error;
-  }
-  activeTaskCounts[type] += 1;
+function taskSlotLimit(slot) {
+  if (slot === "chat") return MAX_CONCURRENT_CHAT_TASKS;
+  if (slot === "chatImage") return MAX_CONCURRENT_CHAT_IMAGE_TASKS;
+  return MAX_CONCURRENT_DRAWING_TASKS;
+}
+
+function taskSlotLabel(slot) {
+  if (slot === "chat") return "对话";
+  if (slot === "chatImage") return "聊天生图";
+  return "生图站";
+}
+
+function targetTaskSlot(target, taskType = "text2img") {
+  if (taskType === "chat") return "chat";
+  return target?.channel?.type === "chatplus" ? "chatImage" : "drawingImage";
+}
+
+function busyTaskError(slot) {
+  const error = new Error(`${taskSlotLabel(slot)}任务正在处理中，请稍后再试。`);
+  error.status = 429;
+  error.busy = true;
+  return error;
+}
+
+function tryReserveTaskSlot(slot) {
+  const max = taskSlotLimit(slot);
+  if (activeTaskCounts[slot] >= max) return null;
+  activeTaskCounts[slot] += 1;
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    activeTaskCounts[type] = Math.max(0, activeTaskCounts[type] - 1);
+    activeTaskCounts[slot] = Math.max(0, activeTaskCounts[slot] - 1);
   };
+}
+
+function reserveTaskSlot(slot) {
+  const release = tryReserveTaskSlot(slot);
+  if (!release) throw busyTaskError(slot);
+  return release;
 }
 
 async function withTaskSlot(type, work) {
@@ -275,6 +301,62 @@ function attemptErrorMessage(attempts) {
   return attempts.map((item) => `${item.channelName}/${item.accountName}：${item.message}`).join("；");
 }
 
+function sameTarget(left, right) {
+  return left?.channel?.id === right?.channel?.id && left?.account?.id === right?.account?.id;
+}
+
+function targetBusyAttempt(target, taskType) {
+  const slot = targetTaskSlot(target, taskType);
+  return {
+    channelId: target.channel.id,
+    channelName: target.channel.name,
+    accountId: target.account.id,
+    accountName: target.account.name,
+    message: busyTaskError(slot).message,
+    busy: true
+  };
+}
+
+function reserveFirstAvailableTarget(targets, taskType) {
+  const attempts = [];
+  for (const target of targets) {
+    const slot = targetTaskSlot(target, taskType);
+    const release = tryReserveTaskSlot(slot);
+    if (release) return { target, release, attempts };
+    attempts.push(targetBusyAttempt(target, taskType));
+  }
+  const error = new Error(`所有渠道都忙，请稍后再试：${attemptErrorMessage(attempts)}`);
+  error.status = 429;
+  error.busy = true;
+  error.attempts = attempts;
+  throw error;
+}
+
+function orderedTargets(targets, reserved) {
+  if (!reserved?.target) return targets;
+  return [
+    reserved.target,
+    ...targets.filter((target) => !sameTarget(target, reserved.target))
+  ];
+}
+
+function allAttemptsBusy(attempts) {
+  return attempts.length > 0 && attempts.every((item) => item.busy);
+}
+
+function targetsFailedError(attempts) {
+  const error = new Error(
+    allAttemptsBusy(attempts)
+      ? `所有渠道都忙，请稍后再试：${attemptErrorMessage(attempts)}`
+      : `所有渠道都失败：${attemptErrorMessage(attempts)}`
+  );
+  if (allAttemptsBusy(attempts)) {
+    error.status = 429;
+    error.busy = true;
+  }
+  return error;
+}
+
 function cleanPrompt(input) {
   return String(input?.prompt || "").trim();
 }
@@ -447,35 +529,56 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
   return nextTask;
 }
 
-async function runQueuedTextTask(task, input) {
+async function runQueuedTextTask(task, input, reserved = null) {
   const config = await loadConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "text2img");
-  const attempts = [];
-  for (const target of targets) {
-    const { channel, account } = target;
-    try {
-      const client = getClient(config, channel, account);
-      let result = await client.createTextTask(input);
-      if (channel.type === "drawing" && !isFinishedTask(result.status)) {
-        result = await client.waitForTask(result.externalId);
+  const attempts = [...(reserved?.attempts || [])];
+  let reservedRelease = reserved?.release || null;
+  try {
+    for (const target of orderedTargets(targets, reserved)) {
+      const { channel, account } = target;
+      let release = null;
+      const usingReserved = reservedRelease && sameTarget(target, reserved?.target);
+      if (usingReserved) {
+        release = reservedRelease;
+        reservedRelease = null;
+      } else {
+        release = tryReserveTaskSlot(targetTaskSlot(target, "text2img"));
+        if (!release) {
+          attempts.push(targetBusyAttempt(target, "text2img"));
+          continue;
+        }
       }
-      return finishQueuedTask(task, result, channel, account, attempts);
-    } catch (error) {
-      attempts.push({
-        channelId: channel.id,
-        channelName: channel.name,
-        accountId: account.id,
-        accountName: account.name,
-        message: error.message || "调用失败"
-      });
-      await updateAccountStatus(account.id, {
-        status: "error",
-        message: error.message || "调用失败"
-      });
+      try {
+        const client = getClient(config, channel, account);
+        let result = await client.createTextTask(input);
+        if (channel.type === "drawing" && !isFinishedTask(result.status)) {
+          result = await client.waitForTask(result.externalId);
+        }
+        return finishQueuedTask(task, result, channel, account, attempts);
+      } catch (error) {
+        attempts.push({
+          channelId: channel.id,
+          channelName: channel.name,
+          accountId: account.id,
+          accountName: account.name,
+          message: error.message || "调用失败"
+        });
+        if (!error.busy) {
+          await updateAccountStatus(account.id, {
+            status: "error",
+            message: error.message || "调用失败"
+          });
+        }
+      } finally {
+        release();
+      }
     }
+  } finally {
+    if (reservedRelease) reservedRelease();
   }
-  return failQueuedTask(task, new Error(`所有渠道都失败：${readableAttemptError(attempts)}`), attempts);
+  return failQueuedTask(task, targetsFailedError(attempts), attempts);
 }
 
 async function submitImageTask(client, input, files) {
@@ -493,35 +596,56 @@ async function submitImageTask(client, input, files) {
   });
 }
 
-async function runQueuedImageTask(task, input, files) {
+async function runQueuedImageTask(task, input, files, reserved = null) {
   const config = await loadConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "img2img");
-  const attempts = [];
-  for (const target of targets) {
-    const { channel, account } = target;
-    try {
-      const client = getClient(config, channel, account);
-      let result = await submitImageTask(client, input, files);
-      if (channel.type === "drawing" && !isFinishedTask(result.status)) {
-        result = await client.waitForTask(result.externalId);
+  const attempts = [...(reserved?.attempts || [])];
+  let reservedRelease = reserved?.release || null;
+  try {
+    for (const target of orderedTargets(targets, reserved)) {
+      const { channel, account } = target;
+      let release = null;
+      const usingReserved = reservedRelease && sameTarget(target, reserved?.target);
+      if (usingReserved) {
+        release = reservedRelease;
+        reservedRelease = null;
+      } else {
+        release = tryReserveTaskSlot(targetTaskSlot(target, "img2img"));
+        if (!release) {
+          attempts.push(targetBusyAttempt(target, "img2img"));
+          continue;
+        }
       }
-      return finishQueuedTask(task, result, channel, account, attempts);
-    } catch (error) {
-      attempts.push({
-        channelId: channel.id,
-        channelName: channel.name,
-        accountId: account.id,
-        accountName: account.name,
-        message: error.message || "调用失败"
-      });
-      await updateAccountStatus(account.id, {
-        status: "error",
-        message: error.message || "调用失败"
-      });
+      try {
+        const client = getClient(config, channel, account);
+        let result = await submitImageTask(client, input, files);
+        if (channel.type === "drawing" && !isFinishedTask(result.status)) {
+          result = await client.waitForTask(result.externalId);
+        }
+        return finishQueuedTask(task, result, channel, account, attempts);
+      } catch (error) {
+        attempts.push({
+          channelId: channel.id,
+          channelName: channel.name,
+          accountId: account.id,
+          accountName: account.name,
+          message: error.message || "调用失败"
+        });
+        if (!error.busy) {
+          await updateAccountStatus(account.id, {
+            status: "error",
+            message: error.message || "调用失败"
+          });
+        }
+      } finally {
+        release();
+      }
     }
+  } finally {
+    if (reservedRelease) reservedRelease();
   }
-  return failQueuedTask(task, new Error(`所有渠道都失败：${readableAttemptError(attempts)}`), attempts);
+  return failQueuedTask(task, targetsFailedError(attempts), attempts);
 }
 
 async function finishChatTask(task, result, channel, account, attempts, responseJson = null) {
@@ -620,20 +744,16 @@ export async function queueTextTask(input = {}) {
   const targets = selectTargets(config, requestedChannel, "text2img");
   if (!targets.length) throw new Error("没有可用的文生图渠道或账号。");
 
-  const release = reserveTaskSlot("image");
-  const task = queuedTask({ input, target: targets[0], taskType: "text2img" });
+  const reserved = reserveFirstAvailableTarget(targets, "text2img");
+  const task = queuedTask({ input, target: reserved.target, taskType: "text2img" });
   try {
     await upsertTask(task);
   } catch (error) {
-    release();
+    reserved.release();
     throw error;
   }
   runInBackground(async () => {
-    try {
-      await runQueuedTextTask(task, input);
-    } finally {
-      release();
-    }
+    await runQueuedTextTask(task, input, reserved);
   });
   return task;
 }
@@ -650,20 +770,16 @@ export async function queueImageTask({ input = {}, file, files: inputFiles }) {
   const targets = selectTargets(config, requestedChannel, "img2img");
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
 
-  const release = reserveTaskSlot("image");
-  const task = queuedTask({ input: { ...input, files }, target: targets[0], taskType: "img2img" });
+  const reserved = reserveFirstAvailableTarget(targets, "img2img");
+  const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img" });
   try {
     await upsertTask(task);
   } catch (error) {
-    release();
+    reserved.release();
     throw error;
   }
   runInBackground(async () => {
-    try {
-      await runQueuedImageTask(task, input, files);
-    } finally {
-      release();
-    }
+    await runQueuedImageTask(task, input, files, reserved);
   });
   return task;
 }
@@ -817,25 +933,30 @@ export async function createTextTask(input = {}, wait = false) {
   const targets = selectTargets(config, requestedChannel, "text2img");
   if (!targets.length) throw new Error("没有可用的文生图渠道或账号。");
 
-  return withTaskSlot("image", async () => {
-    const attempts = [];
-    for (const target of targets) {
-      const { channel, account } = target;
-      try {
-        const client = getClient(config, channel, account);
-        let result = await client.createTextTask(input);
-        if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
-        const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input) });
-        await upsertTask(task);
-        await markAccountAvailable(account.id);
-        return task;
-      } catch (error) {
-        attempts.push({ channelId: channel.id, channelName: channel.name, accountId: account.id, accountName: account.name, message: error.message || "调用失败" });
-        await updateAccountStatus(account.id, { status: "error", message: error.message || "调用失败" });
-      }
+  const attempts = [];
+  for (const target of targets) {
+    const { channel, account } = target;
+    const release = tryReserveTaskSlot(targetTaskSlot(target, "text2img"));
+    if (!release) {
+      attempts.push(targetBusyAttempt(target, "text2img"));
+      continue;
     }
-    throw new Error(`所有渠道都失败：${attemptErrorMessage(attempts)}`);
-  });
+    try {
+      const client = getClient(config, channel, account);
+      let result = await client.createTextTask(input);
+      if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
+      const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input) });
+      await upsertTask(task);
+      await markAccountAvailable(account.id);
+      return task;
+    } catch (error) {
+      attempts.push({ channelId: channel.id, channelName: channel.name, accountId: account.id, accountName: account.name, message: error.message || "调用失败" });
+      if (!error.busy) await updateAccountStatus(account.id, { status: "error", message: error.message || "调用失败" });
+    } finally {
+      release();
+    }
+  }
+  throw targetsFailedError(attempts);
 }
 export async function createImageTask({ input = {}, file, files: inputFiles, wait = false }) {
   if (!String(input.prompt || "").trim()) {
@@ -850,23 +971,28 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   const targets = selectTargets(config, requestedChannel, "img2img");
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
 
-  return withTaskSlot("image", async () => {
-    const attempts = [];
-    for (const target of targets) {
-      const { channel, account } = target;
-      try {
-        const client = getClient(config, channel, account);
-        let result = await submitImageTask(client, input, files);
-        if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
-        const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson({ ...input, files }) });
-        await upsertTask(task);
-        await markAccountAvailable(account.id);
-        return task;
-      } catch (error) {
-        attempts.push({ channelId: channel.id, channelName: channel.name, accountId: account.id, accountName: account.name, message: error.message || "调用失败" });
-        await updateAccountStatus(account.id, { status: "error", message: error.message || "调用失败" });
-      }
+  const attempts = [];
+  for (const target of targets) {
+    const { channel, account } = target;
+    const release = tryReserveTaskSlot(targetTaskSlot(target, "img2img"));
+    if (!release) {
+      attempts.push(targetBusyAttempt(target, "img2img"));
+      continue;
     }
-    throw new Error(`所有渠道都失败：${attemptErrorMessage(attempts)}`);
-  });
+    try {
+      const client = getClient(config, channel, account);
+      let result = await submitImageTask(client, input, files);
+      if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
+      const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson({ ...input, files }) });
+      await upsertTask(task);
+      await markAccountAvailable(account.id);
+      return task;
+    } catch (error) {
+      attempts.push({ channelId: channel.id, channelName: channel.name, accountId: account.id, accountName: account.name, message: error.message || "调用失败" });
+      if (!error.busy) await updateAccountStatus(account.id, { status: "error", message: error.message || "调用失败" });
+    } finally {
+      release();
+    }
+  }
+  throw targetsFailedError(attempts);
 }
