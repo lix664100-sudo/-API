@@ -177,6 +177,40 @@ function updateCommandConfig() {
   };
 }
 
+function shortCommit(value) {
+  return String(value || "").trim().slice(0, 7);
+}
+
+async function currentGitUpdateState(cwd) {
+  const execOptions = {
+    cwd,
+    timeout: updateTimeoutMs,
+    windowsHide: true,
+    maxBuffer: 1024 * 1024 * 2
+  };
+  try {
+    const inside = await execAsync("git rev-parse --is-inside-work-tree", execOptions);
+    if (String(inside.stdout || "").trim() !== "true") return { checked: false };
+
+    const local = await execAsync("git rev-parse HEAD", execOptions);
+    const upstream = await execAsync('git rev-parse --abbrev-ref --symbolic-full-name "@{u}"', execOptions);
+    await execAsync("git fetch --quiet", execOptions);
+    const remote = await execAsync('git rev-parse "@{u}"', execOptions);
+
+    const localCommit = String(local.stdout || "").trim();
+    const remoteCommit = String(remote.stdout || "").trim();
+    return {
+      checked: true,
+      upToDate: localCommit && remoteCommit && localCommit === remoteCommit,
+      localCommit,
+      remoteCommit,
+      upstream: String(upstream.stdout || "").trim()
+    };
+  } catch {
+    return { checked: false };
+  }
+}
+
 function badRequest(message) {
   const error = new Error(message);
   error.status = 400;
@@ -329,6 +363,20 @@ app.post("/api/admin/update", async (_request, reply) => {
   }
   updateRunning = true;
   try {
+    const gitState = await currentGitUpdateState(cwd);
+    if (gitState.upToDate) {
+      return {
+        ok: true,
+        data: {
+          success: true,
+          skipped: true,
+          message: "已经是最新版，无需更新。",
+          stdout: `当前版本：${shortCommit(gitState.localCommit)}\n线上来源：${gitState.upstream || "未识别"}`,
+          stderr: ""
+        }
+      };
+    }
+
     const result = await execAsync(command, {
       cwd,
       timeout: updateTimeoutMs,
