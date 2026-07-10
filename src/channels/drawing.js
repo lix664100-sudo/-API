@@ -28,6 +28,11 @@ function toAbsoluteUrl(baseUrl, url) {
   return `${trimSlash(baseUrl)}${url.startsWith("/") ? "" : "/"}${url}`;
 }
 
+function isDrawingAuthError(error) {
+  const text = `${error?.message || ""} ${error?.status || ""} ${error?.code || ""} ${JSON.stringify(error?.payload || {})}`;
+  return /\b(401|403)\b|账号已在其他设备登录|其他设备登|身份验证失败|请重新登录|重新登录|重新登陆|未登录|未登陆|unauthorized|forbidden/i.test(text);
+}
+
 export function normalizeDrawingTask(task, drawingBaseUrl = "") {
   const items = Array.isArray(task?.items) ? task.items : [];
   const imageUrls = items
@@ -101,7 +106,7 @@ export class DrawingClient {
     if (!this.accessToken) await this.login();
   }
 
-  async request(apiPath, options = {}) {
+  async request(apiPath, options = {}, retried = false) {
     const headers = new Headers(options.headers || {});
     const isForm = options.body instanceof FormData;
     if (options.auth !== false) {
@@ -119,11 +124,22 @@ export class DrawingClient {
     });
 
     const text = await response.text();
-    const payload = text ? JSON.parse(text) : null;
+    let payload = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = text ? { message: text } : null;
+    }
     if (!response.ok || payload?.code) {
       const error = new Error(payload?.message || payload?.msg || `绘图站请求失败：${response.status}`);
       error.status = response.status;
+      error.code = payload?.code;
       error.payload = payload;
+      if (options.auth !== false && !retried && isDrawingAuthError(error)) {
+        this.accessToken = "";
+        await this.login();
+        return this.request(apiPath, options, true);
+      }
       throw error;
     }
     return payload?.data ?? payload;
