@@ -2,9 +2,11 @@ import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { exec } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
   checkAccount,
@@ -33,6 +35,23 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const adminDir = path.join(rootDir, "admin");
 const previewDir = path.join(rootDir, "outputs", "previews");
+const execAsync = promisify(exec);
+
+const adminSessionCookie = "shareai_admin_session";
+const adminUsername = String(process.env.ADMIN_USERNAME || "lixiang");
+const adminPassword = String(process.env.ADMIN_PASSWORD || "999999");
+const adminSessionSecret = String(process.env.ADMIN_SESSION_SECRET || process.env.SESSION_SECRET || "shareai-local-admin-secret");
+const adminSessionMs = Math.max(1, Number(process.env.ADMIN_SESSION_HOURS || 12)) * 60 * 60 * 1000;
+const updateTimeoutMs = Math.max(10, Number(process.env.ADMIN_UPDATE_TIMEOUT_SEC || 120)) * 1000;
+const updateOutputLimit = 8000;
+const publicAdminApiPaths = new Set([
+  "/api/health",
+  "/api/auth/status",
+  "/api/auth/login",
+  "/api/auth/logout"
+]);
+const activeAdminSessions = new Map();
+let updateRunning = false;
 
 const app = Fastify({ logger: true, bodyLimit: 60 * 1024 * 1024 });
 
@@ -53,8 +72,109 @@ async function requireApiKey(request, reply) {
   const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
   const apiKey = String(request.headers["x-api-key"] || bearer || "").trim();
   if (!apiKey || apiKey !== config.apiKey) {
-    reply.code(401).send({ ok: false, message: "API 密钥不正确。" });
+    return reply.code(401).send({ ok: false, message: "API 密钥不正确。" });
   }
+}
+
+function safeTextEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left));
+  const rightBuffer = Buffer.from(String(right));
+  if (leftBuffer.length !== rightBuffer.length) return false;
+  return timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function parseCookies(request) {
+  return String(request.headers.cookie || "")
+    .split(";")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .reduce((cookies, item) => {
+      const index = item.indexOf("=");
+      if (index <= 0) return cookies;
+      try {
+        const name = decodeURIComponent(item.slice(0, index).trim());
+        const value = decodeURIComponent(item.slice(index + 1).trim());
+        cookies[name] = value;
+      } catch {
+        return cookies;
+      }
+      return cookies;
+    }, {});
+}
+
+function signAdminPayload(payload) {
+  return createHmac("sha256", adminSessionSecret).update(payload).digest("base64url");
+}
+
+function createAdminToken(username) {
+  const session = {
+    username,
+    sid: randomUUID(),
+    exp: Date.now() + adminSessionMs
+  };
+  activeAdminSessions.set(session.sid, session.exp);
+  const payload = Buffer.from(JSON.stringify(session)).toString("base64url");
+  return `${payload}.${signAdminPayload(payload)}`;
+}
+
+function verifyAdminToken(token) {
+  const [payload, signature] = String(token || "").split(".");
+  if (!payload || !signature) return null;
+  const expected = signAdminPayload(payload);
+  if (!safeTextEqual(signature, expected)) return null;
+  try {
+    const session = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (session.username !== adminUsername || !session.sid) return null;
+    const activeExp = activeAdminSessions.get(session.sid);
+    if (!activeExp || activeExp !== session.exp) return null;
+    if (Date.now() > Number(session.exp || 0)) {
+      activeAdminSessions.delete(session.sid);
+      return null;
+    }
+    return { username: session.username, sid: session.sid, exp: session.exp };
+  } catch {
+    return null;
+  }
+}
+
+function getAdminSession(request) {
+  const cookies = parseCookies(request);
+  return verifyAdminToken(cookies[adminSessionCookie]);
+}
+
+function setAdminCookie(reply, username) {
+  const token = encodeURIComponent(createAdminToken(username));
+  reply.header("set-cookie", `${adminSessionCookie}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(adminSessionMs / 1000)}`);
+}
+
+function clearAdminCookie(reply) {
+  reply.header("set-cookie", `${adminSessionCookie}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+}
+
+function clearAdminSession(request, reply) {
+  const session = getAdminSession(request);
+  if (session?.sid) activeAdminSessions.delete(session.sid);
+  clearAdminCookie(reply);
+}
+
+async function requireAdmin(request, reply) {
+  const session = getAdminSession(request);
+  if (!session) {
+    return reply.code(401).send({ ok: false, message: "请先登录后台。" });
+  }
+  request.admin = session;
+}
+
+function shortenOutput(value) {
+  const text = String(value || "");
+  return text.length > updateOutputLimit ? text.slice(-updateOutputLimit) : text;
+}
+
+function updateCommandConfig() {
+  return {
+    command: String(process.env.ADMIN_UPDATE_COMMAND || "").trim(),
+    cwd: path.resolve(String(process.env.ADMIN_UPDATE_CWD || rootDir))
+  };
 }
 
 function badRequest(message) {
@@ -139,6 +259,13 @@ function isMultipartRequest(request) {
     : String(request.headers["content-type"] || "").toLowerCase().includes("multipart/form-data");
 }
 
+app.addHook("preHandler", async (request, reply) => {
+  const urlPath = String(request.url || "").split("?")[0];
+  const needsAdmin = (urlPath.startsWith("/api/") && !publicAdminApiPaths.has(urlPath))
+    || urlPath.startsWith("/uploads/previews/");
+  if (needsAdmin) return requireAdmin(request, reply);
+});
+
 app.get("/uploads/previews/:filename", async (request, reply) => {
   const filename = path.basename(String(request.params.filename || ""));
   if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) throw badRequest("图片地址不正确。");
@@ -165,6 +292,71 @@ app.get("/admin/index.html", async (_request, reply) => {
 });
 
 app.get("/api/health", async () => ({ ok: true, time: new Date().toISOString() }));
+
+app.get("/api/auth/status", async (request) => {
+  const session = getAdminSession(request);
+  return {
+    ok: true,
+    data: session
+      ? { authenticated: true, user: { username: session.username } }
+      : { authenticated: false, user: null }
+  };
+});
+
+app.post("/api/auth/login", async (request, reply) => {
+  const body = request.body || {};
+  const username = String(body.username || "");
+  const password = String(body.password || "");
+  if (!safeTextEqual(username, adminUsername) || !safeTextEqual(password, adminPassword)) {
+    return reply.code(401).send({ ok: false, message: "账号或密码不正确。" });
+  }
+  setAdminCookie(reply, adminUsername);
+  return { ok: true, data: { username: adminUsername } };
+});
+
+app.post("/api/auth/logout", async (request, reply) => {
+  clearAdminSession(request, reply);
+  return { ok: true, data: true };
+});
+
+app.post("/api/admin/update", async (_request, reply) => {
+  const { command, cwd } = updateCommandConfig();
+  if (!command) {
+    return reply.code(400).send({ ok: false, message: "还没有配置更新命令。" });
+  }
+  if (updateRunning) {
+    return reply.code(409).send({ ok: false, message: "更新正在执行，请稍后再试。" });
+  }
+  updateRunning = true;
+  try {
+    const result = await execAsync(command, {
+      cwd,
+      timeout: updateTimeoutMs,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024 * 5
+    });
+    return {
+      ok: true,
+      data: {
+        success: true,
+        stdout: shortenOutput(result.stdout),
+        stderr: shortenOutput(result.stderr)
+      }
+    };
+  } catch (error) {
+    return {
+      ok: true,
+      data: {
+        success: false,
+        message: error.killed ? "更新命令超时。" : "更新命令执行失败。",
+        stdout: shortenOutput(error.stdout),
+        stderr: shortenOutput(error.stderr || error.message)
+      }
+    };
+  } finally {
+    updateRunning = false;
+  }
+});
 
 app.get("/api/config", async () => {
   const config = await loadConfig();
@@ -305,6 +497,20 @@ app.post("/api/draw/edit", async (request, reply) => {
   } catch (error) {
     return sendError(reply, error);
   }
+});
+
+app.get("/v1/models", { preHandler: requireApiKey }, async () => {
+  const created = Math.floor(Date.now() / 1000);
+  return {
+    object: "list",
+    data: [
+      { id: "auto", object: "model", created, owned_by: "shareai-api" },
+      { id: "gpt", object: "model", created, owned_by: "shareai-api" },
+      { id: "grok", object: "model", created, owned_by: "shareai-api" },
+      { id: "gemini", object: "model", created, owned_by: "shareai-api" },
+      { id: "gpt-image-2", object: "model", created, owned_by: "shareai-api" }
+    ]
+  };
 });
 
 app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, reply) => {

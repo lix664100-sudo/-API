@@ -72,3 +72,54 @@ curl "http://127.0.0.1:3210/v1/images/edits?wait=1" \
 ```
 
 任务和账号配置保存在本地 `data` 目录。
+
+## 后台登录
+
+后台现在需要先登录才能查看渠道、账号、任务和 API 密钥。
+
+默认后台账号：
+
+```text
+lixiang
+```
+
+默认后台密码：
+
+```text
+999999
+```
+
+线上部署时在 `.env` 里配置：
+
+```env
+ADMIN_USERNAME=lixiang
+ADMIN_PASSWORD=999999
+ADMIN_SESSION_SECRET=换成一串很长的随机字符
+ADMIN_SESSION_HOURS=12
+```
+
+## 更新线上代码按钮
+
+后台右上角有“更新线上代码”按钮。这个按钮只会执行服务器 `.env` 里配置好的更新命令，不会在网页里保存服务器密码，也不会把命令从浏览器传给服务器。
+
+如果部署在 `154.21.194.147:3210` 这台服务器，可以这样填 `.env`：
+
+```env
+PORT=3210
+HOST=0.0.0.0
+ADMIN_USERNAME=lixiang
+ADMIN_PASSWORD=999999
+ADMIN_SESSION_SECRET=换成一串很长的随机字符
+ADMIN_UPDATE_CWD=/root/shareai-api
+ADMIN_UPDATE_COMMAND=git pull --ff-only && npm install --omit=dev && pm2 restart shareai-api
+ADMIN_UPDATE_TIMEOUT_SEC=120
+```
+
+第一次部署时建议用 pm2 启动：
+
+```bash
+pm2 start src/server.js --name shareai-api
+pm2 save
+```
+
+以后你点后台的“更新线上代码”，服务器会进入 `ADMIN_UPDATE_CWD`，执行 `ADMIN_UPDATE_COMMAND`。代码需要先放进 git 仓库，更新按钮才知道从哪里拉新代码。

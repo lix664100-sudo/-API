@@ -40,6 +40,61 @@
           Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
       }
 
+      .boot-screen,
+      .login-shell {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background:
+          linear-gradient(135deg, rgba(22, 119, 255, 0.08), transparent 36%),
+          var(--page-bg);
+      }
+
+      .login-panel {
+        width: min(420px, 100%);
+        padding: 28px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.94);
+        box-shadow: var(--shadow);
+      }
+
+      .login-brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 22px;
+      }
+
+      .login-title {
+        margin: 0;
+        font-size: 20px;
+        line-height: 1.2;
+      }
+
+      .login-subtitle {
+        margin: 4px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .update-output {
+        max-height: 420px;
+        margin: 0;
+        overflow: auto;
+        padding: 12px;
+        border: 1px solid #1f2937;
+        border-radius: 8px;
+        background: #101828;
+        color: #d1fadf;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-size: 12px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
       .topbar {
         position: sticky;
         top: 0;
@@ -520,6 +575,7 @@
         Row,
         Select,
         Space,
+        Spin,
         Switch,
         Table,
         Tabs,
@@ -779,10 +835,87 @@
         };
       }
 
-      function Dashboard() {
+      function LoginScreen({ onLogin }) {
+        const [form] = Form.useForm();
+        const [submitting, setSubmitting] = useState(false);
+
+        async function submit(values) {
+          setSubmitting(true);
+          try {
+            const user = await api("/api/auth/login", { method: "POST", body: values });
+            message.success("登录成功");
+            onLogin(user);
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setSubmitting(false);
+          }
+        }
+
+        return h("main", { className: "login-shell" }, [
+          h("section", { className: "login-panel" }, [
+            h("div", { className: "login-brand" }, [
+              h("div", { className: "brand-mark" }, "AI"),
+              h("div", null, [
+                h("h1", { className: "login-title" }, "ShareAI 后台登录"),
+                h("p", { className: "login-subtitle" }, "登录后才能查看账号、密钥和任务记录")
+              ])
+            ]),
+            h(Form, { form, layout: "vertical", initialValues: { username: "lixiang" }, onFinish: submit }, [
+              h(Form.Item, { label: "账号", name: "username", rules: [{ required: true, message: "请输入账号" }] },
+                h(Input, { autoComplete: "username", prefix: Icon.UserOutlined ? h(Icon.UserOutlined) : null })
+              ),
+              h(Form.Item, { label: "密码", name: "password", rules: [{ required: true, message: "请输入密码" }] },
+                h(Input.Password, { autoComplete: "current-password", prefix: Icon.LockOutlined ? h(Icon.LockOutlined) : null })
+              ),
+              h(Button, {
+                block: true,
+                type: "primary",
+                htmlType: "submit",
+                loading: submitting,
+                icon: Icon.LoginOutlined ? h(Icon.LoginOutlined) : null
+              }, "登录后台")
+            ])
+          ])
+        ]);
+      }
+
+      function App() {
+        const [checking, setChecking] = useState(true);
+        const [adminUser, setAdminUser] = useState(null);
+
+        useEffect(() => {
+          api("/api/auth/status")
+            .then((data) => {
+              if (data?.authenticated) setAdminUser(data.user);
+            })
+            .catch(() => {})
+            .finally(() => setChecking(false));
+        }, []);
+
+        async function logout() {
+          try {
+            await api("/api/auth/logout", { method: "POST", body: {} });
+          } catch (_error) {
+          }
+          setAdminUser(null);
+          message.success("已退出");
+        }
+
+        if (checking) {
+          return h("main", { className: "boot-screen" }, h(Spin, { size: "large" }));
+        }
+
+        return adminUser
+          ? h(Dashboard, { adminUser, onLogout: logout })
+          : h(LoginScreen, { onLogin: setAdminUser });
+      }
+
+      function Dashboard({ adminUser, onLogout }) {
         const [config, setConfig] = useState(null);
         const [tasks, setTasks] = useState([]);
         const [loading, setLoading] = useState(false);
+        const [updating, setUpdating] = useState(false);
         const [nowTick, setNowTick] = useState(Date.now());
         const [chatFileList, setChatFileList] = useState([]);
         const [editFileList, setEditFileList] = useState([]);
@@ -1132,6 +1265,41 @@
           }
         }
 
+        function showUpdateResult(result) {
+          const output = [
+            result?.message ? `结果：${result.message}` : "",
+            result?.stdout ? `输出：\n${result.stdout}` : "",
+            result?.stderr ? `提示：\n${result.stderr}` : ""
+          ].filter(Boolean).join("\n\n") || "更新命令执行完成，没有返回内容。";
+          Modal.info({
+            title: result?.success ? "更新完成" : "更新未完成",
+            width: 760,
+            content: h("pre", { className: "update-output" }, output)
+          });
+        }
+
+        function runUpdate() {
+          Modal.confirm({
+            title: "更新线上代码",
+            content: "会执行服务器 .env 里配置好的更新命令，不会保存服务器密码。",
+            okText: "开始更新",
+            cancelText: "取消",
+            onOk: async () => {
+              setUpdating(true);
+              try {
+                const result = await api("/api/admin/update", { method: "POST", body: {} });
+                if (result?.success) message.success("更新完成");
+                else message.error(result?.message || "更新失败");
+                showUpdateResult(result);
+              } catch (error) {
+                message.error(error.message);
+              } finally {
+                setUpdating(false);
+              }
+            }
+          });
+        }
+
         async function submitChat(values) {
           if (chatSubmitting) return;
           if (chatSubmitBlocked) {
@@ -1426,8 +1594,11 @@
               ])
             ]),
             h(Space, { wrap: true }, [
+              h(Tag, { color: "blue", icon: Icon.UserOutlined ? h(Icon.UserOutlined) : null }, adminUser?.username || "已登录"),
               h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refresh }, "刷新"),
-              h(Button, { type: "primary", icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null, onClick: testAll, loading }, "检测全部账号")
+              h(Button, { icon: Icon.CloudSyncOutlined ? h(Icon.CloudSyncOutlined) : null, onClick: runUpdate, loading: updating }, "更新线上代码"),
+              h(Button, { type: "primary", icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null, onClick: testAll, loading }, "检测全部账号"),
+              h(Button, { icon: Icon.LogoutOutlined ? h(Icon.LogoutOutlined) : null, onClick: onLogout }, "退出")
             ])
           ]),
           h("main", { className: "content" }, [
@@ -1765,7 +1936,7 @@
               Table: { headerBg: "#f8fafc", rowHoverBg: "#f5f9ff" }
             }
           }
-        }, h(Dashboard))
+        }, h(App))
       );
     </script>
   </body>
