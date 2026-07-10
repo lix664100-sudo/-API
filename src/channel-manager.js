@@ -73,7 +73,19 @@ function cooldownError(account) {
 
 function isChatBlockedError(error) {
   const text = `${error?.message || ""} ${error?.code || ""} ${error?.status || ""}`;
-  return /\b403\b|ssl\/tls|schannel|handshake|connection closed|connection timed out|server closed abruptly|close_notify|econnreset|etimedout|err_connection_closed/i.test(text);
+  return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|ssl\/tls|schannel|handshake|connection closed|connection timed out|server closed abruptly|close_notify|econnreset|etimedout|err_connection_closed/i.test(text);
+}
+
+function isChatLoginStateText(text) {
+  return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登/i.test(String(text || ""));
+}
+
+function readableChatFailure(attempts) {
+  const details = attemptErrorMessage(attempts);
+  if (isChatLoginStateText(details)) {
+    return "聊天站登录状态没有完整通过，系统已自动重新登录并换车，但仍然失败。请先检测聊天账号，或稍后再试。";
+  }
+  return `所有对话渠道都失败：${details}`;
 }
 
 async function markChatCooldown(accountId, error) {
@@ -81,7 +93,9 @@ async function markChatCooldown(accountId, error) {
   await updateAccountStatus(accountId, {
     status: "error",
     cooldownUntil,
-    message: `上游拒绝或断开，已冷却到 ${cooldownUntil}。${error?.message || ""}`.trim()
+    message: isChatLoginStateText(error?.message)
+      ? `聊天站登录状态被上游拒绝，已冷却到 ${cooldownUntil}，系统稍后会自动再试。`
+      : `上游拒绝或断开，已冷却到 ${cooldownUntil}。${error?.message || ""}`.trim()
   });
 }
 
@@ -157,6 +171,8 @@ function mergeRefreshedTask(task, result, channel, account) {
     accountId: task.accountId || account.id,
     accountName: task.accountName || account.name,
     completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : task.completedAt || null,
+    requestJson: task.requestJson || null,
+    responseJson: taskResponseJson(result),
     raw: result.raw || task.raw || result
   };
 }
@@ -337,12 +353,16 @@ function assertChatInput(input = {}) {
 
 function jsonValue(value) {
   if (value === undefined) return null;
-  return JSON.parse(JSON.stringify(value, (_key, item) => {
-    if (typeof item === "function") return undefined;
-    if (typeof item === "bigint") return item.toString();
-    if (item instanceof Uint8Array) return `[${item.constructor.name} ${item.byteLength} bytes]`;
-    return item;
-  }));
+  try {
+    return JSON.parse(JSON.stringify(value, (_key, item) => {
+      if (typeof item === "function") return undefined;
+      if (typeof item === "bigint") return item.toString();
+      if (item instanceof Uint8Array) return `[${item.constructor.name} ${item.byteLength} bytes]`;
+      return item;
+    }));
+  } catch {
+    return String(value);
+  }
 }
 
 function taskFileJson(file) {
@@ -576,7 +596,7 @@ async function runChatCompletionTask(task, input) {
     }
   }
 
-  const error = new Error(`所有对话渠道都失败：${attemptErrorMessage(attempts)}`);
+  const error = new Error(readableChatFailure(attempts));
   error.task = await failQueuedTask(task, error, attempts);
   throw error;
 }
@@ -631,7 +651,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles }) {
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
 
   const release = reserveTaskSlot("image");
-  const task = queuedTask({ input, target: targets[0], taskType: "img2img" });
+  const task = queuedTask({ input: { ...input, files }, target: targets[0], taskType: "img2img" });
   try {
     await upsertTask(task);
   } catch (error) {
@@ -805,7 +825,7 @@ export async function createTextTask(input = {}, wait = false) {
         const client = getClient(config, channel, account);
         let result = await client.createTextTask(input);
         if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
-        const task = wrapTask({ result, channel, account, attempts });
+        const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input) });
         await upsertTask(task);
         await markAccountAvailable(account.id);
         return task;
@@ -838,7 +858,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
         const client = getClient(config, channel, account);
         let result = await submitImageTask(client, input, files);
         if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
-        const task = wrapTask({ result, channel, account, attempts });
+        const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson({ ...input, files }) });
         await upsertTask(task);
         await markAccountAvailable(account.id);
         return task;

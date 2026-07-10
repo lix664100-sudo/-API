@@ -383,6 +383,31 @@
         line-height: 1.45;
       }
 
+      .task-error-detail {
+        max-width: 980px;
+        margin-top: 6px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .task-error-detail summary {
+        cursor: pointer;
+        color: #475569;
+        user-select: none;
+      }
+
+      .task-error-detail pre {
+        max-height: 180px;
+        margin: 6px 0 0;
+        overflow: auto;
+        padding: 10px;
+        border: 1px solid #fee2e2;
+        border-radius: 8px;
+        background: #fff7f7;
+        color: #991b1b;
+        white-space: pre-wrap;
+      }
+
       .task-response {
         max-width: 680px;
         margin-top: 5px;
@@ -390,6 +415,44 @@
         font-size: 12px;
         line-height: 1.5;
         white-space: pre-wrap;
+      }
+
+      .task-json-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(260px, 1fr));
+        gap: 8px;
+        max-width: 980px;
+        margin-top: 8px;
+      }
+
+      .task-json-panel {
+        min-width: 0;
+        overflow: hidden;
+        border: 1px solid #1f2937;
+        border-radius: 8px;
+        background: #101828;
+      }
+
+      .task-json-title {
+        padding: 7px 10px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+        color: #e5e7eb;
+        background: #111827;
+        font-size: 12px;
+        font-weight: 760;
+      }
+
+      .task-json-code {
+        max-height: 260px;
+        margin: 0;
+        overflow: auto;
+        padding: 10px;
+        color: #d1fadf;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-size: 11px;
+        line-height: 1.5;
+        white-space: pre;
+        tab-size: 2;
       }
 
       @media (max-width: 1320px) {
@@ -422,6 +485,10 @@
         }
 
         .filters {
+          grid-template-columns: 1fr;
+        }
+
+        .task-json-grid {
           grid-template-columns: 1fr;
         }
 
@@ -513,6 +580,63 @@
 
       function valueText(value) {
         return value === null || value === undefined || value === "" ? "-" : value;
+      }
+
+      function prettyJson(value) {
+        if (value === null || value === undefined || value === "") return "";
+        try {
+          const parsed = typeof value === "string" ? JSON.parse(value) : value;
+          return JSON.stringify(parsed, null, 2);
+        } catch (_error) {
+          return String(value);
+        }
+      }
+
+      function isChatLoginErrorText(value) {
+        return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|聊天站登录状态/.test(String(value || ""));
+      }
+
+      function taskErrorText(row) {
+        const text = row?.errorMessage || row?.responseJson?.message || "";
+        if (!text) return "";
+        if (isChatLoginErrorText(text)) {
+          return "聊天站登录状态没有完整通过，系统已自动重登和换车，但仍失败。请检测聊天账号后重试。";
+        }
+        return text;
+      }
+
+      function taskRawErrorText(row) {
+        const text = row?.errorMessage || row?.responseJson?.message || "";
+        return text && text !== taskErrorText(row) ? text : "";
+      }
+
+      function taskReturnJson(row) {
+        if (row.status === "failed" && (row.responseJson || row.errorMessage)) {
+          return { ok: false, message: taskErrorText(row) || "任务失败" };
+        }
+        if (row.responseJson) return row.responseJson;
+        if (row.errorMessage) return { ok: false, message: row.errorMessage, attempts: row.attempts || [] };
+        if (row.responseText) return { content: row.responseText };
+        if (row.raw && row.raw.queued !== true) return row.raw;
+        return null;
+      }
+
+      function taskJsonPanel(title, value) {
+        const text = prettyJson(value);
+        return text
+          ? h("div", { className: "task-json-panel", key: title }, [
+              h("div", { className: "task-json-title", key: "title" }, title),
+              h("pre", { className: "task-json-code", key: "code" }, text)
+            ])
+          : null;
+      }
+
+      function taskJsonGrid(row) {
+        const panels = [
+          taskJsonPanel("发送 JSON", row.requestJson),
+          taskJsonPanel("返回 JSON", taskReturnJson(row))
+        ].filter(Boolean);
+        return panels.length ? h("div", { className: "task-json-grid" }, panels) : null;
       }
 
       function formatDateTime(value) {
@@ -1243,7 +1367,12 @@
             render: (_, row) => h("div", null, [
               h("div", { className: "primary-text" }, row.prompt || "-"),
               row.responseText ? h("div", { className: "task-response" }, row.responseText) : null,
-              row.errorMessage ? h("div", { className: "error-text" }, row.errorMessage) : null
+              taskJsonGrid(row),
+              taskErrorText(row) ? h("div", { className: "error-text" }, taskErrorText(row)) : null,
+              taskRawErrorText(row) ? h("details", { className: "task-error-detail" }, [
+                h("summary", null, "查看原始错误"),
+                h("pre", null, taskRawErrorText(row))
+              ]) : null
             ])
           },
           { title: "耗时", width: 130, render: (_, row) => taskDuration(row, nowTick) },

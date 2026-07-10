@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 
+const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
+const MAX_CHAT_CAR_ATTEMPTS = 8;
+const BAD_CAR_TTL_MS = 15 * 60 * 1000;
+const badCarUntil = new Map();
+
 function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
 }
 
 function runCurl(args, input = "") {
   return new Promise((resolve, reject) => {
-    const child = spawn("curl.exe", args, { windowsHide: true });
+    const child = spawn(CURL_COMMAND, args, { windowsHide: true });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (data) => {
@@ -41,12 +46,16 @@ function splitHttp(raw) {
   const lines = headerText.split(/\r?\n/);
   const status = Number((lines[0].match(/\s(\d{3})\s/) || [])[1] || 0);
   const headers = {};
-  for (const line of lines.slice(1)) {
-    const index = line.indexOf(":");
-    if (index < 0) continue;
-    const key = line.slice(0, index).trim().toLowerCase();
-    const value = line.slice(index + 1).trim();
-    headers[key] = headers[key] ? [...headers[key], value] : [value];
+  for (const section of sections.slice(0, headerIndex + 1)) {
+    if (!/^HTTP\//i.test(section)) continue;
+    const headerLines = section.split(/\r?\n/).slice(1);
+    for (const line of headerLines) {
+      const index = line.indexOf(":");
+      if (index < 0) continue;
+      const key = line.slice(0, index).trim().toLowerCase();
+      const value = line.slice(index + 1).trim();
+      headers[key] = headers[key] ? [...headers[key], value] : [value];
+    }
   }
   return { status, headers, body };
 }
@@ -63,6 +72,28 @@ function setCookiesFromHeaders(jar, headers) {
     if (index >= 0) jar[index] = cookie;
     else jar.push(cookie);
   }
+}
+
+function badCarKey(accountId, carType, carId) {
+  return `${accountId || "account"}:${carType || "chatgpt"}:${carId || ""}`;
+}
+
+function isBadCar(accountId, carType, carId) {
+  const key = badCarKey(accountId, carType, carId);
+  const until = badCarUntil.get(key) || 0;
+  if (until > Date.now()) return true;
+  if (until) badCarUntil.delete(key);
+  return false;
+}
+
+function rememberBadCar(accountId, carType, carId) {
+  if (!carId) return;
+  badCarUntil.set(badCarKey(accountId, carType, carId), Date.now() + BAD_CAR_TTL_MS);
+}
+
+function isAuthSessionError(error) {
+  const text = `${error?.message || ""} ${error?.body || ""} ${error?.status || error?.statusCode || ""}`;
+  return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|unauthorized|forbidden/i.test(text);
 }
 
 function fileNameFromMime(mimeType, fallback = "image.png") {
@@ -571,21 +602,28 @@ export class ChatplusClient {
 
   async http(path, options = {}) {
     const url = /^https?:\/\//i.test(path) ? path : `${this.baseUrl}${path.startsWith("/") ? "" : "/"}${path}`;
+    const sameSite = url.startsWith(this.baseUrl);
+    const hasBody = options.body !== undefined;
     const headers = {
       "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+      "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+      ...(sameSite ? { referer: `${this.baseUrl}/` } : {}),
+      ...(sameSite && hasBody ? { origin: this.baseUrl } : {}),
       accept: "application/json, text/event-stream, */*",
       ...(options.headers || {})
     };
     if (this.cookies.length) headers.cookie = this.cookieHeader();
-    const args = ["-sS", "-i", "-X", options.method || "GET", url];
+    const args = ["-sS", "-i"];
+    if (options.followRedirect) args.push("-L");
     if (Number(options.timeoutSec) > 0) {
-      args.splice(2, 0, "--max-time", String(options.timeoutSec));
+      args.push("--max-time", String(options.timeoutSec));
     }
+    args.push("-X", options.method || "GET", url);
     for (const [key, value] of Object.entries(headers)) {
       args.push("-H", `${key}: ${value}`);
     }
     let input = "";
-    if (options.body !== undefined) {
+    if (hasBody) {
       input = options.rawBody || Buffer.isBuffer(options.body) || options.body instanceof Uint8Array
         ? options.body
         : typeof options.body === "string" ? options.body : JSON.stringify(options.body);
@@ -606,9 +644,19 @@ export class ChatplusClient {
       payload = null;
     }
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(payload?.detail?.message || payload?.message || `聊天站请求失败：${response.status}`);
+      const error = new Error(payload?.detail?.message || payload?.message || `聊天站请求失败：${response.status}`);
+      error.status = response.status;
+      error.body = response.body;
+      throw error;
     }
     return payload;
+  }
+
+  resetSession() {
+    this.cookies = [];
+    this.portalLoggedIn = false;
+    this.carId = "";
+    this.carType = "chatgpt";
   }
 
   async loginPortal() {
@@ -630,7 +678,19 @@ export class ChatplusClient {
     await this.loginPortal();
     const session = await this.json(`/auth/loginSession?carid=${encodeURIComponent(carId)}&carType=${encodeURIComponent(carType)}`);
     if (session?.code !== 1) throw new Error(session?.msg || "进入聊天车队失败。");
-    await this.http(carType === "gemini" ? "/app" : "/");
+    const page = await this.http(carType === "gemini" ? "/app" : "/", {
+      followRedirect: true,
+      headers: {
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "upgrade-insecure-requests": "1"
+      }
+    });
+    if (page.status >= 400) {
+      const error = new Error(`进入聊天页面失败：${page.status}`);
+      error.status = page.status;
+      error.body = page.body;
+      throw error;
+    }
   }
 
   async login() {
@@ -668,20 +728,27 @@ export class ChatplusClient {
 
   async selectCar(route, ignoredCarIds = new Set()) {
     const cars = await this.fetchCars(route.carType);
-    const candidates = rankedCars(cars, route.strategy).filter((car) => !ignoredCarIds.has(concreteCarId(car)));
+    const candidates = rankedCars(cars, route.strategy)
+      .map((car) => ({ car, carId: concreteCarId(car) }))
+      .filter((item) => !ignoredCarIds.has(item.carId))
+      .filter((item) => !isBadCar(this.account?.id, route.carType, item.carId));
     if (!candidates.length) throw new Error(`${route.name} 暂时没有可用车辆。`);
     const usableCars = route.strategy === "image"
-      ? candidates.filter((car) => car.imageRemaining > 0 && !car.isPro)
+      ? candidates.filter((item) => item.car.imageRemaining > 0 && !item.car.isPro)
       : candidates;
     if (!usableCars.length) throw new Error("暂时没有图片额度可用的 GPT 账号。");
-    const car = usableCars[0];
+    const selected = usableCars[0];
     return {
-      carId: concreteCarId(car),
+      carId: selected.carId,
       carType: route.carType,
-      car,
+      car: selected.car,
       candidateCount: usableCars.length,
       strategy: route.strategy || "balanced"
     };
+  }
+
+  rememberAuthFailedCar(selected) {
+    rememberBadCar(this.account?.id, selected?.carType, selected?.carId);
   }
 
   async prepareChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
@@ -703,6 +770,10 @@ export class ChatplusClient {
         if (route.key === "gemini") {
           error.noRetry = true;
           throw error;
+        }
+        if (isAuthSessionError(error)) {
+          this.rememberAuthFailedCar(selected);
+          this.resetSession();
         }
         errors.push(`${selected.carId}：${error.message || "进入失败"}`);
       }
@@ -929,9 +1000,12 @@ export class ChatplusClient {
 
   async sendConversation(prompt, input = {}, ignoredCarIds = new Set()) {
     const errors = [];
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < MAX_CHAT_CAR_ATTEMPTS; attempt += 1) {
+      let selected = null;
       try {
-        const { route, selected, init } = await this.prepareChatSession(input, ignoredCarIds, 1);
+        const session = await this.prepareChatSession(input, ignoredCarIds, 1);
+        const { route, init } = session;
+        selected = session.selected;
         if (route.key === "grok") return await this.sendGrokConversation(prompt, input, route, selected);
         if (route.key === "gemini") {
           const error = new Error("Gemini 上游当前账号没有有效订阅，暂时不能作为后端 API 转发。");
@@ -951,7 +1025,10 @@ export class ChatplusClient {
           }
         });
         if (response.status < 200 || response.status >= 300) {
-          throw new Error(`聊天站提交失败：${response.status}`);
+          const error = new Error(`聊天站提交失败：${response.status}`);
+          error.status = response.status;
+          error.body = response.body;
+          throw error;
         }
 
         const events = parseSse(response.body);
@@ -964,6 +1041,10 @@ export class ChatplusClient {
       } catch (error) {
         if (error.noRetry || error.imageQuotaExhausted) throw error;
         if (Number(error.status || error.statusCode || 0) === 400) throw error;
+        if (isAuthSessionError(error)) {
+          this.rememberAuthFailedCar(selected);
+          this.resetSession();
+        }
         errors.push(error.message || "调用失败");
       }
     }
