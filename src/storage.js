@@ -14,29 +14,25 @@ const defaultChatModels = [
   { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", enabled: true, default: false }
 ];
 
+const defaultShareAISettings = {
+  mainBaseUrl: "https://ikun.aishare.icu",
+  drawingBaseUrl: "https://drawing.aishare.icu",
+  chatBaseUrl: "https://www.chatplus.cc",
+  defaultModelId: 1,
+  defaultChatModel: "gpt",
+  chatModels: defaultChatModels,
+  autoCarSelection: true,
+  autoCarSelectionMigrated: true
+};
+
 const defaultChannels = [
   {
-    id: "chatplus",
-    name: "A渠道-聊天生图",
-    type: "chatplus",
+    id: "shareai",
+    name: "ShareAI账号",
+    type: "shareai",
     enabled: true,
     priority: 1,
-    settings: {
-      baseUrl: "https://www.chatplus.cc",
-      defaultChatModel: "gpt",
-      chatModels: defaultChatModels
-    }
-  },
-  {
-    id: "drawing",
-    name: "B渠道-绘图站",
-    type: "drawing",
-    enabled: true,
-    priority: 2,
-    settings: {
-      baseUrl: "https://drawing.aishare.icu",
-      defaultModelId: 1
-    }
+    settings: defaultShareAISettings
   }
 ];
 
@@ -109,42 +105,50 @@ function normalizeChatModels(settings = {}, migrateAutoSelection = false) {
   return merged;
 }
 
-function normalizeChannels(channels = []) {
-  const source = Array.isArray(channels) ? channels : defaultChannels;
-  const normalized = [];
-  const seen = new Set();
+function legacyChannelByType(channels = [], type) {
+  return (Array.isArray(channels) ? channels : []).find((channel) => channel?.type === type) || null;
+}
 
-  for (const channel of source) {
-    if (!channel) continue;
-    const type = channel.type === "chatplus" ? "chatplus" : "drawing";
-    const base = defaultChannels.find((item) => item.type === type) || {};
-    const id = String(channel.id || `channel-${randomUUID()}`);
-    if (seen.has(id)) continue;
-    seen.add(id);
-    const settings = { ...(base.settings || {}), ...(channel.settings || {}) };
-    if (type === "chatplus") {
-      const migrateAutoSelection = settings.autoCarSelectionMigrated !== true;
-      settings.chatModels = normalizeChatModels(settings, migrateAutoSelection);
-      settings.defaultChatModel = settings.chatModels.find((item) => item.default && item.enabled)?.key || settings.chatModels[0]?.key || "gpt";
-      settings.autoCarSelection = true;
-      settings.autoCarSelectionMigrated = true;
-      delete settings.carId;
-      delete settings.carType;
-    }
-    if (type === "drawing") {
-      settings.defaultModelId = Number(settings.defaultModelId || 1);
-    }
-    normalized.push({
-      id,
-      name: channel.name || "未命名渠道",
-      type,
-      enabled: channel.enabled !== false,
-      priority: Number(channel.priority || 1),
-      settings
-    });
+function normalizeShareAIChannel(channels = []) {
+  const source = Array.isArray(channels) ? channels : [];
+  const shareai = source.find((channel) => channel?.type === "shareai") || null;
+  const drawing = legacyChannelByType(source, "drawing");
+  const chatplus = legacyChannelByType(source, "chatplus");
+  const settings = {
+    ...defaultShareAISettings,
+    ...(shareai?.settings || {})
+  };
+
+  if (drawing?.settings?.baseUrl) settings.drawingBaseUrl = drawing.settings.baseUrl;
+  if (drawing?.settings?.defaultModelId) settings.defaultModelId = Number(drawing.settings.defaultModelId || 1);
+  if (chatplus?.settings?.baseUrl) settings.chatBaseUrl = chatplus.settings.baseUrl;
+  if (chatplus?.settings) {
+    settings.defaultChatModel = chatplus.settings.defaultChatModel || settings.defaultChatModel;
+    settings.chatModels = chatplus.settings.chatModels || settings.chatModels;
   }
 
-  return normalized.sort((a, b) => Number(a.priority || 99) - Number(b.priority || 99));
+  const migrateAutoSelection = settings.autoCarSelectionMigrated !== true;
+  settings.chatModels = normalizeChatModels(settings, migrateAutoSelection);
+  settings.defaultChatModel = settings.chatModels.find((item) => item.default && item.enabled)?.key || settings.chatModels[0]?.key || "gpt";
+  settings.defaultModelId = Number(settings.defaultModelId || 1);
+  settings.autoCarSelection = true;
+  settings.autoCarSelectionMigrated = true;
+  settings.legacyChannelIds = {
+    drawing: drawing?.id || "drawing",
+    chatplus: chatplus?.id || "chatplus"
+  };
+  delete settings.baseUrl;
+  delete settings.carId;
+  delete settings.carType;
+
+  return [{
+    id: String(shareai?.id || "shareai"),
+    name: shareai?.name || "ShareAI账号",
+    type: "shareai",
+    enabled: (shareai || drawing || chatplus)?.enabled !== false,
+    priority: Number(shareai?.priority || Math.min(Number(drawing?.priority || 1), Number(chatplus?.priority || 1)) || 1),
+    settings
+  }];
 }
 
 function makeDefaultAccounts(stored) {
@@ -153,19 +157,9 @@ function makeDefaultAccounts(stored) {
   const password = stored.password;
   return [
     {
-      id: "chatplus-default",
-      channelId: "chatplus",
-      name: "聊天账号1",
-      username,
-      password,
-      enabled: true,
-      priority: 1,
-      status: "unknown"
-    },
-    {
-      id: "drawing-default",
-      channelId: "drawing",
-      name: "绘图账号1",
+      id: "shareai-default",
+      channelId: "shareai",
+      name: "ShareAI账号1",
       username,
       password,
       enabled: true,
@@ -175,16 +169,18 @@ function makeDefaultAccounts(stored) {
   ];
 }
 
-function normalizeAccounts(stored) {
-  const source = Array.isArray(stored.accounts) && stored.accounts.length ? stored.accounts : makeDefaultAccounts(stored);
-  return source.map((account) => ({
-    id: account.id || `account-${randomUUID()}`,
-    channelId: account.channelId || "drawing",
-    name: account.name || "未命名账号",
-    username: account.username || "",
-    password: account.password || "",
-    enabled: account.enabled !== false,
-    priority: Number(account.priority || 1),
+function legacyChannelTypeMap(stored) {
+  const map = new Map();
+  for (const channel of Array.isArray(stored.channels) ? stored.channels : []) {
+    if (channel?.id) map.set(String(channel.id), channel.type || "");
+  }
+  map.set("drawing", "drawing");
+  map.set("chatplus", "chatplus");
+  return map;
+}
+
+function accountAbilityStatus(account) {
+  return {
     status: account.status || "unknown",
     lastCheckAt: account.lastCheckAt || null,
     cooldownUntil: account.cooldownUntil || null,
@@ -193,14 +189,109 @@ function normalizeAccounts(stored) {
     expireAt: account.expireAt || null,
     message: account.message || "",
     meta: account.meta || {}
-  }));
+  };
+}
+
+function accountGroupKey(account) {
+  return `${String(account.username || "").trim().toLowerCase()}::${String(account.password || "")}`;
+}
+
+function mergeAccountIntoGroup(group, account, type) {
+  const next = group || {
+    id: account.id || `account-${randomUUID()}`,
+    channelId: "shareai",
+    name: "",
+    username: account.username || "",
+    password: account.password || "",
+    enabled: account.enabled !== false,
+    priority: Number(account.priority || 1),
+    status: "unknown",
+    lastCheckAt: null,
+    cooldownUntil: null,
+    quota: null,
+    balance: null,
+    expireAt: null,
+    message: "",
+    meta: { abilities: {} }
+  };
+  if (!next.name || type === "chatplus") next.name = account.name || next.name || account.username || "ShareAI账号";
+  if (!next.password && account.password) next.password = account.password;
+  next.enabled = next.enabled && account.enabled !== false;
+  next.priority = Math.min(Number(next.priority || 99), Number(account.priority || 1));
+  next.meta = { ...(next.meta || {}), abilities: { ...(next.meta?.abilities || {}) } };
+  if (type === "drawing" || type === "chatplus") {
+    next.meta.abilities[type] = accountAbilityStatus(account);
+  } else if (account.meta?.abilities) {
+    next.meta.abilities = { ...next.meta.abilities, ...account.meta.abilities };
+  }
+  return next;
+}
+
+function finalizeShareAIAccount(account) {
+  const abilities = account.meta?.abilities || {};
+  const drawing = abilities.drawing || {};
+  const chatplus = abilities.chatplus || {};
+  const ok = [drawing.status, chatplus.status].includes("ok");
+  return {
+    ...account,
+    channelId: "shareai",
+    name: account.name || account.username || "ShareAI账号",
+    status: ok ? "ok" : account.status || "unknown",
+    lastCheckAt: account.lastCheckAt || drawing.lastCheckAt || chatplus.lastCheckAt || null,
+    cooldownUntil: chatplus.cooldownUntil || null,
+    quota: drawing.quota ?? account.quota ?? null,
+    balance: drawing.balance ?? account.balance ?? null,
+    expireAt: drawing.expireAt || chatplus.expireAt || account.expireAt || null,
+    message: account.message || [drawing.message && `绘图站：${drawing.message}`, chatplus.message && `聊天：${chatplus.message}`].filter(Boolean).join("；"),
+    meta: {
+      ...(account.meta || {}),
+      abilities: {
+        drawing,
+        chatplus
+      }
+    }
+  };
+}
+
+function normalizeAccounts(stored) {
+  const source = Array.isArray(stored.accounts) && stored.accounts.length ? stored.accounts : makeDefaultAccounts(stored);
+  const typeMap = legacyChannelTypeMap(stored);
+  const groups = new Map();
+
+  for (const account of source) {
+    const normalized = {
+      id: account.id || `account-${randomUUID()}`,
+      channelId: account.channelId || "shareai",
+      name: account.name || "未命名账号",
+      username: account.username || "",
+      password: account.password || "",
+      enabled: account.enabled !== false,
+      priority: Number(account.priority || 1),
+      status: account.status || "unknown",
+      lastCheckAt: account.lastCheckAt || null,
+      cooldownUntil: account.cooldownUntil || null,
+      quota: account.quota ?? null,
+      balance: account.balance ?? null,
+      expireAt: account.expireAt || null,
+      message: account.message || "",
+      meta: account.meta || {}
+    };
+    const type = normalized.channelId === "shareai" ? "shareai" : typeMap.get(String(normalized.channelId)) || "shareai";
+    const key = accountGroupKey(normalized) || normalized.id;
+    groups.set(key, mergeAccountIntoGroup(groups.get(key), normalized, type));
+  }
+
+  return [...groups.values()].map(finalizeShareAIAccount);
 }
 
 function normalizeConfig(stored = {}) {
+  const channels = normalizeShareAIChannel(stored.channels);
+  const defaultChannel = stored.defaultChannel === channels[0]?.id ? stored.defaultChannel : "auto";
   const config = {
     ...defaultConfig,
     ...stored,
-    channels: normalizeChannels(stored.channels),
+    defaultChannel,
+    channels,
     accounts: normalizeAccounts(stored)
   };
   if (!config.apiKey) config.apiKey = randomBytes(24).toString("hex");

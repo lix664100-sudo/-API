@@ -68,6 +68,54 @@ function getClient(config, channel, account) {
   throw new Error(`未知渠道：${channel.type}`);
 }
 
+function shareAIAbilityChannel(channel, ability) {
+  const settings = channel?.settings || {};
+  if (ability === "chatplus") {
+    return {
+      ...channel,
+      id: `${channel.id}:chatplus`,
+      parentId: channel.id,
+      ability: "chatplus",
+      name: `${channel.name}/聊天生图`,
+      type: "chatplus",
+      settings: {
+        baseUrl: settings.chatBaseUrl || "https://www.chatplus.cc",
+        defaultChatModel: settings.defaultChatModel || "gpt",
+        chatModels: settings.chatModels || [],
+        autoCarSelection: true,
+        autoCarSelectionMigrated: true
+      }
+    };
+  }
+  return {
+    ...channel,
+    id: `${channel.id}:drawing`,
+    parentId: channel.id,
+    ability: "drawing",
+    name: `${channel.name}/绘图站`,
+    type: "drawing",
+    settings: {
+      baseUrl: settings.drawingBaseUrl || "https://drawing.aishare.icu",
+      defaultModelId: Number(settings.defaultModelId || 1)
+    }
+  };
+}
+
+function requestedAbility(channel, requestedChannel) {
+  const requested = String(requestedChannel || "");
+  const legacy = channel?.settings?.legacyChannelIds || {};
+  if ([legacy.drawing, "drawing", `${channel.id}:drawing`].includes(requested)) return "drawing";
+  if ([legacy.chatplus, "chatplus", `${channel.id}:chatplus`].includes(requested)) return "chatplus";
+  return "";
+}
+
+function shareAIAbilitiesForTask(channel, requestedChannel, taskType) {
+  const requested = requestedAbility(channel, requestedChannel);
+  if (requested) return [requested];
+  if (taskType === "chat") return ["chatplus"];
+  return ["drawing", "chatplus"];
+}
+
 function isPendingTask(status) {
   return ["processing", "queued", "pending", "unknown"].includes(status);
 }
@@ -114,9 +162,55 @@ function readableChatFailure(attempts) {
   return `所有对话渠道都失败：${details}`;
 }
 
-async function markChatCooldown(accountId, error) {
+function channelAbilityKey(channel) {
+  return channel?.parentId && channel?.ability ? channel.ability : "";
+}
+
+function combinedAbilityMessage(drawing, chatplus, fallback = "") {
+  return [
+    drawing?.message ? `绘图站：${drawing.message}` : "",
+    chatplus?.message ? `聊天：${chatplus.message}` : ""
+  ].filter(Boolean).join("；") || fallback;
+}
+
+async function updateTargetAccountStatus(accountId, channel, patch) {
+  const ability = channelAbilityKey(channel);
+  if (!ability) return updateAccountStatus(accountId, patch);
+
+  const config = await loadConfig();
+  const account = config.accounts.find((item) => item.id === accountId);
+  if (!account) return updateAccountStatus(accountId, patch);
+
+  const abilities = {
+    ...(account.meta?.abilities || {})
+  };
+  abilities[ability] = {
+    ...(abilities[ability] || {}),
+    ...patch,
+    lastCheckAt: new Date().toISOString()
+  };
+
+  const drawing = abilities.drawing || {};
+  const chatplus = abilities.chatplus || {};
+  const ok = [drawing.status, chatplus.status].includes("ok");
+  const failed = [drawing.status, chatplus.status].some((status) => ["error", "failed"].includes(status));
+  return updateAccountStatus(accountId, {
+    status: ok ? "ok" : failed ? "error" : patch.status || account.status || "unknown",
+    quota: drawing.quota ?? account.quota ?? null,
+    balance: drawing.balance ?? account.balance ?? null,
+    expireAt: drawing.expireAt || chatplus.expireAt || account.expireAt || "",
+    cooldownUntil: chatplus.cooldownUntil || null,
+    message: combinedAbilityMessage(drawing, chatplus, patch.message || account.message || ""),
+    meta: {
+      ...(account.meta || {}),
+      abilities
+    }
+  });
+}
+
+async function markChatCooldown(accountId, channel, error) {
   const cooldownUntil = new Date(Date.now() + CHAT_COOLDOWN_MS).toISOString();
-  await updateAccountStatus(accountId, {
+  await updateTargetAccountStatus(accountId, channel, {
     status: "error",
     cooldownUntil,
     message: isChatLoginStateText(error?.message)
@@ -137,22 +231,40 @@ function queueChatForAccount(accountId, work) {
 
 function firstAccountForChannel(config, channelId) {
   return config.accounts
-    .filter((account) => account.enabled !== false && account.channelId === channelId)
+    .filter((account) => account.enabled !== false && (account.channelId === channelId || (channelId === "shareai" && account.channelId === "shareai")))
     .sort((a, b) => Number(a.priority || 99) - Number(b.priority || 99))[0];
+}
+
+function shareAIRefreshChannel(config, task) {
+  const channel = config.channels.find((item) => item.type === "shareai" && item.enabled !== false)
+    || config.channels.find((item) => item.type === "shareai");
+  if (!channel) return null;
+  const requested = task.channelId || task.channelType || "";
+  const ability = requestedAbility(channel, requested) || (task.channelType === "chatplus" ? "chatplus" : task.channelType === "drawing" ? "drawing" : "");
+  return ability ? shareAIAbilityChannel(channel, ability) : null;
 }
 
 function inferRefreshTarget(config, task) {
   let channel = config.channels.find((item) => item.id === task.channelId);
+  if (!channel && String(task.channelId || "").startsWith("shareai:")) {
+    channel = shareAIRefreshChannel(config, task);
+  }
+  if (!channel) {
+    channel = shareAIRefreshChannel(config, task);
+  }
+  if (!channel && ["drawing", "chatplus"].includes(task.channelType || task.channelId)) {
+    channel = shareAIRefreshChannel(config, task);
+  }
   if (!channel && task.channelType) {
     channel = config.channels.find((item) => item.type === task.channelType && item.enabled !== false);
   }
   if (!channel && (task.taskType || task.raw?.task_type || task.taskNo || task.raw?.task_no)) {
-    channel = config.channels.find((item) => item.type === "drawing" && item.enabled !== false);
+    channel = config.channels.find((item) => item.type === "drawing" && item.enabled !== false) || shareAIRefreshChannel(config, { ...task, channelType: "drawing" });
   }
   if (!channel) throw new Error("找不到这个任务所属的渠道。");
 
   let account = config.accounts.find((item) => item.id === task.accountId);
-  if (!account) account = firstAccountForChannel(config, channel.id);
+  if (!account) account = firstAccountForChannel(config, channel.parentId || channel.id);
   if (!account) throw new Error("这个渠道还没有可用账号。");
   return { channel, account };
 }
@@ -169,12 +281,14 @@ function taskErrorMessage(result, task) {
   return result.errorMessage || itemError || task.errorMessage || "";
 }
 
-async function markAccountAvailable(accountId) {
-  await updateAccountStatus(accountId, {
+async function markAccountAvailable(accountId, channel = "") {
+  const channelType = typeof channel === "string" ? channel : channel?.type || "";
+  const patch = {
     status: "ok",
-    message: "最近调用成功",
-    cooldownUntil: null
-  });
+    message: "最近调用成功"
+  };
+  if (channelType === "chatplus" || !channelType) patch.cooldownUntil = null;
+  await updateTargetAccountStatus(accountId, channel, patch);
 }
 
 function mergeRefreshedTask(task, result, channel, account) {
@@ -247,20 +361,40 @@ export async function refreshProcessingTasks() {
   return results;
 }
 
+function channelMatchesRequest(channel, requestedChannel = "auto") {
+  if (requestedChannel === "auto" || channel.id === requestedChannel) return true;
+  if (channel.type !== "shareai") return false;
+  return Boolean(requestedAbility(channel, requestedChannel));
+}
+
+function accountMatchesChannel(account, channel) {
+  if (account.channelId === channel.id) return true;
+  return channel.type === "shareai" && account.channelId === "shareai";
+}
+
 function selectTargets(config, requestedChannel = "auto", taskType = "text2img", options = {}) {
   const channels = config.channels
     .filter((channel) => channel.enabled !== false)
-    .filter((channel) => requestedChannel === "auto" || channel.id === requestedChannel)
+    .filter((channel) => channelMatchesRequest(channel, requestedChannel))
     .filter((channel) => !(taskType === "chat" && channel.type === "drawing"))
     .sort((a, b) => Number(a.priority || 99) - Number(b.priority || 99));
 
   const targets = [];
   for (const channel of channels) {
     const accounts = config.accounts
-      .filter((account) => account.enabled !== false && account.channelId === channel.id)
-      .filter((account) => channel.type !== "chatplus" || options.includeCooling || !accountCooling(account))
+      .filter((account) => account.enabled !== false && accountMatchesChannel(account, channel))
       .sort((a, b) => Number(a.priority || 99) - Number(b.priority || 99));
-    for (const account of accounts) targets.push({ channel, account });
+    for (const account of accounts) {
+      if (channel.type === "shareai") {
+        for (const ability of shareAIAbilitiesForTask(channel, requestedChannel, taskType)) {
+          if (ability === "chatplus" && !options.includeCooling && accountCooling(account)) continue;
+          targets.push({ channel: shareAIAbilityChannel(channel, ability), account });
+        }
+        continue;
+      }
+      if (channel.type === "chatplus" && !options.includeCooling && accountCooling(account)) continue;
+      targets.push({ channel, account });
+    }
   }
   return targets;
 }
@@ -525,7 +659,7 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
     completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : null
   };
   await upsertTask(nextTask);
-  await markAccountAvailable(account.id);
+  await markAccountAvailable(account.id, channel);
   return nextTask;
 }
 
@@ -566,7 +700,7 @@ async function runQueuedTextTask(task, input, reserved = null) {
           message: error.message || "调用失败"
         });
         if (!error.busy) {
-          await updateAccountStatus(account.id, {
+          await updateTargetAccountStatus(account.id, channel, {
             status: "error",
             message: error.message || "调用失败"
           });
@@ -633,7 +767,7 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
           message: error.message || "调用失败"
         });
         if (!error.busy) {
-          await updateAccountStatus(account.id, {
+          await updateTargetAccountStatus(account.id, channel, {
             status: "error",
             message: error.message || "调用失败"
           });
@@ -671,7 +805,7 @@ async function finishChatTask(task, result, channel, account, attempts, response
     raw: result.raw || result
   };
   await upsertTask(nextTask);
-  await markAccountAvailable(account.id);
+  await markAccountAvailable(account.id, channel);
   return nextTask;
 }
 
@@ -706,9 +840,9 @@ async function runChatCompletionTask(task, input) {
         message: error.message || "调用失败"
       });
       if (channel.type === "chatplus" && isChatBlockedError(error)) {
-        await markChatCooldown(account.id, error);
+        await markChatCooldown(account.id, channel, error);
       } else {
-        await updateAccountStatus(account.id, {
+        await updateTargetAccountStatus(account.id, channel, {
           status: "error",
           message: error.message || "调用失败"
         });
@@ -819,12 +953,64 @@ export async function queueChatCompletion(input = {}) {
   });
   return task;
 }
+
+async function checkShareAIAbility(config, channel, account, ability) {
+  const client = getClient(config, shareAIAbilityChannel(channel, ability), account);
+  try {
+    return { ok: true, data: await client.check() };
+  } catch (error) {
+    return {
+      ok: false,
+      data: {
+        status: "error",
+        quota: null,
+        balance: null,
+        expireAt: "",
+        message: error.message || "检测失败"
+      }
+    };
+  }
+}
+
+function combinedShareAIStatus(results) {
+  const drawing = results.drawing.data;
+  const chatplus = results.chatplus.data;
+  const ok = results.drawing.ok || results.chatplus.ok;
+  return {
+    status: ok ? "ok" : "error",
+    quota: drawing.quota ?? null,
+    balance: drawing.balance ?? null,
+    expireAt: drawing.expireAt || chatplus.expireAt || "",
+    message: [
+      `绘图站：${drawing.message || (results.drawing.ok ? "可用" : "不可用")}`,
+      `聊天：${chatplus.message || (results.chatplus.ok ? "可用" : "不可用")}`
+    ].join("；"),
+    cooldownUntil: results.chatplus.ok ? null : undefined,
+    meta: {
+      abilities: {
+        drawing,
+        chatplus
+      }
+    }
+  };
+}
+
 export async function checkAccount(accountId) {
   const config = await loadConfig();
   const account = config.accounts.find((item) => item.id === accountId);
   if (!account) throw new Error("账号不存在。");
   const channel = config.channels.find((item) => item.id === account.channelId);
   if (!channel) throw new Error("账号所属渠道不存在。");
+  if (channel.type === "shareai") {
+    const results = {
+      drawing: await checkShareAIAbility(config, channel, account, "drawing"),
+      chatplus: await checkShareAIAbility(config, channel, account, "chatplus")
+    };
+    const status = combinedShareAIStatus(results);
+    await updateAccountStatus(account.id, status);
+    if (status.status !== "ok") throw new Error(status.message || "检测失败");
+    return status;
+  }
   const client = getClient(config, channel, account);
   try {
     const status = await client.check();
@@ -947,11 +1133,11 @@ export async function createTextTask(input = {}, wait = false) {
       if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
       const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input) });
       await upsertTask(task);
-      await markAccountAvailable(account.id);
+      await markAccountAvailable(account.id, channel);
       return task;
     } catch (error) {
       attempts.push({ channelId: channel.id, channelName: channel.name, accountId: account.id, accountName: account.name, message: error.message || "调用失败" });
-      if (!error.busy) await updateAccountStatus(account.id, { status: "error", message: error.message || "调用失败" });
+      if (!error.busy) await updateTargetAccountStatus(account.id, channel, { status: "error", message: error.message || "调用失败" });
     } finally {
       release();
     }
@@ -985,11 +1171,11 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
       if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
       const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson({ ...input, files }) });
       await upsertTask(task);
-      await markAccountAvailable(account.id);
+      await markAccountAvailable(account.id, channel);
       return task;
     } catch (error) {
       attempts.push({ channelId: channel.id, channelName: channel.name, accountId: account.id, accountName: account.name, message: error.message || "调用失败" });
-      if (!error.busy) await updateAccountStatus(account.id, { status: "error", message: error.message || "调用失败" });
+      if (!error.busy) await updateTargetAccountStatus(account.id, channel, { status: "error", message: error.message || "调用失败" });
     } finally {
       release();
     }

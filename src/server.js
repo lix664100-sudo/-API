@@ -311,6 +311,10 @@ app.get("/", async (_request, reply) => {
   reply.redirect("/admin/");
 });
 
+app.get("/favicon.ico", async (_request, reply) => {
+  reply.code(204).send();
+});
+
 app.get("/admin", async (_request, reply) => {
   reply.redirect("/admin/");
 });
@@ -469,11 +473,13 @@ app.post("/api/config/test", async () => {
 
 app.get("/api/balance", async () => {
   const config = await loadConfig();
+  const shareaiAccounts = config.accounts.filter((account) => account.channelId === "shareai");
   const chatAccounts = config.accounts.filter((account) => account.channelId === "chatplus");
   const drawingAccounts = config.accounts.filter((account) => account.channelId === "drawing");
   return {
     ok: true,
     data: {
+      shareai: shareaiAccounts,
       chatplus: chatAccounts,
       drawing: drawingAccounts
     }
@@ -491,13 +497,24 @@ function fallbackDrawingModels() {
 app.get("/api/models", async () => {
   const config = await loadConfig();
   const channel = config.channels.find((item) => item.type === "drawing" && item.enabled !== false)
+    || config.channels.find((item) => item.type === "shareai" && item.enabled !== false)
     || config.channels.find((item) => item.type === "drawing");
   const account = channel
     ? config.accounts.find((item) => item.channelId === channel.id && item.enabled !== false)
     : null;
   if (channel && account) {
     try {
-      const client = new DrawingClient({ config, channel, account });
+      const drawingChannel = channel.type === "shareai"
+        ? {
+            ...channel,
+            type: "drawing",
+            settings: {
+              baseUrl: channel.settings?.drawingBaseUrl || config.drawingBaseUrl,
+              defaultModelId: channel.settings?.defaultModelId || config.defaultModelId || 1
+            }
+          }
+        : channel;
+      const client = new DrawingClient({ config, channel: drawingChannel, account });
       const models = await client.getModels();
       const items = Array.isArray(models?.items) ? models.items : Array.isArray(models) ? models : [];
       if (items.length) return { ok: true, data: { items } };
