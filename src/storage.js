@@ -18,6 +18,12 @@ const defaultImageStorage = {
   retentionDays: 7
 };
 
+const defaultConcurrency = {
+  chat: 3,
+  drawingImage: 2,
+  chatImage: 2
+};
+
 const defaultChatModels = [
   { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", enabled: true, default: true },
   { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", enabled: true, default: false },
@@ -56,6 +62,7 @@ const defaultConfig = {
   defaultImageCount: 1,
   waitTimeoutSec: 180,
   imageStorage: defaultImageStorage,
+  concurrency: defaultConcurrency,
   channels: defaultChannels,
   accounts: []
 };
@@ -90,6 +97,14 @@ function normalizeImageStorage(value = {}) {
     mode,
     autoCleanup: value.autoCleanup !== false,
     retentionDays: Math.min(3650, Math.max(1, Number(value.retentionDays || defaultImageStorage.retentionDays)))
+  };
+}
+
+function normalizeConcurrency(value = {}) {
+  return {
+    chat: Math.min(20, Math.max(1, Number(value.chat || defaultConcurrency.chat))),
+    drawingImage: Math.min(20, Math.max(1, Number(value.drawingImage || defaultConcurrency.drawingImage))),
+    chatImage: Math.min(20, Math.max(1, Number(value.chatImage || defaultConcurrency.chatImage)))
   };
 }
 
@@ -325,6 +340,7 @@ function normalizeConfig(stored = {}) {
     ...stored,
     defaultChannel,
     imageStorage: normalizeImageStorage(stored.imageStorage),
+    concurrency: normalizeConcurrency(stored.concurrency),
     channels,
     accounts: normalizeAccounts(stored)
   };
@@ -371,6 +387,7 @@ export function publicConfig(config) {
     defaultImageCount: config.defaultImageCount,
     waitTimeoutSec: config.waitTimeoutSec,
     imageStorage: config.imageStorage,
+    concurrency: config.concurrency,
     channels: config.channels,
     accounts: config.accounts.map(redactAccount),
     updatedAt: config.updatedAt || null

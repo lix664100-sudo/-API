@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { normalizeProxyUrl } from "../proxy.js";
 
 const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
 const MAX_CHAT_CAR_ATTEMPTS = 8;
@@ -8,12 +9,6 @@ const badCarUntil = new Map();
 
 function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
-}
-
-function normalizeProxyUrl(value) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  return /^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`;
 }
 
 function proxyUrlFor(account) {

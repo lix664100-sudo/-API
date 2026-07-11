@@ -582,7 +582,8 @@ app.post("/api/config", async (request) => {
     defaultRatio: body.defaultRatio || current.defaultRatio || "1:1",
     defaultImageCount: Number(body.defaultImageCount || current.defaultImageCount || 1),
     waitTimeoutSec: Number(body.waitTimeoutSec || current.waitTimeoutSec || 180),
-    imageStorage: body.imageStorage || current.imageStorage
+    imageStorage: body.imageStorage || current.imageStorage,
+    concurrency: body.concurrency || current.concurrency
   });
   return { ok: true, data: publicConfig(config) };
 });

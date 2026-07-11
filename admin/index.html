@@ -256,6 +256,25 @@
         white-space: nowrap;
       }
 
+      .proxy-cell {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+        min-width: 0;
+      }
+
+      .proxy-expire {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.2;
+        white-space: nowrap;
+      }
+
+      .proxy-expire.expired {
+        color: var(--danger);
+      }
+
       .mono {
         font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
       }
@@ -915,6 +934,33 @@
       function statusTag(status) {
         const [color, text] = statusInfo(status);
         return h(Tag, { color }, text);
+      }
+
+      function pipeProxyExpireText(value) {
+        const parts = String(value || "").trim().split("|").map((part) => part.trim());
+        if (parts.length < 5) return "";
+        const [host, port, username, password, expiresAt] = parts;
+        return host && port && username && password && expiresAt ? expiresAt : "";
+      }
+
+      function isPipeProxyExpired(value) {
+        const expiresAt = pipeProxyExpireText(value);
+        if (!expiresAt) return false;
+        const dateText = /^\d{4}-\d{2}-\d{2}$/.test(expiresAt) ? `${expiresAt}T23:59:59+08:00` : expiresAt;
+        const date = new Date(dateText);
+        return Number.isFinite(date.getTime()) && date.getTime() < Date.now();
+      }
+
+      function proxyCell(value) {
+        if (!value) return h(Tag, { color: "default" }, "默认IP");
+        const expiresAt = pipeProxyExpireText(value);
+        const proxyTag = h(Tag, { color: "green", style: { marginInlineEnd: 0 } }, "已配置");
+        if (!expiresAt) return h(Tooltip, { title: value }, proxyTag);
+        const expired = isPipeProxyExpired(value);
+        return h(Tooltip, { title: value }, h("div", { className: "proxy-cell" }, [
+          proxyTag,
+          h("span", { className: `proxy-expire${expired ? " expired" : ""}` }, `${expired ? "已到期" : "到期"} ${expiresAt}`)
+        ]));
       }
 
       function taskTypeLabel(type) {
@@ -1777,8 +1823,8 @@
           {
             title: "代理",
             dataIndex: "proxyUrl",
-            width: 100,
-            render: (value) => value ? h(Tag, { color: "green" }, "已配置") : h(Tag, { color: "default" }, "默认IP")
+            width: 150,
+            render: proxyCell
           },
           { title: "状态", dataIndex: "status", width: 90, render: statusTag },
           {
@@ -2178,6 +2224,20 @@
                         h(Form.Item, { label: "API 密钥", name: "apiKey" }, h(Input, { readOnly: true, addonAfter: h(Button, { type: "link", size: "small", onClick: copyApiKey }, "复制") }))
                       ]),
                       h("div", { className: "api-doc-section", style: { marginBottom: 14 } }, [
+                        h("div", { className: "section-title" }, h("h3", null, "并发设置")),
+                        h("div", { className: "form-grid" }, [
+                          h(Form.Item, { label: "普通聊天同时任务数", name: ["concurrency", "chat"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
+                          h(Form.Item, { label: "生图站同时任务数", name: ["concurrency", "drawingImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
+                          h(Form.Item, { label: "聊天生图同时任务数", name: ["concurrency", "chatImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
+                        ]),
+                        h(Alert, {
+                          type: "warning",
+                          showIcon: true,
+                          message: "建议先用：普通聊天 3、生图站 2、聊天生图 2。调太高可能更容易被上游限流或断开。",
+                          style: { marginBottom: 0 }
+                        })
+                      ]),
+                      h("div", { className: "api-doc-section", style: { marginBottom: 14 } }, [
                         h("div", { className: "section-title" }, [
                           h("h3", null, "图片存储"),
                           h(Space, { wrap: true }, [
@@ -2308,7 +2368,7 @@
             ]),
             h(Form.Item, { label: "登录账号", name: "username", rules: [{ required: true, message: "请输入登录账号" }] }, h(Input)),
             h(Form.Item, { label: "登录密码", name: "password" }, h(Input.Password, { placeholder: editingAccount?.hasPassword ? "不改密码就留空" : "请输入密码" })),
-            h(Form.Item, { label: "代理 IP", name: "proxyUrl", extra: "每个账号填自己的 SOCKS5/HTTP 代理；不填就走服务器 IP。" }, h(Input, { placeholder: "socks5://用户名:密码@IP:端口" })),
+            h(Form.Item, { label: "代理 IP", name: "proxyUrl", extra: "支持 socks5://用户名:密码@IP:端口，也支持 IP|端口|账号|密码|到期日期；不填就走服务器 IP。" }, h(Input, { placeholder: "182.44.2.160|9125|3854552|a95a31fd5|2026-07-11" })),
             h("div", { className: "form-grid" }, [
               h(Form.Item, { label: "优先级", name: "priority", initialValue: 1 }, h(InputNumber, { min: 1, max: 99, style: { width: "100%" } })),
               h(Form.Item, { label: "启用", name: "enabled", valuePropName: "checked", initialValue: true }, h(Switch))

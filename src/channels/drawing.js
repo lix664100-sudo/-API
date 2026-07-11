@@ -1,14 +1,9 @@
 import fetch, { Headers } from "node-fetch";
 import { ProxyAgent } from "proxy-agent";
+import { normalizeProxyUrl } from "../proxy.js";
 
 function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
-}
-
-function normalizeProxyUrl(value) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  return /^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`;
 }
 
 function proxyUrlFor(account) {

@@ -5,17 +5,28 @@ import { mirrorImageUrls } from "./image-store.js";
 import { getTask, listTasks, loadConfig, recordTaskStat, updateAccountStatus, upsertTask } from "./storage.js";
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
-const MAX_CONCURRENT_CHAT_TASKS = 1;
-const MAX_CONCURRENT_DRAWING_TASKS = 3;
-const MAX_CONCURRENT_CHAT_IMAGE_TASKS = 1;
+const defaultTaskConcurrency = { chat: 3, drawingImage: 2, chatImage: 2 };
 const chatAccountQueues = new Map();
 const scheduledChatTasks = new Set();
 const activeTaskCounts = { chat: 0, drawingImage: 0, chatImage: 0 };
+let activeTaskConcurrency = { ...defaultTaskConcurrency };
+
+function normalizeTaskConcurrency(value = {}) {
+  return {
+    chat: Math.min(20, Math.max(1, Number(value.chat || defaultTaskConcurrency.chat))),
+    drawingImage: Math.min(20, Math.max(1, Number(value.drawingImage || defaultTaskConcurrency.drawingImage))),
+    chatImage: Math.min(20, Math.max(1, Number(value.chatImage || defaultTaskConcurrency.chatImage)))
+  };
+}
+
+async function loadRuntimeConfig() {
+  const config = await loadRuntimeConfig();
+  activeTaskConcurrency = normalizeTaskConcurrency(config.concurrency);
+  return config;
+}
 
 function taskSlotLimit(slot) {
-  if (slot === "chat") return MAX_CONCURRENT_CHAT_TASKS;
-  if (slot === "chatImage") return MAX_CONCURRENT_CHAT_IMAGE_TASKS;
-  return MAX_CONCURRENT_DRAWING_TASKS;
+  return activeTaskConcurrency[slot] || defaultTaskConcurrency[slot] || 1;
 }
 
 function taskSlotLabel(slot) {
@@ -204,7 +215,7 @@ async function updateTargetAccountStatus(accountId, channel, patch) {
   const ability = channelAbilityKey(channel);
   if (!ability) return updateAccountStatus(accountId, patch);
 
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const account = config.accounts.find((item) => item.id === accountId);
   if (!account) return updateAccountStatus(accountId, patch);
 
@@ -249,13 +260,33 @@ async function markChatCooldown(accountId, channel, error) {
 }
 
 function queueChatForAccount(accountId, work) {
-  const previous = chatAccountQueues.get(accountId) || Promise.resolve();
-  const run = previous.catch(() => {}).then(work);
-  const tail = run.catch(() => {}).finally(() => {
-    if (chatAccountQueues.get(accountId) === tail) chatAccountQueues.delete(accountId);
+  const key = String(accountId || "default");
+  const limit = taskSlotLimit("chat");
+  const state = chatAccountQueues.get(key) || { active: 0, queue: [] };
+  chatAccountQueues.set(key, state);
+
+  const drain = () => {
+    while (state.active < limit && state.queue.length) {
+      const next = state.queue.shift();
+      next();
+    }
+    if (state.active === 0 && !state.queue.length) chatAccountQueues.delete(key);
+  };
+
+  return new Promise((resolve, reject) => {
+    state.queue.push(async () => {
+      state.active += 1;
+      try {
+        resolve(await work());
+      } catch (error) {
+        reject(error);
+      } finally {
+        state.active = Math.max(0, state.active - 1);
+        drain();
+      }
+    });
+    drain();
   });
-  chatAccountQueues.set(accountId, tail);
-  return run;
 }
 
 function firstAccountForChannel(config, channelId) {
@@ -365,7 +396,7 @@ export async function refreshTask(taskId) {
   if (!task) throw new Error("任务不存在。");
   if (!needsTaskRefresh(task)) return task;
 
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const { channel, account } = inferRefreshTarget(config, task);
   const client = getClient(config, channel, account);
   if (typeof client.getTask !== "function") return task;
@@ -768,7 +799,7 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
 }
 
 async function runQueuedTextTask(task, input, reserved = null) {
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "text2img");
   const attempts = [...(reserved?.attempts || [])];
@@ -828,7 +859,7 @@ async function submitImageTask(client, input, files) {
 }
 
 async function runQueuedImageTask(task, input, files, reserved = null) {
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "img2img");
   const attempts = [...(reserved?.attempts || [])];
@@ -901,7 +932,7 @@ async function finishChatTask(task, result, channel, account, attempts, response
 }
 
 async function runChatCompletionTask(task, input) {
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "chat");
   const attempts = [];
@@ -961,7 +992,7 @@ export async function queueTextTask(input = {}) {
     error.status = 400;
     throw error;
   }
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "text2img");
   if (!targets.length) throw new Error("没有可用的文生图渠道或账号。");
@@ -987,7 +1018,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles }) {
   }
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files, 3);
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "img2img");
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
@@ -1009,7 +1040,7 @@ export async function queueChatCompletion(input = {}) {
   if (input.stream === true) input = { ...input, stream: false };
   assertChatInput(input);
 
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "chat");
   if (!targets.length) throw noChatTargetsError(config, requestedChannel);
@@ -1088,7 +1119,7 @@ function combinedShareAIStatus(results) {
 }
 
 export async function checkAccount(accountId) {
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const account = config.accounts.find((item) => item.id === accountId);
   if (!account) throw new Error("账号不存在。");
   const channel = config.channels.find((item) => item.id === account.channelId);
@@ -1124,7 +1155,7 @@ export async function checkAccount(accountId) {
 }
 
 export async function checkAllAccounts() {
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const results = [];
   for (const account of config.accounts) {
     try {
@@ -1176,7 +1207,7 @@ export async function createChatCompletion(input = {}) {
   if (input.stream === true) input = { ...input, stream: false };
   assertChatInput(input);
 
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "chat");
   if (!targets.length) throw noChatTargetsError(config, requestedChannel);
@@ -1207,7 +1238,7 @@ export async function createTextTask(input = {}, wait = false) {
     error.status = 400;
     throw error;
   }
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "text2img");
   if (!targets.length) throw new Error("没有可用的文生图渠道或账号。");
@@ -1248,7 +1279,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   }
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files, 3);
-  const config = await loadConfig();
+  const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = selectTargets(config, requestedChannel, "img2img");
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
