@@ -76,6 +76,33 @@ function sendError(reply, error) {
   });
 }
 
+function firstHeaderValue(value) {
+  return String(Array.isArray(value) ? value[0] : value || "").split(",")[0].trim();
+}
+
+function normalizeIp(value) {
+  const text = String(value || "").trim();
+  return text.startsWith("::ffff:") ? text.slice(7) : text;
+}
+
+function requestClientIp(request) {
+  return normalizeIp(
+    firstHeaderValue(request.headers["x-forwarded-for"])
+      || firstHeaderValue(request.headers["x-real-ip"])
+      || firstHeaderValue(request.headers["cf-connecting-ip"])
+      || request.ip
+      || request.socket?.remoteAddress
+  );
+}
+
+function apiRequestMeta(request) {
+  return {
+    callerIp: requestClientIp(request),
+    calledAt: new Date().toISOString(),
+    forwardedFor: firstHeaderValue(request.headers["x-forwarded-for"])
+  };
+}
+
 async function requireApiKey(request, reply) {
   const config = await loadConfig();
   const authHeader = String(request.headers.authorization || "");
@@ -710,13 +737,14 @@ app.post("/api/tasks/:id/refresh", async (request, reply) => {
 
 app.post("/api/draw/edit", async (request, reply) => {
   try {
+    const requestMeta = apiRequestMeta(request);
     const { input, files } = await readImageInput(request, { maxFiles: 3 });
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
     let task;
     if (request.query?.wait === "1") {
-      task = await createImageTask({ input, files, wait: true });
+      task = await createImageTask({ input, files, wait: true, requestMeta });
     } else {
-      task = await queueImageTask({ input, files });
+      task = await queueImageTask({ input, files, requestMeta });
     }
     return { ok: true, data: task };
   } catch (error) {
@@ -749,20 +777,21 @@ function imageEditResponse(task) {
 
 app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, reply) => {
   try {
+    const requestMeta = apiRequestMeta(request);
     if (isMultipartRequest(request)) {
       const { input, files } = await readMultipartInput(request, { maxFiles: 5, savePreview: true });
       if (request.query?.wait === "0") {
-        const task = await queueChatCompletion({ ...input, files });
+        const task = await queueChatCompletion({ ...input, files }, requestMeta);
         return { created: Math.floor(Date.now() / 1000), task };
       }
-      return await createChatCompletion({ ...input, files });
+      return await createChatCompletion({ ...input, files }, requestMeta);
     }
     const input = normalizeFields(request.body || {});
     if (request.query?.wait === "0") {
-      const task = await queueChatCompletion(input);
+      const task = await queueChatCompletion(input, requestMeta);
       return { created: Math.floor(Date.now() / 1000), task };
     }
-    return await createChatCompletion(input);
+    return await createChatCompletion(input, requestMeta);
   } catch (error) {
     return sendError(reply, error);
   }
@@ -770,9 +799,10 @@ app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, 
 
 app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, reply) => {
   try {
+    const requestMeta = apiRequestMeta(request);
     const { input, files } = await readImageInput(request, { maxFiles: 3 });
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
-    const task = await createImageTask({ input, files, wait: request.query?.wait !== "0" });
+    const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta });
     return imageEditResponse(task);
   } catch (error) {
     return sendError(reply, error);

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
 import { DrawingClient } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
+import { normalizeProxyUrl, parsePipeProxy } from "./proxy.js";
 import { getTask, listTasks, loadConfig, recordTaskStat, updateAccountStatus, upsertTask } from "./storage.js";
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
@@ -10,6 +11,64 @@ const chatAccountQueues = new Map();
 const scheduledChatTasks = new Set();
 const activeTaskCounts = { chat: 0, drawingImage: 0, chatImage: 0 };
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
+
+function taskRequestMeta(value = {}) {
+  return {
+    callerIp: String(value.callerIp || "").trim(),
+    calledAt: value.calledAt || new Date().toISOString(),
+    forwardedFor: String(value.forwardedFor || "").trim()
+  };
+}
+
+function safeProxyEndpoint(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return {
+      proxyConfigured: false,
+      proxyLabel: "默认服务器IP",
+      proxyProtocol: "",
+      proxyHost: "",
+      proxyPort: ""
+    };
+  }
+
+  const pipeProxy = parsePipeProxy(text);
+  if (pipeProxy) {
+    return {
+      proxyConfigured: true,
+      proxyLabel: `socks5://${pipeProxy.host}:${pipeProxy.port}`,
+      proxyProtocol: "socks5",
+      proxyHost: pipeProxy.host,
+      proxyPort: pipeProxy.port
+    };
+  }
+
+  try {
+    const url = new URL(normalizeProxyUrl(text));
+    const protocol = url.protocol.replace(/:$/, "");
+    const host = url.hostname || "";
+    const port = url.port || "";
+    return {
+      proxyConfigured: true,
+      proxyLabel: `${protocol ? `${protocol}://` : ""}${host}${port ? `:${port}` : ""}` || "已配置代理",
+      proxyProtocol: protocol,
+      proxyHost: host,
+      proxyPort: port
+    };
+  } catch {
+    return {
+      proxyConfigured: true,
+      proxyLabel: "已配置代理",
+      proxyProtocol: "",
+      proxyHost: "",
+      proxyPort: ""
+    };
+  }
+}
+
+function taskNetworkMeta(account = {}) {
+  return safeProxyEndpoint(account.proxyUrl || account.proxy || "");
+}
 
 function normalizeTaskConcurrency(value = {}) {
   return {
@@ -480,7 +539,7 @@ function noChatTargetsError(config, requestedChannel) {
   return cooling ? cooldownError(cooling.account) : new Error("没有可用的对话渠道或账号。");
 }
 
-function wrapTask({ result, channel, account, attempts, requestJson = null }) {
+function wrapTask({ result, channel, account, attempts, requestJson = null, requestMeta = {} }) {
   const status = result.status || "unknown";
   return {
     id: `task-${randomUUID()}`,
@@ -498,6 +557,8 @@ function wrapTask({ result, channel, account, attempts, requestJson = null }) {
     channelType: channel.type,
     accountId: account.id,
     accountName: account.name,
+    requestMeta: taskRequestMeta(requestMeta),
+    network: taskNetworkMeta(account),
     attempts,
     requestJson,
     responseJson: taskResponseJson(result),
@@ -734,7 +795,7 @@ function taskResponseJson(value = {}) {
   return jsonValue(value) || {};
 }
 
-function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrls, raw }) {
+function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrls, raw, requestMeta = {} }) {
   return {
     id: `task-${randomUUID()}`,
     status: "processing",
@@ -751,6 +812,8 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
     channelType: target.channel.type,
     accountId: target.account.id,
     accountName: target.account.name,
+    requestMeta: taskRequestMeta(requestMeta),
+    network: taskNetworkMeta(target.account),
     attempts: [],
     requestJson: taskRequestJson(input),
     responseJson: null,
@@ -786,7 +849,7 @@ async function failQueuedTask(task, error, attempts = []) {
 async function finishQueuedTask(task, result, channel, account, attempts) {
   const status = result.status || task.status;
   const nextTask = {
-    ...wrapTask({ result, channel, account, attempts, requestJson: task.requestJson }),
+    ...wrapTask({ result, channel, account, attempts, requestJson: task.requestJson, requestMeta: task.requestMeta }),
     id: task.id,
     status,
     createdAt: task.createdAt,
@@ -920,6 +983,7 @@ async function finishChatTask(task, result, channel, account, attempts, response
     channelType: channel.type,
     accountId: account.id,
     accountName: account.name,
+    network: taskNetworkMeta(account),
     attempts,
     responseJson: responseJson || chatCompletionResponseJson({ result, channel }),
     completedAt: new Date().toISOString(),
@@ -986,7 +1050,7 @@ function runInBackground(work) {
   }, 0);
 }
 
-export async function queueTextTask(input = {}) {
+export async function queueTextTask(input = {}, requestMeta = {}) {
   if (!cleanPrompt(input)) {
     const error = new Error("请输入生图描述。");
     error.status = 400;
@@ -998,7 +1062,7 @@ export async function queueTextTask(input = {}) {
   if (!targets.length) throw new Error("没有可用的文生图渠道或账号。");
 
   const reserved = reserveFirstAvailableTarget(targets, "text2img");
-  const task = queuedTask({ input, target: reserved.target, taskType: "text2img" });
+  const task = queuedTask({ input, target: reserved.target, taskType: "text2img", requestMeta });
   try {
     await upsertTask(task);
   } catch (error) {
@@ -1010,7 +1074,7 @@ export async function queueTextTask(input = {}) {
   });
   return task;
 }
-export async function queueImageTask({ input = {}, file, files: inputFiles }) {
+export async function queueImageTask({ input = {}, file, files: inputFiles, requestMeta = {} }) {
   if (!cleanPrompt(input)) {
     const error = new Error("请输入改图要求。");
     error.status = 400;
@@ -1024,7 +1088,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles }) {
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
 
   const reserved = reserveFirstAvailableTarget(targets, "img2img");
-  const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img" });
+  const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img", requestMeta });
   try {
     await upsertTask(task);
   } catch (error) {
@@ -1036,7 +1100,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles }) {
   });
   return task;
 }
-export async function queueChatCompletion(input = {}) {
+export async function queueChatCompletion(input = {}, requestMeta = {}) {
   if (input.stream === true) input = { ...input, stream: false };
   assertChatInput(input);
 
@@ -1053,7 +1117,8 @@ export async function queueChatCompletion(input = {}) {
     prompt: cleanChatPrompt(input),
     imageCount: chatImageCount(input),
     inputImageUrls: chatPreviewUrls(input),
-    raw: { endpoint: "/v1/chat/completions" }
+    raw: { endpoint: "/v1/chat/completions" },
+    requestMeta
   });
   try {
     await upsertTask(task);
@@ -1203,7 +1268,7 @@ function chatCompletionResponse({ result, channel, task, responseJson }) {
   };
 }
 
-export async function createChatCompletion(input = {}) {
+export async function createChatCompletion(input = {}, requestMeta = {}) {
   if (input.stream === true) input = { ...input, stream: false };
   assertChatInput(input);
 
@@ -1220,7 +1285,8 @@ export async function createChatCompletion(input = {}) {
       prompt: cleanChatPrompt(input),
       imageCount: chatImageCount(input),
       inputImageUrls: chatPreviewUrls(input),
-      raw: { endpoint: "/v1/chat/completions" }
+      raw: { endpoint: "/v1/chat/completions" },
+      requestMeta
     });
     await upsertTask(task);
     scheduledChatTasks.add(task.id);
@@ -1232,7 +1298,7 @@ export async function createChatCompletion(input = {}) {
     }
   });
 }
-export async function createTextTask(input = {}, wait = false) {
+export async function createTextTask(input = {}, wait = false, requestMeta = {}) {
   if (!String(input.prompt || "").trim()) {
     const error = new Error("请输入生图描述。");
     error.status = 400;
@@ -1257,7 +1323,7 @@ export async function createTextTask(input = {}, wait = false) {
       let result = await client.createTextTask(input);
       if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
       result = await mirrorTaskImages(result, config);
-      const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input) });
+      const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
       await upsertTask(task);
       if (isFinishedTask(task.status)) await recordTaskStat(task);
       await markAccountAvailable(account.id, channel);
@@ -1271,7 +1337,7 @@ export async function createTextTask(input = {}, wait = false) {
   }
   throw targetsFailedError(attempts);
 }
-export async function createImageTask({ input = {}, file, files: inputFiles, wait = false }) {
+export async function createImageTask({ input = {}, file, files: inputFiles, wait = false, requestMeta = {} }) {
   if (!String(input.prompt || "").trim()) {
     const error = new Error("请输入改图要求。");
     error.status = 400;
@@ -1298,7 +1364,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
       let result = await submitImageTask(client, input, files);
       if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
       result = await mirrorTaskImages(result, config);
-      const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson({ ...input, files }) });
+      const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson({ ...input, files }), requestMeta });
       await upsertTask(task);
       if (isFinishedTask(task.status)) await recordTaskStat(task);
       await markAccountAvailable(account.id, channel);

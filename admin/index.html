@@ -256,6 +256,31 @@
         white-space: nowrap;
       }
 
+      .task-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 10px;
+        margin-top: 8px;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .task-meta-item {
+        display: inline-flex;
+        align-items: center;
+        max-width: 100%;
+        padding: 2px 8px;
+        border: 1px solid #d7e3f5;
+        border-radius: 6px;
+        background: #f8fafc;
+        color: #344054;
+      }
+
+      .task-meta-label {
+        flex: 0 0 auto;
+        color: var(--muted);
+      }
+
       .proxy-cell {
         display: flex;
         flex-direction: column;
@@ -790,6 +815,30 @@
           hour: "2-digit",
           minute: "2-digit"
         }).replace(/\//g, "-");
+      }
+
+      function taskNetworkLabel(row) {
+        const network = row?.network || {};
+        if (network.proxyConfigured === true) return network.proxyLabel || "已配置代理";
+        if (network.proxyConfigured === false) return network.proxyLabel || "默认服务器IP";
+        return "";
+      }
+
+      function taskMetaLine(row) {
+        const meta = row?.requestMeta || {};
+        const items = [
+          meta.callerIp ? ["调用IP", meta.callerIp] : null,
+          meta.calledAt ? ["调用时间", formatDateTime(meta.calledAt)] : null,
+          taskNetworkLabel(row) ? ["代理", taskNetworkLabel(row)] : null
+        ].filter(Boolean);
+        return items.length
+          ? h("div", { className: "task-meta" }, items.map(([label, value]) =>
+              h("span", { className: "task-meta-item", key: label }, [
+                h("span", { className: "task-meta-label", key: "label" }, `${label}：`),
+                h("span", { key: "value" }, value)
+              ])
+            ))
+          : null;
       }
 
       function formatBytes(value) {
@@ -1885,6 +1934,7 @@
             dataIndex: "prompt",
             render: (_, row) => h("div", null, [
               h("div", { className: "primary-text" }, row.prompt || "-"),
+              taskMetaLine(row),
               row.responseText ? h("div", { className: "task-response" }, row.responseText) : null,
               taskJsonGrid(row),
               taskErrorText(row) ? h("div", { className: "error-text" }, taskErrorText(row)) : null,
