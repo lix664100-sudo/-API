@@ -134,15 +134,44 @@ export function normalizeDrawingTask(task, drawingBaseUrl = "") {
 }
 
 export class DrawingClient {
-  constructor({ config, channel, account }) {
+  constructor({ config, channel, account, sessionLock }) {
     this.config = config;
     this.channel = channel;
     this.account = account;
     this.mainBaseUrl = trimSlash(config.mainBaseUrl || "https://ikun.aishare.icu");
     this.drawingBaseUrl = trimSlash(channel?.settings?.baseUrl || config.drawingBaseUrl || "https://drawing.aishare.icu");
     this.accessToken = "";
+    this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     this.proxyUrl = proxyUrlFor(account);
     this.proxyAgent = this.proxyUrl ? new ProxyAgent({ getProxyForUrl: () => this.proxyUrl }) : null;
+    this.contextSignature = this.makeContextSignature({ config, channel, account });
+  }
+
+  makeContextSignature({ config, channel, account }) {
+    return [
+      trimSlash(config?.mainBaseUrl || "https://ikun.aishare.icu"),
+      trimSlash(channel?.settings?.baseUrl || config?.drawingBaseUrl || "https://drawing.aishare.icu"),
+      String(account?.username || "").trim().toLowerCase(),
+      String(account?.password || ""),
+      proxyUrlFor(account)
+    ].join("::");
+  }
+
+  updateContext({ config, channel, account, sessionLock }) {
+    const nextSignature = this.makeContextSignature({ config, channel, account });
+    const changed = nextSignature !== this.contextSignature;
+    this.config = config;
+    this.channel = channel;
+    this.account = account;
+    this.mainBaseUrl = trimSlash(config.mainBaseUrl || "https://ikun.aishare.icu");
+    this.drawingBaseUrl = trimSlash(channel?.settings?.baseUrl || config.drawingBaseUrl || "https://drawing.aishare.icu");
+    this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
+    if (changed) {
+      this.contextSignature = nextSignature;
+      this.accessToken = "";
+      this.proxyUrl = proxyUrlFor(account);
+      this.proxyAgent = this.proxyUrl ? new ProxyAgent({ getProxyForUrl: () => this.proxyUrl }) : null;
+    }
   }
 
   assertConfigured() {
@@ -151,7 +180,7 @@ export class DrawingClient {
     }
   }
 
-  async login(options = {}) {
+  async performLogin(options = {}) {
     this.assertConfigured();
     const loginOptions = {
       method: "POST",
@@ -187,16 +216,28 @@ export class DrawingClient {
     return ssoData;
   }
 
+  async login(options = {}) {
+    return this.sessionLock(async () => {
+      this.accessToken = "";
+      return this.performLogin(options);
+    });
+  }
+
   async ensureLogin(options = {}) {
-    if (!this.accessToken) await this.login(options);
+    if (this.accessToken) return;
+    await this.sessionLock(async () => {
+      if (!this.accessToken) await this.performLogin(options);
+    });
   }
 
   async request(apiPath, options = {}, retried = false) {
     const headers = new Headers(options.headers || {});
     const isForm = options.body instanceof FormData;
+    let authToken = "";
     if (options.auth !== false) {
       await this.ensureLogin({ timeoutMs: options.timeoutMs });
-      headers.set("Authorization", `Bearer ${this.accessToken}`);
+      authToken = this.accessToken;
+      headers.set("Authorization", `Bearer ${authToken}`);
     }
     if (options.body && !isForm && !headers.has("content-type")) {
       headers.set("content-type", "application/json");
@@ -229,8 +270,12 @@ export class DrawingClient {
         error.quotaResetAt = quotaResetAtFrom(payload, payload?.data);
       }
       if (options.auth !== false && !retried && isDrawingAuthError(error)) {
-        this.accessToken = "";
-        await this.login({ timeoutMs: options.timeoutMs });
+        await this.sessionLock(async () => {
+          if (this.accessToken === authToken) {
+            this.accessToken = "";
+            await this.performLogin({ timeoutMs: options.timeoutMs });
+          }
+        });
         return this.request(apiPath, options, true);
       }
       throw error;

@@ -608,7 +608,7 @@ function concreteCarId(car) {
 }
 
 export class ChatplusClient {
-  constructor({ config, channel, account }) {
+  constructor({ config, channel, account, sessionLock }) {
     this.config = config;
     this.channel = channel;
     this.account = account;
@@ -618,6 +618,32 @@ export class ChatplusClient {
     this.cookies = [];
     this.portalLoggedIn = false;
     this.defaultModel = "gpt-5-5-thinking";
+    this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
+    this.contextSignature = this.makeContextSignature({ channel, account });
+    this.accountWork = Promise.resolve();
+  }
+
+  makeContextSignature({ channel, account }) {
+    return [
+      trimSlash(channel?.settings?.baseUrl || "https://www.chatplus.cc"),
+      String(account?.username || "").trim().toLowerCase(),
+      String(account?.password || ""),
+      proxyUrlFor(account)
+    ].join("::");
+  }
+
+  updateContext({ config, channel, account, sessionLock }) {
+    const nextSignature = this.makeContextSignature({ channel, account });
+    const changed = nextSignature !== this.contextSignature;
+    this.config = config;
+    this.channel = channel;
+    this.account = account;
+    this.baseUrl = trimSlash(channel?.settings?.baseUrl || "https://www.chatplus.cc");
+    this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
+    if (changed) {
+      this.contextSignature = nextSignature;
+      this.resetSession();
+    }
   }
 
   assertConfigured() {
@@ -691,9 +717,18 @@ export class ChatplusClient {
     this.carType = "chatgpt";
   }
 
-  async loginPortal(options = {}) {
+  async runAccountWork(work) {
+    const current = this.accountWork.catch(() => {}).then(work);
+    this.accountWork = current;
+    try {
+      return await current;
+    } finally {
+      if (this.accountWork === current) this.accountWork = Promise.resolve();
+    }
+  }
+
+  async performPortalLogin(options = {}) {
     this.assertConfigured();
-    if (this.portalLoggedIn) return;
     const login = await this.json("/frontend-api/login", {
       method: "POST",
       timeoutSec: options.timeoutSec,
@@ -707,26 +742,35 @@ export class ChatplusClient {
     this.portalLoggedIn = true;
   }
 
-  async enterCar(carId, carType, options = {}) {
-    await this.loginPortal(options);
-    const session = await this.json(`/auth/loginSession?carid=${encodeURIComponent(carId)}&carType=${encodeURIComponent(carType)}`, {
-      timeoutSec: options.timeoutSec
+  async loginPortal(options = {}) {
+    if (this.portalLoggedIn) return;
+    await this.sessionLock(async () => {
+      if (!this.portalLoggedIn) await this.performPortalLogin(options);
     });
-    if (session?.code !== 1) throw new Error(session?.msg || "进入聊天车队失败。");
-    const page = await this.http(carType === "gemini" ? "/app" : "/", {
-      followRedirect: true,
-      timeoutSec: options.timeoutSec,
-      headers: {
-        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "upgrade-insecure-requests": "1"
+  }
+
+  async enterCar(carId, carType, options = {}) {
+    await this.sessionLock(async () => {
+      if (!this.portalLoggedIn) await this.performPortalLogin(options);
+      const session = await this.json(`/auth/loginSession?carid=${encodeURIComponent(carId)}&carType=${encodeURIComponent(carType)}`, {
+        timeoutSec: options.timeoutSec
+      });
+      if (session?.code !== 1) throw new Error(session?.msg || "进入聊天车队失败。");
+      const page = await this.http(carType === "gemini" ? "/app" : "/", {
+        followRedirect: true,
+        timeoutSec: options.timeoutSec,
+        headers: {
+          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "upgrade-insecure-requests": "1"
+        }
+      });
+      if (page.status >= 400) {
+        const error = new Error(`进入聊天页面失败：${page.status}`);
+        error.status = page.status;
+        error.body = page.body;
+        throw error;
       }
     });
-    if (page.status >= 400) {
-      const error = new Error(`进入聊天页面失败：${page.status}`);
-      error.status = page.status;
-      error.body = page.body;
-      throw error;
-    }
   }
 
   async login() {
@@ -816,7 +860,7 @@ export class ChatplusClient {
         }
         if (isAuthSessionError(error)) {
           this.rememberAuthFailedCar(selected);
-          this.resetSession();
+          await this.sessionLock(async () => this.resetSession());
         }
         errors.push(`${selected.carId}：${error.message || "进入失败"}`);
       }
@@ -825,30 +869,32 @@ export class ChatplusClient {
   }
 
   async check() {
-    const { init, route, selected } = await this.prepareChatSession({
-      model: this.channel?.settings?.defaultChatModel || "",
-      preferImageCar: true,
-      checkTimeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC
-    }, new Set(), 1);
-    const imageLimit = limitFromInit(init);
-    const remaining = imageLimit.remaining ?? null;
-    const remainingNumber = numberOrNull(remaining);
-    const quotaEmpty = remainingNumber !== null && remainingNumber <= 0;
-    return {
-      status: quotaEmpty ? "quota_empty" : "ok",
-      quota: remaining,
-      balance: remaining,
-      quotaResetAt: imageQuotaResetAt(imageLimit),
-      expireAt: "",
-      message: quotaEmpty ? "聊天图片额度不足" : "聊天账号可用",
-      meta: {
-        defaultModel: init.default_model_slug || this.defaultModel,
-        imageLimit,
-        chatModel: route.key,
-        selectedCarId: selected.carId,
-        strategy: selected.strategy
-      }
-    };
+    return this.runAccountWork(async () => {
+      const { init, route, selected } = await this.prepareChatSession({
+        model: this.channel?.settings?.defaultChatModel || "",
+        preferImageCar: true,
+        checkTimeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC
+      }, new Set(), 1);
+      const imageLimit = limitFromInit(init);
+      const remaining = imageLimit.remaining ?? null;
+      const remainingNumber = numberOrNull(remaining);
+      const quotaEmpty = remainingNumber !== null && remainingNumber <= 0;
+      return {
+        status: quotaEmpty ? "quota_empty" : "ok",
+        quota: remaining,
+        balance: remaining,
+        quotaResetAt: imageQuotaResetAt(imageLimit),
+        expireAt: "",
+        message: quotaEmpty ? "聊天图片额度不足" : "聊天账号可用",
+        meta: {
+          defaultModel: init.default_model_slug || this.defaultModel,
+          imageLimit,
+          chatModel: route.key,
+          selectedCarId: selected.carId,
+          strategy: selected.strategy
+        }
+      };
+    });
   }
 
   buildConversationBody(prompt, model, imageAssets = []) {
@@ -1054,24 +1100,24 @@ export class ChatplusClient {
         const session = await this.prepareChatSession(input, ignoredCarIds, 1);
         const { route, init } = session;
         selected = session.selected;
-        if (route.key === "grok") return await this.sendGrokConversation(prompt, input, route, selected);
+        if (route.key === "grok") return await this.sessionLock(() => this.sendGrokConversation(prompt, input, route, selected));
         if (route.key === "gemini") {
           const error = new Error("Gemini 上游当前账号没有有效订阅，暂时不能作为后端 API 转发。");
           error.noRetry = true;
           throw error;
         }
         const model = route.model || init?.default_model_slug || this.defaultModel;
-        const imageAssets = await this.uploadChatImages(input.files || []);
+        const imageAssets = await this.sessionLock(() => this.uploadChatImages(input.files || []));
         const { body, messageId } = this.buildConversationBody(prompt, model, imageAssets);
 
-        const response = await this.http("/backend-api/conversation", {
+        const response = await this.sessionLock(() => this.http("/backend-api/conversation", {
           method: "POST",
           body,
           headers: {
             accept: "text/event-stream",
             referer: `${this.baseUrl}/`
           }
-        });
+        }));
         if (response.status < 200 || response.status >= 300) {
           const error = new Error(`聊天站提交失败：${response.status}`);
           error.status = response.status;
@@ -1091,7 +1137,7 @@ export class ChatplusClient {
         if (Number(error.status || error.statusCode || 0) === 400) throw error;
         if (isAuthSessionError(error)) {
           this.rememberAuthFailedCar(selected);
-          this.resetSession();
+          await this.sessionLock(async () => this.resetSession());
         }
         errors.push(error.message || "调用失败");
       }
@@ -1137,52 +1183,56 @@ export class ChatplusClient {
   }
 
   async createTextTask(input) {
-    const prompt = String(input.prompt || "").trim();
-    if (!prompt) throw new Error("请输入生图描述。");
-    const result = await this.withImageQuotaFallback(prompt, { ...input, preferImageCar: true }, async (conversation) => {
-      const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec);
-      if (!imageUrls.length) throw new Error("聊天通道没有返回图片，已尝试切换备用渠道。");
-      return { ...conversation, imageUrls };
-    });
-    const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
+    return this.runAccountWork(async () => {
+      const prompt = String(input.prompt || "").trim();
+      if (!prompt) throw new Error("请输入生图描述。");
+      const result = await this.withImageQuotaFallback(prompt, { ...input, preferImageCar: true }, async (conversation) => {
+        const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec);
+        if (!imageUrls.length) throw new Error("聊天通道没有返回图片，已尝试切换备用渠道。");
+        return { ...conversation, imageUrls };
+      });
+      const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
 
-    return {
-      externalId: conversationId || messageId,
-      status: "success",
-      prompt,
-      taskType: "text2img",
-      modelId: model,
-      ratio: input.ratio_label || input.ratio || "",
-      imageCount: imageUrls.length,
-      imageUrls,
-      raw: { conversationId, eventCount: events.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy }
-    };
+      return {
+        externalId: conversationId || messageId,
+        status: "success",
+        prompt,
+        taskType: "text2img",
+        modelId: model,
+        ratio: input.ratio_label || input.ratio || "",
+        imageCount: imageUrls.length,
+        imageUrls,
+        raw: { conversationId, eventCount: events.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy }
+      };
+    });
   }
 
   async createImageTask(input = {}) {
-    const files = normalizeChatFiles(input, []);
-    const prompt = String(input.prompt || "").trim();
-    if (!prompt) throw new Error("Please enter an image edit prompt.");
-    if (!files.length) throw new Error("Please upload a source image.");
+    return this.runAccountWork(async () => {
+      const files = normalizeChatFiles(input, []);
+      const prompt = String(input.prompt || "").trim();
+      if (!prompt) throw new Error("Please enter an image edit prompt.");
+      if (!files.length) throw new Error("Please upload a source image.");
 
-    const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: true }, async (conversation) => {
-      const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true });
-      if (!imageUrls.length) throw new Error("Chat image channel did not return an edited image.");
-      return { ...conversation, imageUrls };
+      const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: true }, async (conversation) => {
+        const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true });
+        if (!imageUrls.length) throw new Error("Chat image channel did not return an edited image.");
+        return { ...conversation, imageUrls };
+      });
+      const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
+
+      return {
+        externalId: conversationId || messageId,
+        status: "success",
+        prompt,
+        taskType: "img2img",
+        modelId: model,
+        ratio: input.ratio_label || input.ratio || "",
+        imageCount: imageUrls.length,
+        imageUrls,
+        raw: { conversationId, eventCount: events.length, sourceImageCount: files.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy }
+      };
     });
-    const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
-
-    return {
-      externalId: conversationId || messageId,
-      status: "success",
-      prompt,
-      taskType: "img2img",
-      modelId: model,
-      ratio: input.ratio_label || input.ratio || "",
-      imageCount: imageUrls.length,
-      imageUrls,
-      raw: { conversationId, eventCount: events.length, sourceImageCount: files.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy }
-    };
   }
 
   async createChatCompletion(input = {}) {
@@ -1195,46 +1245,48 @@ export class ChatplusClient {
       throw error;
     }
 
-    let conversationToDelete = null;
-    try {
-      const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: files.length > 0 }, async (conversation) => {
-        conversationToDelete = conversation;
-        const { events, conversationId, route, directContent } = conversation;
-        const streamContent = extractAssistantText(events);
-        let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: files.length > 0 });
-        let detailContent = "";
-        if (conversationId && route?.key !== "grok") {
+    return this.runAccountWork(async () => {
+      let conversationToDelete = null;
+      try {
+        const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: files.length > 0 }, async (conversation) => {
+          conversationToDelete = conversation;
+          const { events, conversationId, route, directContent } = conversation;
+          const streamContent = extractAssistantText(events);
+          let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: files.length > 0 });
+          let detailContent = "";
+          if (conversationId && route?.key !== "grok") {
+            try {
+              const detail = await this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}`);
+              detailContent = extractAssistantText(detail);
+              imageUrls = [...new Set([...imageUrls, ...(await this.imageUrlsFrom(detail, { generatedOnly: true }))])];
+            } catch {
+              // The stream still has the answer if the detail endpoint is briefly unavailable.
+            }
+          }
+          const rawContent = [directContent, streamContent, detailContent].filter(Boolean).sort((a, b) => b.length - a.length)[0] || "";
+          throwIfImageGenerationLimit(rawContent);
+          const content = isSkippedMainlineContent(rawContent) ? "" : rawContent;
+          if (!content && imageUrls.length) return { ...conversation, content, detailContent, imageUrls };
+          if (!content) throw new Error("聊天渠道没有返回文字内容，已尝试切换备用渠道。");
+          return { ...conversation, content, detailContent, imageUrls };
+        });
+        const { events, conversationId, messageId, model, upstreamModel, route, selected, content, detailContent, imageUrls } = result;
+        return {
+          externalId: conversationId || messageId,
+          model,
+          content,
+          imageUrls,
+          raw: { conversationId, eventCount: events.length, imageCount: files.length, outputImageCount: imageUrls.length, detailTextLength: detailContent.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy }
+        };
+      } finally {
+        if (conversationToDelete?.conversationId) {
           try {
-            const detail = await this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}`);
-            detailContent = extractAssistantText(detail);
-            imageUrls = [...new Set([...imageUrls, ...(await this.imageUrlsFrom(detail, { generatedOnly: true }))])];
-          } catch {
-            // The stream still has the answer if the detail endpoint is briefly unavailable.
+            await this.deleteConversation(conversationToDelete.conversationId, conversationToDelete.route);
+          } catch (error) {
+            console.error(error);
           }
         }
-        const rawContent = [directContent, streamContent, detailContent].filter(Boolean).sort((a, b) => b.length - a.length)[0] || "";
-        throwIfImageGenerationLimit(rawContent);
-        const content = isSkippedMainlineContent(rawContent) ? "" : rawContent;
-        if (!content && imageUrls.length) return { ...conversation, content, detailContent, imageUrls };
-        if (!content) throw new Error("聊天渠道没有返回文字内容，已尝试切换备用渠道。");
-        return { ...conversation, content, detailContent, imageUrls };
-      });
-      const { events, conversationId, messageId, model, upstreamModel, route, selected, content, detailContent, imageUrls } = result;
-      return {
-        externalId: conversationId || messageId,
-        model,
-        content,
-        imageUrls,
-        raw: { conversationId, eventCount: events.length, imageCount: files.length, outputImageCount: imageUrls.length, detailTextLength: detailContent.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy }
-      };
-    } finally {
-      if (conversationToDelete?.conversationId) {
-        try {
-          await this.deleteConversation(conversationToDelete.conversationId, conversationToDelete.route);
-        } catch (error) {
-          console.error(error);
-        }
       }
-    }
+    });
   }
 }

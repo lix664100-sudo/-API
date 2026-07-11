@@ -821,14 +821,14 @@
       }
 
       function isChatLoginErrorText(value) {
-        return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|聊天站登录状态/.test(String(value || ""));
+        return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|聊天站登录状态|掉线/.test(String(value || ""));
       }
 
       function taskErrorText(row) {
         const text = row?.errorMessage || row?.responseJson?.message || "";
         if (!text) return "";
         if (isChatLoginErrorText(text)) {
-          return "聊天站登录状态没有完整通过，系统已自动重登和换车，但仍失败。请检测聊天账号后重试。";
+          return "聊天站掉线，系统会自动重登和换车。若连续失败，请检测聊天账号后重试。";
         }
         return text;
       }
@@ -1032,6 +1032,7 @@
       function statusInfo(status) {
         const map = {
           ok: ["success", "可用"],
+          disconnected: ["warning", "掉线"],
           quota_empty: ["warning", "额度不足"],
           error: ["error", "异常"],
           success: ["success", "成功"],
@@ -1208,6 +1209,7 @@
       function getChannelStatus(channel, relatedAccounts) {
         if (channel.enabled === false) return "disabled";
         if (!relatedAccounts.length) return "empty";
+        if (relatedAccounts.some((item) => item.enabled !== false && item.status === "disconnected")) return "disconnected";
         if (relatedAccounts.some((item) => item.enabled !== false && item.status === "ok")) return "ok";
         if (relatedAccounts.every((item) => item.status === "error" || item.status === "failed")) return "error";
         if (relatedAccounts.some((item) => item.enabled !== false && item.status === "quota_empty")) return "quota_empty";
@@ -1773,7 +1775,7 @@
           }
           await refresh().catch(() => {});
           setLoading(false);
-          message.info(`检测完成：${ok} 个可用，${failed} 个异常`);
+          message.info(`检测完成：${ok} 个可用，${failed} 个需处理`);
         }
 
         async function testAll() {
@@ -2220,6 +2222,7 @@
                     h(Select, { value: statusFilter, onChange: setStatusFilter, options: [
                       { label: "全部状态", value: "all" },
                       { label: "可用", value: "ok" },
+                      { label: "掉线", value: "disconnected" },
                       { label: "额度不足", value: "quota_empty" },
                       { label: "异常", value: "error" },
                       { label: "未检测", value: "unknown" },

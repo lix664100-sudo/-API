@@ -10,6 +10,8 @@ const defaultTaskConcurrency = { chat: 3, drawingImage: 2, chatImage: 2 };
 const chatAccountQueues = new Map();
 const scheduledChatTasks = new Set();
 const activeTaskCounts = new Map();
+const activeAccountAuthTasks = new Map();
+const clientCache = new Map();
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 
 function taskRequestMeta(value = {}) {
@@ -174,10 +176,57 @@ async function withTaskSlot(type, work) {
   }
 }
 
+function accountSessionKey(account = {}) {
+  return [
+    String(account.username || account.id || "").trim().toLowerCase(),
+    String(account.proxyUrl || account.proxy || "").trim()
+  ].join("::");
+}
+
+async function withAccountAuthLock(account, work) {
+  const key = accountSessionKey(account);
+  const previous = activeAccountAuthTasks.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(work);
+  activeAccountAuthTasks.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (activeAccountAuthTasks.get(key) === current) activeAccountAuthTasks.delete(key);
+  }
+}
+
+function clientCacheKey(channel, account) {
+  return [
+    channel.type,
+    channel.parentId || channel.id,
+    channel.ability || "",
+    account.id || account.username || ""
+  ].join("::");
+}
+
+function clientContext(config, channel, account) {
+  return {
+    config,
+    channel,
+    account,
+    sessionLock: (work) => withAccountAuthLock(account, work)
+  };
+}
+
 function getClient(config, channel, account) {
-  if (channel.type === "chatplus") return new ChatplusClient({ config, channel, account });
-  if (channel.type === "drawing") return new DrawingClient({ config, channel, account });
-  throw new Error(`未知渠道：${channel.type}`);
+  const key = clientCacheKey(channel, account);
+  const current = clientCache.get(key);
+  const context = clientContext(config, channel, account);
+  if (current) {
+    if (typeof current.updateContext === "function") current.updateContext(context);
+    return current;
+  }
+  let client = null;
+  if (channel.type === "chatplus") client = new ChatplusClient(context);
+  else if (channel.type === "drawing") client = new DrawingClient(context);
+  else throw new Error(`未知渠道：${channel.type}`);
+  clientCache.set(key, client);
+  return client;
 }
 
 function shareAIAbilityChannel(channel, ability) {
@@ -266,6 +315,16 @@ function isChatLoginStateText(text) {
   return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登/i.test(String(text || ""));
 }
 
+function isDisconnectedError(error) {
+  return isChatLoginStateText([
+    error?.message || "",
+    error?.code || "",
+    error?.status || error?.statusCode || "",
+    error?.body || "",
+    JSON.stringify(error?.payload || {})
+  ].join(" "));
+}
+
 function isQuotaEmptyText(text) {
   return /(?:积分|余额|额度|配额).{0,18}(?:不足|不够|用完|耗尽|为\s*0|已满|上限|限制)|(?:quota|credit|balance|limit).{0,28}(?:insufficient|exhausted|empty|reached|used up)/i.test(String(text || ""));
 }
@@ -279,6 +338,12 @@ function isQuotaEmptyError(error) {
 }
 
 function accountStatusFromError(error) {
+  if (isDisconnectedError(error)) {
+    return {
+      status: "disconnected",
+      message: error?.message || "登录掉线，系统稍后会自动重登。"
+    };
+  }
   if (isQuotaEmptyError(error)) {
     return {
       status: "quota_empty",
@@ -295,7 +360,7 @@ function accountStatusFromError(error) {
 function readableChatFailure(attempts) {
   const details = attemptErrorMessage(attempts);
   if (isChatLoginStateText(details)) {
-    return "聊天站登录状态没有完整通过，系统已自动重新登录并换车，但仍然失败。请先检测聊天账号，或稍后再试。";
+    return "聊天站掉线，系统已自动重登和换车，但仍然失败。请检测聊天账号，或稍后再试。";
   }
   return `所有对话渠道都失败：${details}`;
 }
@@ -330,11 +395,12 @@ async function updateTargetAccountStatus(accountId, channel, patch) {
 
   const drawing = abilities.drawing || {};
   const chatplus = abilities.chatplus || {};
+  const disconnected = [drawing.status, chatplus.status].includes("disconnected");
   const ok = [drawing.status, chatplus.status].includes("ok");
   const failed = [drawing.status, chatplus.status].some((status) => ["error", "failed"].includes(status));
   const quotaEmpty = [drawing.status, chatplus.status].includes("quota_empty");
   return updateAccountStatus(accountId, {
-    status: ok ? "ok" : failed ? "error" : quotaEmpty ? "quota_empty" : patch.status || account.status || "unknown",
+    status: disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : patch.status || account.status || "unknown",
     quota: drawing.quota ?? account.quota ?? null,
     balance: drawing.balance ?? account.balance ?? null,
     quotaResetAt: drawing.quotaResetAt || chatplus.quotaResetAt || account.quotaResetAt || "",
@@ -350,11 +416,12 @@ async function updateTargetAccountStatus(accountId, channel, patch) {
 
 async function markChatCooldown(accountId, channel, error) {
   const cooldownUntil = new Date(Date.now() + CHAT_COOLDOWN_MS).toISOString();
+  const disconnected = isDisconnectedError(error);
   await updateTargetAccountStatus(accountId, channel, {
-    status: "error",
+    status: disconnected ? "disconnected" : "error",
     cooldownUntil,
-    message: isChatLoginStateText(error?.message)
-      ? `聊天站登录状态被上游拒绝，已冷却到 ${cooldownUntil}，系统稍后会自动再试。`
+    message: disconnected
+      ? `聊天站掉线，已冷却到 ${cooldownUntil}，系统稍后会自动重登。`
       : `上游拒绝或断开，已冷却到 ${cooldownUntil}。${error?.message || ""}`.trim()
   });
 }
@@ -1237,7 +1304,7 @@ async function checkShareAIAbility(config, channel, account, ability) {
     return {
       ok: false,
       data: {
-        status: isQuotaEmptyError(error) ? "quota_empty" : "error",
+        status: isDisconnectedError(error) ? "disconnected" : isQuotaEmptyError(error) ? "quota_empty" : "error",
         quota: null,
         balance: null,
         quotaResetAt: error?.quotaResetAt || "",
@@ -1265,11 +1332,12 @@ function readableCheckErrorMessage(error) {
 function combinedShareAIStatus(results) {
   const drawing = results.drawing.data;
   const chatplus = results.chatplus.data;
+  const disconnected = [drawing.status, chatplus.status].includes("disconnected");
   const ok = [drawing.status, chatplus.status].includes("ok");
   const failed = [drawing.status, chatplus.status].some((status) => ["error", "failed"].includes(status));
   const quotaEmpty = [drawing.status, chatplus.status].includes("quota_empty");
   return {
-    status: ok ? "ok" : failed ? "error" : quotaEmpty ? "quota_empty" : "error",
+    status: disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : "error",
     quota: drawing.quota ?? null,
     balance: drawing.balance ?? null,
     quotaResetAt: drawing.quotaResetAt || chatplus.quotaResetAt || "",
@@ -1318,7 +1386,7 @@ export async function checkAccount(accountId) {
   } catch (error) {
     const message = readableCheckErrorMessage(error);
     const status = withProxyCheckMeta({
-      status: isQuotaEmptyError(error) ? "quota_empty" : "error",
+      status: isDisconnectedError(error) ? "disconnected" : isQuotaEmptyError(error) ? "quota_empty" : "error",
       quota: null,
       balance: null,
       quotaResetAt: error?.quotaResetAt || "",
