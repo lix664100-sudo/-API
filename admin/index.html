@@ -300,6 +300,40 @@
         color: var(--danger);
       }
 
+      .proxy-state {
+        font-size: 12px;
+        line-height: 1.2;
+        white-space: nowrap;
+      }
+
+      .proxy-state.ok {
+        color: #027a48;
+      }
+
+      .proxy-state.failed {
+        color: var(--danger);
+      }
+
+      .proxy-state.pending {
+        color: var(--muted);
+      }
+
+      .account-usage {
+        display: grid;
+        gap: 3px;
+        min-width: 0;
+      }
+
+      .account-usage strong {
+        color: var(--ink);
+        font-size: 13px;
+      }
+
+      .account-usage span {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
       .mono {
         font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
       }
@@ -736,6 +770,21 @@
         return data?.data ?? data;
       }
 
+      async function withTimeout(promise, timeoutMs, fallback) {
+        let timer = null;
+        try {
+          return await Promise.race([
+            promise.finally(() => clearTimeout(timer)),
+            new Promise((resolve) => {
+              timer = setTimeout(() => resolve(fallback), timeoutMs);
+            })
+          ]);
+        } catch {
+          clearTimeout(timer);
+          return fallback;
+        }
+      }
+
       function numberValue(value) {
         const next = Number(value);
         return Number.isFinite(next) ? next : 0;
@@ -1000,16 +1049,32 @@
         return Number.isFinite(date.getTime()) && date.getTime() < Date.now();
       }
 
-      function proxyCell(value) {
-        if (!value) return h(Tag, { color: "default" }, "默认IP");
+      function proxyHostText(value) {
+        const text = String(value || "").trim();
+        if (!text) return "";
+        const pipeParts = text.split("|").map((part) => part.trim());
+        if (pipeParts.length >= 4 && pipeParts[0]) return pipeParts[0];
+        try {
+          return new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`).hostname || "已配置";
+        } catch (_error) {
+          return "已配置";
+        }
+      }
+
+      function proxyCell(value, row) {
+        if (!value) return h(Tag, { color: "default" }, "服务器IP");
         const expiresAt = pipeProxyExpireText(value);
-        const proxyTag = h(Tag, { color: "green", style: { marginInlineEnd: 0 } }, "已配置");
-        if (!expiresAt) return h(Tooltip, { title: value }, proxyTag);
         const expired = isPipeProxyExpired(value);
-        return h(Tooltip, { title: value }, h("div", { className: "proxy-cell" }, [
-          proxyTag,
-          h("span", { className: `proxy-expire${expired ? " expired" : ""}` }, `${expired ? "已到期" : "到期"} ${expiresAt}`)
-        ]));
+        const check = row?.meta?.proxyCheck || {};
+        const status = expired ? "failed" : check.status === "ok" ? "ok" : check.status === "failed" ? "failed" : "pending";
+        const statusText = expired ? "已到期" : status === "ok" ? "正常" : status === "failed" ? "不可用" : "等待任务检测";
+        const color = status === "ok" ? "green" : status === "failed" ? "red" : "default";
+        const content = h("div", { className: "proxy-cell" }, [
+          h(Tag, { color, style: { marginInlineEnd: 0 }, key: "ip" }, proxyHostText(value)),
+          h("span", { className: `proxy-state ${status}`, key: "status" }, statusText),
+          expiresAt ? h("span", { className: `proxy-expire${expired ? " expired" : ""}`, key: "expire" }, `到期 ${expiresAt}`) : null
+        ]);
+        return check.message && status === "failed" ? h(Tooltip, { title: check.message }, content) : content;
       }
 
       function taskTypeLabel(type) {
@@ -1252,8 +1317,8 @@
         const [accountForm] = Form.useForm();
         const [globalForm] = Form.useForm();
         const editingChannelType = Form.useWatch("type", channelForm);
-        const selectedChatChannelValue = Form.useWatch("channel", chatForm);
-        const selectedEditChannelValue = Form.useWatch("channel", editForm);
+        const selectedChatAccountValue = Form.useWatch("accountId", chatForm);
+        const selectedEditAccountValue = Form.useWatch("accountId", editForm);
 
         const channels = config?.channels || [];
         const accounts = config?.accounts || [];
@@ -1267,20 +1332,41 @@
           ...channels.map((item) => ({ label: item.name, value: item.id }))
         ], [channels]);
 
-        const chatChannelOptions = useMemo(() => [
+        const chatAccountOptions = useMemo(() => {
+          const chatIds = new Set(chatChannels.map((item) => item.id));
+          return [
+            { label: "自动选择", value: "auto" },
+            ...accounts
+              .filter((account) => account.enabled !== false && chatIds.has(account.channelId))
+              .map((account) => ({
+                label: `${account.name || account.username || "未命名账号"} / ${channelName(config, account.channelId)}`,
+                value: account.id
+              }))
+          ];
+        }, [accounts, chatChannels, config]);
+
+        const imageAccountOptions = useMemo(() => [
           { label: "自动选择", value: "auto" },
-          ...chatChannels.map((item) => ({ label: item.name, value: item.id }))
-        ], [chatChannels]);
+          ...accounts
+            .filter((account) => account.enabled !== false)
+            .map((account) => ({
+              label: `${account.name || account.username || "未命名账号"} / ${channelName(config, account.channelId)}`,
+              value: account.id
+            }))
+        ], [accounts, config]);
 
         const chatTestModelOptions = useMemo(() => {
-          const selected = selectedChatChannelValue && selectedChatChannelValue !== "auto"
-            ? chatChannels.find((item) => item.id === selectedChatChannelValue)
+          const selectedAccount = selectedChatAccountValue && selectedChatAccountValue !== "auto"
+            ? accounts.find((item) => item.id === selectedChatAccountValue)
+            : null;
+          const selected = selectedAccount
+            ? chatChannels.find((item) => item.id === selectedAccount.channelId)
             : null;
           const source = selected
             ? chatModelSelectOptions(selected)
             : [...new Map(chatChannels.flatMap(chatModelSelectOptions).map((item) => [item.value, item])).values()];
           return [{ label: "自动使用渠道默认", value: "" }, ...source];
-        }, [chatChannels, selectedChatChannelValue]);
+        }, [accounts, chatChannels, selectedChatAccountValue]);
 
         const drawingModelOptions = useMemo(() => {
           const items = Array.isArray(drawingModels) && drawingModels.length ? drawingModels : fallbackModelOptions;
@@ -1315,9 +1401,9 @@
           const chatIds = new Set(chatChannels.map((item) => item.id));
           return accounts.filter((account) => {
             if (account.enabled === false || !chatIds.has(account.channelId)) return false;
-            return !selectedChatChannelValue || selectedChatChannelValue === "auto" || account.channelId === selectedChatChannelValue;
+            return !selectedChatAccountValue || selectedChatAccountValue === "auto" || account.id === selectedChatAccountValue;
           });
-        }, [accounts, chatChannels, selectedChatChannelValue]);
+        }, [accounts, chatChannels, selectedChatAccountValue]);
 
         const coolingChatAccount = useMemo(() => matchingChatAccounts.find(accountIsCooling) || null, [matchingChatAccounts, nowTick]);
         const chatSubmitBlocked = matchingChatAccounts.length > 0 && matchingChatAccounts.every(accountIsCooling);
@@ -1384,33 +1470,40 @@
 
         const taskStats = useMemo(() => summarizeTasks(filteredStatRecords), [filteredStatRecords]);
 
+        const accountTodayUsage = useMemo(() => {
+          const today = dateKeyInShanghai(Date.now());
+          const usage = new Map();
+          statRecords.forEach((record) => {
+            if (!record.accountId || (record.day || dateKeyInShanghai(record.time)) !== today) return;
+            usage.set(record.accountId, numberValue(usage.get(record.accountId)) + numberValue(record.successImages));
+          });
+          return usage;
+        }, [statRecords]);
+
         async function refresh() {
-          const [nextConfig, taskList, statsData, modelData, storageData] = await Promise.all([
+          const [nextConfig, taskList, statsData, storageData] = await Promise.all([
             api("/api/config"),
             api("/api/tasks"),
             api("/api/stats").catch(() => ({ records: [] })),
-            api("/api/models").catch(() => ({ items: [] })),
             api("/api/admin/image-storage").catch(() => null)
           ]);
           setConfig(nextConfig);
           setTasks(taskList);
           setStatRecords(Array.isArray(statsData?.records) ? statsData.records : []);
-          setDrawingModels(Array.isArray(modelData?.items) ? modelData.items : []);
           if (storageData) setImageStorageStats(storageData);
           globalForm.setFieldsValue(nextConfig);
-          const defaultChatChannel = nextConfig.channels?.some((item) => item.id === nextConfig.defaultChannel && (item.type === "chatplus" || item.type === "shareai"))
-            ? nextConfig.defaultChannel
-            : "auto";
           chatForm.setFieldsValue({
-            channel: defaultChatChannel,
+            accountId: "auto",
             model: ""
           });
           editForm.setFieldsValue({
-            channel: nextConfig.defaultChannel || "auto",
+            accountId: "auto",
             model_id: defaultModelForChannel(nextConfig.defaultChannel, nextConfig.channels || [], nextConfig),
             ratio_label: nextConfig.defaultRatio || "1:1",
             image_count: 1
           });
+          withTimeout(api("/api/models"), 5000, { items: [] })
+            .then((modelData) => setDrawingModels(Array.isArray(modelData?.items) ? modelData.items : []));
         }
 
         async function refreshImageStorage() {
@@ -1453,10 +1546,12 @@
         }, [chatForm, chatTestModelOptions]);
 
         useEffect(() => {
-          if (!selectedEditChannelValue) return;
-          const nextModel = defaultModelForChannel(selectedEditChannelValue);
+          if (!selectedEditAccountValue) return;
+          const account = accounts.find((item) => item.id === selectedEditAccountValue);
+          const channelId = account?.channelId || config?.defaultChannel || "auto";
+          const nextModel = defaultModelForChannel(channelId);
           if (nextModel) editForm.setFieldValue("model_id", nextModel);
-        }, [selectedEditChannelValue, channels, config]);
+        }, [selectedEditAccountValue, accounts, channels, config]);
 
         useEffect(() => {
           if (!tasks.some((item) => ["processing", "queued", "pending", "unknown"].includes(item.status))) return undefined;
@@ -1708,14 +1803,16 @@
               ? (() => {
                   const form = new FormData();
                   form.append("message", text);
-                  form.append("channel", values.channel || "auto");
+                  form.append("channel", "auto");
+                  if (values.accountId && values.accountId !== "auto") form.append("accountId", values.accountId);
                   if (values.model) form.append("model", values.model);
                   chatFileList.forEach((file) => form.append("image", file.originFileObj));
                   return form;
                 })()
               : {
                   message: text,
-                  channel: values.channel || "auto",
+                  channel: "auto",
+                  ...(values.accountId && values.accountId !== "auto" ? { accountId: values.accountId } : {}),
                   ...(values.model ? { model: values.model } : {})
                 };
             const result = await api("/v1/chat/completions?wait=0", { method: "POST", headers, body });
@@ -1744,7 +1841,11 @@
           setLoading(true);
           try {
             const form = new FormData();
-            Object.entries(values).forEach(([key, value]) => form.append(key, value ?? ""));
+            Object.entries(values).forEach(([key, value]) => {
+              if (key !== "accountId") form.append(key, value ?? "");
+            });
+            form.set("channel", "auto");
+            if (values.accountId && values.accountId !== "auto") form.append("accountId", values.accountId);
             editFileList.forEach((file) => form.append("image", file.originFileObj));
             const task = await api("/api/draw/edit", { method: "POST", body: form });
             setTasks((current) => [task, ...current.filter((item) => String(item.id) !== String(task.id))]);
@@ -1873,9 +1974,20 @@
             title: "代理",
             dataIndex: "proxyUrl",
             width: 150,
-            render: proxyCell
+            render: (value, row) => proxyCell(value, row)
           },
           { title: "状态", dataIndex: "status", width: 90, render: statusTag },
+          {
+            title: "今日使用",
+            width: 130,
+            render: (_, row) => {
+              const count = numberValue(accountTodayUsage.get(row.id));
+              return h("div", { className: "account-usage" }, [
+                h("strong", { key: "images" }, `${count} 张图`),
+                h("span", { key: "dialogs" }, `对话 ${count} 次`)
+              ]);
+            }
+          },
           {
             title: "额度",
             width: 230,
@@ -2104,6 +2216,7 @@
                         columns: accountColumns,
                         dataSource: selectedAccounts,
                         pagination: selectedAccounts.length > 5 ? { pageSize: 5 } : false,
+                        scroll: { x: 1500 },
                         size: "small",
                         locale: { emptyText: "这个渠道还没有绑定账号" }
                       })
@@ -2182,7 +2295,7 @@
                           ? h(Alert, { type: "warning", showIcon: true, message: `聊天账号冷却中，约 ${accountCooldownText(coolingChatAccount)} 后再试。`, style: { marginBottom: 14 } })
                           : null,
                         h("div", { className: "form-grid" }, [
-                          h(Form.Item, { label: "渠道", name: "channel" }, h(Select, { options: chatChannelOptions })),
+                          h(Form.Item, { label: "账号", name: "accountId" }, h(Select, { options: chatAccountOptions })),
                           h(Form.Item, { label: "模型", name: "model" }, h(Select, { options: chatTestModelOptions }))
                         ]),
                         h(Form.Item, { label: "图片", extra: "可选，最多 5 张" }, h(Upload, {
@@ -2209,7 +2322,7 @@
                     children: h("div", { className: "operation-body" }, h(Form, { layout: "vertical", form: editForm, onFinish: submitEdit }, [
                       h(Alert, { type: "info", showIcon: true, message: "图生图会先走绘图站；绘图站忙或失败时，自动改走聊天生图；两边都不可用才失败。", style: { marginBottom: 14 } }),
                       h("div", { className: "form-grid" }, [
-                        h(Form.Item, { label: "渠道", name: "channel" }, h(Select, { options: channelOptions })),
+                        h(Form.Item, { label: "账号", name: "accountId" }, h(Select, { options: imageAccountOptions })),
                         h(Form.Item, { label: "绘图模型", name: "model_id" }, h(Select, { options: drawingModelOptions }))
                       ]),
                       h(Form.Item, { label: "源图", extra: "必填，最多 3 张" }, h(Upload, {

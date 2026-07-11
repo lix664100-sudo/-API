@@ -254,14 +254,21 @@ function mergeAccountIntoGroup(group, account, type) {
     quotaResetAt: null,
     expireAt: null,
     message: "",
-    meta: { abilities: {} }
+    meta: {
+      ...(account.meta || {}),
+      abilities: { ...(account.meta?.abilities || {}) }
+    }
   };
   if (!next.name || type === "chatplus") next.name = account.name || next.name || account.username || "ShareAI账号";
   if (!next.password && account.password) next.password = account.password;
   if (!next.proxyUrl && (account.proxyUrl || account.proxy)) next.proxyUrl = account.proxyUrl || account.proxy;
   next.enabled = next.enabled && account.enabled !== false;
   next.priority = Math.min(Number(next.priority || 99), Number(account.priority || 1));
-  next.meta = { ...(next.meta || {}), abilities: { ...(next.meta?.abilities || {}) } };
+  next.meta = {
+    ...(next.meta || {}),
+    ...(account.meta || {}),
+    abilities: { ...(next.meta?.abilities || {}) }
+  };
   if (type === "drawing" || type === "chatplus") {
     next.meta.abilities[type] = accountAbilityStatus(account);
   } else if (account.meta?.abilities) {

@@ -679,6 +679,16 @@ function fallbackDrawingModels() {
   ];
 }
 
+async function withTimeout(promise, timeoutMs) {
+  let timer = null;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+    })
+  ]);
+}
+
 app.get("/api/models", async () => {
   const config = await loadConfig();
   const channel = config.channels.find((item) => item.type === "drawing" && item.enabled !== false)
@@ -700,7 +710,7 @@ app.get("/api/models", async () => {
           }
         : channel;
       const client = new DrawingClient({ config, channel: drawingChannel, account });
-      const models = await client.getModels();
+      const models = await withTimeout(client.getModels(), 5000);
       const items = Array.isArray(models?.items) ? models.items : Array.isArray(models) ? models : [];
       if (items.length) return { ok: true, data: { items } };
     } catch {

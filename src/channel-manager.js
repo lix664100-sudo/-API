@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
 import { DrawingClient } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
-import { normalizeProxyUrl, parsePipeProxy } from "./proxy.js";
+import { checkProxyReachability, safeProxyEndpoint } from "./proxy.js";
 import { getTask, listTasks, loadConfig, recordTaskStat, updateAccountStatus, upsertTask } from "./storage.js";
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
@@ -18,52 +18,6 @@ function taskRequestMeta(value = {}) {
     calledAt: value.calledAt || new Date().toISOString(),
     forwardedFor: String(value.forwardedFor || "").trim()
   };
-}
-
-function safeProxyEndpoint(value) {
-  const text = String(value || "").trim();
-  if (!text) {
-    return {
-      proxyConfigured: false,
-      proxyLabel: "默认服务器IP",
-      proxyProtocol: "",
-      proxyHost: "",
-      proxyPort: ""
-    };
-  }
-
-  const pipeProxy = parsePipeProxy(text);
-  if (pipeProxy) {
-    return {
-      proxyConfigured: true,
-      proxyLabel: `socks5://${pipeProxy.host}:${pipeProxy.port}`,
-      proxyProtocol: "socks5",
-      proxyHost: pipeProxy.host,
-      proxyPort: pipeProxy.port
-    };
-  }
-
-  try {
-    const url = new URL(normalizeProxyUrl(text));
-    const protocol = url.protocol.replace(/:$/, "");
-    const host = url.hostname || "";
-    const port = url.port || "";
-    return {
-      proxyConfigured: true,
-      proxyLabel: `${protocol ? `${protocol}://` : ""}${host}${port ? `:${port}` : ""}` || "已配置代理",
-      proxyProtocol: protocol,
-      proxyHost: host,
-      proxyPort: port
-    };
-  } catch {
-    return {
-      proxyConfigured: true,
-      proxyLabel: "已配置代理",
-      proxyProtocol: "",
-      proxyHost: "",
-      proxyPort: ""
-    };
-  }
 }
 
 function taskNetworkMeta(account = {}) {
@@ -507,6 +461,7 @@ function accountMatchesChannel(account, channel) {
 }
 
 function selectTargets(config, requestedChannel = "auto", taskType = "text2img", options = {}) {
+  const requestedAccountId = String(options.accountId || "").trim();
   const channels = config.channels
     .filter((channel) => channel.enabled !== false)
     .filter((channel) => channelMatchesRequest(channel, requestedChannel))
@@ -517,6 +472,7 @@ function selectTargets(config, requestedChannel = "auto", taskType = "text2img",
   for (const channel of channels) {
     const accounts = config.accounts
       .filter((account) => account.enabled !== false && accountMatchesChannel(account, channel))
+      .filter((account) => !requestedAccountId || account.id === requestedAccountId)
       .sort((a, b) => Number(a.priority || 99) - Number(b.priority || 99));
     for (const account of accounts) {
       if (channel.type === "shareai") {
@@ -636,7 +592,41 @@ async function refreshQuotaBeforeUse(config, target, attempts) {
   }
 }
 
+function proxyTargetUrl(channel = {}) {
+  return channel.settings?.baseUrl
+    || (channel.type === "drawing" ? "https://drawing.aishare.icu" : "https://www.chatplus.cc");
+}
+
+async function saveProxyCheck(account, result) {
+  const config = await loadConfig();
+  const current = config.accounts.find((item) => item.id === account.id) || account;
+  await updateAccountStatus(account.id, {
+    meta: {
+      ...(current.meta || {}),
+      proxyCheck: {
+        status: result.ok ? "ok" : "failed",
+        ip: result.proxyHost || "",
+        checkedAt: result.checkedAt || new Date().toISOString(),
+        message: result.ok ? "" : result.message || "代理不可用"
+      }
+    }
+  });
+}
+
+async function ensureProxyReady(target, attempts) {
+  const proxyValue = target.account.proxyUrl || target.account.proxy || "";
+  if (!String(proxyValue).trim()) return true;
+
+  const result = await checkProxyReachability(proxyValue, proxyTargetUrl(target.channel));
+  await saveProxyCheck(target.account, result);
+  if (result.ok) return true;
+
+  pushAttempt(attempts, target, `${result.message || "代理不可用"}，已跳过这个账号。`, { proxyFailed: true });
+  return false;
+}
+
 async function ensureTargetReady(config, target, taskType, attempts) {
+  if (!(await ensureProxyReady(target, attempts))) return false;
   if (!shouldRefreshQuotaBeforeUse(target, taskType)) return true;
   return refreshQuotaBeforeUse(config, target, attempts);
 }
@@ -924,7 +914,8 @@ async function submitImageTask(client, input, files) {
 async function runQueuedImageTask(task, input, files, reserved = null) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "img2img");
+  const requestedAccountId = String(input.accountId || input.account_id || "").trim();
+  const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId });
   const attempts = [...(reserved?.attempts || [])];
   let reservedRelease = reserved?.release || null;
   try {
@@ -998,7 +989,8 @@ async function finishChatTask(task, result, channel, account, attempts, response
 async function runChatCompletionTask(task, input) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "chat");
+  const requestedAccountId = String(input.accountId || input.account_id || "").trim();
+  const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId });
   const attempts = [];
   if (!targets.length) {
     const error = noChatTargetsError(config, requestedChannel);
@@ -1008,6 +1000,7 @@ async function runChatCompletionTask(task, input) {
   for (const target of targets) {
     const { channel, account } = target;
     try {
+      if (!(await ensureTargetReady(config, target, "chat", attempts))) continue;
       const client = getClient(config, channel, account);
       if (typeof client.createChatCompletion !== "function") {
         throw new Error("这个渠道暂不支持对话。");
@@ -1030,7 +1023,7 @@ async function runChatCompletionTask(task, input) {
       } else {
         await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
       }
-      if (status >= 400 && status < 500 && !isChatBlockedError(error)) {
+      if (status === 400 && !isChatBlockedError(error)) {
         error.task = await failQueuedTask(task, error, attempts);
         throw error;
       }
@@ -1084,7 +1077,8 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   assertImageFileCount(files, 3);
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "img2img");
+  const requestedAccountId = String(input.accountId || input.account_id || "").trim();
+  const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId });
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
 
   const reserved = reserveFirstAvailableTarget(targets, "img2img");
@@ -1106,7 +1100,8 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
 
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "chat");
+  const requestedAccountId = String(input.accountId || input.account_id || "").trim();
+  const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId });
   if (!targets.length) throw noChatTargetsError(config, requestedChannel);
 
   const release = reserveTaskSlot("chat");
@@ -1274,7 +1269,8 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
 
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "chat");
+  const requestedAccountId = String(input.accountId || input.account_id || "").trim();
+  const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId });
   if (!targets.length) throw noChatTargetsError(config, requestedChannel);
 
   return withTaskSlot("chat", async () => {
@@ -1347,7 +1343,8 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   assertImageFileCount(files, 3);
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "img2img");
+  const requestedAccountId = String(input.accountId || input.account_id || "").trim();
+  const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId });
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
 
   const attempts = [];
