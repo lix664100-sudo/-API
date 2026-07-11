@@ -246,10 +246,14 @@ async function currentGitUpdateState(cwd) {
       upstream: String(upstream.stdout || "").trim()
     };
   } catch (error) {
+    const stderr = shortenOutput(error.stderr || error.message);
+    if (/not a git repository/i.test(stderr)) {
+      return { checked: false, message: "当前目录不是代码仓库，未执行更新。", stderr };
+    }
     return {
       checked: false,
       message: "无法确认当前是否为最新版，未执行更新。",
-      stderr: shortenOutput(error.stderr || error.message)
+      stderr
     };
   }
 }
