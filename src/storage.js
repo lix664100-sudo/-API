@@ -9,6 +9,12 @@ const tasksFile = path.join(dataDir, "tasks.json");
 const taskHistoryLimit = 2000;
 const taskHistoryDays = 7;
 
+const defaultImageStorage = {
+  mode: "smart",
+  autoCleanup: true,
+  retentionDays: 7
+};
+
 const defaultChatModels = [
   { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", enabled: true, default: true },
   { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", enabled: true, default: false },
@@ -46,6 +52,7 @@ const defaultConfig = {
   defaultRatio: "1:1",
   defaultImageCount: 1,
   waitTimeoutSec: 180,
+  imageStorage: defaultImageStorage,
   channels: defaultChannels,
   accounts: []
 };
@@ -72,6 +79,15 @@ async function writeJson(file, value) {
 
 function normalizeChatModelKey(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function normalizeImageStorage(value = {}) {
+  const mode = ["smart", "always", "never"].includes(value.mode) ? value.mode : defaultImageStorage.mode;
+  return {
+    mode,
+    autoCleanup: value.autoCleanup !== false,
+    retentionDays: Math.min(3650, Math.max(1, Number(value.retentionDays || defaultImageStorage.retentionDays)))
+  };
 }
 
 function normalizeChatModels(settings = {}, migrateAutoSelection = false) {
@@ -299,6 +315,7 @@ function normalizeConfig(stored = {}) {
     ...defaultConfig,
     ...stored,
     defaultChannel,
+    imageStorage: normalizeImageStorage(stored.imageStorage),
     channels,
     accounts: normalizeAccounts(stored)
   };
@@ -344,6 +361,7 @@ export function publicConfig(config) {
     defaultRatio: config.defaultRatio,
     defaultImageCount: config.defaultImageCount,
     waitTimeoutSec: config.waitTimeoutSec,
+    imageStorage: config.imageStorage,
     channels: config.channels,
     accounts: config.accounts.map(redactAccount),
     updatedAt: config.updatedAt || null

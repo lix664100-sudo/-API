@@ -669,6 +669,12 @@
         { label: "低负载优先", value: "speed" }
       ];
 
+      const imageStorageModeOptions = [
+        { label: "智能转存：临时链接才保存到本服务器", value: "smart" },
+        { label: "全部转存：所有返回图片都保存到本服务器", value: "always" },
+        { label: "不转存：全部按上游原链接返回", value: "never" }
+      ];
+
       async function api(path, options = {}) {
         const isForm = options.body instanceof FormData;
         const hasBody = options.body !== undefined && options.body !== null;
@@ -765,6 +771,28 @@
           hour: "2-digit",
           minute: "2-digit"
         }).replace(/\//g, "-");
+      }
+
+      function formatBytes(value) {
+        const bytes = Number(value || 0);
+        if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+        const units = ["B", "KB", "MB", "GB", "TB"];
+        let size = bytes;
+        let index = 0;
+        while (size >= 1024 && index < units.length - 1) {
+          size /= 1024;
+          index += 1;
+        }
+        return `${size >= 10 || index === 0 ? Math.round(size) : size.toFixed(1)} ${units[index]}`;
+      }
+
+      function imageStorageModeLabel(value) {
+        const map = {
+          smart: "智能转存",
+          always: "全部转存",
+          never: "不转存"
+        };
+        return map[value] || "智能转存";
       }
 
       function accountQuotaText(account, channel) {
@@ -1076,6 +1104,8 @@
         const [tasks, setTasks] = useState([]);
         const [loading, setLoading] = useState(false);
         const [updating, setUpdating] = useState(false);
+        const [imageStorageStats, setImageStorageStats] = useState(null);
+        const [imageStorageCleaning, setImageStorageCleaning] = useState(false);
         const [nowTick, setNowTick] = useState(Date.now());
         const [chatFileList, setChatFileList] = useState([]);
         const [editFileList, setEditFileList] = useState([]);
@@ -1221,14 +1251,16 @@
         const taskStats = useMemo(() => summarizeTasks(filteredTasks), [filteredTasks]);
 
         async function refresh() {
-          const [nextConfig, taskList, modelData] = await Promise.all([
+          const [nextConfig, taskList, modelData, storageData] = await Promise.all([
             api("/api/config"),
             api("/api/tasks"),
-            api("/api/models").catch(() => ({ items: [] }))
+            api("/api/models").catch(() => ({ items: [] })),
+            api("/api/admin/image-storage").catch(() => null)
           ]);
           setConfig(nextConfig);
           setTasks(taskList);
           setDrawingModels(Array.isArray(modelData?.items) ? modelData.items : []);
+          if (storageData) setImageStorageStats(storageData);
           globalForm.setFieldsValue(nextConfig);
           const defaultChatChannel = nextConfig.channels?.some((item) => item.id === nextConfig.defaultChannel && (item.type === "chatplus" || item.type === "shareai"))
             ? nextConfig.defaultChannel
@@ -1243,6 +1275,27 @@
             ratio_label: nextConfig.defaultRatio || "1:1",
             image_count: 1
           });
+        }
+
+        async function refreshImageStorage() {
+          try {
+            setImageStorageStats(await api("/api/admin/image-storage"));
+          } catch (error) {
+            message.error(error.message);
+          }
+        }
+
+        async function cleanupImageStorage(mode) {
+          setImageStorageCleaning(true);
+          try {
+            const result = await api("/api/admin/image-storage/cleanup", { method: "POST", body: { mode } });
+            setImageStorageStats(result.after);
+            message.success(`已清理 ${result.deletedCount || 0} 张图片，释放 ${formatBytes(result.deletedBytes || 0)}`);
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setImageStorageCleaning(false);
+          }
         }
 
         useEffect(() => {
@@ -1292,7 +1345,10 @@
         async function saveGlobal(values) {
           setLoading(true);
           try {
-            setConfig(await api("/api/config", { method: "POST", body: values }));
+            const nextConfig = await api("/api/config", { method: "POST", body: values });
+            setConfig(nextConfig);
+            globalForm.setFieldsValue(nextConfig);
+            await refreshImageStorage();
             message.success("设置已保存");
           } catch (error) {
             message.error(error.message);
@@ -1782,6 +1838,8 @@
         ];
 
         const selectedStats = selectedChannel ? channelStats.get(selectedChannel.id) || {} : {};
+        const storageSettings = imageStorageStats?.settings || config?.imageStorage || {};
+        const storageDisk = imageStorageStats?.disk || null;
 
         return h("div", null, [
           h("header", { className: "topbar", key: "topbar" }, [
@@ -2067,6 +2125,48 @@
                       h("div", { className: "form-grid" }, [
                         h(Form.Item, { label: "中转 API 地址" }, h(Input, { readOnly: true, value: publicApiBaseUrl, addonAfter: h(Button, { type: "link", size: "small", onClick: copyPublicApiUrl }, "复制") })),
                         h(Form.Item, { label: "API 密钥", name: "apiKey" }, h(Input, { readOnly: true, addonAfter: h(Button, { type: "link", size: "small", onClick: copyApiKey }, "复制") }))
+                      ]),
+                      h("div", { className: "api-doc-section", style: { marginBottom: 14 } }, [
+                        h("div", { className: "section-title" }, [
+                          h("h3", null, "图片存储"),
+                          h(Space, { wrap: true }, [
+                            h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refreshImageStorage, loading }, "刷新空间"),
+                            h(Button, { onClick: () => cleanupImageStorage("expired"), loading: imageStorageCleaning }, "清理过期图片"),
+                            h(Popconfirm, {
+                              title: "清空所有已转存图片？",
+                              description: "清空后，旧任务里的本地图片链接会打不开。",
+                              okText: "清空",
+                              cancelText: "取消",
+                              onConfirm: () => cleanupImageStorage("all")
+                            }, h(Button, { danger: true, loading: imageStorageCleaning, icon: Icon.DeleteOutlined ? h(Icon.DeleteOutlined) : null }, "清空全部"))
+                          ])
+                        ]),
+                        h("div", { className: "detail-grid" }, [
+                          h("div", { className: "detail-stat" }, [
+                            h("div", { className: "detail-stat-label" }, "已存图片"),
+                            h("div", { className: "detail-stat-value" }, `${imageStorageStats?.count ?? 0} 张`)
+                          ]),
+                          h("div", { className: "detail-stat" }, [
+                            h("div", { className: "detail-stat-label" }, "占用空间"),
+                            h("div", { className: "detail-stat-value" }, formatBytes(imageStorageStats?.totalBytes || 0))
+                          ]),
+                          h("div", { className: "detail-stat" }, [
+                            h("div", { className: "detail-stat-label" }, "服务器磁盘"),
+                            h("div", { className: "detail-stat-value" }, storageDisk ? `${formatBytes(storageDisk.freeBytes)} 可用` : "-")
+                          ])
+                        ]),
+                        h("div", { className: "form-grid" }, [
+                          h(Form.Item, { label: "图片返回策略", name: ["imageStorage", "mode"] }, h(Select, { options: imageStorageModeOptions })),
+                          h(Form.Item, { label: "只保留最近几天", name: ["imageStorage", "retentionDays"] }, h(InputNumber, { min: 1, max: 3650, style: { width: "100%" } })),
+                          h(Form.Item, { label: "自动清理", name: ["imageStorage", "autoCleanup"], valuePropName: "checked" }, h(Switch, { checkedChildren: "开启", unCheckedChildren: "关闭" })),
+                          h(Form.Item, { label: "当前策略" }, h(Input, { readOnly: true, value: `${imageStorageModeLabel(storageSettings.mode)}｜保留 ${storageSettings.retentionDays || 7} 天` }))
+                        ]),
+                        h(Alert, {
+                          type: "info",
+                          showIcon: true,
+                          message: "智能转存会直接返回普通公开图片；遇到 ChatPlus 这类临时链接，才保存到本服务器再返回。",
+                          style: { marginBottom: 0 }
+                        })
                       ]),
                       h(Alert, {
                         type: "info",

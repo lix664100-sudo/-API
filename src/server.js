@@ -19,7 +19,14 @@ import {
   refreshTask
 } from "./channel-manager.js";
 import { DrawingClient } from "./channels/drawing.js";
-import { mirrorImageUrl, resultImageDir, setRuntimePublicBaseUrl } from "./image-store.js";
+import {
+  cleanupResultImages,
+  getResultImageStorageStats,
+  mirrorImageUrl,
+  resultImageDir,
+  runAutoCleanupResultImages,
+  setRuntimePublicBaseUrl
+} from "./image-store.js";
 import {
   getTask,
   listTasks,
@@ -45,6 +52,7 @@ const adminSessionSecret = String(process.env.ADMIN_SESSION_SECRET || process.en
 const adminSessionMs = Math.max(1, Number(process.env.ADMIN_SESSION_HOURS || 12)) * 60 * 60 * 1000;
 const updateTimeoutMs = Math.max(10, Number(process.env.ADMIN_UPDATE_TIMEOUT_SEC || 120)) * 1000;
 const updateOutputLimit = 8000;
+const resultImageCleanupIntervalMs = Math.max(5, Number(process.env.RESULT_IMAGE_CLEANUP_INTERVAL_MIN || 60)) * 60 * 1000;
 const publicAdminApiPaths = new Set([
   "/api/health",
   "/api/auth/status",
@@ -546,6 +554,17 @@ app.post("/api/admin/mirror-image", async (request, reply) => {
   }
 });
 
+app.get("/api/admin/image-storage", async () => {
+  const config = await loadConfig();
+  return { ok: true, data: await getResultImageStorageStats(config) };
+});
+
+app.post("/api/admin/image-storage/cleanup", async (request) => {
+  const config = await loadConfig();
+  const mode = request.body?.mode === "all" ? "all" : "expired";
+  return { ok: true, data: await cleanupResultImages(config, { mode }) };
+});
+
 app.get("/api/config", async () => {
   const config = await loadConfig();
   return { ok: true, data: publicConfig(config) };
@@ -561,7 +580,8 @@ app.post("/api/config", async (request) => {
     defaultModelId: Number(body.defaultModelId || current.defaultModelId || 1),
     defaultRatio: body.defaultRatio || current.defaultRatio || "1:1",
     defaultImageCount: Number(body.defaultImageCount || current.defaultImageCount || 1),
-    waitTimeoutSec: Number(body.waitTimeoutSec || current.waitTimeoutSec || 180)
+    waitTimeoutSec: Number(body.waitTimeoutSec || current.waitTimeoutSec || 180),
+    imageStorage: body.imageStorage || current.imageStorage
   });
   return { ok: true, data: publicConfig(config) };
 });
@@ -755,11 +775,26 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
   }
 });
 
+function scheduleResultImageCleanup() {
+  const cleanup = async () => {
+    try {
+      const config = await loadConfig();
+      await runAutoCleanupResultImages(config, { force: true });
+    } catch (error) {
+      app.log.warn({ error }, "result image cleanup failed");
+    }
+  };
+  cleanup();
+  const timer = setInterval(cleanup, resultImageCleanupIntervalMs);
+  timer.unref?.();
+}
+
 const port = Number(process.env.PORT || 3210);
 const host = process.env.HOST || "127.0.0.1";
 
 try {
   await app.listen({ port, host });
+  scheduleResultImageCleanup();
   app.log.info(`管理后台：http://${host}:${port}/admin/`);
 } catch (error) {
   app.log.error(error);
