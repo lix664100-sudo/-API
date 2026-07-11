@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
 import { DrawingClient } from "./channels/drawing.js";
+import { mirrorImageUrls } from "./image-store.js";
 import { getTask, listTasks, loadConfig, updateAccountStatus, upsertTask } from "./storage.js";
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
@@ -281,6 +282,20 @@ function taskErrorMessage(result, task) {
   return result.errorMessage || itemError || task.errorMessage || "";
 }
 
+async function mirrorTaskImages(result, config) {
+  const imageUrls = Array.isArray(result?.imageUrls) ? result.imageUrls.filter(Boolean) : [];
+  if (!imageUrls.length) return result;
+  const mirroredUrls = await mirrorImageUrls(imageUrls, config);
+  return {
+    ...result,
+    imageUrls: mirroredUrls,
+    raw: {
+      ...(result.raw || {}),
+      originalImageUrls: imageUrls
+    }
+  };
+}
+
 async function markAccountAvailable(accountId, channel = "") {
   const channelType = typeof channel === "string" ? channel : channel?.type || "";
   const patch = {
@@ -330,7 +345,7 @@ export async function refreshTask(taskId) {
   const externalId = taskExternalId(task);
   if (!externalId || (task.raw?.queued && String(externalId).startsWith("task-"))) return task;
 
-  const result = await client.getTask(externalId);
+  const result = await mirrorTaskImages(await client.getTask(externalId), config);
   const nextTask = mergeRefreshedTask(task, result, channel, account);
   await upsertTask(nextTask);
   return nextTask;
@@ -694,6 +709,7 @@ async function runQueuedTextTask(task, input, reserved = null) {
         if (channel.type === "drawing" && !isFinishedTask(result.status)) {
           result = await client.waitForTask(result.externalId);
         }
+        result = await mirrorTaskImages(result, config);
         return finishQueuedTask(task, result, channel, account, attempts);
       } catch (error) {
         attempts.push({
@@ -761,6 +777,7 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
         if (channel.type === "drawing" && !isFinishedTask(result.status)) {
           result = await client.waitForTask(result.externalId);
         }
+        result = await mirrorTaskImages(result, config);
         return finishQueuedTask(task, result, channel, account, attempts);
       } catch (error) {
         attempts.push({
@@ -830,7 +847,7 @@ async function runChatCompletionTask(task, input) {
       if (typeof client.createChatCompletion !== "function") {
         throw new Error("这个渠道暂不支持对话。");
       }
-      const result = await client.createChatCompletion(input);
+      const result = await mirrorTaskImages(await client.createChatCompletion(input), config);
       const responseJson = chatCompletionResponseJson({ result, channel });
       const finishedTask = await finishChatTask(task, result, channel, account, attempts, responseJson);
       return { result, channel, account, task: finishedTask, responseJson };
@@ -1135,6 +1152,7 @@ export async function createTextTask(input = {}, wait = false) {
       const client = getClient(config, channel, account);
       let result = await client.createTextTask(input);
       if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
+      result = await mirrorTaskImages(result, config);
       const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input) });
       await upsertTask(task);
       await markAccountAvailable(account.id, channel);
@@ -1173,6 +1191,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
       const client = getClient(config, channel, account);
       let result = await submitImageTask(client, input, files);
       if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
+      result = await mirrorTaskImages(result, config);
       const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson({ ...input, files }) });
       await upsertTask(task);
       await markAccountAvailable(account.id, channel);

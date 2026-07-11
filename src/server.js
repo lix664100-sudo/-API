@@ -19,6 +19,7 @@ import {
   refreshTask
 } from "./channel-manager.js";
 import { DrawingClient } from "./channels/drawing.js";
+import { resultImageDir, setRuntimePublicBaseUrl } from "./image-store.js";
 import {
   getTask,
   listTasks,
@@ -256,6 +257,10 @@ function previewContentType(filename) {
   return "image/png";
 }
 
+function imageContentType(filename) {
+  return previewContentType(filename);
+}
+
 function isImageInputField(fieldname) {
   const name = String(fieldname || "").trim().toLowerCase();
   return /^(image|images|file|files)(\[\d*\]|_\d+|\d+)?$/.test(name);
@@ -394,6 +399,10 @@ function isMultipartRequest(request) {
 }
 
 app.addHook("preHandler", async (request, reply) => {
+  const protocol = request.headers["x-forwarded-proto"] || (request.protocol || "http");
+  const hostHeader = request.headers["x-forwarded-host"] || request.headers.host;
+  if (hostHeader) setRuntimePublicBaseUrl(`${protocol}://${hostHeader}`);
+
   const urlPath = String(request.url || "").split("?")[0];
   const needsAdmin = (urlPath.startsWith("/api/") && !publicAdminApiPaths.has(urlPath))
     || urlPath.startsWith("/uploads/previews/");
@@ -405,6 +414,13 @@ app.get("/uploads/previews/:filename", async (request, reply) => {
   if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) throw badRequest("图片地址不正确。");
   const file = await readFile(path.join(previewDir, filename));
   reply.type(previewContentType(filename)).send(file);
+});
+
+app.get("/uploads/results/:filename", async (request, reply) => {
+  const filename = path.basename(String(request.params.filename || ""));
+  if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) throw badRequest("图片地址不正确。");
+  const file = await readFile(path.join(resultImageDir, filename));
+  reply.type(imageContentType(filename)).send(file);
 });
 
 app.get("/", async (_request, reply) => {
