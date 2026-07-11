@@ -1746,14 +1746,18 @@
         }
 
         function showUpdateResult(result) {
+          const title = result?.success
+            ? (result?.skipped ? "已经是最新版" : "更新完成")
+            : (result?.skipped ? "未执行更新" : "更新未完成");
           const output = [
             result?.message ? `结果：${result.message}` : "",
             result?.stdout ? `输出：\n${result.stdout}` : "",
             result?.stderr ? `提示：\n${result.stderr}` : ""
           ].filter(Boolean).join("\n\n") || "更新命令执行完成，没有返回内容。";
           Modal.info({
-            title: result?.success ? "更新完成" : "更新未完成",
+            title,
             width: 760,
+            okText: "知道了",
             content: h("pre", { className: "update-output" }, output)
           });
         }
@@ -1761,14 +1765,16 @@
         function runUpdate() {
           Modal.confirm({
             title: "更新线上代码",
-            content: "会执行服务器 .env 里配置好的更新命令，不会保存服务器密码。",
-            okText: "开始更新",
+            content: "会先检查服务器代码版本；只有发现新版本，才会执行更新命令。",
+            okText: "检查并更新",
             cancelText: "取消",
             onOk: async () => {
               setUpdating(true);
               try {
                 const result = await api("/api/admin/update", { method: "POST", body: {} });
-                if (result?.success) message.success("更新完成");
+                if (result?.success && result?.skipped) message.info(result?.message || "已经是最新版，无需更新");
+                else if (result?.success) message.success("更新完成");
+                else if (result?.skipped) message.warning(result?.message || "未执行更新");
                 else message.error(result?.message || "更新失败");
                 showUpdateResult(result);
               } catch (error) {
