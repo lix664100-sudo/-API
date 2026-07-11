@@ -20,8 +20,12 @@ function taskRequestMeta(value = {}) {
   };
 }
 
+function accountProxyValue(account = {}) {
+  return account.proxyUrl || account.proxy || "";
+}
+
 function taskNetworkMeta(account = {}) {
-  const endpoint = safeProxyEndpoint(account.proxyUrl || account.proxy || "");
+  const endpoint = safeProxyEndpoint(accountProxyValue(account));
   const check = account.meta?.proxyCheck || {};
   const checkHost = String(check.proxyHost || "").trim();
   const sameProxy = !checkHost || !endpoint.proxyHost || checkHost === endpoint.proxyHost;
@@ -34,6 +38,29 @@ function taskNetworkMeta(account = {}) {
         proxyOriginalLabel: endpoint.proxyLabel
       }
     : endpoint;
+}
+
+function proxyCheckMeta(result) {
+  return {
+    status: result.ok ? "ok" : "failed",
+    ip: result.realIp || "",
+    realIp: result.realIp || "",
+    proxyHost: result.proxyHost || "",
+    proxyLabel: result.proxyLabel || "",
+    checkedAt: result.checkedAt || new Date().toISOString(),
+    message: result.ok ? "" : result.message || "代理不可用"
+  };
+}
+
+function withProxyCheckMeta(status, proxyResult) {
+  if (!proxyResult) return status;
+  return {
+    ...status,
+    meta: {
+      ...(status.meta || {}),
+      proxyCheck: proxyCheckMeta(proxyResult)
+    }
+  };
 }
 
 function normalizeTaskConcurrency(value = {}) {
@@ -615,21 +642,13 @@ async function saveProxyCheck(account, result) {
   await updateAccountStatus(account.id, {
     meta: {
       ...(current.meta || {}),
-      proxyCheck: {
-        status: result.ok ? "ok" : "failed",
-        ip: result.realIp || "",
-        realIp: result.realIp || "",
-        proxyHost: result.proxyHost || "",
-        proxyLabel: result.proxyLabel || "",
-        checkedAt: result.checkedAt || new Date().toISOString(),
-        message: result.ok ? "" : result.message || "代理不可用"
-      }
+      proxyCheck: proxyCheckMeta(result)
     }
   });
 }
 
 async function ensureProxyReady(target, attempts) {
-  const proxyValue = target.account.proxyUrl || target.account.proxy || "";
+  const proxyValue = accountProxyValue(target.account);
   if (!String(proxyValue).trim()) return true;
 
   const result = await checkProxyReachability(proxyValue, proxyTargetUrl(target.channel));
@@ -638,6 +657,18 @@ async function ensureProxyReady(target, attempts) {
 
   pushAttempt(attempts, target, `${result.message || "代理不可用"}，已跳过这个账号。`, { proxyFailed: true });
   return false;
+}
+
+async function checkAccountProxy(account, channel) {
+  const proxyValue = accountProxyValue(account);
+  if (!String(proxyValue).trim()) return null;
+
+  const result = await checkProxyReachability(proxyValue, proxyTargetUrl(channel));
+  if (!result.ok) {
+    await saveProxyCheck(account, result);
+    throw new Error(result.message || "代理不可用");
+  }
+  return result;
 }
 
 async function ensureTargetReady(config, target, taskType, attempts) {
@@ -1213,13 +1244,17 @@ export async function checkAccount(accountId) {
   if (!account) throw new Error("账号不存在。");
   const channel = config.channels.find((item) => item.id === account.channelId);
   if (!channel) throw new Error("账号所属渠道不存在。");
+  const proxyResult = await checkAccountProxy(
+    account,
+    channel.type === "shareai" ? shareAIAbilityChannel(channel, "drawing") : channel
+  );
   if (channel.type === "shareai") {
     const [drawing, chatplus] = await Promise.all([
       checkShareAIAbility(config, channel, account, "drawing"),
       checkShareAIAbility(config, channel, account, "chatplus")
     ]);
     const results = { drawing, chatplus };
-    const status = combinedShareAIStatus(results);
+    const status = withProxyCheckMeta(combinedShareAIStatus(results), proxyResult);
     await updateAccountStatus(account.id, status);
     if (status.status !== "ok") throw new Error(status.message || "检测失败");
     return status;
@@ -1227,19 +1262,19 @@ export async function checkAccount(accountId) {
   const client = getClient(config, channel, account);
   try {
     const status = await client.check();
-    const nextStatus = { ...status, cooldownUntil: null };
+    const nextStatus = withProxyCheckMeta({ ...status, cooldownUntil: null }, proxyResult);
     await updateAccountStatus(account.id, nextStatus);
     return nextStatus;
   } catch (error) {
     const message = readableCheckErrorMessage(error);
-    const status = {
+    const status = withProxyCheckMeta({
       status: isQuotaEmptyError(error) ? "quota_empty" : "error",
       quota: null,
       balance: null,
       quotaResetAt: error?.quotaResetAt || "",
       expireAt: "",
       message
-    };
+    }, proxyResult);
     await updateAccountStatus(account.id, status);
     throw new Error(message);
   }
