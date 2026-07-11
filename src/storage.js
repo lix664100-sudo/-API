@@ -206,6 +206,7 @@ function accountAbilityStatus(account) {
     cooldownUntil: account.cooldownUntil || null,
     quota: account.quota ?? null,
     balance: account.balance ?? null,
+    quotaResetAt: account.quotaResetAt || null,
     expireAt: account.expireAt || null,
     message: account.message || "",
     meta: account.meta || {}
@@ -235,6 +236,7 @@ function mergeAccountIntoGroup(group, account, type) {
     cooldownUntil: null,
     quota: null,
     balance: null,
+    quotaResetAt: null,
     expireAt: null,
     message: "",
     meta: { abilities: {} }
@@ -258,15 +260,18 @@ function finalizeShareAIAccount(account) {
   const drawing = abilities.drawing || {};
   const chatplus = abilities.chatplus || {};
   const ok = [drawing.status, chatplus.status].includes("ok");
+  const failed = [drawing.status, chatplus.status].some((status) => ["error", "failed"].includes(status));
+  const quotaEmpty = [drawing.status, chatplus.status].includes("quota_empty");
   return {
     ...account,
     channelId: "shareai",
     name: account.name || account.username || "ShareAI账号",
-    status: ok ? "ok" : account.status || "unknown",
+    status: ok ? "ok" : failed ? "error" : quotaEmpty ? "quota_empty" : account.status || "unknown",
     lastCheckAt: account.lastCheckAt || drawing.lastCheckAt || chatplus.lastCheckAt || null,
     cooldownUntil: chatplus.cooldownUntil || null,
     quota: drawing.quota ?? account.quota ?? null,
     balance: drawing.balance ?? account.balance ?? null,
+    quotaResetAt: drawing.quotaResetAt || chatplus.quotaResetAt || account.quotaResetAt || null,
     expireAt: drawing.expireAt || chatplus.expireAt || account.expireAt || null,
     message: account.message || [drawing.message && `绘图站：${drawing.message}`, chatplus.message && `聊天：${chatplus.message}`].filter(Boolean).join("；"),
     meta: {
@@ -299,6 +304,7 @@ function normalizeAccounts(stored) {
       cooldownUntil: account.cooldownUntil || null,
       quota: account.quota ?? null,
       balance: account.balance ?? null,
+      quotaResetAt: account.quotaResetAt || null,
       expireAt: account.expireAt || null,
       message: account.message || "",
       meta: account.meta || {}

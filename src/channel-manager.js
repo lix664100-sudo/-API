@@ -155,6 +155,32 @@ function isChatLoginStateText(text) {
   return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登/i.test(String(text || ""));
 }
 
+function isQuotaEmptyText(text) {
+  return /(?:积分|余额|额度|配额).{0,18}(?:不足|不够|用完|耗尽|为\s*0|已满|上限|限制)|(?:quota|credit|balance|limit).{0,28}(?:insufficient|exhausted|empty|reached|used up)/i.test(String(text || ""));
+}
+
+function isQuotaEmptyError(error) {
+  return Boolean(
+    error?.quotaEmpty
+      || error?.imageQuotaExhausted
+      || isQuotaEmptyText(`${error?.message || ""} ${error?.body || ""} ${JSON.stringify(error?.payload || {})}`)
+  );
+}
+
+function accountStatusFromError(error) {
+  if (isQuotaEmptyError(error)) {
+    return {
+      status: "quota_empty",
+      quotaResetAt: error?.quotaResetAt || "",
+      message: error?.message || "额度不足"
+    };
+  }
+  return {
+    status: "error",
+    message: error?.message || "调用失败"
+  };
+}
+
 function readableChatFailure(attempts) {
   const details = attemptErrorMessage(attempts);
   if (isChatLoginStateText(details)) {
@@ -195,10 +221,12 @@ async function updateTargetAccountStatus(accountId, channel, patch) {
   const chatplus = abilities.chatplus || {};
   const ok = [drawing.status, chatplus.status].includes("ok");
   const failed = [drawing.status, chatplus.status].some((status) => ["error", "failed"].includes(status));
+  const quotaEmpty = [drawing.status, chatplus.status].includes("quota_empty");
   return updateAccountStatus(accountId, {
-    status: ok ? "ok" : failed ? "error" : patch.status || account.status || "unknown",
+    status: ok ? "ok" : failed ? "error" : quotaEmpty ? "quota_empty" : patch.status || account.status || "unknown",
     quota: drawing.quota ?? account.quota ?? null,
     balance: drawing.balance ?? account.balance ?? null,
+    quotaResetAt: drawing.quotaResetAt || chatplus.quotaResetAt || account.quotaResetAt || "",
     expireAt: drawing.expireAt || chatplus.expireAt || account.expireAt || "",
     cooldownUntil: chatplus.cooldownUntil || null,
     message: combinedAbilityMessage(drawing, chatplus, patch.message || account.message || ""),
@@ -467,6 +495,60 @@ function targetBusyAttempt(target, taskType) {
   };
 }
 
+function targetQuotaStatus(target) {
+  const ability = channelAbilityKey(target?.channel);
+  const abilityStatus = ability ? target?.account?.meta?.abilities?.[ability] || {} : null;
+  return abilityStatus && Object.keys(abilityStatus).length ? abilityStatus : target?.account || {};
+}
+
+function shouldRefreshQuotaBeforeUse(target, taskType) {
+  if (taskType === "chat") return false;
+  return targetQuotaStatus(target).status === "quota_empty";
+}
+
+function pushAttempt(attempts, target, message, extra = {}) {
+  attempts.push({
+    channelId: target.channel.id,
+    channelName: target.channel.name,
+    accountId: target.account.id,
+    accountName: target.account.name,
+    message,
+    ...extra
+  });
+}
+
+async function refreshQuotaBeforeUse(config, target, attempts) {
+  try {
+    const status = await getClient(config, target.channel, target.account).check();
+    await updateTargetAccountStatus(target.account.id, target.channel, {
+      ...status,
+      cooldownUntil: status.status === "ok" && target.channel.type === "chatplus" ? null : status.cooldownUntil
+    });
+    if (status.status === "quota_empty") {
+      pushAttempt(attempts, target, `${status.message || "额度不足"}，已自动刷新额度后跳过。`, { quotaEmpty: true });
+      return false;
+    }
+    return true;
+  } catch (error) {
+    const patch = accountStatusFromError(error);
+    await updateTargetAccountStatus(target.account.id, target.channel, patch);
+    pushAttempt(
+      attempts,
+      target,
+      patch.status === "quota_empty"
+        ? `${patch.message || "额度不足"}，已自动刷新额度后跳过。`
+        : `自动刷新额度失败：${patch.message || "检测失败"}`,
+      { quotaEmpty: patch.status === "quota_empty" }
+    );
+    return false;
+  }
+}
+
+async function ensureTargetReady(config, target, taskType, attempts) {
+  if (!shouldRefreshQuotaBeforeUse(target, taskType)) return true;
+  return refreshQuotaBeforeUse(config, target, attempts);
+}
+
 function reserveFirstAvailableTarget(targets, taskType) {
   const attempts = [];
   for (const target of targets) {
@@ -707,6 +789,7 @@ async function runQueuedTextTask(task, input, reserved = null) {
         }
       }
       try {
+        if (!(await ensureTargetReady(config, target, "text2img", attempts))) continue;
         const client = getClient(config, channel, account);
         let result = await client.createTextTask(input);
         if (channel.type === "drawing" && !isFinishedTask(result.status)) {
@@ -715,18 +798,9 @@ async function runQueuedTextTask(task, input, reserved = null) {
         result = await mirrorTaskImages(result, config);
         return finishQueuedTask(task, result, channel, account, attempts);
       } catch (error) {
-        attempts.push({
-          channelId: channel.id,
-          channelName: channel.name,
-          accountId: account.id,
-          accountName: account.name,
-          message: error.message || "调用失败"
-        });
+        pushAttempt(attempts, target, error.message || "调用失败");
         if (!error.busy) {
-          await updateTargetAccountStatus(account.id, channel, {
-            status: "error",
-            message: error.message || "调用失败"
-          });
+          await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
         }
       } finally {
         release();
@@ -775,6 +849,7 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
         }
       }
       try {
+        if (!(await ensureTargetReady(config, target, "img2img", attempts))) continue;
         const client = getClient(config, channel, account);
         let result = await submitImageTask(client, input, files);
         if (channel.type === "drawing" && !isFinishedTask(result.status)) {
@@ -783,18 +858,9 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
         result = await mirrorTaskImages(result, config);
         return finishQueuedTask(task, result, channel, account, attempts);
       } catch (error) {
-        attempts.push({
-          channelId: channel.id,
-          channelName: channel.name,
-          accountId: account.id,
-          accountName: account.name,
-          message: error.message || "调用失败"
-        });
+        pushAttempt(attempts, target, error.message || "调用失败");
         if (!error.busy) {
-          await updateTargetAccountStatus(account.id, channel, {
-            status: "error",
-            message: error.message || "调用失败"
-          });
+          await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
         }
       } finally {
         release();
@@ -867,10 +933,7 @@ async function runChatCompletionTask(task, input) {
       if (channel.type === "chatplus" && isChatBlockedError(error)) {
         await markChatCooldown(account.id, channel, error);
       } else {
-        await updateTargetAccountStatus(account.id, channel, {
-          status: "error",
-          message: error.message || "调用失败"
-        });
+        await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
       }
       if (status >= 400 && status < 500 && !isChatBlockedError(error)) {
         error.task = await failQueuedTask(task, error, attempts);
@@ -987,9 +1050,10 @@ async function checkShareAIAbility(config, channel, account, ability) {
     return {
       ok: false,
       data: {
-        status: "error",
+        status: isQuotaEmptyError(error) ? "quota_empty" : "error",
         quota: null,
         balance: null,
+        quotaResetAt: error?.quotaResetAt || "",
         expireAt: "",
         message: error.message || "检测失败"
       }
@@ -1000,17 +1064,20 @@ async function checkShareAIAbility(config, channel, account, ability) {
 function combinedShareAIStatus(results) {
   const drawing = results.drawing.data;
   const chatplus = results.chatplus.data;
-  const ok = results.drawing.ok || results.chatplus.ok;
+  const ok = [drawing.status, chatplus.status].includes("ok");
+  const failed = [drawing.status, chatplus.status].some((status) => ["error", "failed"].includes(status));
+  const quotaEmpty = [drawing.status, chatplus.status].includes("quota_empty");
   return {
-    status: ok ? "ok" : "error",
+    status: ok ? "ok" : failed ? "error" : quotaEmpty ? "quota_empty" : "error",
     quota: drawing.quota ?? null,
     balance: drawing.balance ?? null,
+    quotaResetAt: drawing.quotaResetAt || chatplus.quotaResetAt || "",
     expireAt: drawing.expireAt || chatplus.expireAt || "",
     message: [
       `绘图站：${drawing.message || (results.drawing.ok ? "可用" : "不可用")}`,
       `聊天：${chatplus.message || (results.chatplus.ok ? "可用" : "不可用")}`
     ].join("；"),
-    cooldownUntil: results.chatplus.ok ? null : undefined,
+    cooldownUntil: chatplus.status === "ok" ? null : undefined,
     meta: {
       abilities: {
         drawing,
@@ -1044,9 +1111,10 @@ export async function checkAccount(accountId) {
     return nextStatus;
   } catch (error) {
     const status = {
-      status: "error",
+      status: isQuotaEmptyError(error) ? "quota_empty" : "error",
       quota: null,
       balance: null,
+      quotaResetAt: error?.quotaResetAt || "",
       expireAt: "",
       message: error.message || "检测失败"
     };
@@ -1153,6 +1221,7 @@ export async function createTextTask(input = {}, wait = false) {
       continue;
     }
     try {
+      if (!(await ensureTargetReady(config, target, "text2img", attempts))) continue;
       const client = getClient(config, channel, account);
       let result = await client.createTextTask(input);
       if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
@@ -1163,8 +1232,8 @@ export async function createTextTask(input = {}, wait = false) {
       await markAccountAvailable(account.id, channel);
       return task;
     } catch (error) {
-      attempts.push({ channelId: channel.id, channelName: channel.name, accountId: account.id, accountName: account.name, message: error.message || "调用失败" });
-      if (!error.busy) await updateTargetAccountStatus(account.id, channel, { status: "error", message: error.message || "调用失败" });
+      pushAttempt(attempts, target, error.message || "调用失败");
+      if (!error.busy) await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
     } finally {
       release();
     }
@@ -1193,6 +1262,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
       continue;
     }
     try {
+      if (!(await ensureTargetReady(config, target, "img2img", attempts))) continue;
       const client = getClient(config, channel, account);
       let result = await submitImageTask(client, input, files);
       if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
@@ -1203,8 +1273,8 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
       await markAccountAvailable(account.id, channel);
       return task;
     } catch (error) {
-      attempts.push({ channelId: channel.id, channelName: channel.name, accountId: account.id, accountName: account.name, message: error.message || "调用失败" });
-      if (!error.busy) await updateTargetAccountStatus(account.id, channel, { status: "error", message: error.message || "调用失败" });
+      pushAttempt(attempts, target, error.message || "调用失败");
+      if (!error.busy) await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
     } finally {
       release();
     }

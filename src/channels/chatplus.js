@@ -349,7 +349,31 @@ function throwIfImageGenerationLimit(content) {
   if (!isImageGenerationLimitMessage(content)) return;
   const error = new Error("当前账户的图片生成额度已用完，正在切换下一个账户。");
   error.imageQuotaExhausted = true;
+  error.quotaEmpty = true;
   throw error;
+}
+
+function imageQuotaError(message = "图片生成额度已用完。") {
+  const error = new Error(message);
+  error.imageQuotaExhausted = true;
+  error.quotaEmpty = true;
+  error.status = 429;
+  return error;
+}
+
+function numberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function imageQuotaResetAt(imageLimit = {}) {
+  return imageLimit.reset_after
+    || imageLimit.reset_at
+    || imageLimit.resetAt
+    || imageLimit.resets_at
+    || imageLimit.next_reset_at
+    || "";
 }
 
 function isAssistantContentPatch(value) {
@@ -748,7 +772,7 @@ export class ChatplusClient {
     const usableCars = route.strategy === "image"
       ? candidates.filter((item) => item.car.imageRemaining > 0 && !item.car.isPro)
       : candidates;
-    if (!usableCars.length) throw new Error("暂时没有图片额度可用的 GPT 账号。");
+    if (!usableCars.length) throw imageQuotaError("暂时没有图片额度可用的 GPT 账号。");
     const selected = usableCars[0];
     return {
       carId: selected.carId,
@@ -799,12 +823,16 @@ export class ChatplusClient {
       preferImageCar: true
     });
     const imageLimit = limitFromInit(init);
+    const remaining = imageLimit.remaining ?? null;
+    const remainingNumber = numberOrNull(remaining);
+    const quotaEmpty = remainingNumber !== null && remainingNumber <= 0;
     return {
-      status: "ok",
-      quota: imageLimit.remaining ?? null,
-      balance: imageLimit.remaining ?? null,
-      expireAt: imageLimit.reset_after || "",
-      message: "聊天账号可用",
+      status: quotaEmpty ? "quota_empty" : "ok",
+      quota: remaining,
+      balance: remaining,
+      quotaResetAt: imageQuotaResetAt(imageLimit),
+      expireAt: "",
+      message: quotaEmpty ? "聊天图片额度不足" : "聊天账号可用",
       meta: {
         defaultModel: init.default_model_slug || this.defaultModel,
         imageLimit,
@@ -1075,7 +1103,7 @@ export class ChatplusClient {
         quotaErrors.push(error.message || "图片生成额度已用完。");
       }
     }
-    throw new Error(`已自动尝试 ${quotaErrors.length} 个账户，但图片生成额度都已用完。`);
+    throw imageQuotaError(`已自动尝试 ${quotaErrors.length} 个账户，但图片生成额度都已用完。`);
   }
 
   async waitForConversationImages(events, conversationId, timeoutSec, options = {}) {

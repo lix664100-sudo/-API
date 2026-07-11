@@ -46,6 +46,54 @@ function isDrawingAuthError(error) {
   return /\b(401|403)\b|账号已在其他设备登录|其他设备登|身份验证失败|请重新登录|重新登录|重新登陆|未登录|未登陆|unauthorized|forbidden/i.test(text);
 }
 
+function isDrawingQuotaEmptyError(error) {
+  const text = `${error?.message || ""} ${error?.status || ""} ${error?.code || ""} ${JSON.stringify(error?.payload || {})}`;
+  return /(?:积分|余额|额度|配额).{0,16}(?:不足|不够|用完|耗尽|为\s*0|已满|上限|限制)|(?:quota|credit|balance|limit).{0,24}(?:insufficient|exhausted|empty|reached|used up)/i.test(text);
+}
+
+function numberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function isZeroOrLess(value) {
+  const number = numberOrNull(value);
+  return number !== null && number <= 0;
+}
+
+function findFirstField(source, keys) {
+  const stack = [source];
+  const seen = new Set();
+  while (stack.length) {
+    const item = stack.pop();
+    if (!item || typeof item !== "object" || seen.has(item)) continue;
+    seen.add(item);
+    for (const [key, value] of Object.entries(item)) {
+      if (keys.has(key) && value !== null && value !== undefined && value !== "") return value;
+      if (value && typeof value === "object") stack.push(value);
+    }
+  }
+  return "";
+}
+
+function quotaResetAtFrom(profile, stats) {
+  return findFirstField({ profile, stats }, new Set([
+    "quotaResetAt",
+    "quota_reset_at",
+    "quota_reset_time",
+    "points_reset_at",
+    "points_reset_time",
+    "balance_reset_at",
+    "balance_reset_time",
+    "resetAt",
+    "reset_at",
+    "reset_time",
+    "next_reset_at",
+    "nextResetAt"
+  ]));
+}
+
 export function normalizeDrawingTask(task, drawingBaseUrl = "") {
   const items = Array.isArray(task?.items) ? task.items : [];
   const imageUrls = items
@@ -156,6 +204,10 @@ export class DrawingClient {
       error.status = response.status;
       error.code = payload?.code;
       error.payload = payload;
+      if (isDrawingQuotaEmptyError(error)) {
+        error.quotaEmpty = true;
+        error.quotaResetAt = quotaResetAtFrom(payload, payload?.data);
+      }
       if (options.auth !== false && !retried && isDrawingAuthError(error)) {
         this.accessToken = "";
         await this.login();
@@ -171,12 +223,16 @@ export class DrawingClient {
       this.request("/api/v1/profile"),
       this.request("/api/v1/profile/stats")
     ]);
+    const balance = profile?.balance ?? profile?.quota_points ?? stats?.balance ?? null;
+    const quota = profile?.quota_points ?? profile?.quota ?? stats?.quota ?? null;
+    const quotaEmpty = isZeroOrLess(balance);
     return {
-      status: "ok",
-      balance: profile?.balance ?? profile?.quota_points ?? null,
-      quota: profile?.quota_points ?? null,
+      status: quotaEmpty ? "quota_empty" : "ok",
+      balance,
+      quota,
+      quotaResetAt: quotaResetAtFrom(profile, stats),
       expireAt: profile?.external_sub_expire_at || "",
-      message: "绘图账号可用",
+      message: quotaEmpty ? "绘图积分不足" : "绘图账号可用",
       meta: { profile, stats }
     };
   }

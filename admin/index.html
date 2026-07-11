@@ -807,6 +807,28 @@
         return `${quota}/${balance}`;
       }
 
+      function accountQuotaResetText(account, channel) {
+        if (channel?.type === "shareai") {
+          const drawing = abilityStatus(account, "drawing");
+          const chatplus = abilityStatus(account, "chatplus");
+          const parts = [
+            drawing.quotaResetAt ? `绘图 ${formatDateTime(drawing.quotaResetAt)}` : "",
+            chatplus.quotaResetAt ? `聊天 ${formatDateTime(chatplus.quotaResetAt)}` : ""
+          ].filter(Boolean);
+          return parts.length ? parts.join("｜") : "-";
+        }
+        return formatDateTime(account.quotaResetAt);
+      }
+
+      function accountExpireText(account, channel) {
+        if (channel?.type === "shareai") {
+          const drawing = abilityStatus(account, "drawing");
+          const chatplus = abilityStatus(account, "chatplus");
+          return formatDateTime(drawing.expireAt || chatplus.expireAt || account.expireAt);
+        }
+        return formatDateTime(account.expireAt);
+      }
+
       function channelQuotaText(channel, stats = {}) {
         if (channel?.type === "shareai") {
           return `绘图 ${quotaPairText(stats.drawingQuota, stats.drawingBalance)}｜聊天 剩余 ${valueText(stats.chatBalance)}`;
@@ -877,6 +899,7 @@
       function statusInfo(status) {
         const map = {
           ok: ["success", "可用"],
+          quota_empty: ["warning", "额度不足"],
           error: ["error", "异常"],
           success: ["success", "成功"],
           failed: ["error", "失败"],
@@ -993,6 +1016,7 @@
         if (!relatedAccounts.length) return "empty";
         if (relatedAccounts.some((item) => item.enabled !== false && item.status === "ok")) return "ok";
         if (relatedAccounts.every((item) => item.status === "error" || item.status === "failed")) return "error";
+        if (relatedAccounts.some((item) => item.enabled !== false && item.status === "quota_empty")) return "quota_empty";
         return "unknown";
       }
 
@@ -1762,7 +1786,16 @@
             width: 230,
             render: (_, row) => accountQuotaText(row, channels.find((item) => item.id === row.channelId))
           },
-          { title: "重置/到期", dataIndex: "expireAt", width: 170, render: formatDateTime },
+          {
+            title: "额度重置",
+            width: 190,
+            render: (_, row) => accountQuotaResetText(row, channels.find((item) => item.id === row.channelId))
+          },
+          {
+            title: "套餐到期",
+            width: 170,
+            render: (_, row) => accountExpireText(row, channels.find((item) => item.id === row.channelId))
+          },
           {
             title: "启用",
             dataIndex: "enabled",
@@ -1918,6 +1951,7 @@
                     h(Select, { value: statusFilter, onChange: setStatusFilter, options: [
                       { label: "全部状态", value: "all" },
                       { label: "可用", value: "ok" },
+                      { label: "额度不足", value: "quota_empty" },
                       { label: "异常", value: "error" },
                       { label: "未检测", value: "unknown" },
                       { label: "未绑账号", value: "empty" },
