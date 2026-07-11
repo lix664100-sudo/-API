@@ -13,6 +13,7 @@ import {
   checkAllAccounts,
   createChatCompletion,
   createImageTask,
+  getRuntimeStatus,
   queueChatCompletion,
   queueImageTask,
   refreshProcessingTasks,
@@ -750,6 +751,8 @@ app.get("/api/models", async () => {
 app.get("/api/tasks", async () => ({ ok: true, data: await listTasks() }));
 
 app.get("/api/stats", async () => ({ ok: true, data: await listTaskStats() }));
+
+app.get("/api/admin/runtime", async () => ({ ok: true, data: await getRuntimeStatus() }));
 
 app.post("/api/tasks/refresh-processing", async () => {
   return { ok: true, data: await refreshProcessingTasks() };

@@ -147,7 +147,7 @@
 
       .metrics-grid {
         display: grid;
-        grid-template-columns: repeat(6, minmax(0, 1fr));
+        grid-template-columns: repeat(7, minmax(0, 1fr));
         gap: 12px;
         margin-bottom: 14px;
       }
@@ -185,6 +185,12 @@
         font-size: 22px;
         font-weight: 760;
         line-height: 1;
+      }
+
+      .metric-value.compact {
+        font-size: 18px;
+        line-height: 1.2;
+        white-space: nowrap;
       }
 
       .workspace {
@@ -1320,6 +1326,7 @@
         const [loading, setLoading] = useState(false);
         const [updating, setUpdating] = useState(false);
         const [imageStorageStats, setImageStorageStats] = useState(null);
+        const [runtimeStatus, setRuntimeStatus] = useState(null);
         const [imageStorageCleaning, setImageStorageCleaning] = useState(false);
         const [nowTick, setNowTick] = useState(Date.now());
         const [chatFileList, setChatFileList] = useState([]);
@@ -1503,22 +1510,32 @@
           const usage = new Map();
           statRecords.forEach((record) => {
             if (!record.accountId || (record.day || dateKeyInShanghai(record.time)) !== today) return;
-            usage.set(record.accountId, numberValue(usage.get(record.accountId)) + numberValue(record.successImages));
+            const current = usage.get(record.accountId) || { drawingImages: 0, chatImages: 0, chats: 0 };
+            if (record.taskType === "chat") {
+              current.chats += numberValue(record.tasks || 1);
+            } else if (record.channelGroup === "chatplus") {
+              current.chatImages += numberValue(record.successImages);
+            } else {
+              current.drawingImages += numberValue(record.successImages);
+            }
+            usage.set(record.accountId, current);
           });
           return usage;
         }, [statRecords]);
 
         async function refresh() {
-          const [nextConfig, taskList, statsData, storageData] = await Promise.all([
+          const [nextConfig, taskList, statsData, storageData, runtimeData] = await Promise.all([
             api("/api/config"),
             api("/api/tasks"),
             api("/api/stats").catch(() => ({ records: [] })),
-            api("/api/admin/image-storage").catch(() => null)
+            api("/api/admin/image-storage").catch(() => null),
+            api("/api/admin/runtime").catch(() => null)
           ]);
           setConfig(nextConfig);
           setTasks(taskList);
           setStatRecords(Array.isArray(statsData?.records) ? statsData.records : []);
           if (storageData) setImageStorageStats(storageData);
+          if (runtimeData) setRuntimeStatus(runtimeData);
           globalForm.setFieldsValue(nextConfig);
           chatForm.setFieldsValue({
             accountId: "auto",
@@ -2013,12 +2030,13 @@
           { title: "状态", dataIndex: "status", width: 90, render: statusTag },
           {
             title: "今日使用",
-            width: 130,
+            width: 150,
             render: (_, row) => {
-              const count = numberValue(accountTodayUsage.get(row.id));
+              const usage = accountTodayUsage.get(row.id) || {};
               return h("div", { className: "account-usage" }, [
-                h("strong", { key: "images" }, `${count} 张图`),
-                h("span", { key: "dialogs" }, `对话 ${count} 次`)
+                h("strong", { key: "drawing" }, `绘图站 ${numberValue(usage.drawingImages)} 张`),
+                h("span", { key: "chatImage" }, `聊天生图 ${numberValue(usage.chatImages)} 张`),
+                h("span", { key: "dialogs" }, `对话 ${numberValue(usage.chats)} 次`)
               ]);
             }
           },
@@ -2132,6 +2150,8 @@
         const selectedStats = selectedChannel ? channelStats.get(selectedChannel.id) || {} : {};
         const storageSettings = imageStorageStats?.settings || config?.imageStorage || {};
         const storageDisk = imageStorageStats?.disk || null;
+        const concurrencyTotal = numberValue(runtimeStatus?.concurrency?.total);
+        const runningTotal = numberValue(runtimeStatus?.running?.total);
 
         return h("div", null, [
           h("header", { className: "topbar", key: "topbar" }, [
@@ -2171,6 +2191,13 @@
               h("div", { className: "metric" }, [
                 h("div", { className: "metric-icon" }, Icon.WalletOutlined ? h(Icon.WalletOutlined) : null),
                 h("div", null, [h("div", { className: "metric-label" }, "剩余额度"), h("div", { className: "metric-value" }, totals.balance)])
+              ]),
+              h("div", { className: "metric" }, [
+                h("div", { className: "metric-icon" }, Icon.ClusterOutlined ? h(Icon.ClusterOutlined) : null),
+                h("div", null, [
+                  h("div", { className: "metric-label" }, "并发状态"),
+                  h("div", { className: "metric-value compact" }, `并发 ${concurrencyTotal} / 正在跑 ${runningTotal}`)
+                ])
               ]),
               h("div", { className: "metric" }, [
                 h("div", { className: "metric-icon" }, Icon.FileDoneOutlined ? h(Icon.FileDoneOutlined) : null),
@@ -2423,14 +2450,14 @@
                       h("div", { className: "api-doc-section", style: { marginBottom: 14 } }, [
                         h("div", { className: "section-title" }, h("h3", null, "并发设置")),
                         h("div", { className: "form-grid" }, [
-                          h(Form.Item, { label: "普通聊天同时任务数", name: ["concurrency", "chat"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
-                          h(Form.Item, { label: "生图站同时任务数", name: ["concurrency", "drawingImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
-                          h(Form.Item, { label: "聊天生图同时任务数", name: ["concurrency", "chatImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
+                          h(Form.Item, { label: "普通聊天总同时任务数", name: ["concurrency", "chat"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
+                          h(Form.Item, { label: "每账号生图站同时任务数", name: ["concurrency", "drawingImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
+                          h(Form.Item, { label: "每账号聊天生图同时任务数", name: ["concurrency", "chatImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
                         ]),
                         h(Alert, {
                           type: "warning",
                           showIcon: true,
-                          message: "建议先用：普通聊天 3、生图站 2、聊天生图 2。调太高可能更容易被上游限流或断开。",
+                          message: "生图并发按账号单独计算：2 个账号填 4，就是生图站最多 8 个同时跑。普通聊天仍按总数控制。",
                           style: { marginBottom: 0 }
                         })
                       ]),

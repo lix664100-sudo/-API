@@ -9,7 +9,7 @@ const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
 const defaultTaskConcurrency = { chat: 3, drawingImage: 2, chatImage: 2 };
 const chatAccountQueues = new Map();
 const scheduledChatTasks = new Set();
-const activeTaskCounts = { chat: 0, drawingImage: 0, chatImage: 0 };
+const activeTaskCounts = new Map();
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 
 function taskRequestMeta(value = {}) {
@@ -81,10 +81,54 @@ function taskSlotLimit(slot) {
   return activeTaskConcurrency[slot] || defaultTaskConcurrency[slot] || 1;
 }
 
+function activeCountForSlot(slot) {
+  if (slot === "chat") return activeTaskCounts.get(slot) || 0;
+  const prefix = `${slot}:`;
+  let total = activeTaskCounts.get(slot) || 0;
+  for (const [key, count] of activeTaskCounts.entries()) {
+    if (String(key).startsWith(prefix)) total += count;
+  }
+  return total;
+}
+
+export async function getRuntimeStatus() {
+  const config = await loadConfig();
+  const concurrency = normalizeTaskConcurrency(config.concurrency);
+  activeTaskConcurrency = concurrency;
+  const running = {
+    chat: activeCountForSlot("chat"),
+    drawingImage: activeCountForSlot("drawingImage"),
+    chatImage: activeCountForSlot("chatImage")
+  };
+  return {
+    concurrency: {
+      ...concurrency,
+      total: concurrency.chat + concurrency.drawingImage + concurrency.chatImage
+    },
+    running: {
+      ...running,
+      total: running.chat + running.drawingImage + running.chatImage
+    }
+  };
+}
+
 function taskSlotLabel(slot) {
   if (slot === "chat") return "对话";
   if (slot === "chatImage") return "聊天生图";
   return "生图站";
+}
+
+function taskSlotKey(slot, target = {}) {
+  if (slot === "chat") return slot;
+  const accountId = String(target?.account?.id || "").trim();
+  return accountId ? `${slot}:${accountId}` : slot;
+}
+
+function taskSlotBusyLabel(slot, target = {}) {
+  const accountName = String(target?.account?.name || target?.account?.username || "").trim();
+  return slot === "chat" || !accountName
+    ? taskSlotLabel(slot)
+    : `${accountName}的${taskSlotLabel(slot)}`;
 }
 
 function targetTaskSlot(target, taskType = "text2img") {
@@ -92,28 +136,32 @@ function targetTaskSlot(target, taskType = "text2img") {
   return target?.channel?.type === "chatplus" ? "chatImage" : "drawingImage";
 }
 
-function busyTaskError(slot) {
-  const error = new Error(`${taskSlotLabel(slot)}任务正在处理中，请稍后再试。`);
+function busyTaskError(slot, target = {}) {
+  const error = new Error(`${taskSlotBusyLabel(slot, target)}任务正在处理中，请稍后再试。`);
   error.status = 429;
   error.busy = true;
   return error;
 }
 
-function tryReserveTaskSlot(slot) {
+function tryReserveTaskSlot(slot, target = {}) {
   const max = taskSlotLimit(slot);
-  if (activeTaskCounts[slot] >= max) return null;
-  activeTaskCounts[slot] += 1;
+  const key = taskSlotKey(slot, target);
+  const count = activeTaskCounts.get(key) || 0;
+  if (count >= max) return null;
+  activeTaskCounts.set(key, count + 1);
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    activeTaskCounts[slot] = Math.max(0, activeTaskCounts[slot] - 1);
+    const next = Math.max(0, (activeTaskCounts.get(key) || 0) - 1);
+    if (next) activeTaskCounts.set(key, next);
+    else activeTaskCounts.delete(key);
   };
 }
 
-function reserveTaskSlot(slot) {
-  const release = tryReserveTaskSlot(slot);
-  if (!release) throw busyTaskError(slot);
+function reserveTaskSlot(slot, target = {}) {
+  const release = tryReserveTaskSlot(slot, target);
+  if (!release) throw busyTaskError(slot, target);
   return release;
 }
 
@@ -513,14 +561,16 @@ function selectTargets(config, requestedChannel = "auto", taskType = "text2img",
       .filter((account) => account.enabled !== false && accountMatchesChannel(account, channel))
       .filter((account) => !requestedAccountId || account.id === requestedAccountId)
       .sort((a, b) => Number(a.priority || 99) - Number(b.priority || 99));
-    for (const account of accounts) {
-      if (channel.type === "shareai") {
-        for (const ability of shareAIAbilitiesForTask(channel, requestedChannel, taskType)) {
+    if (channel.type === "shareai") {
+      for (const ability of shareAIAbilitiesForTask(channel, requestedChannel, taskType)) {
+        for (const account of accounts) {
           if (ability === "chatplus" && !options.includeCooling && accountCooling(account)) continue;
           targets.push({ channel: shareAIAbilityChannel(channel, ability), account });
         }
-        continue;
       }
+      continue;
+    }
+    for (const account of accounts) {
       if (channel.type === "chatplus" && !options.includeCooling && accountCooling(account)) continue;
       targets.push({ channel, account });
     }
@@ -577,7 +627,7 @@ function targetBusyAttempt(target, taskType) {
     channelName: target.channel.name,
     accountId: target.account.id,
     accountName: target.account.name,
-    message: busyTaskError(slot).message,
+    message: busyTaskError(slot, target).message,
     busy: true
   };
 }
@@ -681,7 +731,7 @@ function reserveFirstAvailableTarget(targets, taskType) {
   const attempts = [];
   for (const target of targets) {
     const slot = targetTaskSlot(target, taskType);
-    const release = tryReserveTaskSlot(slot);
+    const release = tryReserveTaskSlot(slot, target);
     if (release) return { target, release, attempts };
     attempts.push(targetBusyAttempt(target, taskType));
   }
@@ -912,7 +962,7 @@ async function runQueuedTextTask(task, input, reserved = null) {
         release = reservedRelease;
         reservedRelease = null;
       } else {
-        release = tryReserveTaskSlot(targetTaskSlot(target, "text2img"));
+        release = tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target);
         if (!release) {
           attempts.push(targetBusyAttempt(target, "text2img"));
           continue;
@@ -973,7 +1023,7 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
         release = reservedRelease;
         reservedRelease = null;
       } else {
-        release = tryReserveTaskSlot(targetTaskSlot(target, "img2img"));
+        release = tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target);
         if (!release) {
           attempts.push(targetBusyAttempt(target, "img2img"));
           continue;
@@ -1378,7 +1428,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
   const attempts = [];
   for (const target of targets) {
     const { channel, account } = target;
-    const release = tryReserveTaskSlot(targetTaskSlot(target, "text2img"));
+    const release = tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target);
     if (!release) {
       attempts.push(targetBusyAttempt(target, "text2img"));
       continue;
@@ -1420,7 +1470,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   const attempts = [];
   for (const target of targets) {
     const { channel, account } = target;
-    const release = tryReserveTaskSlot(targetTaskSlot(target, "img2img"));
+    const release = tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target);
     if (!release) {
       attempts.push(targetBusyAttempt(target, "img2img"));
       continue;
