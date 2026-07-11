@@ -1146,10 +1146,24 @@ async function checkShareAIAbility(config, channel, account, ability) {
         balance: null,
         quotaResetAt: error?.quotaResetAt || "",
         expireAt: "",
-        message: error.message || "检测失败"
+        message: readableCheckErrorMessage(error)
       }
     };
   }
+}
+
+function readableCheckErrorMessage(error) {
+  const message = String(error?.message || "").trim();
+  if (/proxy/i.test(message) && /timeout|timed out|ETIMEDOUT|Failed connect/i.test(message)) {
+    return "账号代理连接目标站超时，请更换或关闭这个账号的代理。";
+  }
+  if (/检测超时|timeout|timed out|ETIMEDOUT|AbortError/i.test(message)) {
+    return "服务器连接目标站超时，请检查服务器网络或账号代理。";
+  }
+  if (/Failed connect|ECONNREFUSED|ENOTFOUND|EAI_AGAIN/i.test(message)) {
+    return "服务器连接目标站失败，请检查服务器网络或账号代理。";
+  }
+  return message || "检测失败";
 }
 
 function combinedShareAIStatus(results) {
@@ -1185,10 +1199,11 @@ export async function checkAccount(accountId) {
   const channel = config.channels.find((item) => item.id === account.channelId);
   if (!channel) throw new Error("账号所属渠道不存在。");
   if (channel.type === "shareai") {
-    const results = {
-      drawing: await checkShareAIAbility(config, channel, account, "drawing"),
-      chatplus: await checkShareAIAbility(config, channel, account, "chatplus")
-    };
+    const [drawing, chatplus] = await Promise.all([
+      checkShareAIAbility(config, channel, account, "drawing"),
+      checkShareAIAbility(config, channel, account, "chatplus")
+    ]);
+    const results = { drawing, chatplus };
     const status = combinedShareAIStatus(results);
     await updateAccountStatus(account.id, status);
     if (status.status !== "ok") throw new Error(status.message || "检测失败");
@@ -1201,16 +1216,17 @@ export async function checkAccount(accountId) {
     await updateAccountStatus(account.id, nextStatus);
     return nextStatus;
   } catch (error) {
+    const message = readableCheckErrorMessage(error);
     const status = {
       status: isQuotaEmptyError(error) ? "quota_empty" : "error",
       quota: null,
       balance: null,
       quotaResetAt: error?.quotaResetAt || "",
       expireAt: "",
-      message: error.message || "检测失败"
+      message
     };
     await updateAccountStatus(account.id, status);
-    throw error;
+    throw new Error(message);
   }
 }
 
@@ -1218,6 +1234,10 @@ export async function checkAllAccounts() {
   const config = await loadRuntimeConfig();
   const results = [];
   for (const account of config.accounts) {
+    if (account.enabled === false) {
+      results.push({ accountId: account.id, ok: false, skipped: true, message: "账号已停用，已跳过检测。" });
+      continue;
+    }
     try {
       results.push({ accountId: account.id, ok: true, data: await checkAccount(account.id) });
     } catch (error) {

@@ -2,6 +2,8 @@ import fetch, { Headers } from "node-fetch";
 import { ProxyAgent } from "proxy-agent";
 import { normalizeProxyUrl } from "../proxy.js";
 
+const ACCOUNT_CHECK_TIMEOUT_MS = 10000;
+
 function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
 }
@@ -55,6 +57,26 @@ function numberOrNull(value) {
 function isZeroOrLess(value) {
   const number = numberOrNull(value);
   return number !== null && number <= 0;
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const timeoutMs = Number(options.timeoutMs || 0);
+  const fetchOptions = { ...options };
+  delete fetchOptions.timeoutMs;
+  if (!(timeoutMs > 0)) return fetch(url, fetchOptions);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...fetchOptions, signal: fetchOptions.signal || controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("检测超时：服务器连接绘图站超时。");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function findFirstField(source, keys) {
@@ -129,11 +151,12 @@ export class DrawingClient {
     }
   }
 
-  async login() {
+  async login(options = {}) {
     this.assertConfigured();
     const loginOptions = {
       method: "POST",
       headers: { "content-type": "application/json" },
+      timeoutMs: options.timeoutMs,
       body: JSON.stringify({
         userToken: this.account.username,
         password: this.account.password,
@@ -142,7 +165,7 @@ export class DrawingClient {
     };
     if (this.proxyAgent) loginOptions.agent = this.proxyAgent;
 
-    const loginResponse = await fetch(`${this.mainBaseUrl}/frontend-api/login`, loginOptions);
+    const loginResponse = await fetchWithTimeout(`${this.mainBaseUrl}/frontend-api/login`, loginOptions);
 
     const loginPayload = await loginResponse.json().catch(() => null);
     if (!loginResponse.ok || loginPayload?.code !== 1) {
@@ -155,6 +178,7 @@ export class DrawingClient {
     const ssoData = await this.request("/api/v1/auth/external-sso", {
       method: "POST",
       auth: false,
+      timeoutMs: options.timeoutMs,
       body: { "share-token": shareSession }
     });
 
@@ -163,15 +187,15 @@ export class DrawingClient {
     return ssoData;
   }
 
-  async ensureLogin() {
-    if (!this.accessToken) await this.login();
+  async ensureLogin(options = {}) {
+    if (!this.accessToken) await this.login(options);
   }
 
   async request(apiPath, options = {}, retried = false) {
     const headers = new Headers(options.headers || {});
     const isForm = options.body instanceof FormData;
     if (options.auth !== false) {
-      await this.ensureLogin();
+      await this.ensureLogin({ timeoutMs: options.timeoutMs });
       headers.set("Authorization", `Bearer ${this.accessToken}`);
     }
     if (options.body && !isForm && !headers.has("content-type")) {
@@ -181,11 +205,12 @@ export class DrawingClient {
     const requestOptions = {
       method: options.method || "GET",
       headers,
+      timeoutMs: options.timeoutMs,
       body: isForm ? options.body : options.body ? JSON.stringify(options.body) : undefined
     };
     if (this.proxyAgent) requestOptions.agent = this.proxyAgent;
 
-    const response = await fetch(`${this.drawingBaseUrl}${apiPath}`, requestOptions);
+    const response = await fetchWithTimeout(`${this.drawingBaseUrl}${apiPath}`, requestOptions);
 
     const text = await response.text();
     let payload = null;
@@ -205,7 +230,7 @@ export class DrawingClient {
       }
       if (options.auth !== false && !retried && isDrawingAuthError(error)) {
         this.accessToken = "";
-        await this.login();
+        await this.login({ timeoutMs: options.timeoutMs });
         return this.request(apiPath, options, true);
       }
       throw error;
@@ -214,9 +239,11 @@ export class DrawingClient {
   }
 
   async check() {
+    const checkOptions = { timeoutMs: ACCOUNT_CHECK_TIMEOUT_MS };
+    await this.ensureLogin(checkOptions);
     const [profile, stats] = await Promise.all([
-      this.request("/api/v1/profile"),
-      this.request("/api/v1/profile/stats")
+      this.request("/api/v1/profile", checkOptions),
+      this.request("/api/v1/profile/stats", checkOptions)
     ]);
     const balance = profile?.balance ?? profile?.quota_points ?? stats?.balance ?? null;
     const quota = profile?.quota_points ?? profile?.quota ?? stats?.quota ?? null;

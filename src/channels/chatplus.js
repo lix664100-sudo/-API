@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { normalizeProxyUrl } from "../proxy.js";
 
 const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
+const ACCOUNT_CHECK_TIMEOUT_SEC = 10;
 const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
 const badCarUntil = new Map();
@@ -690,11 +691,12 @@ export class ChatplusClient {
     this.carType = "chatgpt";
   }
 
-  async loginPortal() {
+  async loginPortal(options = {}) {
     this.assertConfigured();
     if (this.portalLoggedIn) return;
     const login = await this.json("/frontend-api/login", {
       method: "POST",
+      timeoutSec: options.timeoutSec,
       body: {
         userToken: this.account.username,
         password: this.account.password,
@@ -705,12 +707,15 @@ export class ChatplusClient {
     this.portalLoggedIn = true;
   }
 
-  async enterCar(carId, carType) {
-    await this.loginPortal();
-    const session = await this.json(`/auth/loginSession?carid=${encodeURIComponent(carId)}&carType=${encodeURIComponent(carType)}`);
+  async enterCar(carId, carType, options = {}) {
+    await this.loginPortal(options);
+    const session = await this.json(`/auth/loginSession?carid=${encodeURIComponent(carId)}&carType=${encodeURIComponent(carType)}`, {
+      timeoutSec: options.timeoutSec
+    });
     if (session?.code !== 1) throw new Error(session?.msg || "进入聊天车队失败。");
     const page = await this.http(carType === "gemini" ? "/app" : "/", {
       followRedirect: true,
+      timeoutSec: options.timeoutSec,
       headers: {
         accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "upgrade-insecure-requests": "1"
@@ -737,17 +742,22 @@ export class ChatplusClient {
     return this.loadInit();
   }
 
-  async loadInit() {
-    const init = await this.json("/backend-api/conversation/init", { method: "POST", body: {} });
+  async loadInit(options = {}) {
+    const init = await this.json("/backend-api/conversation/init", {
+      method: "POST",
+      timeoutSec: options.timeoutSec,
+      body: {}
+    });
     if (init?.default_model_slug) this.defaultModel = init.default_model_slug;
     return init;
   }
 
-  async fetchCars(carType) {
-    await this.loginPortal();
+  async fetchCars(carType, options = {}) {
+    await this.loginPortal(options);
     const endpoint = carListEndpoints[carType] || carListEndpoints.chatgpt;
     const payload = await this.json(endpoint, {
       method: "POST",
+      timeoutSec: options.timeoutSec,
       body: { page: 1, pageSize: 100, limit: 100 }
     });
     if (payload?.code !== undefined && payload.code !== 1) {
@@ -757,8 +767,8 @@ export class ChatplusClient {
     return Array.isArray(list) ? list.map((item) => normalizeCar(item, carType)).filter((item) => item.id) : [];
   }
 
-  async selectCar(route, ignoredCarIds = new Set()) {
-    const cars = await this.fetchCars(route.carType);
+  async selectCar(route, ignoredCarIds = new Set(), options = {}) {
+    const cars = await this.fetchCars(route.carType, options);
     const candidates = rankedCars(cars, route.strategy)
       .map((car) => ({ car, carId: concreteCarId(car) }))
       .filter((item) => !ignoredCarIds.has(item.carId))
@@ -787,15 +797,17 @@ export class ChatplusClient {
     const route = input.preferImageCar && resolvedRoute.key === "gpt"
       ? { ...resolvedRoute, strategy: "image" }
       : resolvedRoute;
+    const timeoutSec = Number(input.checkTimeoutSec || 0);
+    const requestOptions = timeoutSec > 0 ? { timeoutSec } : {};
     const errors = [];
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const selected = await this.selectCar(route, ignoredCarIds);
+      const selected = await this.selectCar(route, ignoredCarIds, requestOptions);
       ignoredCarIds.add(selected.carId);
       this.carId = selected.carId;
       this.carType = selected.carType;
       try {
-        await this.enterCar(selected.carId, selected.carType);
-        const init = route.key === "gpt" ? await this.loadInit() : {};
+        await this.enterCar(selected.carId, selected.carType, requestOptions);
+        const init = route.key === "gpt" ? await this.loadInit(requestOptions) : {};
         return { route, selected, init };
       } catch (error) {
         if (route.key === "gemini") {
@@ -815,8 +827,9 @@ export class ChatplusClient {
   async check() {
     const { init, route, selected } = await this.prepareChatSession({
       model: this.channel?.settings?.defaultChatModel || "",
-      preferImageCar: true
-    });
+      preferImageCar: true,
+      checkTimeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC
+    }, new Set(), 1);
     const imageLimit = limitFromInit(init);
     const remaining = imageLimit.remaining ?? null;
     const remainingNumber = numberOrNull(remaining);
