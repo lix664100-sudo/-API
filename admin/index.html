@@ -1104,6 +1104,7 @@
       function Dashboard({ adminUser, onLogout }) {
         const [config, setConfig] = useState(null);
         const [tasks, setTasks] = useState([]);
+        const [statRecords, setStatRecords] = useState([]);
         const [loading, setLoading] = useState(false);
         const [updating, setUpdating] = useState(false);
         const [imageStorageStats, setImageStorageStats] = useState(null);
@@ -1235,11 +1236,14 @@
           tasks.forEach((task) => {
             if (task.accountId && !options.has(task.accountId)) options.set(task.accountId, task.accountName || task.accountId);
           });
+          statRecords.forEach((record) => {
+            if (record.accountId && !options.has(record.accountId)) options.set(record.accountId, record.accountName || record.accountId);
+          });
           return [
             { label: "全部账号", value: "all" },
             ...[...options.entries()].map(([value, label]) => ({ label, value }))
           ];
-        }, [accounts, tasks]);
+        }, [accounts, tasks, statRecords]);
 
         const filteredTasks = useMemo(() => {
           return tasks.filter((task) => {
@@ -1250,17 +1254,28 @@
           });
         }, [tasks, taskAccountFilter, taskChannelFilter, taskStatusFilter]);
 
-        const taskStats = useMemo(() => summarizeTasks(filteredTasks), [filteredTasks]);
+        const filteredStatRecords = useMemo(() => {
+          return statRecords.filter((record) => {
+            const accountOk = taskAccountFilter === "all" || record.accountId === taskAccountFilter;
+            const channelOk = taskChannelFilter === "all" || record.channelGroup === taskChannelFilter;
+            const statusOk = taskStatusFilter === "all" || record.status === taskStatusFilter;
+            return accountOk && channelOk && statusOk;
+          });
+        }, [statRecords, taskAccountFilter, taskChannelFilter, taskStatusFilter]);
+
+        const taskStats = useMemo(() => summarizeTasks(filteredStatRecords), [filteredStatRecords]);
 
         async function refresh() {
-          const [nextConfig, taskList, modelData, storageData] = await Promise.all([
+          const [nextConfig, taskList, statsData, modelData, storageData] = await Promise.all([
             api("/api/config"),
             api("/api/tasks"),
+            api("/api/stats").catch(() => ({ records: [] })),
             api("/api/models").catch(() => ({ items: [] })),
             api("/api/admin/image-storage").catch(() => null)
           ]);
           setConfig(nextConfig);
           setTasks(taskList);
+          setStatRecords(Array.isArray(statsData?.records) ? statsData.records : []);
           setDrawingModels(Array.isArray(modelData?.items) ? modelData.items : []);
           if (storageData) setImageStorageStats(storageData);
           globalForm.setFieldsValue(nextConfig);
@@ -2013,7 +2028,7 @@
                           { label: "失败", value: "failed" },
                           { label: "处理中", value: "processing" }
                         ] }),
-                        h("div", { className: "toolbar-note" }, `当前 ${filteredTasks.length} 条任务；统计会跟随筛选变化`)
+                        h("div", { className: "toolbar-note" }, `列表 ${filteredTasks.length} 条；统计来自独立累计，不受20条记录限制`)
                       ]),
                       h("div", { className: "task-toolbar" }, [
                         h("span", { className: "toolbar-note" }, "卡在处理中的任务，可以点这里重新查询结果"),
