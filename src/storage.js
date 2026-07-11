@@ -6,7 +6,8 @@ const rootDir = process.cwd();
 const dataDir = path.resolve(rootDir, process.env.DATA_DIR || "data");
 const configFile = path.join(dataDir, "config.json");
 const tasksFile = path.join(dataDir, "tasks.json");
-const taskHistoryLimit = 20;
+const taskHistoryLimit = 2000;
+const taskHistoryDays = 7;
 
 const defaultChatModels = [
   { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", enabled: true, default: true },
@@ -193,7 +194,11 @@ function accountAbilityStatus(account) {
 }
 
 function accountGroupKey(account) {
-  return `${String(account.username || "").trim().toLowerCase()}::${String(account.password || "")}`;
+  return [
+    String(account.username || "").trim().toLowerCase(),
+    String(account.password || ""),
+    String(account.proxyUrl || account.proxy || "").trim()
+  ].join("::");
 }
 
 function mergeAccountIntoGroup(group, account, type) {
@@ -203,6 +208,7 @@ function mergeAccountIntoGroup(group, account, type) {
     name: "",
     username: account.username || "",
     password: account.password || "",
+    proxyUrl: account.proxyUrl || account.proxy || "",
     enabled: account.enabled !== false,
     priority: Number(account.priority || 1),
     status: "unknown",
@@ -216,6 +222,7 @@ function mergeAccountIntoGroup(group, account, type) {
   };
   if (!next.name || type === "chatplus") next.name = account.name || next.name || account.username || "ShareAI账号";
   if (!next.password && account.password) next.password = account.password;
+  if (!next.proxyUrl && (account.proxyUrl || account.proxy)) next.proxyUrl = account.proxyUrl || account.proxy;
   next.enabled = next.enabled && account.enabled !== false;
   next.priority = Math.min(Number(next.priority || 99), Number(account.priority || 1));
   next.meta = { ...(next.meta || {}), abilities: { ...(next.meta?.abilities || {}) } };
@@ -265,6 +272,7 @@ function normalizeAccounts(stored) {
       name: account.name || "未命名账号",
       username: account.username || "",
       password: account.password || "",
+      proxyUrl: account.proxyUrl || account.proxy || "",
       enabled: account.enabled !== false,
       priority: Number(account.priority || 1),
       status: account.status || "unknown",
@@ -408,7 +416,13 @@ function sortTasks(tasks) {
 }
 
 function limitTasks(tasks) {
-  return sortTasks(tasks).slice(0, taskHistoryLimit);
+  const cutoff = Date.now() - taskHistoryDays * 24 * 60 * 60 * 1000;
+  return sortTasks(tasks)
+    .filter((task) => {
+      const time = Date.parse(task.createdAt || task.updatedAt || "");
+      return !Number.isFinite(time) || time >= cutoff;
+    })
+    .slice(0, taskHistoryLimit);
 }
 
 async function loadTasks() {

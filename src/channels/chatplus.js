@@ -10,6 +10,16 @@ function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
 }
 
+function normalizeProxyUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`;
+}
+
+function proxyUrlFor(account) {
+  return normalizeProxyUrl(account?.proxyUrl || account?.proxy || "");
+}
+
 function runCurl(args, input = "") {
   return new Promise((resolve, reject) => {
     const child = spawn(CURL_COMMAND, args, { windowsHide: true });
@@ -618,6 +628,8 @@ export class ChatplusClient {
     if (Number(options.timeoutSec) > 0) {
       args.push("--max-time", String(options.timeoutSec));
     }
+    const proxyUrl = proxyUrlFor(this.account);
+    if (proxyUrl) args.push("--proxy", proxyUrl);
     args.push("-X", options.method || "GET", url);
     for (const [key, value] of Object.entries(headers)) {
       args.push("-H", `${key}: ${value}`);

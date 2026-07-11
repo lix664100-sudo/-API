@@ -1,5 +1,18 @@
+import fetch, { Headers } from "node-fetch";
+import { ProxyAgent } from "proxy-agent";
+
 function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
+}
+
+function normalizeProxyUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`;
+}
+
+function proxyUrlFor(account) {
+  return normalizeProxyUrl(account?.proxyUrl || account?.proxy || "");
 }
 
 function getCookieValue(setCookieHeaders, name) {
@@ -63,6 +76,8 @@ export class DrawingClient {
     this.mainBaseUrl = trimSlash(config.mainBaseUrl || "https://ikun.aishare.icu");
     this.drawingBaseUrl = trimSlash(channel?.settings?.baseUrl || config.drawingBaseUrl || "https://drawing.aishare.icu");
     this.accessToken = "";
+    this.proxyUrl = proxyUrlFor(account);
+    this.proxyAgent = this.proxyUrl ? new ProxyAgent({ getProxyForUrl: () => this.proxyUrl }) : null;
   }
 
   assertConfigured() {
@@ -73,7 +88,7 @@ export class DrawingClient {
 
   async login() {
     this.assertConfigured();
-    const loginResponse = await fetch(`${this.mainBaseUrl}/frontend-api/login`, {
+    const loginOptions = {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -81,7 +96,10 @@ export class DrawingClient {
         password: this.account.password,
         token: ""
       })
-    });
+    };
+    if (this.proxyAgent) loginOptions.agent = this.proxyAgent;
+
+    const loginResponse = await fetch(`${this.mainBaseUrl}/frontend-api/login`, loginOptions);
 
     const loginPayload = await loginResponse.json().catch(() => null);
     if (!loginResponse.ok || loginPayload?.code !== 1) {
@@ -117,11 +135,14 @@ export class DrawingClient {
       headers.set("content-type", "application/json");
     }
 
-    const response = await fetch(`${this.drawingBaseUrl}${apiPath}`, {
+    const requestOptions = {
       method: options.method || "GET",
       headers,
       body: isForm ? options.body : options.body ? JSON.stringify(options.body) : undefined
-    });
+    };
+    if (this.proxyAgent) requestOptions.agent = this.proxyAgent;
+
+    const response = await fetch(`${this.drawingBaseUrl}${apiPath}`, requestOptions);
 
     const text = await response.text();
     let payload = null;
