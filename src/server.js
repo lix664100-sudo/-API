@@ -29,6 +29,7 @@ import {
 } from "./image-store.js";
 import {
   getTask,
+  listTaskStats,
   listTasks,
   loadConfig,
   publicConfig,
@@ -687,6 +688,8 @@ app.get("/api/models", async () => {
 });
 
 app.get("/api/tasks", async () => ({ ok: true, data: await listTasks() }));
+
+app.get("/api/stats", async () => ({ ok: true, data: await listTaskStats() }));
 
 app.post("/api/tasks/refresh-processing", async () => {
   return { ok: true, data: await refreshProcessingTasks() };

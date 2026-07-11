@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
 import { DrawingClient } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
-import { getTask, listTasks, loadConfig, updateAccountStatus, upsertTask } from "./storage.js";
+import { getTask, listTasks, loadConfig, recordTaskStat, updateAccountStatus, upsertTask } from "./storage.js";
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
 const MAX_CONCURRENT_CHAT_TASKS = 1;
@@ -348,6 +348,7 @@ export async function refreshTask(taskId) {
   const result = await mirrorTaskImages(await client.getTask(externalId), config);
   const nextTask = mergeRefreshedTask(task, result, channel, account);
   await upsertTask(nextTask);
+  if (isFinishedTask(nextTask.status)) await recordTaskStat(nextTask);
   return nextTask;
 }
 
@@ -665,6 +666,7 @@ async function failQueuedTask(task, error, attempts = []) {
     completedAt: new Date().toISOString()
   };
   await upsertTask(failedTask);
+  await recordTaskStat(failedTask);
   return failedTask;
 }
 
@@ -678,6 +680,7 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
     completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : null
   };
   await upsertTask(nextTask);
+  if (isFinishedTask(nextTask.status)) await recordTaskStat(nextTask);
   await markAccountAvailable(account.id, channel);
   return nextTask;
 }
@@ -826,6 +829,7 @@ async function finishChatTask(task, result, channel, account, attempts, response
     raw: result.raw || result
   };
   await upsertTask(nextTask);
+  await recordTaskStat(nextTask);
   await markAccountAvailable(account.id, channel);
   return nextTask;
 }
@@ -1155,6 +1159,7 @@ export async function createTextTask(input = {}, wait = false) {
       result = await mirrorTaskImages(result, config);
       const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input) });
       await upsertTask(task);
+      if (isFinishedTask(task.status)) await recordTaskStat(task);
       await markAccountAvailable(account.id, channel);
       return task;
     } catch (error) {
@@ -1194,6 +1199,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
       result = await mirrorTaskImages(result, config);
       const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson({ ...input, files }) });
       await upsertTask(task);
+      if (isFinishedTask(task.status)) await recordTaskStat(task);
       await markAccountAvailable(account.id, channel);
       return task;
     } catch (error) {

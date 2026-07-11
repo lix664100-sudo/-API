@@ -6,8 +6,11 @@ const rootDir = process.cwd();
 const dataDir = path.resolve(rootDir, process.env.DATA_DIR || "data");
 const configFile = path.join(dataDir, "config.json");
 const tasksFile = path.join(dataDir, "tasks.json");
-const taskHistoryLimit = 2000;
-const taskHistoryDays = 7;
+const statsFile = path.join(dataDir, "stats.json");
+const taskHistoryLimit = 20;
+const statRecordDays = 31;
+const statRecordLimit = 50000;
+let statsWriteQueue = Promise.resolve();
 
 const defaultImageStorage = {
   mode: "smart",
@@ -434,13 +437,7 @@ function sortTasks(tasks) {
 }
 
 function limitTasks(tasks) {
-  const cutoff = Date.now() - taskHistoryDays * 24 * 60 * 60 * 1000;
-  return sortTasks(tasks)
-    .filter((task) => {
-      const time = Date.parse(task.createdAt || task.updatedAt || "");
-      return !Number.isFinite(time) || time >= cutoff;
-    })
-    .slice(0, taskHistoryLimit);
+  return sortTasks(tasks).slice(0, taskHistoryLimit);
 }
 
 async function loadTasks() {
@@ -473,4 +470,131 @@ export async function upsertTask(task) {
 export async function getTask(id) {
   const tasks = await loadTasks();
   return tasks.find((task) => String(task.id) === String(id)) || null;
+}
+
+function finalStatStatus(status) {
+  if (status === "success" || status === "failed") return status;
+  return "";
+}
+
+function dateKeyInShanghai(value) {
+  const date = new Date(value || Date.now());
+  if (!Number.isFinite(date.getTime())) return "";
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
+}
+
+function taskStatTime(task) {
+  const time = Date.parse(task.completedAt || task.updatedAt || task.createdAt || "");
+  return Number.isFinite(time) ? time : Date.now();
+}
+
+function taskStatChannelGroup(task) {
+  if (task?.channelType === "drawing") return "drawing";
+  if (task?.channelType === "chatplus") return "chatplus";
+  const text = `${task?.channelName || ""} ${task?.channelId || ""}`;
+  if (/绘图站|drawing/i.test(text)) return "drawing";
+  if (/聊天|chatplus/i.test(text)) return "chatplus";
+  return "other";
+}
+
+function taskGeneratedImageCount(task) {
+  const urls = Array.isArray(task?.imageUrls) ? task.imageUrls.filter(Boolean).length : 0;
+  if (urls) return urls;
+  if (task?.status === "success" && task?.taskType !== "chat") return Number(task.imageCount || 0) || 0;
+  return 0;
+}
+
+function taskStatRecord(task) {
+  const status = finalStatStatus(task?.status);
+  if (!status || !task?.id) return null;
+  const time = taskStatTime(task);
+  return {
+    taskId: String(task.id),
+    day: dateKeyInShanghai(time),
+    time,
+    status,
+    taskType: task.taskType || "",
+    accountId: task.accountId || "",
+    accountName: task.accountName || "",
+    channelId: task.channelId || "",
+    channelName: task.channelName || "",
+    channelType: task.channelType || "",
+    channelGroup: taskStatChannelGroup(task),
+    tasks: 1,
+    successImages: status === "success" ? taskGeneratedImageCount(task) : 0,
+    failedTasks: status === "failed" ? 1 : 0
+  };
+}
+
+function normalizeStats(stats = {}) {
+  return {
+    version: 1,
+    updatedAt: stats.updatedAt || null,
+    records: stats.records && typeof stats.records === "object" ? stats.records : {}
+  };
+}
+
+function pruneStats(stats) {
+  const cutoff = Date.now() - statRecordDays * 24 * 60 * 60 * 1000;
+  const records = Object.values(stats.records || {})
+    .filter((record) => Number(record.time || 0) >= cutoff)
+    .sort((a, b) => Number(b.time || 0) - Number(a.time || 0))
+    .slice(0, statRecordLimit);
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    records: Object.fromEntries(records.map((record) => [record.taskId, record]))
+  };
+}
+
+async function withStatsLock(work) {
+  const run = statsWriteQueue.then(work, work);
+  statsWriteQueue = run.catch(() => {});
+  return run;
+}
+
+async function loadStats() {
+  return normalizeStats(await readJson(statsFile, { version: 1, records: {} }));
+}
+
+async function seedStatsFromTasks(stats) {
+  if (Object.keys(stats.records || {}).length) return stats;
+  const tasks = await loadTasks();
+  for (const task of tasks) {
+    const record = taskStatRecord(task);
+    if (record) stats.records[record.taskId] = record;
+  }
+  const next = pruneStats(stats);
+  await writeJson(statsFile, next);
+  return next;
+}
+
+export async function recordTaskStat(task) {
+  const record = taskStatRecord(task);
+  if (!record) return null;
+  return withStatsLock(async () => {
+    const stats = await loadStats();
+    stats.records[record.taskId] = record;
+    const next = pruneStats(stats);
+    await writeJson(statsFile, next);
+    return record;
+  });
+}
+
+export async function listTaskStats() {
+  return withStatsLock(async () => {
+    const stats = await seedStatsFromTasks(await loadStats());
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    return {
+      updatedAt: stats.updatedAt || null,
+      records: Object.values(stats.records || {})
+        .filter((record) => Number(record.time || 0) >= cutoff)
+        .sort((a, b) => Number(b.time || 0) - Number(a.time || 0))
+    };
+  });
 }

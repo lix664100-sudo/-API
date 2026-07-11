@@ -930,11 +930,13 @@
       }
 
       function taskTime(row) {
+        if (Number.isFinite(Number(row?.time))) return Number(row.time);
         const time = Date.parse(row?.createdAt || row?.completedAt || row?.updatedAt || "");
         return Number.isFinite(time) ? time : 0;
       }
 
       function taskGeneratedImageCount(row) {
+        if (Number.isFinite(Number(row?.successImages))) return Number(row.successImages);
         const urls = Array.isArray(row?.imageUrls) ? row.imageUrls.filter(Boolean).length : 0;
         if (urls) return urls;
         if (row?.status === "success" && row?.taskType !== "chat") return numberValue(row.imageCount);
