@@ -20,7 +20,7 @@ function normalizeTaskConcurrency(value = {}) {
 }
 
 async function loadRuntimeConfig() {
-  const config = await loadRuntimeConfig();
+  const config = await loadConfig();
   activeTaskConcurrency = normalizeTaskConcurrency(config.concurrency);
   return config;
 }
