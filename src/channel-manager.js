@@ -93,10 +93,39 @@ function activeCountForSlot(slot) {
   return total;
 }
 
+function taskConcurrencyTotal(value = {}) {
+  return Number(value.chat || 0) + Number(value.drawingImage || 0) + Number(value.chatImage || 0);
+}
+
+function targetRuntimeAvailable(target, taskType) {
+  if (!target?.channel || !target?.account) return false;
+  if (target.channel.enabled === false || target.account.enabled === false) return false;
+  if (taskType === "chat" && accountCooling(target.account)) return false;
+  return targetQuotaStatus(target).status === "ok";
+}
+
+function hasRuntimeTarget(config, taskType, channelType) {
+  return selectTargets(config, "auto", taskType, { includeCooling: true })
+    .some((target) => target.channel.type === channelType && targetRuntimeAvailable(target, taskType));
+}
+
+function runtimeAvailableConcurrency(config, concurrency) {
+  const available = {
+    chat: hasRuntimeTarget(config, "chat", "chatplus") ? concurrency.chat : 0,
+    drawingImage: hasRuntimeTarget(config, "text2img", "drawing") ? concurrency.drawingImage : 0,
+    chatImage: hasRuntimeTarget(config, "text2img", "chatplus") ? concurrency.chatImage : 0
+  };
+  return {
+    ...available,
+    total: taskConcurrencyTotal(available)
+  };
+}
+
 export async function getRuntimeStatus() {
   const config = await loadConfig();
   const concurrency = normalizeTaskConcurrency(config.concurrency);
   activeTaskConcurrency = concurrency;
+  const available = runtimeAvailableConcurrency(config, concurrency);
   const running = {
     chat: activeCountForSlot("chat"),
     drawingImage: activeCountForSlot("drawingImage"),
@@ -105,11 +134,14 @@ export async function getRuntimeStatus() {
   return {
     concurrency: {
       ...concurrency,
-      total: concurrency.chat + concurrency.drawingImage + concurrency.chatImage
+      total: taskConcurrencyTotal(concurrency)
+    },
+    available: {
+      ...available
     },
     running: {
       ...running,
-      total: running.chat + running.drawingImage + running.chatImage
+      total: taskConcurrencyTotal(running)
     }
   };
 }
@@ -1535,31 +1567,24 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId });
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
 
-  const attempts = [];
-  for (const target of targets) {
-    const { channel, account } = target;
-    const release = tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target);
-    if (!release) {
-      attempts.push(targetBusyAttempt(target, "img2img"));
-      continue;
-    }
+  if (wait) {
+    const reserved = reserveFirstAvailableTarget(targets, "img2img");
+    const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img", requestMeta });
     try {
-      if (!(await ensureTargetReady(config, target, "img2img", attempts))) continue;
-      const client = getClient(config, channel, account);
-      let result = await submitImageTask(client, input, files);
-      if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
-      result = await mirrorTaskImages(result, config);
-      const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson({ ...input, files }), requestMeta });
       await upsertTask(task);
-      if (isFinishedTask(task.status)) await recordTaskStat(task);
-      await markAccountAvailable(account.id, channel);
-      return task;
     } catch (error) {
-      pushAttempt(attempts, target, error.message || "调用失败");
-      if (!error.busy) await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
-    } finally {
-      release();
+      reserved.release();
+      throw error;
     }
+    const finalTask = await runQueuedImageTask(task, input, files, reserved);
+    if (finalTask.status === "failed") {
+      const error = new Error(finalTask.errorMessage || "图生图任务失败。");
+      error.status = 502;
+      error.task = finalTask;
+      throw error;
+    }
+    return finalTask;
   }
-  throw targetsFailedError(attempts);
+
+  return queueImageTask({ input, files, requestMeta });
 }

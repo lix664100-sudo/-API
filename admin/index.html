@@ -188,9 +188,9 @@
       }
 
       .metric-value.compact {
-        font-size: 18px;
-        line-height: 1.2;
-        white-space: nowrap;
+        font-size: 15px;
+        line-height: 1.35;
+        white-space: normal;
       }
 
       .workspace {
@@ -1525,6 +1525,12 @@
           return usage;
         }, [statRecords]);
 
+        async function refreshRuntimeStatus() {
+          const runtimeData = await api("/api/admin/runtime").catch(() => null);
+          if (runtimeData) setRuntimeStatus(runtimeData);
+          return runtimeData;
+        }
+
         async function refresh() {
           const [nextConfig, taskList, statsData, storageData, runtimeData] = await Promise.all([
             api("/api/config"),
@@ -1607,12 +1613,21 @@
               await api("/api/tasks/refresh-processing", { method: "POST", body: {} });
               const taskList = await api("/api/tasks");
               setTasks(taskList);
+              await refreshRuntimeStatus();
             } catch (_error) {
               // 下一轮继续刷新，避免临时网络波动打断页面。
             }
           }, 5000);
           return () => clearInterval(timer);
         }, [tasks]);
+
+        useEffect(() => {
+          if (numberValue(runtimeStatus?.running?.total) <= 0) return undefined;
+          const timer = setInterval(() => {
+            refreshRuntimeStatus().catch(() => {});
+          }, 5000);
+          return () => clearInterval(timer);
+        }, [runtimeStatus?.running?.total]);
 
         useEffect(() => {
           if (!tasks.some((item) => ["processing", "queued", "pending", "unknown"].includes(item.status))) return undefined;
@@ -1872,6 +1887,7 @@
             if (result.task) {
               setTasks((current) => [result.task, ...current.filter((item) => String(item.id) !== String(result.task.id))]);
             }
+            await refreshRuntimeStatus();
             setChatResult("");
             message.success("对话已提交，任务记录里查看结果和耗时");
           } catch (error) {
@@ -1902,6 +1918,7 @@
             editFileList.forEach((file) => form.append("image", file.originFileObj));
             const task = await api("/api/draw/edit", { method: "POST", body: form });
             setTasks((current) => [task, ...current.filter((item) => String(item.id) !== String(task.id))]);
+            await refreshRuntimeStatus();
             message.success(`已提交到 ${task.channelName}，后台生成中`);
           } catch (error) {
             message.error(error.message);
@@ -2153,6 +2170,7 @@
         const storageSettings = imageStorageStats?.settings || config?.imageStorage || {};
         const storageDisk = imageStorageStats?.disk || null;
         const concurrencyTotal = numberValue(runtimeStatus?.concurrency?.total);
+        const availableTotal = numberValue(runtimeStatus?.available?.total);
         const runningTotal = numberValue(runtimeStatus?.running?.total);
 
         return h("div", null, [
@@ -2198,7 +2216,7 @@
                 h("div", { className: "metric-icon" }, Icon.ClusterOutlined ? h(Icon.ClusterOutlined) : null),
                 h("div", null, [
                   h("div", { className: "metric-label" }, "并发状态"),
-                  h("div", { className: "metric-value compact" }, `并发 ${concurrencyTotal} / 正在跑 ${runningTotal}`)
+                  h("div", { className: "metric-value compact" }, `配置 ${concurrencyTotal} / 可用 ${availableTotal} / 正在跑 ${runningTotal}`)
                 ])
               ]),
               h("div", { className: "metric" }, [

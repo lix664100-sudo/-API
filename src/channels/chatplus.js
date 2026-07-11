@@ -4,6 +4,8 @@ import { normalizeProxyUrl } from "../proxy.js";
 
 const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
 const ACCOUNT_CHECK_TIMEOUT_SEC = 3;
+const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 180;
+const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
 const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
 const badCarUntil = new Map();
@@ -14,6 +16,16 @@ function trimSlash(value) {
 
 function proxyUrlFor(account) {
   return normalizeProxyUrl(account?.proxyUrl || account?.proxy || "");
+}
+
+function requestTimeoutSec(options = {}, config = {}) {
+  const configured = Number(
+    options.timeoutSec
+      || config.upstreamTimeoutSec
+      || config.waitTimeoutSec
+      || DEFAULT_CHAT_HTTP_TIMEOUT_SEC
+  );
+  return Math.max(1, configured);
 }
 
 function runCurl(args, input = "") {
@@ -29,8 +41,14 @@ function runCurl(args, input = "") {
     });
     child.on("error", reject);
     child.on("close", (code) => {
-      if (code) reject(new Error(stderr || `curl 退出码：${code}`));
-      else resolve(stdout);
+      if (!code) {
+        resolve(stdout);
+        return;
+      }
+      const message = stderr || `curl 退出码：${code}`;
+      const error = new Error(code === 28 ? `上游请求超时：${message}` : message);
+      if (code === 28) error.status = 504;
+      reject(error);
     });
     if (input) child.stdin.end(input);
     else child.stdin.end();
@@ -671,9 +689,8 @@ export class ChatplusClient {
     if (this.cookies.length) headers.cookie = this.cookieHeader();
     const args = ["-sS", "-i"];
     if (options.followRedirect) args.push("-L");
-    if (Number(options.timeoutSec) > 0) {
-      args.push("--max-time", String(options.timeoutSec));
-    }
+    args.push("--connect-timeout", String(DEFAULT_CONNECT_TIMEOUT_SEC));
+    args.push("--max-time", String(requestTimeoutSec(options, this.config)));
     const proxyUrl = proxyUrlFor(this.account);
     if (proxyUrl) args.push("--proxy", proxyUrl);
     args.push("-X", options.method || "GET", url);
