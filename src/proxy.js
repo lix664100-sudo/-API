@@ -2,6 +2,13 @@ import fetch from "node-fetch";
 import { ProxyAgent } from "proxy-agent";
 
 const URL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+const PROXY_EXIT_IP_URLS = [
+  "https://api.ipify.org?format=json",
+  "https://api64.ipify.org?format=json",
+  "https://icanhazip.com"
+];
+const IPV4_RE = /\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b/;
+const IPV6_RE = /\b(?:[a-f0-9]{1,4}:){2,}[a-f0-9:.]{1,}\b/i;
 
 export function parsePipeProxy(value) {
   const text = String(value || "").trim();
@@ -92,31 +99,85 @@ function proxyExpired(expiresAt) {
   return Number.isFinite(time) && time < Date.now();
 }
 
-export async function checkProxyReachability(value, targetUrl, timeoutMs = 8000) {
+function extractIpText(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+
+  try {
+    const json = JSON.parse(text);
+    const ip = extractIpText(json.ip || json.query || json.origin || "");
+    if (ip) return ip;
+  } catch {
+    // Plain text IP responses are handled below.
+  }
+
+  return text.match(IPV4_RE)?.[0] || text.match(IPV6_RE)?.[0] || "";
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(new URL(url), {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function lookupProxyExitIp(agent, timeoutMs) {
+  const probes = PROXY_EXIT_IP_URLS.map(async (url) => {
+    const response = await fetchWithTimeout(url, {
+      method: "GET",
+      redirect: "follow",
+      agent
+    }, timeoutMs);
+    const text = await response.text();
+    if (!response.ok) throw new Error(`IP 查询失败：${response.status}`);
+    const ip = extractIpText(text);
+    if (!ip) throw new Error("没有拿到真实代理 IP");
+    return ip;
+  });
+
+  return Promise.any(probes);
+}
+
+async function checkTargetReachable(agent, targetUrl, timeoutMs) {
+  const response = await fetchWithTimeout(targetUrl, {
+    method: "HEAD",
+    redirect: "manual",
+    agent
+  }, timeoutMs);
+  response.body?.destroy?.();
+  return response;
+}
+
+export async function checkProxyReachability(value, targetUrl, timeoutMs = 3000) {
   const endpoint = safeProxyEndpoint(value);
   if (!endpoint.proxyConfigured) return { ok: true, ...endpoint };
   if (!endpoint.proxyHost) return { ok: false, ...endpoint, message: "代理 IP 格式不正确" };
   if (proxyExpired(endpoint.expiresAt)) return { ok: false, ...endpoint, message: "代理 IP 已到期" };
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(new URL(targetUrl), {
-      method: "HEAD",
-      redirect: "manual",
-      signal: controller.signal,
-      agent: new ProxyAgent({ getProxyForUrl: () => normalizeProxyUrl(value) })
-    });
-    response.body?.destroy?.();
-    return { ok: true, ...endpoint, checkedAt: new Date().toISOString() };
-  } catch (error) {
-    return {
-      ok: false,
-      ...endpoint,
-      checkedAt: new Date().toISOString(),
-      message: error?.name === "AbortError" ? "代理连接超时" : "代理无法连接目标站"
-    };
-  } finally {
-    clearTimeout(timer);
+  const checkedAt = new Date().toISOString();
+  const agent = new ProxyAgent({ getProxyForUrl: () => normalizeProxyUrl(value) });
+  const [targetResult, ipResult] = await Promise.allSettled([
+    checkTargetReachable(agent, targetUrl, timeoutMs),
+    lookupProxyExitIp(agent, timeoutMs)
+  ]);
+  const realIp = ipResult.status === "fulfilled" ? ipResult.value : "";
+
+  if (targetResult.status === "fulfilled") {
+    return { ok: true, ...endpoint, realIp, checkedAt };
   }
+
+  const error = targetResult.reason;
+  return {
+    ok: false,
+    ...endpoint,
+    realIp,
+    checkedAt,
+    message: error?.name === "AbortError" ? "代理连接超时" : "代理无法连接目标站"
+  };
 }

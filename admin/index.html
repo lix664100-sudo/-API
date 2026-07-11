@@ -296,6 +296,16 @@
         white-space: nowrap;
       }
 
+      .proxy-host {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.2;
+        max-width: 140px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
       .proxy-expire.expired {
         color: var(--danger);
       }
@@ -868,7 +878,7 @@
 
       function taskNetworkLabel(row) {
         const network = row?.network || {};
-        if (network.proxyConfigured === true) return network.proxyLabel || "已配置代理";
+        if (network.proxyConfigured === true) return network.proxyRealIp || network.proxyLabel || "已配置代理";
         if (network.proxyConfigured === false) return network.proxyLabel || "默认服务器IP";
         return "";
       }
@@ -1061,6 +1071,19 @@
         }
       }
 
+      function isIpAddress(value) {
+        const text = String(value || "").trim();
+        return /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/.test(text)
+          || /^(?:[a-f0-9]{1,4}:){2,}[a-f0-9:.]{1,}$/i.test(text);
+      }
+
+      function proxyRealIpText(check) {
+        const realIp = String(check?.realIp || "").trim();
+        if (isIpAddress(realIp)) return realIp;
+        const legacyIp = String(check?.ip || "").trim();
+        return isIpAddress(legacyIp) ? legacyIp : "";
+      }
+
       function proxyCell(value, row) {
         if (!value) return h(Tag, { color: "default" }, "服务器IP");
         const expiresAt = pipeProxyExpireText(value);
@@ -1069,8 +1092,13 @@
         const status = expired ? "failed" : check.status === "ok" ? "ok" : check.status === "failed" ? "failed" : "pending";
         const statusText = expired ? "已到期" : status === "ok" ? "正常" : status === "failed" ? "不可用" : "等待任务检测";
         const color = status === "ok" ? "green" : status === "failed" ? "red" : "default";
+        const hostText = proxyHostText(value);
+        const realIpText = proxyRealIpText(check);
         const content = h("div", { className: "proxy-cell" }, [
-          h(Tag, { color, style: { marginInlineEnd: 0 }, key: "ip" }, proxyHostText(value)),
+          h(Tag, { color, style: { marginInlineEnd: 0 }, key: "ip" }, realIpText || hostText),
+          realIpText && hostText && realIpText !== hostText
+            ? h("span", { className: "proxy-host", key: "host", title: hostText }, `代理域名 ${hostText}`)
+            : null,
           h("span", { className: `proxy-state ${status}`, key: "status" }, statusText),
           expiresAt ? h("span", { className: `proxy-expire${expired ? " expired" : ""}`, key: "expire" }, `到期 ${expiresAt}`) : null
         ]);

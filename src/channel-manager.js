@@ -21,7 +21,19 @@ function taskRequestMeta(value = {}) {
 }
 
 function taskNetworkMeta(account = {}) {
-  return safeProxyEndpoint(account.proxyUrl || account.proxy || "");
+  const endpoint = safeProxyEndpoint(account.proxyUrl || account.proxy || "");
+  const check = account.meta?.proxyCheck || {};
+  const checkHost = String(check.proxyHost || "").trim();
+  const sameProxy = !checkHost || !endpoint.proxyHost || checkHost === endpoint.proxyHost;
+  const realIp = endpoint.proxyConfigured && sameProxy ? String(check.realIp || "").trim() : "";
+  return realIp
+    ? {
+        ...endpoint,
+        proxyLabel: realIp,
+        proxyRealIp: realIp,
+        proxyOriginalLabel: endpoint.proxyLabel
+      }
+    : endpoint;
 }
 
 function normalizeTaskConcurrency(value = {}) {
@@ -605,7 +617,10 @@ async function saveProxyCheck(account, result) {
       ...(current.meta || {}),
       proxyCheck: {
         status: result.ok ? "ok" : "failed",
-        ip: result.proxyHost || "",
+        ip: result.realIp || "",
+        realIp: result.realIp || "",
+        proxyHost: result.proxyHost || "",
+        proxyLabel: result.proxyLabel || "",
         checkedAt: result.checkedAt || new Date().toISOString(),
         message: result.ok ? "" : result.message || "代理不可用"
       }
