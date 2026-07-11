@@ -19,7 +19,7 @@ import {
   refreshTask
 } from "./channel-manager.js";
 import { DrawingClient } from "./channels/drawing.js";
-import { resultImageDir, setRuntimePublicBaseUrl } from "./image-store.js";
+import { mirrorImageUrl, resultImageDir, setRuntimePublicBaseUrl } from "./image-store.js";
 import {
   getTask,
   listTasks,
@@ -523,6 +523,26 @@ app.post("/api/admin/update", async (_request, reply) => {
     };
   } finally {
     updateRunning = false;
+  }
+});
+
+app.post("/api/admin/mirror-image", async (request, reply) => {
+  const url = String(request.body?.url || "").trim();
+  if (!/^https?:\/\//i.test(url)) {
+    return reply.code(400).send({ ok: false, message: "图片链接不正确。" });
+  }
+  try {
+    const config = await loadConfig();
+    const mirroredUrl = await mirrorImageUrl(url, config);
+    return {
+      ok: true,
+      data: {
+        url: mirroredUrl,
+        originalUrl: url
+      }
+    };
+  } catch (error) {
+    return sendError(reply, error);
   }
 });
 
