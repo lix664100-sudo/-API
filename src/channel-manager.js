@@ -585,7 +585,8 @@ function taskFileJson(file) {
   return {
     filename: file?.filename || file?.name || "",
     mimetype: file?.mimetype || file?.type || "",
-    previewUrl: file?.previewUrl || ""
+    previewUrl: file?.previewUrl || "",
+    fieldname: file?.fieldname || ""
   };
 }
 
@@ -593,7 +594,10 @@ function taskRequestJson(input = {}) {
   const { file, files, ...fields } = input || {};
   const requestJson = jsonValue(fields) || {};
   const fileItems = imageFiles(files || file).map(taskFileJson);
-  if (fileItems.length) requestJson.files = fileItems;
+  if (fileItems.length) {
+    requestJson.received_image_count = fileItems.length;
+    requestJson.files = fileItems;
+  }
   return requestJson;
 }
 

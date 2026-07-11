@@ -256,6 +256,21 @@ function previewContentType(filename) {
   return "image/png";
 }
 
+function isImageInputField(fieldname) {
+  const name = String(fieldname || "").trim().toLowerCase();
+  return /^(image|images|file|files)(\[\d*\]|_\d+|\d+)?$/.test(name);
+}
+
+function assignInputField(input, fieldname, value) {
+  if (input[fieldname] === undefined) {
+    input[fieldname] = value ?? "";
+    return;
+  }
+  input[fieldname] = Array.isArray(input[fieldname])
+    ? [...input[fieldname], value ?? ""]
+    : [input[fieldname], value ?? ""];
+}
+
 async function savePreviewImage(buffer, part) {
   if (!String(part.mimetype || "").startsWith("image/")) return "";
   await mkdir(previewDir, { recursive: true });
@@ -264,27 +279,112 @@ async function savePreviewImage(buffer, part) {
   return `/uploads/previews/${filename}`;
 }
 
+function imageMimeFromBuffer(buffer) {
+  if (buffer?.[0] === 0x89 && buffer?.[1] === 0x50 && buffer?.[2] === 0x4e && buffer?.[3] === 0x47) return "image/png";
+  if (buffer?.[0] === 0xff && buffer?.[1] === 0xd8) return "image/jpeg";
+  if (buffer?.slice(0, 4).toString("ascii") === "GIF8") return "image/gif";
+  if (buffer?.slice(0, 4).toString("ascii") === "RIFF" && buffer?.slice(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  return "";
+}
+
+function safeImageFilename(filename, mimetype, index) {
+  const fallback = `image_${index}${imageExtension(mimetype)}`;
+  const base = path.basename(String(filename || fallback)).replace(/[^\w.-]/g, "_") || fallback;
+  return path.extname(base) ? base : `${base}${imageExtension(mimetype)}`;
+}
+
+function base64ImageToFile(value, fieldname, index) {
+  const source = typeof value === "object" && value !== null
+    ? value.data || value.base64 || value.image || value.content || value.url || ""
+    : value;
+  let text = String(source || "").trim();
+  if (!text) return null;
+
+  let mimetype = typeof value === "object" && value !== null ? String(value.mimetype || value.type || "") : "";
+  const dataUrl = text.match(/^data:(image\/[\w.+-]+);base64,(.+)$/i);
+  if (dataUrl) {
+    mimetype = dataUrl[1];
+    text = dataUrl[2];
+  }
+  const normalized = text.replace(/\s/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  if (normalized.length < 32 || !/^[a-z0-9+/]+=*$/i.test(normalized)) return null;
+
+  const buffer = Buffer.from(normalized, "base64");
+  const detectedType = imageMimeFromBuffer(buffer);
+  if (!detectedType && !String(mimetype).startsWith("image/")) return null;
+  const type = detectedType || mimetype || "image/png";
+  const filename = safeImageFilename(typeof value === "object" && value !== null ? value.filename || value.name : "", type, index);
+  return {
+    filename,
+    mimetype: type,
+    previewUrl: "",
+    fieldname,
+    toBuffer: async () => buffer
+  };
+}
+
+async function pushBufferedImage(files, buffer, part, { maxFiles, savePreview }) {
+  if (files.length >= maxFiles) throw badRequest(`最多只能上传 ${maxFiles} 张图片。`);
+  const mimetype = part.mimetype || imageMimeFromBuffer(buffer) || "image/png";
+  const filename = safeImageFilename(part.filename, mimetype, files.length + 1);
+  const previewUrl = savePreview ? await savePreviewImage(buffer, { ...part, filename, mimetype }) : "";
+  files.push({
+    filename,
+    mimetype,
+    previewUrl,
+    fieldname: part.fieldname || "",
+    toBuffer: async () => buffer
+  });
+}
+
+async function pushBase64Image(files, value, fieldname, options) {
+  if (files.length >= options.maxFiles) throw badRequest(`最多只能上传 ${options.maxFiles} 张图片。`);
+  const file = base64ImageToFile(value, fieldname, files.length + 1);
+  if (!file) return false;
+  const buffer = await file.toBuffer();
+  const previewUrl = options.savePreview ? await savePreviewImage(buffer, file) : "";
+  files.push({ ...file, previewUrl });
+  return true;
+}
+
+function imageFieldValues(value) {
+  const parsed = typeof value === "string" ? parseJsonField(value, value) : value;
+  return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+async function appendImageFields(input, files, options) {
+  const nextInput = { ...input };
+  for (const [fieldname, value] of Object.entries(input)) {
+    if (!isImageInputField(fieldname)) continue;
+    let used = false;
+    for (const item of imageFieldValues(value)) {
+      used = await pushBase64Image(files, item, fieldname, options) || used;
+    }
+    if (used) delete nextInput[fieldname];
+  }
+  return { input: nextInput, files };
+}
+
 async function readMultipartInput(request, { maxFiles, savePreview = false }) {
   const input = {};
   const files = [];
   for await (const part of request.parts()) {
     if (part.type === "file") {
-      if (!["image", "images", "file", "files"].includes(part.fieldname)) continue;
+      if (!isImageInputField(part.fieldname)) continue;
       if (!part.filename) continue;
-      if (files.length >= maxFiles) throw badRequest(`最多只能上传 ${maxFiles} 张图片。`);
       const buffer = await part.toBuffer();
-      const previewUrl = savePreview ? await savePreviewImage(buffer, part) : "";
-      files.push({
-        filename: part.filename,
-        mimetype: part.mimetype,
-        previewUrl,
-        toBuffer: async () => buffer
-      });
+      await pushBufferedImage(files, buffer, part, { maxFiles, savePreview });
       continue;
     }
-    input[part.fieldname] = part.value ?? "";
+    assignInputField(input, part.fieldname, part.value ?? "");
   }
-  return { input: normalizeFields(input), files };
+  return appendImageFields(normalizeFields(input), files, { maxFiles, savePreview });
+}
+
+async function readImageInput(request, options) {
+  if (isMultipartRequest(request)) return readMultipartInput(request, options);
+  const input = normalizeFields(request.body || {});
+  return appendImageFields(input, [], options);
 }
 
 function isMultipartRequest(request) {
@@ -550,7 +650,7 @@ app.post("/api/tasks/:id/refresh", async (request, reply) => {
 
 app.post("/api/draw/edit", async (request, reply) => {
   try {
-    const { input, files } = await readMultipartInput(request, { maxFiles: 3 });
+    const { input, files } = await readImageInput(request, { maxFiles: 3 });
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
     let task;
     if (request.query?.wait === "1") {
@@ -610,7 +710,7 @@ app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, 
 
 app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, reply) => {
   try {
-    const { input, files } = await readMultipartInput(request, { maxFiles: 3 });
+    const { input, files } = await readImageInput(request, { maxFiles: 3 });
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
     const task = await createImageTask({ input, files, wait: request.query?.wait !== "0" });
     return imageEditResponse(task);
