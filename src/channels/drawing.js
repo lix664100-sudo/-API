@@ -2,7 +2,7 @@ import fetch, { Headers } from "node-fetch";
 import { ProxyAgent } from "proxy-agent";
 import { normalizeProxyUrl } from "../proxy.js";
 
-const ACCOUNT_CHECK_TIMEOUT_MS = 10000;
+const ACCOUNT_CHECK_TIMEOUT_MS = 3000;
 
 function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
@@ -71,7 +71,7 @@ async function fetchWithTimeout(url, options = {}) {
     return await fetch(url, { ...fetchOptions, signal: fetchOptions.signal || controller.signal });
   } catch (error) {
     if (error?.name === "AbortError") {
-      throw new Error("检测超时：服务器连接绘图站超时。");
+      throw new Error("目标网站打不开，可能是服务器 IP 被限制或代理不可用。");
     }
     throw error;
   } finally {

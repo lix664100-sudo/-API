@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { normalizeProxyUrl } from "../proxy.js";
 
 const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
-const ACCOUNT_CHECK_TIMEOUT_SEC = 10;
+const ACCOUNT_CHECK_TIMEOUT_SEC = 3;
 const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
 const badCarUntil = new Map();

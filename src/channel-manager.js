@@ -1155,13 +1155,13 @@ async function checkShareAIAbility(config, channel, account, ability) {
 function readableCheckErrorMessage(error) {
   const message = String(error?.message || "").trim();
   if (/proxy/i.test(message) && /timeout|timed out|ETIMEDOUT|Failed connect/i.test(message)) {
-    return "账号代理连接目标站超时，请更换或关闭这个账号的代理。";
+    return "目标网站打不开，可能是服务器 IP 被限制或代理不可用。";
   }
   if (/检测超时|timeout|timed out|ETIMEDOUT|AbortError/i.test(message)) {
-    return "服务器连接目标站超时，请检查服务器网络或账号代理。";
+    return "目标网站打不开，可能是服务器 IP 被限制或代理不可用。";
   }
   if (/Failed connect|ECONNREFUSED|ENOTFOUND|EAI_AGAIN/i.test(message)) {
-    return "服务器连接目标站失败，请检查服务器网络或账号代理。";
+    return "目标网站打不开，可能是服务器 IP 被限制或代理不可用。";
   }
   return message || "检测失败";
 }
