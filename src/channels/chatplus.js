@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { normalizeProxyUrl } from "../proxy.js";
 
 const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
-const ACCOUNT_CHECK_TIMEOUT_SEC = 3;
+const ACCOUNT_CHECK_TIMEOUT_SEC = 8;
 const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 180;
 const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
 const MAX_CHAT_CAR_ATTEMPTS = 8;
@@ -46,7 +46,7 @@ function runCurl(args, input = "") {
         return;
       }
       const message = stderr || `curl 退出码：${code}`;
-      const error = new Error(code === 28 ? `上游请求超时：${message}` : message);
+      const error = new Error(code === 28 ? "聊天站响应慢，代理可能可用但请求超时。" : message);
       if (code === 28) error.status = 504;
       reject(error);
     });
