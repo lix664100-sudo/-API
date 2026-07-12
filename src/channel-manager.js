@@ -12,6 +12,7 @@ const scheduledChatTasks = new Set();
 const activeTaskCounts = new Map();
 const activeAccountAuthTasks = new Map();
 const clientCache = new Map();
+const accountRoutingState = new Map();
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 
 function taskRequestMeta(value = {}) {
@@ -646,6 +647,41 @@ function accountMatchesChannel(account, channel) {
   return channel.type === "shareai" && account.channelId === "shareai";
 }
 
+function accountRoutingWeight(account) {
+  const weight = Math.round(Number(account?.routingWeight || 1));
+  return Math.min(100, Math.max(1, Number.isFinite(weight) ? weight : 1));
+}
+
+function balancedAccountOrder(accounts, routingKey) {
+  if (accounts.length < 2) return accounts;
+
+  const activeIds = new Set(accounts.map((account) => account.id));
+  const signature = accounts.map((account) => `${account.id}:${accountRoutingWeight(account)}`).join("|");
+  const currentState = accountRoutingState.get(routingKey);
+  const scores = currentState?.signature === signature ? currentState.scores : new Map();
+  for (const accountId of scores.keys()) {
+    if (!activeIds.has(accountId)) scores.delete(accountId);
+  }
+
+  const totalWeight = accounts.reduce((total, account) => total + accountRoutingWeight(account), 0);
+  for (const account of accounts) {
+    scores.set(account.id, (scores.get(account.id) || 0) + accountRoutingWeight(account));
+  }
+
+  const selected = accounts.reduce((best, account) =>
+    (scores.get(account.id) || 0) > (scores.get(best.id) || 0) ? account : best
+  );
+  scores.set(selected.id, (scores.get(selected.id) || 0) - totalWeight);
+  accountRoutingState.set(routingKey, { signature, scores });
+
+  return [
+    selected,
+    ...accounts
+      .filter((account) => account.id !== selected.id)
+      .sort((a, b) => (scores.get(b.id) || 0) - (scores.get(a.id) || 0))
+  ];
+}
+
 function selectTargets(config, requestedChannel = "auto", taskType = "text2img", options = {}) {
   const requestedAccountId = String(options.accountId || "").trim();
   const channels = config.channels
@@ -662,15 +698,25 @@ function selectTargets(config, requestedChannel = "auto", taskType = "text2img",
       .sort((a, b) => Number(a.priority || 99) - Number(b.priority || 99));
     if (channel.type === "shareai") {
       for (const ability of shareAIAbilitiesForTask(channel, requestedChannel, taskType)) {
-        for (const account of accounts) {
-          if (ability === "chatplus" && !options.includeCooling && accountCooling(account)) continue;
+        const abilityAccounts = accounts.filter((account) =>
+          !(ability === "chatplus" && !options.includeCooling && accountCooling(account))
+        );
+        const orderedAccounts = options.balanced && !requestedAccountId
+          ? balancedAccountOrder(abilityAccounts, `${channel.id}:${ability}:${taskType}`)
+          : abilityAccounts;
+        for (const account of orderedAccounts) {
           targets.push({ channel: shareAIAbilityChannel(channel, ability), account });
         }
       }
       continue;
     }
-    for (const account of accounts) {
-      if (channel.type === "chatplus" && !options.includeCooling && accountCooling(account)) continue;
+    const channelAccounts = accounts.filter((account) =>
+      !(channel.type === "chatplus" && !options.includeCooling && accountCooling(account))
+    );
+    const orderedAccounts = options.balanced && !requestedAccountId
+      ? balancedAccountOrder(channelAccounts, `${channel.id}:${taskType}`)
+      : channelAccounts;
+    for (const account of orderedAccounts) {
       targets.push({ channel, account });
     }
   }
@@ -1186,13 +1232,19 @@ async function runChatCompletionTask(task, input) {
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId });
+  const preferredTarget = requestedAccountId
+    ? null
+    : targets.find((target) => target.account.id === task.accountId && target.channel.id === task.channelId);
+  const orderedChatTargets = preferredTarget
+    ? [preferredTarget, ...targets.filter((target) => !sameTarget(target, preferredTarget))]
+    : targets;
   const attempts = [];
   if (!targets.length) {
     const error = noChatTargetsError(config, requestedChannel);
     error.task = await failQueuedTask(task, error, attempts);
     throw error;
   }
-  for (const target of targets) {
+  for (const target of orderedChatTargets) {
     const { channel, account } = target;
     try {
       if (!(await ensureTargetReady(config, target, "chat", attempts))) continue;
@@ -1246,7 +1298,7 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   }
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "text2img");
+  const targets = selectTargets(config, requestedChannel, "text2img", { balanced: true });
   if (!targets.length) throw new Error("没有可用的文生图渠道或账号。");
 
   const reserved = reserveFirstAvailableTarget(targets, "text2img");
@@ -1273,7 +1325,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId });
+  const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: true });
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
 
   const reserved = reserveFirstAvailableTarget(targets, "img2img");
@@ -1296,7 +1348,7 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId });
+  const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
   if (!targets.length) throw noChatTargetsError(config, requestedChannel);
 
   const release = reserveTaskSlot("chat");
@@ -1490,7 +1542,7 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId });
+  const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
   if (!targets.length) throw noChatTargetsError(config, requestedChannel);
 
   return withTaskSlot("chat", async () => {
@@ -1522,7 +1574,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
   }
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "text2img");
+  const targets = selectTargets(config, requestedChannel, "text2img", { balanced: true });
   if (!targets.length) throw new Error("没有可用的文生图渠道或账号。");
 
   const attempts = [];
@@ -1564,7 +1616,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId });
+  const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: wait });
   if (!targets.length) throw new Error("图生图目前没有可用渠道。");
 
   if (wait) {

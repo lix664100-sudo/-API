@@ -350,6 +350,40 @@
         font-size: 12px;
       }
 
+      .routing-share {
+        display: grid;
+        gap: 5px;
+        width: 132px;
+      }
+
+      .routing-share-meta {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1;
+      }
+
+      .routing-share-weight {
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .routing-weight-control {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 112px;
+        align-items: center;
+        gap: 18px;
+        min-height: 38px;
+      }
+
+      .routing-weight-input {
+        width: 100%;
+      }
+
       .mono {
         font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
       }
@@ -719,8 +753,10 @@
         message,
         Modal,
         Popconfirm,
+        Progress,
         Row,
         Select,
+        Slider,
         Space,
         Spin,
         Switch,
@@ -804,6 +840,37 @@
       function numberValue(value) {
         const next = Number(value);
         return Number.isFinite(next) ? next : 0;
+      }
+
+      function routingWeightValue(value) {
+        const weight = Math.round(Number(value || 1));
+        return Math.min(100, Math.max(1, Number.isFinite(weight) ? weight : 1));
+      }
+
+      function RoutingWeightInput({ value, onChange }) {
+        const weight = routingWeightValue(value);
+        const update = (nextValue) => onChange?.(routingWeightValue(nextValue));
+        return h("div", { className: "routing-weight-control" }, [
+          h(Slider, {
+            key: "slider",
+            min: 1,
+            max: 100,
+            value: weight,
+            onChange: update,
+            tooltip: { formatter: (current) => `${current} 份` },
+            "aria-label": "分流比例"
+          }),
+          h(InputNumber, {
+            key: "number",
+            className: "routing-weight-input",
+            min: 1,
+            max: 100,
+            value: weight,
+            onChange: update,
+            addonAfter: "份",
+            "aria-label": "分流比例数值"
+          })
+        ]);
       }
 
       function valueText(value) {
@@ -1725,7 +1792,7 @@
           accountForm.resetFields();
           accountForm.setFieldsValue(account
             ? { ...account, password: "" }
-            : { channelId: selectedChannel?.id, name: "", username: "", password: "", proxyUrl: "", priority: 1, enabled: true }
+            : { channelId: selectedChannel?.id, name: "", username: "", password: "", proxyUrl: "", priority: 1, routingWeight: 1, enabled: true }
           );
           setAccountModalOpen(true);
         }
@@ -2048,6 +2115,32 @@
           },
           { title: "状态", dataIndex: "status", width: 90, render: statusTag },
           {
+            title: h(Tooltip, { title: "全部账号相同就是均分；数值越大，分到的任务越多。" }, h("span", null, "分流")),
+            dataIndex: "routingWeight",
+            width: 160,
+            render: (_, row) => {
+              const enabledAccounts = selectedAccounts.filter((account) => account.enabled !== false);
+              const totalWeight = enabledAccounts.reduce((total, account) => total + routingWeightValue(account.routingWeight), 0);
+              const weight = routingWeightValue(row.routingWeight);
+              const percent = row.enabled === false || !totalWeight ? 0 : Math.round((weight / totalWeight) * 100);
+              return h("div", { className: "routing-share" }, [
+                h("div", { className: "routing-share-meta", key: "meta" }, [
+                  h("span", { className: "routing-share-weight", key: "weight" }, `${weight} 份`),
+                  h("span", { key: "percent" }, row.enabled === false ? "已停用" : `约 ${percent}%`)
+                ]),
+                h(Progress, {
+                  key: "progress",
+                  percent,
+                  showInfo: false,
+                  strokeWidth: 5,
+                  strokeColor: row.enabled === false ? "#d0d5dd" : "#1677ff",
+                  trailColor: "#eef2f6",
+                  style: { margin: 0, lineHeight: 1 }
+                })
+              ]);
+            }
+          },
+          {
             title: "今日使用",
             width: 150,
             render: (_, row) => {
@@ -2298,7 +2391,7 @@
                         columns: accountColumns,
                         dataSource: selectedAccounts,
                         pagination: selectedAccounts.length > 5 ? { pageSize: 5 } : false,
-                        scroll: { x: 1500 },
+                        scroll: { x: 1660 },
                         size: "small",
                         locale: { emptyText: "这个渠道还没有绑定账号" }
                       })
@@ -2615,7 +2708,12 @@
             h(Form.Item, { label: "登录密码", name: "password" }, h(Input.Password, { placeholder: editingAccount?.hasPassword ? "不改密码就留空" : "请输入密码" })),
             h(Form.Item, { label: "代理 IP", name: "proxyUrl", extra: "支持 socks5://用户名:密码@IP:端口，也支持 IP|端口|账号|密码|到期日期；不填就走服务器 IP。" }, h(Input, { placeholder: "182.44.2.160|9125|3854552|a95a31fd5|2026-07-11" })),
             h("div", { className: "form-grid" }, [
-              h(Form.Item, { label: "优先级", name: "priority", initialValue: 1 }, h(InputNumber, { min: 1, max: 99, style: { width: "100%" } })),
+              h(Form.Item, {
+                label: "分流比例",
+                name: "routingWeight",
+                initialValue: 1,
+                extra: "相同数值就是平均分；例如 10 和 1，大约按 10:1 分配。"
+              }, h(RoutingWeightInput)),
               h(Form.Item, { label: "启用", name: "enabled", valuePropName: "checked", initialValue: true }, h(Switch))
             ])
           ]))

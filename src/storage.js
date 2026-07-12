@@ -67,6 +67,11 @@ const defaultConfig = {
   accounts: []
 };
 
+function normalizeRoutingWeight(value) {
+  const weight = Math.round(Number(value || 1));
+  return Math.min(100, Math.max(1, Number.isFinite(weight) ? weight : 1));
+}
+
 async function ensureDir() {
   await mkdir(dataDir, { recursive: true });
 }
@@ -199,6 +204,7 @@ function makeDefaultAccounts(stored) {
       password,
       enabled: true,
       priority: 1,
+      routingWeight: 1,
       status: "unknown"
     }
   ];
@@ -246,6 +252,7 @@ function mergeAccountIntoGroup(group, account, type) {
     proxyUrl: account.proxyUrl || account.proxy || "",
     enabled: account.enabled !== false,
     priority: Number(account.priority || 1),
+    routingWeight: normalizeRoutingWeight(account.routingWeight),
     status: "unknown",
     lastCheckAt: null,
     cooldownUntil: null,
@@ -322,6 +329,7 @@ function normalizeAccounts(stored) {
       proxyUrl: account.proxyUrl || account.proxy || "",
       enabled: account.enabled !== false,
       priority: Number(account.priority || 1),
+      routingWeight: normalizeRoutingWeight(account.routingWeight),
       status: account.status || "unknown",
       lastCheckAt: account.lastCheckAt || null,
       cooldownUntil: account.cooldownUntil || null,
@@ -440,7 +448,8 @@ export async function saveAccount(accountInput) {
     ...accountInput,
     id: accountInput.id || `account-${randomUUID()}`,
     enabled: accountInput.enabled !== false,
-    priority: Number(accountInput.priority || current.priority || 1)
+    priority: Number(accountInput.priority || current.priority || 1),
+    routingWeight: normalizeRoutingWeight(accountInput.routingWeight ?? current.routingWeight)
   };
   if (!accountInput.password && current.password) next.password = current.password;
   if (index >= 0) accounts[index] = next;
