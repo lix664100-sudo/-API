@@ -806,20 +806,36 @@
       ];
 
       async function api(path, options = {}) {
-        const isForm = options.body instanceof FormData;
-        const hasBody = options.body !== undefined && options.body !== null;
-        const body = hasBody && !isForm && typeof options.body !== "string" ? JSON.stringify(options.body) : options.body;
-        const response = await fetch(path, {
-          ...options,
-          body,
-          headers: {
-            ...(hasBody && !isForm ? { "content-type": "application/json" } : {}),
-            ...(options.headers || {})
+        const { timeoutMs = 0, ...requestOptions } = options;
+        const isForm = requestOptions.body instanceof FormData;
+        const hasBody = requestOptions.body !== undefined && requestOptions.body !== null;
+        const body = hasBody && !isForm && typeof requestOptions.body !== "string" ? JSON.stringify(requestOptions.body) : requestOptions.body;
+        const controller = timeoutMs > 0 ? new AbortController() : null;
+        const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+        try {
+          const response = await fetch(path, {
+            ...requestOptions,
+            body,
+            signal: requestOptions.signal || controller?.signal,
+            headers: {
+              ...(hasBody && !isForm ? { "content-type": "application/json" } : {}),
+              ...(requestOptions.headers || {})
+            }
+          });
+          const data = await response.json().catch(() => null);
+          if (!response.ok || data?.ok === false) throw new Error(data?.message || "请求失败");
+          return data?.data ?? data;
+        } catch (error) {
+          if (error?.name === "AbortError") {
+            const timeoutError = new Error("服务器更新时间较长，页面已停止等待，请稍后刷新查看结果。");
+            timeoutError.code = "REQUEST_TIMEOUT";
+            throw timeoutError;
           }
-        });
-        const data = await response.json().catch(() => null);
-        if (!response.ok || data?.ok === false) throw new Error(data?.message || "请求失败");
-        return data?.data ?? data;
+          if (error instanceof TypeError && !error.code) error.code = "NETWORK_ERROR";
+          throw error;
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
       }
 
       async function withTimeout(promise, timeoutMs, fallback) {
@@ -1891,26 +1907,67 @@
           });
         }
 
+        const updateMessageKey = "admin-code-update";
+
+        function wait(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        async function waitForServerRecovery() {
+          for (let attempt = 0; attempt < 45; attempt += 1) {
+            const ready = await withTimeout(
+              fetch("/api/health", { cache: "no-store" }).then((response) => response.ok),
+              2000,
+              false
+            );
+            if (ready) {
+              message.success({ key: updateMessageKey, content: "服务器已恢复，正在刷新页面", duration: 2 });
+              setTimeout(() => window.location.reload(), 600);
+              return true;
+            }
+            await wait(2000);
+          }
+          message.warning({ key: updateMessageKey, content: "服务器暂未恢复，请稍后手动刷新页面", duration: 6 });
+          return false;
+        }
+
+        async function executeUpdate() {
+          setUpdating(true);
+          message.loading({ key: updateMessageKey, content: "正在后台检查更新，可继续使用页面", duration: 0 });
+          try {
+            const result = await api("/api/admin/update", { method: "POST", body: {}, timeoutMs: 210000 });
+            if (result?.success && !result?.skipped) {
+              message.loading({ key: updateMessageKey, content: "更新完成，正在等待服务器重启", duration: 0 });
+              await wait(2500);
+              await waitForServerRecovery();
+              return;
+            }
+            if (result?.success) message.info({ key: updateMessageKey, content: result?.message || "已经是最新版，无需更新", duration: 4 });
+            else if (result?.skipped) message.warning({ key: updateMessageKey, content: result?.message || "未执行更新", duration: 5 });
+            else message.error({ key: updateMessageKey, content: result?.message || "更新失败", duration: 5 });
+            showUpdateResult(result);
+          } catch (error) {
+            if (error?.code === "NETWORK_ERROR") {
+              message.loading({ key: updateMessageKey, content: "服务器正在重启，正在自动重新连接", duration: 0 });
+              await waitForServerRecovery();
+            } else if (error?.code === "REQUEST_TIMEOUT") {
+              message.warning({ key: updateMessageKey, content: error.message, duration: 8 });
+            } else {
+              message.error({ key: updateMessageKey, content: error.message, duration: 6 });
+            }
+          } finally {
+            setUpdating(false);
+          }
+        }
+
         function runUpdate() {
           Modal.confirm({
             title: "更新线上代码",
             content: "会先检查服务器代码版本；只有发现新版本，才会执行更新命令。",
             okText: "检查并更新",
             cancelText: "取消",
-            onOk: async () => {
-              setUpdating(true);
-              try {
-                const result = await api("/api/admin/update", { method: "POST", body: {} });
-                if (result?.success && result?.skipped) message.info(result?.message || "已经是最新版，无需更新");
-                else if (result?.success) message.success("更新完成");
-                else if (result?.skipped) message.warning(result?.message || "未执行更新");
-                else message.error(result?.message || "更新失败");
-                showUpdateResult(result);
-              } catch (error) {
-                message.error(error.message);
-              } finally {
-                setUpdating(false);
-              }
+            onOk: () => {
+              executeUpdate();
             }
           });
         }
@@ -2278,7 +2335,7 @@
             h(Space, { wrap: true }, [
               h(Tag, { color: "blue", icon: Icon.UserOutlined ? h(Icon.UserOutlined) : null }, adminUser?.username || "已登录"),
               h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refresh }, "刷新"),
-              h(Button, { icon: Icon.CloudSyncOutlined ? h(Icon.CloudSyncOutlined) : null, onClick: runUpdate, loading: updating }, "更新线上代码"),
+              h(Button, { icon: Icon.CloudSyncOutlined ? h(Icon.CloudSyncOutlined) : null, onClick: runUpdate, loading: updating }, updating ? "后台更新中" : "更新线上代码"),
               h(Button, { type: "primary", icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null, onClick: testAll, loading }, "检测全部账号"),
               h(Button, { icon: Icon.LogoutOutlined ? h(Icon.LogoutOutlined) : null, onClick: onLogout }, "退出")
             ])
