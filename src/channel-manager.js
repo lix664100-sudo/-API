@@ -1214,7 +1214,7 @@ function reserveFirstAvailableTarget(targets, taskType) {
     if (release) return { target, release, attempts };
     attempts.push(targetBusyAttempt(target, taskType));
   }
-  const error = new Error(`所有渠道都忙，请稍后再试：${attemptErrorMessage(attempts)}`);
+  const error = new Error("并发上限");
   error.status = 429;
   error.busy = true;
   error.attempts = attempts;
@@ -1229,17 +1229,19 @@ function orderedTargets(targets, reserved) {
   ];
 }
 
-function allAttemptsBusy(attempts) {
-  return attempts.length > 0 && attempts.every((item) => item.busy);
+function concurrencyLimitReached(attempts) {
+  return attempts.some((item) => item.busy)
+    && attempts.every((item) => item.busy || item.quotaEmpty);
 }
 
 function targetsFailedError(attempts) {
+  const concurrencyLimited = concurrencyLimitReached(attempts);
   const error = new Error(
-    allAttemptsBusy(attempts)
-      ? `所有渠道都忙，请稍后再试：${attemptErrorMessage(attempts)}`
+    concurrencyLimited
+      ? "并发上限"
       : `所有渠道都失败：${attemptErrorMessage(attempts)}`
   );
-  if (allAttemptsBusy(attempts)) {
+  if (concurrencyLimited) {
     error.status = 429;
     error.busy = true;
   }

@@ -241,6 +241,73 @@ test("同一聊天账号的对话和生图不会同时登录", async () => {
   }
 });
 
+test("绘图额度不足且聊天生图并发已满时直接提示并发上限", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    concurrency: { chat: 3, drawingImage: 1, chatImage: 1 },
+    accounts: [{
+      id: "account-concurrency-limit",
+      channelId: "shareai",
+      name: "并发上限测试账号",
+      username: "concurrency-limit@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", balance: 1, message: "绘图账号可用" },
+          chatplus: { status: "ok", balance: 20, message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  const originalChatCreateTextTask = ChatplusClient.prototype.createTextTask;
+  let releaseActiveTask;
+  let markActiveTaskStarted;
+  const activeTaskStarted = new Promise((resolve) => { markActiveTaskStarted = resolve; });
+  const holdActiveTask = new Promise((resolve) => { releaseActiveTask = resolve; });
+
+  DrawingClient.prototype.check = async () => ({
+    status: "quota_empty",
+    quota: 50,
+    balance: 0,
+    message: "绘图积分不足"
+  });
+  ChatplusClient.prototype.createTextTask = async (input) => {
+    markActiveTaskStarted();
+    await holdActiveTask;
+    return {
+      externalId: "chat-image-concurrency-task",
+      status: "success",
+      taskType: "text2img",
+      prompt: input.prompt,
+      modelId: "gpt",
+      ratio: "1:1",
+      imageCount: 1,
+      imageUrls: ["https://example.com/result.png"],
+      raw: {}
+    };
+  };
+
+  const activeTask = createTextTask({ channel: "chatplus", prompt: "占用聊天生图并发" }, true);
+  await activeTaskStarted;
+  try {
+    await assert.rejects(
+      createTextTask({ prompt: "并发已满时的新任务" }, true),
+      (error) => error?.status === 429 && error?.message === "并发上限"
+    );
+  } finally {
+    releaseActiveTask();
+    await activeTask;
+    DrawingClient.prototype.check = originalDrawingCheck;
+    ChatplusClient.prototype.createTextTask = originalChatCreateTextTask;
+  }
+});
+
 test("每条绘图任务提交前检查额度，提交后更新页面额度", async () => {
   const config = await loadConfig();
   await saveConfig({
