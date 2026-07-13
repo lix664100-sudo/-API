@@ -7,8 +7,8 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-recovery-"));
 process.env.DATA_DIR = dataDir;
 
-const { getTask, listTaskStats, upsertTask } = await import("../src/storage.js");
-const { refreshProcessingTasks } = await import("../src/channel-manager.js");
+const { getTask, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
+const { refreshProcessingTasks, refreshTask } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 
 after(async () => {
@@ -82,4 +82,61 @@ test("聊天生图拿到上游编号后会先通知保存，再继续等待图�
   assert.equal(submitted.taskType, "img2img");
   assert.equal(submitted.raw.selectedCarId, "car-1");
   assert.equal(result.status, "waiting_upstream");
+});
+
+test("有上游编号的旧任务超过等待时间后保持等待上游", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    waitTimeoutSec: 300,
+    accounts: [{
+      id: "account-waiting",
+      channelId: "shareai",
+      name: "等待测试账号",
+      username: "test@example.com",
+      password: "test",
+      enabled: true
+    }]
+  });
+  const id = "task-restart-with-upstream-id";
+  await upsertTask({
+    id,
+    externalId: "conversation-waiting",
+    status: "processing",
+    taskType: "img2img",
+    prompt: "测试等待上游状态",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-waiting",
+    accountName: "等待测试账号",
+    raw: {
+      queued: false,
+      submitted: true,
+      submittedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+      selectedCarId: "car-waiting",
+      selectedCarType: "chatgpt"
+    },
+    createdAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+    completedAt: null
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  ChatplusClient.prototype.getTask = async (externalId) => ({
+    externalId,
+    status: "processing",
+    imageCount: 0,
+    imageUrls: [],
+    raw: { conversationId: externalId }
+  });
+  try {
+    const firstRefresh = await refreshTask(id);
+    const secondRefresh = await refreshTask(id);
+    assert.equal(firstRefresh.status, "waiting_upstream");
+    assert.equal(secondRefresh.status, "waiting_upstream");
+    assert.equal(secondRefresh.errorMessage, "");
+    assert.equal(secondRefresh.raw.waitingUpstream, true);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+  }
 });

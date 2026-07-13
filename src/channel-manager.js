@@ -572,6 +572,24 @@ function taskErrorMessage(result, task) {
   return result.errorMessage || itemError || task.errorMessage || "";
 }
 
+function refreshedTaskWaitState(task, result, timeoutSec) {
+  if (isFinishedTask(result?.status)) return result;
+  const seconds = Math.min(3600, Math.max(30, Number(timeoutSec || 300)));
+  const submittedAt = Date.parse(task.raw?.submittedAt || task.createdAt || "");
+  const waitExpired = Number.isFinite(submittedAt) && Date.now() - submittedAt >= seconds * 1000;
+  if (task.status !== "waiting_upstream" && !waitExpired) return result;
+  return {
+    ...result,
+    status: "waiting_upstream",
+    errorMessage: "",
+    raw: {
+      ...(result.raw || {}),
+      waitingUpstream: true,
+      waitingSince: task.raw?.waitingSince || new Date().toISOString()
+    }
+  };
+}
+
 async function mirrorTaskImages(result, config) {
   const imageUrls = Array.isArray(result?.imageUrls) ? result.imageUrls.filter(Boolean) : [];
   if (!imageUrls.length) return result;
@@ -638,10 +656,11 @@ export async function refreshTask(taskId) {
   const externalId = taskExternalId(task);
   if (!externalId || (task.raw?.queued && String(externalId).startsWith("task-"))) return task;
 
-  const result = await mirrorTaskImages(await client.getTask(externalId, {
+  const refreshedResult = await client.getTask(externalId, {
     carId: task.raw?.selectedCarId,
     carType: task.raw?.selectedCarType
-  }), config);
+  });
+  const result = await mirrorTaskImages(refreshedTaskWaitState(task, refreshedResult, config.waitTimeoutSec), config);
   const nextTask = mergeRefreshedTask(task, result, channel, account);
   await upsertTask(nextTask);
   if (isFinishedTask(nextTask.status)) await recordTaskStat(nextTask);
@@ -1189,7 +1208,8 @@ async function persistSubmittedTask(task, result, channel, account, attempts) {
   submittedTask.raw = {
     ...(submittedTask.raw || {}),
     queued: false,
-    submitted: true
+    submitted: true,
+    submittedAt: task.raw?.submittedAt || new Date().toISOString()
   };
   await upsertTask(submittedTask);
   return submittedTask;
