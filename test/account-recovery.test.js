@@ -8,7 +8,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-account-recovery-"
 process.env.DATA_DIR = dataDir;
 
 const { loadConfig, saveConfig } = await import("../src/storage.js");
-const { createChatCompletion, createImageTask, createTextTask } = await import("../src/channel-manager.js");
+const { createChatCompletion, createImageTask, createTextTask, getRuntimeStatus } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient, normalizeDrawingTask } = await import("../src/channels/drawing.js");
 
@@ -313,4 +313,123 @@ test("绘图站中转 500 显示准确提示", () => {
   });
 
   assert.equal(task.errorMessage, "绘图站上游服务异常（500），不是额度不足，请稍后重试。");
+});
+
+test("同一账号绘图上游连续失败三次后冷却十分钟", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    concurrency: { chat: 3, drawingImage: 2, chatImage: 2 },
+    accounts: [{
+      id: "account-drawing-cooldown",
+      channelId: "shareai",
+      name: "绘图冷却测试账号",
+      username: "drawing-cooldown@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", quota: 50, balance: 10, message: "绘图账号可用" },
+          chatplus: { status: "ok", balance: 20, message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  const originalCreateTextTask = DrawingClient.prototype.createTextTask;
+  let submitCount = 0;
+  DrawingClient.prototype.check = async () => ({
+    status: "ok",
+    quota: 50,
+    balance: 10,
+    message: "绘图账号可用"
+  });
+  DrawingClient.prototype.createTextTask = async (input) => {
+    submitCount += 1;
+    if ([1, 2, 4, 5, 6].includes(submitCount)) {
+      return normalizeDrawingTask({
+        id: 35000 + submitCount,
+        status: "failed",
+        task_type: "text2img",
+        prompt: input.prompt,
+        items: [{ error_message: "中转接口请求失败，状态码：500" }]
+      });
+    }
+    return normalizeDrawingTask({
+      id: 35004,
+      status: "success",
+      task_type: "text2img",
+      prompt: input.prompt,
+      items: [{ image_url: "https://example.com/result.png" }]
+    });
+  };
+
+  try {
+    for (let index = 1; index <= 2; index += 1) {
+      const task = await createTextTask({ channel: "drawing", prompt: `中途成功前失败 ${index}` }, true);
+      assert.equal(task.status, "failed");
+    }
+    const resetTask = await createTextTask({ channel: "drawing", prompt: "成功后重新计数" }, true);
+    assert.equal(resetTask.status, "success");
+    let stored = await loadConfig();
+    assert.equal(stored.accounts[0].meta.abilities.drawing.upstreamFailureStreak, 0);
+
+    for (let index = 1; index <= 3; index += 1) {
+      const task = await createTextTask({ channel: "drawing", prompt: `连续失败 ${index}` }, true);
+      assert.equal(task.status, "failed");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    stored = await loadConfig();
+    let account = stored.accounts[0];
+    let drawing = account.meta.abilities.drawing;
+    const runtime = await getRuntimeStatus();
+
+    assert.equal(drawing.status, "cooldown");
+    assert.equal(drawing.upstreamFailureStreak, 3);
+    assert.ok(Date.parse(drawing.cooldownUntil) - Date.now() > 9 * 60 * 1000);
+    assert.equal(account.meta.abilities.chatplus.status, "ok");
+    assert.equal(runtime.available.drawingImage, 0);
+    assert.equal(runtime.available.chatImage, 2);
+    await assert.rejects(
+      createTextTask({ channel: "drawing", prompt: "冷却期间不能再调用" }, true),
+      (error) => error?.status === 503
+    );
+
+    drawing = {
+      ...drawing,
+      cooldownUntil: new Date(Date.now() - 1000).toISOString()
+    };
+    await saveConfig({
+      ...stored,
+      accounts: [{
+        ...account,
+        meta: {
+          ...account.meta,
+          abilities: {
+            ...account.meta.abilities,
+            drawing
+          }
+        }
+      }]
+    });
+
+    const recoveredTask = await createTextTask({ channel: "drawing", prompt: "冷却结束自动恢复" }, true);
+    stored = await loadConfig();
+    account = stored.accounts[0];
+    drawing = account.meta.abilities.drawing;
+
+    assert.equal(recoveredTask.status, "success");
+    assert.equal(submitCount, 7);
+    assert.equal(drawing.status, "ok");
+    assert.equal(drawing.upstreamFailureStreak, 0);
+    assert.equal(drawing.cooldownUntil, null);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+    DrawingClient.prototype.createTextTask = originalCreateTextTask;
+  }
 });

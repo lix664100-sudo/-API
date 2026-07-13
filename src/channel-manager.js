@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
-import { DrawingClient } from "./channels/drawing.js";
+import { DrawingClient, drawingUpstreamFailureCode } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
 import { checkProxyReachability, safeProxyEndpoint } from "./proxy.js";
 import { getTask, listTasks, loadConfig, recordTaskStat, updateAccountStatus, upsertTask } from "./storage.js";
@@ -17,6 +17,8 @@ const accountRoutingState = new Map();
 const accountRecoveryTasks = new Map();
 const accountRecoveryRetryAt = new Map();
 const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
+const DRAWING_FAILURE_LIMIT = 3;
+const DRAWING_COOLDOWN_MS = 10 * 60 * 1000;
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 
 function taskRequestMeta(value = {}) {
@@ -105,7 +107,9 @@ function targetRuntimeAvailable(target, taskType) {
   if (!target?.channel || !target?.account) return false;
   if (target.channel.enabled === false || target.account.enabled === false) return false;
   if (taskType === "chat" && accountCooling(target.account)) return false;
-  return targetQuotaStatus(target).status === "ok";
+  const status = targetQuotaStatus(target);
+  if (statusCooling(status)) return false;
+  return status.status === "ok" || status.status === "cooldown";
 }
 
 function runtimeTargetAccountCount(config, taskType, channelType, availableOnly = false) {
@@ -364,6 +368,11 @@ function accountCooling(account) {
   return Number.isFinite(until) && until > Date.now();
 }
 
+function statusCooling(status) {
+  const until = Date.parse(status?.cooldownUntil || "");
+  return Number.isFinite(until) && until > Date.now();
+}
+
 function cooldownRemainingText(cooldownUntil) {
   const ms = Math.max(0, Date.parse(cooldownUntil || "") - Date.now());
   const minutes = Math.max(1, Math.ceil(ms / 60000));
@@ -601,6 +610,68 @@ async function markAccountAvailable(accountId, channel = "") {
   await updateTargetAccountStatus(accountId, channel, patch);
 }
 
+function drawingFailureCodeFromResult(result = {}) {
+  const itemErrors = (result?.raw?.items || [])
+    .map((item) => item?.error_message || item?.message || "")
+    .filter(Boolean);
+  return drawingUpstreamFailureCode([result.errorMessage, ...itemErrors].filter(Boolean).join("；"));
+}
+
+async function updateAccountAfterTask(account, channel, result = {}) {
+  if (channel?.type !== "drawing" || !isFinishedTask(result.status)) {
+    await markAccountAvailable(account.id, channel);
+    return false;
+  }
+
+  return withAccountAuthLock(account, async () => {
+    const config = await loadRuntimeConfig();
+    const currentAccount = config.accounts.find((item) => item.id === account.id) || account;
+    const drawing = currentAccount.meta?.abilities?.drawing || {};
+    if (statusCooling(drawing)) return true;
+
+    const failureCode = result.status === "failed" ? drawingFailureCodeFromResult(result) : "";
+    const previousStreak = drawing.status === "cooldown"
+      ? 0
+      : Math.max(0, Number(drawing.upstreamFailureStreak || 0));
+
+    if (failureCode) {
+      const upstreamFailureStreak = previousStreak + 1;
+      if (upstreamFailureStreak >= DRAWING_FAILURE_LIMIT) {
+        const cooldownUntil = new Date(Date.now() + DRAWING_COOLDOWN_MS).toISOString();
+        await updateTargetAccountStatus(account.id, channel, {
+          status: "cooldown",
+          cooldownUntil,
+          cooldownReason: "drawing_upstream_error",
+          upstreamFailureCode: failureCode,
+          upstreamFailureStreak,
+          message: `绘图站上游连续失败 ${DRAWING_FAILURE_LIMIT} 次，绘图已冷却 10 分钟。`
+        });
+        return true;
+      }
+
+      await updateTargetAccountStatus(account.id, channel, {
+        status: "ok",
+        cooldownUntil: null,
+        cooldownReason: "",
+        upstreamFailureCode: failureCode,
+        upstreamFailureStreak,
+        message: `绘图站上游服务异常，连续失败 ${upstreamFailureStreak}/${DRAWING_FAILURE_LIMIT} 次。`
+      });
+      return false;
+    }
+
+    await updateTargetAccountStatus(account.id, channel, {
+      status: "ok",
+      cooldownUntil: null,
+      cooldownReason: "",
+      upstreamFailureCode: "",
+      upstreamFailureStreak: 0,
+      message: result.status === "success" ? "最近绘图调用成功" : "绘图账号可继续使用"
+    });
+    return false;
+  });
+}
+
 function mergeRefreshedTask(task, result, channel, account) {
   const status = result.status || task.status;
   return {
@@ -650,7 +721,10 @@ export async function refreshTask(taskId) {
   const result = await mirrorTaskImages(refreshedTaskWaitState(task, refreshedResult, config.waitTimeoutSec), config);
   const nextTask = mergeRefreshedTask(task, result, channel, account);
   await upsertTask(nextTask);
-  if (isFinishedTask(nextTask.status)) await recordTaskStat(nextTask);
+  if (isFinishedTask(nextTask.status)) {
+    await recordTaskStat(nextTask);
+    await updateAccountAfterTask(account, channel, nextTask);
+  }
   return nextTask;
 }
 
@@ -859,6 +933,10 @@ function targetQuotaStatus(target) {
   return abilityStatus && Object.keys(abilityStatus).length ? abilityStatus : target?.account || {};
 }
 
+function targetAbilityCooling(target) {
+  return statusCooling(targetQuotaStatus(target));
+}
+
 function targetKnownUnavailable(target) {
   const status = String(targetQuotaStatus(target).status || "unknown").toLowerCase();
   return ["error", "failed", "disconnected", "disabled"].includes(status);
@@ -920,7 +998,8 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
     includeCooling: true
   });
   const ready = admissionTargets(targets).filter((target) => !(
-    target.channel.type === "chatplus" && accountCooling(target.account)
+    targetAbilityCooling(target)
+      || (target.channel.type === "chatplus" && accountCooling(target.account))
   ));
   const recoveryTargets = targets.filter(targetNeedsRecovery);
   if (!recoveryTargets.length) return ready;
@@ -961,12 +1040,26 @@ function pushAttempt(attempts, target, message, extra = {}) {
   });
 }
 
+async function updateTargetStatusForWork(target, patch) {
+  const update = () => updateTargetAccountStatus(target.account.id, target.channel, patch);
+  return target.channel.type === "drawing"
+    ? withAccountAuthLock(target.account, update)
+    : update();
+}
+
 async function refreshQuotaBeforeUse(config, target, attempts) {
   try {
     const status = await getClient(config, target.channel, target.account).check();
-    await updateTargetAccountStatus(target.account.id, target.channel, {
+    const previousStatus = targetQuotaStatus(target);
+    const expiredDrawingCooldown = target.channel.type === "drawing"
+      && previousStatus.status === "cooldown"
+      && !statusCooling(previousStatus);
+    await updateTargetStatusForWork(target, {
       ...status,
-      cooldownUntil: status.status === "ok" && target.channel.type === "chatplus" ? null : status.cooldownUntil
+      cooldownUntil: status.status === "ok" ? null : status.cooldownUntil,
+      ...(expiredDrawingCooldown
+        ? { cooldownReason: "", upstreamFailureCode: "", upstreamFailureStreak: 0 }
+        : {})
     });
     if (status.status === "quota_empty") {
       pushAttempt(attempts, target, `${status.message || "额度不足"}，已自动刷新额度后跳过。`, { quotaEmpty: true });
@@ -975,7 +1068,7 @@ async function refreshQuotaBeforeUse(config, target, attempts) {
     return true;
   } catch (error) {
     const patch = accountStatusFromError(error);
-    await updateTargetAccountStatus(target.account.id, target.channel, patch);
+    await updateTargetStatusForWork(target, patch);
     pushAttempt(
       attempts,
       target,
@@ -993,7 +1086,22 @@ async function refreshDrawingQuota(account, channel) {
   const config = await loadRuntimeConfig();
   const currentAccount = config.accounts.find((item) => item.id === account.id) || account;
   const status = await getClient(config, channel, currentAccount).check();
-  await updateTargetAccountStatus(account.id, channel, status);
+  await withAccountAuthLock(account, async () => {
+    const latestConfig = await loadRuntimeConfig();
+    const latestAccount = latestConfig.accounts.find((item) => item.id === account.id) || account;
+    const drawing = latestAccount.meta?.abilities?.drawing || {};
+    await updateTargetAccountStatus(account.id, channel, statusCooling(drawing)
+      ? {
+          ...status,
+          status: "cooldown",
+          cooldownUntil: drawing.cooldownUntil,
+          cooldownReason: drawing.cooldownReason,
+          upstreamFailureCode: drawing.upstreamFailureCode,
+          upstreamFailureStreak: drawing.upstreamFailureStreak,
+          message: drawing.message
+        }
+      : status);
+  });
 }
 
 function scheduleDrawingQuotaRefresh(account, channel) {
@@ -1263,7 +1371,7 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
   };
   await upsertTask(nextTask);
   if (isFinishedTask(nextTask.status)) await recordTaskStat(nextTask);
-  await markAccountAvailable(account.id, channel);
+  await updateAccountAfterTask(account, channel, nextTask);
   scheduleDrawingQuotaRefresh(account, channel);
   return nextTask;
 }
@@ -1704,6 +1812,32 @@ function combinedShareAIStatus(results) {
   };
 }
 
+function preserveDrawingCooldown(account, status) {
+  const currentDrawing = account.meta?.abilities?.drawing || {};
+  if (!statusCooling(currentDrawing)) return status;
+  const abilities = status.meta?.abilities || {};
+  const drawing = {
+    ...(abilities.drawing || {}),
+    status: "cooldown",
+    cooldownUntil: currentDrawing.cooldownUntil,
+    cooldownReason: currentDrawing.cooldownReason,
+    upstreamFailureCode: currentDrawing.upstreamFailureCode,
+    upstreamFailureStreak: currentDrawing.upstreamFailureStreak,
+    message: currentDrawing.message
+  };
+  return {
+    ...status,
+    message: combinedAbilityMessage(drawing, abilities.chatplus, status.message),
+    meta: {
+      ...(status.meta || {}),
+      abilities: {
+        ...abilities,
+        drawing
+      }
+    }
+  };
+}
+
 export async function checkAccount(accountId) {
   const config = await loadRuntimeConfig();
   const account = config.accounts.find((item) => item.id === accountId);
@@ -1738,7 +1872,10 @@ export async function checkAccount(accountId) {
       checkShareAIAbility(config, channel, account, "chatplus")
     ]);
     const results = { drawing, chatplus };
-    const status = withProxyCheckMeta(combinedShareAIStatus(results), proxyResult);
+    const status = preserveDrawingCooldown(
+      account,
+      withProxyCheckMeta(combinedShareAIStatus(results), proxyResult)
+    );
     await updateAccountStatus(account.id, status);
     if (status.status !== "ok") throw new Error(status.message || "检测失败");
     return status;
@@ -1880,7 +2017,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
         await upsertTask(task);
         if (isFinishedTask(task.status)) await recordTaskStat(task);
-        await markAccountAvailable(account.id, channel);
+        await updateAccountAfterTask(account, channel, task);
         scheduleDrawingQuotaRefresh(account, channel);
         return task;
       });

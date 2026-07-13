@@ -111,13 +111,19 @@ function quotaResetAtFrom(profile, stats) {
   ]));
 }
 
-export function userFacingDrawingErrorMessage(value) {
+export function drawingUpstreamFailureCode(value) {
   const text = String(value || "").trim();
   if (!text) return "";
   const relayFailure = text.match(/中转接口请求失败[^\d]*状态码\s*[:：]\s*(\d{3})/);
-  if (relayFailure) {
-    return `绘图站上游服务异常（${relayFailure[1]}），不是额度不足，请稍后重试。`;
-  }
+  if (relayFailure) return relayFailure[1];
+  return text.match(/绘图站上游服务异常[（(](\d{3})[）)]/)?.[1] || "";
+}
+
+export function userFacingDrawingErrorMessage(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const failureCode = drawingUpstreamFailureCode(text);
+  if (failureCode) return `绘图站上游服务异常（${failureCode}），不是额度不足，请稍后重试。`;
   return text;
 }
 

@@ -1649,6 +1649,21 @@
           return `${Math.max(1, Math.ceil(ms / 60000))} 分钟`;
         }
 
+        function drawingCooldownStatus(account) {
+          return abilityStatus(account, "drawing");
+        }
+
+        function drawingAccountIsCooling(account) {
+          const until = Date.parse(drawingCooldownStatus(account)?.cooldownUntil || "");
+          return Number.isFinite(until) && until > Date.now();
+        }
+
+        function drawingCooldownText(account) {
+          const status = drawingCooldownStatus(account);
+          const ms = Math.max(0, Date.parse(status?.cooldownUntil || "") - Date.now());
+          return `${Math.max(1, Math.ceil(ms / 60000))} 分钟`;
+        }
+
         const matchingChatAccounts = useMemo(() => {
           const chatIds = new Set(chatChannels.map((item) => item.id));
           return accounts.filter((account) => {
@@ -1659,6 +1674,12 @@
 
         const coolingChatAccount = useMemo(() => matchingChatAccounts.find(accountIsCooling) || null, [matchingChatAccounts, nowTick]);
         const chatSubmitBlocked = matchingChatAccounts.length > 0 && matchingChatAccounts.every(accountIsCooling);
+        const activeDrawingCooldowns = accounts.filter(drawingAccountIsCooling);
+        const activeDrawingCooldownCount = activeDrawingCooldowns.length;
+        const nextDrawingCooldownAt = activeDrawingCooldowns.reduce((soonest, account) => {
+          const value = Date.parse(drawingCooldownStatus(account)?.cooldownUntil || "");
+          return !soonest || value < soonest ? value : soonest;
+        }, 0);
 
         const channelStats = useMemo(() => {
           const map = new Map();
@@ -1826,8 +1847,12 @@
           const timer = setInterval(async () => {
             try {
               await api("/api/tasks/refresh-processing", { method: "POST", body: {} });
-              const taskList = await api("/api/tasks");
+              const [taskList, nextConfig] = await Promise.all([
+                api("/api/tasks"),
+                api("/api/config")
+              ]);
               setTasks(taskList);
+              setConfig(nextConfig);
               await refreshRuntimeStatus();
             } catch (_error) {
               // 下一轮继续刷新，避免临时网络波动打断页面。
@@ -1845,10 +1870,17 @@
         }, [runtimeStatus?.running?.total]);
 
         useEffect(() => {
-          if (!tasks.some((item) => ["processing", "queued", "pending", "unknown", "waiting_upstream"].includes(item.status))) return undefined;
-          const timer = setInterval(() => setNowTick(Date.now()), 1000);
+          const hasActiveTask = tasks.some((item) => ["processing", "queued", "pending", "unknown", "waiting_upstream"].includes(item.status));
+          if (!hasActiveTask && activeDrawingCooldownCount <= 0) return undefined;
+          const timer = setInterval(() => {
+            const now = Date.now();
+            setNowTick(now);
+            if (nextDrawingCooldownAt && now >= nextDrawingCooldownAt) {
+              refreshRuntimeStatus().catch(() => {});
+            }
+          }, 1000);
           return () => clearInterval(timer);
-        }, [tasks]);
+        }, [tasks, activeDrawingCooldownCount, nextDrawingCooldownAt]);
 
         async function saveGlobal(values) {
           setLoading(true);
@@ -2306,7 +2338,22 @@
             width: 150,
             render: (value, row) => proxyCell(value, row)
           },
-          { title: "状态", dataIndex: "status", width: 90, render: statusTag },
+          {
+            title: "状态",
+            dataIndex: "status",
+            width: 150,
+            render: (_, row) => {
+              if (!drawingAccountIsCooling(row)) return statusTag(row.status);
+              const drawing = drawingCooldownStatus(row);
+              const tooltip = `绘图站上游连续失败 3 次，已暂停该账号绘图；${formatDateTime(drawing.cooldownUntil)} 自动恢复。`;
+              return h(Space, { direction: "vertical", size: 2, align: "start" }, [
+                h("span", { key: "status" }, statusTag(row.status)),
+                h(Tooltip, { key: "cooldown", title: tooltip },
+                  h(Tag, { color: "orange" }, `绘图冷却中 · ${drawingCooldownText(row)}`)
+                )
+              ]);
+            }
+          },
           {
             title: h(Tooltip, { title: "全部账号相同就是均分；数值越大，分到的任务越多。" }, h("span", null, "分流")),
             dataIndex: "routingWeight",
