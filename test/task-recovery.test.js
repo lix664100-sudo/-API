@@ -7,8 +7,8 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-recovery-"));
 process.env.DATA_DIR = dataDir;
 
-const { getTask, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
-const { refreshProcessingTasks, refreshTask } = await import("../src/channel-manager.js");
+const { getTask, listTasks, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
+const { createImageTask, refreshProcessingTasks, refreshTask } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 
 after(async () => {
@@ -45,6 +45,73 @@ test("重启后没有上游编号的生图任务会变成结果待确认，且�
   assert.match(stored.responseJson.message, /不计失败/);
   assert.ok(stored.completedAt);
   assert.equal(Object.keys(stats.records).length, 0);
+});
+
+test("正在执行的同步生图任务不会被刷新误判为结果待确认", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-active-image",
+      channelId: "shareai",
+      name: "正在生图的账号",
+      username: "active@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", message: "绘图积分不足" },
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let continueUpstream;
+  let markUpstreamStarted;
+  const upstreamStarted = new Promise((resolve) => {
+    markUpstreamStarted = resolve;
+  });
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    markUpstreamStarted();
+    await new Promise((resolve) => {
+      continueUpstream = resolve;
+    });
+    return {
+      externalId: "active-image-upstream-id",
+      status: "success",
+      taskType: "img2img",
+      prompt: input.prompt,
+      imageCount: 1,
+      imageUrls: [],
+      raw: {}
+    };
+  };
+
+  try {
+    const creation = createImageTask({
+      input: { channel: "chatplus", prompt: "测试执行中刷新" },
+      files: [{ filename: "source.png", mimetype: "image/png" }],
+      wait: true
+    });
+    await upstreamStarted;
+
+    await refreshProcessingTasks();
+    const activeTask = (await listTasks()).find((task) => task.prompt === "测试执行中刷新");
+    assert.equal(activeTask.status, "processing");
+    assert.equal(activeTask.raw.queued, true);
+    assert.notEqual(activeTask.raw.interrupted, true);
+
+    continueUpstream();
+    const completedTask = await creation;
+    assert.equal(completedTask.status, "success");
+  } finally {
+    continueUpstream?.();
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+  }
 });
 
 test("聊天生图拿到上游编号后会先通知保存，再继续等待图片", async () => {

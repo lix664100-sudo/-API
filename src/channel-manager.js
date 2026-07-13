@@ -1900,7 +1900,13 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
       reserved.release();
       throw error;
     }
-    const finalTask = await runQueuedImageTask(task, input, files, reserved);
+    scheduledImageTasks.add(task.id);
+    let finalTask;
+    try {
+      finalTask = await runQueuedImageTask(task, input, files, reserved);
+    } finally {
+      scheduledImageTasks.delete(task.id);
+    }
     if (finalTask.status === "failed") {
       const error = new Error(finalTask.errorMessage || "图生图任务失败。");
       error.status = 502;
