@@ -85,7 +85,6 @@ function taskSlotLimit(slot) {
 }
 
 function activeCountForSlot(slot) {
-  if (slot === "chat") return activeTaskCounts.get(slot) || 0;
   const prefix = `${slot}:`;
   let total = activeTaskCounts.get(slot) || 0;
   for (const [key, count] of activeTaskCounts.entries()) {
@@ -105,20 +104,23 @@ function targetRuntimeAvailable(target, taskType) {
   return targetQuotaStatus(target).status === "ok";
 }
 
-function hasRuntimeTarget(config, taskType, channelType) {
-  return selectTargets(config, "auto", taskType, { includeCooling: true })
-    .some((target) => target.channel.type === channelType && targetRuntimeAvailable(target, taskType));
+function runtimeTargetAccountCount(config, taskType, channelType, availableOnly = false) {
+  const accountIds = selectTargets(config, "auto", taskType, { includeCooling: true })
+    .filter((target) => target.channel.type === channelType)
+    .filter((target) => !availableOnly || targetRuntimeAvailable(target, taskType))
+    .map((target) => target.account.id);
+  return new Set(accountIds).size;
 }
 
-function runtimeAvailableConcurrency(config, concurrency) {
-  const available = {
-    chat: hasRuntimeTarget(config, "chat", "chatplus") ? concurrency.chat : 0,
-    drawingImage: hasRuntimeTarget(config, "text2img", "drawing") ? concurrency.drawingImage : 0,
-    chatImage: hasRuntimeTarget(config, "text2img", "chatplus") ? concurrency.chatImage : 0
+function runtimeAccountConcurrency(config, concurrency, availableOnly = false) {
+  const capacity = {
+    chat: runtimeTargetAccountCount(config, "chat", "chatplus", availableOnly) * concurrency.chat,
+    drawingImage: runtimeTargetAccountCount(config, "text2img", "drawing", availableOnly) * concurrency.drawingImage,
+    chatImage: runtimeTargetAccountCount(config, "text2img", "chatplus", availableOnly) * concurrency.chatImage
   };
   return {
-    ...available,
-    total: taskConcurrencyTotal(available)
+    ...capacity,
+    total: taskConcurrencyTotal(capacity)
   };
 }
 
@@ -126,7 +128,8 @@ export async function getRuntimeStatus() {
   const config = await loadConfig();
   const concurrency = normalizeTaskConcurrency(config.concurrency);
   activeTaskConcurrency = concurrency;
-  const available = runtimeAvailableConcurrency(config, concurrency);
+  const configured = runtimeAccountConcurrency(config, concurrency);
+  const available = runtimeAccountConcurrency(config, concurrency, true);
   const running = {
     chat: activeCountForSlot("chat"),
     drawingImage: activeCountForSlot("drawingImage"),
@@ -135,7 +138,7 @@ export async function getRuntimeStatus() {
   return {
     concurrency: {
       ...concurrency,
-      total: taskConcurrencyTotal(concurrency)
+      total: configured.total
     },
     available: {
       ...available
@@ -154,14 +157,13 @@ function taskSlotLabel(slot) {
 }
 
 function taskSlotKey(slot, target = {}) {
-  if (slot === "chat") return slot;
   const accountId = String(target?.account?.id || "").trim();
   return accountId ? `${slot}:${accountId}` : slot;
 }
 
 function taskSlotBusyLabel(slot, target = {}) {
   const accountName = String(target?.account?.name || target?.account?.username || "").trim();
-  return slot === "chat" || !accountName
+  return !accountName
     ? taskSlotLabel(slot)
     : `${accountName}的${taskSlotLabel(slot)}`;
 }
@@ -192,21 +194,6 @@ function tryReserveTaskSlot(slot, target = {}) {
     if (next) activeTaskCounts.set(key, next);
     else activeTaskCounts.delete(key);
   };
-}
-
-function reserveTaskSlot(slot, target = {}) {
-  const release = tryReserveTaskSlot(slot, target);
-  if (!release) throw busyTaskError(slot, target);
-  return release;
-}
-
-async function withTaskSlot(type, work) {
-  const release = reserveTaskSlot(type);
-  try {
-    return await work();
-  } finally {
-    release();
-  }
 }
 
 function accountSessionKey(account = {}) {
@@ -1351,10 +1338,10 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
   const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
   if (!targets.length) throw noChatTargetsError(config, requestedChannel);
 
-  const release = reserveTaskSlot("chat");
+  const reserved = reserveFirstAvailableTarget(targets, "chat");
   const task = queuedTask({
     input,
-    target: targets[0],
+    target: reserved.target,
     taskType: "chat",
     prompt: cleanChatPrompt(input),
     imageCount: chatImageCount(input),
@@ -1365,7 +1352,7 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
   try {
     await upsertTask(task);
   } catch (error) {
-    release();
+    reserved.release();
     throw error;
   }
   scheduledChatTasks.add(task.id);
@@ -1374,7 +1361,7 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
       await queueChatForAccount(task.accountId, () => runChatCompletionTask(task, input));
     } finally {
       scheduledChatTasks.delete(task.id);
-      release();
+      reserved.release();
     }
   });
   return task;
@@ -1545,10 +1532,11 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
   const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
   if (!targets.length) throw noChatTargetsError(config, requestedChannel);
 
-  return withTaskSlot("chat", async () => {
+  const reserved = reserveFirstAvailableTarget(targets, "chat");
+  try {
     const task = queuedTask({
       input,
-      target: targets[0],
+      target: reserved.target,
       taskType: "chat",
       prompt: cleanChatPrompt(input),
       imageCount: chatImageCount(input),
@@ -1564,7 +1552,9 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
     } finally {
       scheduledChatTasks.delete(task.id);
     }
-  });
+  } finally {
+    reserved.release();
+  }
 }
 export async function createTextTask(input = {}, wait = false, requestMeta = {}) {
   if (!String(input.prompt || "").trim()) {

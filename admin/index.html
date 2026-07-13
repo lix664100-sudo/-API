@@ -2621,14 +2621,14 @@
                       h("div", { className: "api-doc-section", style: { marginBottom: 14 } }, [
                         h("div", { className: "section-title" }, h("h3", null, "并发设置")),
                         h("div", { className: "form-grid" }, [
-                          h(Form.Item, { label: "普通聊天总同时任务数", name: ["concurrency", "chat"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
+                          h(Form.Item, { label: "每账号普通聊天同时任务数", name: ["concurrency", "chat"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
                           h(Form.Item, { label: "每账号生图站同时任务数", name: ["concurrency", "drawingImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
                           h(Form.Item, { label: "每账号聊天生图同时任务数", name: ["concurrency", "chatImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
                         ]),
                         h(Alert, {
                           type: "warning",
                           showIcon: true,
-                          message: "生图并发按账号单独计算：2 个账号填 4，就是生图站最多 8 个同时跑。普通聊天仍按总数控制。",
+                          message: "所有并发都按启用账号单独计算。例如每账号对话 2、生图站 2、聊天生图 3：启用两个账号时总并发 14，停用一个后总并发 7。",
                           style: { marginBottom: 0 }
                         })
                       ]),
