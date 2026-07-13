@@ -8,7 +8,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-account-recovery-"
 process.env.DATA_DIR = dataDir;
 
 const { loadConfig, saveConfig } = await import("../src/storage.js");
-const { createChatCompletion } = await import("../src/channel-manager.js");
+const { createChatCompletion, createImageTask } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 
 after(async () => {
@@ -105,5 +105,87 @@ test("任务到来时会自动恢复掉线账号", async () => {
   } finally {
     ChatplusClient.prototype.check = originalCheck;
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
+  }
+});
+
+test("同一聊天账号的对话和生图不会同时登录", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    concurrency: { chat: 3, drawingImage: 2, chatImage: 2 },
+    accounts: [{
+      id: "account-exclusive",
+      channelId: "shareai",
+      name: "独享测试账号",
+      username: "exclusive@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", message: "绘图积分不足" },
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let activeLogins = 0;
+  let maxActiveLogins = 0;
+  const trackLogin = async () => {
+    activeLogins += 1;
+    maxActiveLogins = Math.max(maxActiveLogins, activeLogins);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    } finally {
+      activeLogins -= 1;
+    }
+  };
+
+  ChatplusClient.prototype.createChatCompletion = async () => {
+    await trackLogin();
+    return {
+      externalId: "conversation-exclusive",
+      model: "gpt",
+      content: "对话完成",
+      imageUrls: [],
+      raw: {}
+    };
+  };
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    await trackLogin();
+    return {
+      externalId: "image-exclusive",
+      status: "success",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: "gpt",
+      ratio: "1:1",
+      imageCount: 1,
+      imageUrls: [],
+      raw: {}
+    };
+  };
+
+  try {
+    await Promise.all([
+      createChatCompletion({
+        channel: "chatplus",
+        messages: [{ role: "user", content: "测试对话" }]
+      }),
+      createImageTask({
+        input: { channel: "chatplus", prompt: "测试改图" },
+        files: [{ filename: "test.png", mimetype: "image/png" }],
+        wait: true
+      })
+    ]);
+
+    assert.equal(maxActiveLogins, 1);
+  } finally {
+    ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
   }
 });

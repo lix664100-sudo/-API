@@ -7,11 +7,11 @@ import { getTask, listTasks, loadConfig, recordTaskStat, updateAccountStatus, up
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
 const defaultTaskConcurrency = { chat: 3, drawingImage: 2, chatImage: 2 };
-const chatAccountQueues = new Map();
 const scheduledChatTasks = new Set();
 const scheduledImageTasks = new Set();
 const activeTaskCounts = new Map();
 const activeAccountAuthTasks = new Map();
+const activeChatplusAccountWork = new Map();
 const clientCache = new Map();
 const accountRoutingState = new Map();
 const accountRecoveryTasks = new Map();
@@ -229,6 +229,20 @@ function accountSessionKey(account = {}) {
     String(account.username || account.id || "").trim().toLowerCase(),
     String(account.proxyUrl || account.proxy || "").trim()
   ].join("::");
+}
+
+async function runChatplusAccountWork(channel, account, work) {
+  if (channel?.type !== "chatplus") return work();
+
+  const key = accountSessionKey(account);
+  const previous = activeChatplusAccountWork.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(work);
+  activeChatplusAccountWork.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (activeChatplusAccountWork.get(key) === current) activeChatplusAccountWork.delete(key);
+  }
 }
 
 async function withAccountAuthLock(account, work) {
@@ -482,36 +496,6 @@ async function markChatCooldown(accountId, channel, error) {
   });
 }
 
-function queueChatForAccount(accountId, work) {
-  const key = String(accountId || "default");
-  const limit = taskSlotLimit("chat");
-  const state = chatAccountQueues.get(key) || { active: 0, queue: [] };
-  chatAccountQueues.set(key, state);
-
-  const drain = () => {
-    while (state.active < limit && state.queue.length) {
-      const next = state.queue.shift();
-      next();
-    }
-    if (state.active === 0 && !state.queue.length) chatAccountQueues.delete(key);
-  };
-
-  return new Promise((resolve, reject) => {
-    state.queue.push(async () => {
-      state.active += 1;
-      try {
-        resolve(await work());
-      } catch (error) {
-        reject(error);
-      } finally {
-        state.active = Math.max(0, state.active - 1);
-        drain();
-      }
-    });
-    drain();
-  });
-}
-
 function firstAccountForChannel(config, channelId) {
   return config.accounts
     .filter((account) => account.enabled !== false && (account.channelId === channelId || (channelId === "shareai" && account.channelId === "shareai")))
@@ -659,10 +643,10 @@ export async function refreshTask(taskId) {
   const externalId = taskExternalId(task);
   if (!externalId || (task.raw?.queued && String(externalId).startsWith("task-"))) return task;
 
-  const refreshedResult = await client.getTask(externalId, {
+  const refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
     carId: task.raw?.selectedCarId,
     carType: task.raw?.selectedCarType
-  });
+  }));
   const result = await mirrorTaskImages(refreshedTaskWaitState(task, refreshedResult, config.waitTimeoutSec), config);
   const nextTask = mergeRefreshedTask(task, result, channel, account);
   await upsertTask(nextTask);
@@ -903,7 +887,11 @@ async function recoverTarget(config, target) {
 
   const recovery = (async () => {
     try {
-      const status = await getClient(config, target.channel, target.account).check();
+      const status = await runChatplusAccountWork(
+        target.channel,
+        target.account,
+        () => getClient(config, target.channel, target.account).check()
+      );
       await updateTargetAccountStatus(target.account.id, target.channel, {
         ...status,
         cooldownUntil: null
@@ -1305,19 +1293,22 @@ async function runQueuedTextTask(task, input, reserved = null) {
         }
       }
       try {
-        if (!(await ensureTargetReady(config, target, "text2img", attempts))) continue;
-        const client = getWorkClient(config, channel, account);
-        let taskState = task;
-        const onSubmitted = async (submittedResult) => {
-          taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
-        };
-        let result = await client.createTextTask({ ...input, onSubmitted });
-        taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
-        if (channel.type === "drawing" && !isFinishedTask(result.status)) {
-          result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
-        }
-        result = await mirrorTaskImages(result, config);
-        return finishQueuedTask(taskState, result, channel, account, attempts);
+        const finishedTask = await runChatplusAccountWork(channel, account, async () => {
+          if (!(await ensureTargetReady(config, target, "text2img", attempts))) return null;
+          const client = getWorkClient(config, channel, account);
+          let taskState = task;
+          const onSubmitted = async (submittedResult) => {
+            taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
+          };
+          let result = await client.createTextTask({ ...input, onSubmitted });
+          taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
+          if (channel.type === "drawing" && !isFinishedTask(result.status)) {
+            result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
+          }
+          result = await mirrorTaskImages(result, config);
+          return finishQueuedTask(taskState, result, channel, account, attempts);
+        });
+        if (finishedTask) return finishedTask;
       } catch (error) {
         pushAttempt(attempts, target, error.message || "调用失败");
         if (!error.busy) {
@@ -1409,19 +1400,22 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
         }
       }
       try {
-        if (!(await ensureTargetReady(config, target, "img2img", attempts))) continue;
-        const client = getWorkClient(config, channel, account);
-        let taskState = task;
-        const onSubmitted = async (submittedResult) => {
-          taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
-        };
-        let result = await submitImageTask(client, { ...input, onSubmitted }, files);
-        taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
-        if (channel.type === "drawing" && !isFinishedTask(result.status)) {
-          result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
-        }
-        result = await mirrorTaskImages(result, config);
-        return finishQueuedTask(taskState, result, channel, account, attempts);
+        const finishedTask = await runChatplusAccountWork(channel, account, async () => {
+          if (!(await ensureTargetReady(config, target, "img2img", attempts))) return null;
+          const client = getWorkClient(config, channel, account);
+          let taskState = task;
+          const onSubmitted = async (submittedResult) => {
+            taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
+          };
+          let result = await submitImageTask(client, { ...input, onSubmitted }, files);
+          taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
+          if (channel.type === "drawing" && !isFinishedTask(result.status)) {
+            result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
+          }
+          result = await mirrorTaskImages(result, config);
+          return finishQueuedTask(taskState, result, channel, account, attempts);
+        });
+        if (finishedTask) return finishedTask;
       } catch (error) {
         pushAttempt(attempts, target, error.message || "调用失败");
         if (!error.busy) {
@@ -1486,15 +1480,18 @@ async function runChatCompletionTask(task, input) {
   for (const target of orderedChatTargets) {
     const { channel, account } = target;
     try {
-      if (!(await ensureTargetReady(config, target, "chat", attempts))) continue;
-      const client = getWorkClient(config, channel, account);
-      if (typeof client.createChatCompletion !== "function") {
-        throw new Error("这个渠道暂不支持对话。");
-      }
-      const result = await mirrorTaskImages(await client.createChatCompletion(input), config);
-      const responseJson = chatCompletionResponseJson({ result, channel });
-      const finishedTask = await finishChatTask(task, result, channel, account, attempts, responseJson);
-      return { result, channel, account, task: finishedTask, responseJson };
+      const finished = await runChatplusAccountWork(channel, account, async () => {
+        if (!(await ensureTargetReady(config, target, "chat", attempts))) return null;
+        const client = getWorkClient(config, channel, account);
+        if (typeof client.createChatCompletion !== "function") {
+          throw new Error("这个渠道暂不支持对话。");
+        }
+        const result = await mirrorTaskImages(await client.createChatCompletion(input), config);
+        const responseJson = chatCompletionResponseJson({ result, channel });
+        const finishedTask = await finishChatTask(task, result, channel, account, attempts, responseJson);
+        return { result, channel, account, task: finishedTask, responseJson };
+      });
+      if (finished) return finished;
     } catch (error) {
       const status = Number(error.status || error.statusCode || 0);
       attempts.push({
@@ -1620,7 +1617,7 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
   scheduledChatTasks.add(task.id);
   runInBackground(async () => {
     try {
-      await queueChatForAccount(task.accountId, () => runChatCompletionTask(task, input));
+      await runChatCompletionTask(task, input);
     } finally {
       scheduledChatTasks.delete(task.id);
       reserved.release();
@@ -1630,9 +1627,11 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
 }
 
 async function checkShareAIAbility(config, channel, account, ability) {
-  const client = getClient(config, shareAIAbilityChannel(channel, ability), account);
+  const abilityChannel = shareAIAbilityChannel(channel, ability);
+  const client = getClient(config, abilityChannel, account);
   try {
-    return { ok: true, data: await client.check() };
+    const data = await runChatplusAccountWork(abilityChannel, account, () => client.check());
+    return { ok: true, data };
   } catch (error) {
     return {
       ok: false,
@@ -1730,7 +1729,7 @@ export async function checkAccount(accountId) {
   }
   const client = getClient(config, channel, account);
   try {
-    const status = await client.check();
+    const status = await runChatplusAccountWork(channel, account, () => client.check());
     const nextStatus = withProxyCheckMeta({ ...status, cooldownUntil: null }, proxyResult);
     await updateAccountStatus(account.id, nextStatus);
     return nextStatus;
@@ -1827,7 +1826,7 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
     await upsertTask(task);
     scheduledChatTasks.add(task.id);
     try {
-      const result = await queueChatForAccount(task.accountId, () => runChatCompletionTask(task, input));
+      const result = await runChatCompletionTask(task, input);
       return chatCompletionResponse(result);
     } finally {
       scheduledChatTasks.delete(task.id);
@@ -1856,16 +1855,19 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
       continue;
     }
     try {
-      if (!(await ensureTargetReady(config, target, "text2img", attempts))) continue;
-      const client = getWorkClient(config, channel, account);
-      let result = await client.createTextTask(input);
-      if (wait && channel.type === "drawing") result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
-      result = await mirrorTaskImages(result, config);
-      const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
-      await upsertTask(task);
-      if (isFinishedTask(task.status)) await recordTaskStat(task);
-      await markAccountAvailable(account.id, channel);
-      return task;
+      const finishedTask = await runChatplusAccountWork(channel, account, async () => {
+        if (!(await ensureTargetReady(config, target, "text2img", attempts))) return null;
+        const client = getWorkClient(config, channel, account);
+        let result = await client.createTextTask(input);
+        if (wait && channel.type === "drawing") result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
+        result = await mirrorTaskImages(result, config);
+        const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
+        await upsertTask(task);
+        if (isFinishedTask(task.status)) await recordTaskStat(task);
+        await markAccountAvailable(account.id, channel);
+        return task;
+      });
+      if (finishedTask) return finishedTask;
     } catch (error) {
       pushAttempt(attempts, target, error.message || "调用失败");
       if (!error.busy) await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
