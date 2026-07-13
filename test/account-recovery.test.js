@@ -10,7 +10,7 @@ process.env.DATA_DIR = dataDir;
 const { loadConfig, saveConfig } = await import("../src/storage.js");
 const { createChatCompletion, createImageTask, createTextTask } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
-const { DrawingClient } = await import("../src/channels/drawing.js");
+const { DrawingClient, normalizeDrawingTask } = await import("../src/channels/drawing.js");
 
 after(async () => {
   await rm(dataDir, { recursive: true, force: true });
@@ -303,4 +303,14 @@ test("绘图额度为零时不会提交任务", async () => {
     DrawingClient.prototype.check = originalCheck;
     DrawingClient.prototype.createTextTask = originalCreateTextTask;
   }
+});
+
+test("绘图站中转 500 显示准确提示", () => {
+  const task = normalizeDrawingTask({
+    id: 34874,
+    status: "failed",
+    items: [{ error_message: "中转接口请求失败，状态码：500" }]
+  });
+
+  assert.equal(task.errorMessage, "绘图站上游服务异常（500），不是额度不足，请稍后重试。");
 });

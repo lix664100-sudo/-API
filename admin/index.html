@@ -1023,6 +1023,14 @@
         return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|聊天站登录状态|掉线/.test(String(value || ""));
       }
 
+      function drawingUpstreamErrorText(value) {
+        const text = String(value || "");
+        const relayFailure = text.match(/中转接口请求失败[^\d]*状态码\s*[:：]\s*(\d{3})/);
+        return relayFailure
+          ? `绘图站上游服务异常（${relayFailure[1]}），不是额度不足，请稍后重试。`
+          : text;
+      }
+
       function taskErrorText(row) {
         if (row?.status === "interrupted") return "";
         const text = row?.errorMessage || row?.responseJson?.message || "";
@@ -1030,7 +1038,7 @@
         if (isChatLoginErrorText(text)) {
           return "聊天站掉线，系统会自动重登和换车。若连续失败，请检测聊天账号后重试。";
         }
-        return text;
+        return drawingUpstreamErrorText(text);
       }
 
       function taskRawErrorText(row) {

@@ -111,8 +111,22 @@ function quotaResetAtFrom(profile, stats) {
   ]));
 }
 
+export function userFacingDrawingErrorMessage(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const relayFailure = text.match(/中转接口请求失败[^\d]*状态码\s*[:：]\s*(\d{3})/);
+  if (relayFailure) {
+    return `绘图站上游服务异常（${relayFailure[1]}），不是额度不足，请稍后重试。`;
+  }
+  return text;
+}
+
 export function normalizeDrawingTask(task, drawingBaseUrl = "") {
   const items = Array.isArray(task?.items) ? task.items : [];
+  const itemError = items
+    .map((item) => item?.error_message || item?.message || "")
+    .filter(Boolean)
+    .join("；");
   const imageUrls = items
     .map((item) => item?.image_url || item?.public_url || "")
     .filter(Boolean)
@@ -128,7 +142,7 @@ export function normalizeDrawingTask(task, drawingBaseUrl = "") {
     ratio: task?.ratio_label || task?.ratio || "",
     imageCount: Number(task?.image_count || imageUrls.length || 1),
     imageUrls,
-    errorMessage: task?.error_message || task?.message || "",
+    errorMessage: userFacingDrawingErrorMessage(task?.error_message || task?.message || itemError),
     raw: task
   };
 }
@@ -261,7 +275,8 @@ export class DrawingClient {
       payload = text ? { message: text } : null;
     }
     if (!response.ok || payload?.code) {
-      const error = new Error(payload?.message || payload?.msg || `绘图站请求失败：${response.status}`);
+      const message = payload?.message || payload?.msg || `绘图站请求失败：${response.status}`;
+      const error = new Error(userFacingDrawingErrorMessage(message));
       error.status = response.status;
       error.code = payload?.code;
       error.payload = payload;
