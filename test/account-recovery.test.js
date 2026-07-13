@@ -483,3 +483,73 @@ test("同一账号绘图上游连续失败三次后冷却十分钟", async () =>
     DrawingClient.prototype.createTextTask = originalCreateTextTask;
   }
 });
+
+test("绘图站提示上传过于频繁时按上游时间立即冷却", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    concurrency: { chat: 3, drawingImage: 2, chatImage: 2 },
+    accounts: [{
+      id: "account-drawing-rate-limit",
+      channelId: "shareai",
+      name: "绘图限流测试账号",
+      username: "drawing-rate-limit@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", quota: 50, balance: 10, message: "绘图账号可用" },
+          chatplus: { status: "ok", balance: 20, message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  const originalUploadImage = DrawingClient.prototype.uploadImage;
+  let uploadCount = 0;
+  DrawingClient.prototype.check = async () => ({
+    status: "ok",
+    quota: 50,
+    balance: 10,
+    message: "绘图账号可用"
+  });
+  DrawingClient.prototype.uploadImage = async () => {
+    uploadCount += 1;
+    throw new Error("上传过于频繁，请 354 秒后再试");
+  };
+
+  try {
+    await assert.rejects(createImageTask({
+      input: { channel: "drawing", prompt: "触发上游限流" },
+      file: { filename: "source.png", mimetype: "image/png", buffer: Buffer.from("image") },
+      wait: true
+    }), /上传过于频繁/);
+
+    const stored = await loadConfig();
+    const account = stored.accounts[0];
+    const drawing = account.meta.abilities.drawing;
+    const remaining = Date.parse(drawing.cooldownUntil) - Date.now();
+
+    assert.equal(drawing.status, "cooldown");
+    assert.equal(drawing.cooldownReason, "drawing_rate_limited");
+    assert.equal(drawing.upstreamFailureStreak, 0);
+    assert.match(drawing.message, /暂停绘图 354 秒/);
+    assert.ok(remaining > 350 * 1000 && remaining <= 354 * 1000);
+    assert.equal(account.meta.abilities.chatplus.status, "ok");
+    await assert.rejects(
+      createImageTask({
+        input: { channel: "drawing", prompt: "冷却时不能重复提交" },
+        file: { filename: "source.png", mimetype: "image/png", buffer: Buffer.from("image") },
+        wait: true
+      }),
+      (error) => error?.status === 503
+    );
+    assert.equal(uploadCount, 1);
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+    DrawingClient.prototype.uploadImage = originalUploadImage;
+  }
+});

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
-import { DrawingClient, drawingUpstreamFailureCode } from "./channels/drawing.js";
+import { DrawingClient, drawingRetryAfterSeconds, drawingUpstreamFailureCode } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
 import { checkProxyReachability, safeProxyEndpoint } from "./proxy.js";
 import { getTask, listTasks, loadConfig, recordTaskStat, updateAccountStatus, upsertTask } from "./storage.js";
@@ -610,11 +610,35 @@ async function markAccountAvailable(accountId, channel = "") {
   await updateTargetAccountStatus(accountId, channel, patch);
 }
 
-function drawingFailureCodeFromResult(result = {}) {
+function drawingFailureTextFromResult(result = {}) {
   const itemErrors = (result?.raw?.items || [])
     .map((item) => item?.error_message || item?.message || "")
     .filter(Boolean);
-  return drawingUpstreamFailureCode([result.errorMessage, ...itemErrors].filter(Boolean).join("；"));
+  return [result.errorMessage, ...itemErrors].filter(Boolean).join("；");
+}
+
+function drawingRateLimitPatch(retryAfterSeconds) {
+  return {
+    status: "cooldown",
+    cooldownUntil: new Date(Date.now() + retryAfterSeconds * 1000).toISOString(),
+    cooldownReason: "drawing_rate_limited",
+    upstreamFailureCode: "",
+    upstreamFailureStreak: 0,
+    message: `上传过于频繁，按上游要求暂停绘图 ${retryAfterSeconds} 秒。`
+  };
+}
+
+async function updateTargetStatusAfterError(account, channel, error) {
+  const retryAfterSeconds = channel?.type === "drawing"
+    ? drawingRetryAfterSeconds(error?.message)
+    : 0;
+  if (!retryAfterSeconds) {
+    await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
+    return;
+  }
+  await withAccountAuthLock(account, () => (
+    updateTargetAccountStatus(account.id, channel, drawingRateLimitPatch(retryAfterSeconds))
+  ));
 }
 
 async function updateAccountAfterTask(account, channel, result = {}) {
@@ -629,10 +653,17 @@ async function updateAccountAfterTask(account, channel, result = {}) {
     const drawing = currentAccount.meta?.abilities?.drawing || {};
     if (statusCooling(drawing)) return true;
 
-    const failureCode = result.status === "failed" ? drawingFailureCodeFromResult(result) : "";
+    const failureText = result.status === "failed" ? drawingFailureTextFromResult(result) : "";
+    const retryAfterSeconds = drawingRetryAfterSeconds(failureText);
+    const failureCode = drawingUpstreamFailureCode(failureText);
     const previousStreak = drawing.status === "cooldown"
       ? 0
       : Math.max(0, Number(drawing.upstreamFailureStreak || 0));
+
+    if (retryAfterSeconds) {
+      await updateTargetAccountStatus(account.id, channel, drawingRateLimitPatch(retryAfterSeconds));
+      return true;
+    }
 
     if (failureCode) {
       const upstreamFailureStreak = previousStreak + 1;
@@ -1455,7 +1486,7 @@ async function runQueuedTextTask(task, input, reserved = null) {
       } catch (error) {
         pushAttempt(attempts, target, error.message || "调用失败");
         if (!error.busy) {
-          await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
+          await updateTargetStatusAfterError(account, channel, error);
         }
       } finally {
         release();
@@ -1563,7 +1594,7 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
       } catch (error) {
         pushAttempt(attempts, target, error.message || "调用失败");
         if (!error.busy) {
-          await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
+          await updateTargetStatusAfterError(account, channel, error);
         }
       } finally {
         release();
@@ -2044,7 +2075,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
       if (finishedTask) return finishedTask;
     } catch (error) {
       pushAttempt(attempts, target, error.message || "调用失败");
-      if (!error.busy) await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
+      if (!error.busy) await updateTargetStatusAfterError(account, channel, error);
     } finally {
       release();
     }

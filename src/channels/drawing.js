@@ -119,6 +119,14 @@ export function drawingUpstreamFailureCode(value) {
   return text.match(/绘图站上游服务异常[（(](\d{3})[）)]/)?.[1] || "";
 }
 
+export function drawingRetryAfterSeconds(value) {
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  const match = text.match(/上传过于频繁[^\d]*请\s*(\d+)\s*秒后再试/);
+  const seconds = Number(match?.[1] || 0);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : 0;
+}
+
 export function userFacingDrawingErrorMessage(value) {
   const text = String(value || "").trim();
   if (!text) return "";

@@ -2358,7 +2358,10 @@
             render: (_, row) => {
               if (!drawingAccountIsCooling(row)) return statusTag(row.status);
               const drawing = drawingCooldownStatus(row);
-              const tooltip = `绘图站上游连续失败 3 次，已暂停该账号绘图；${formatDateTime(drawing.cooldownUntil)} 自动恢复。`;
+              const reason = drawing.cooldownReason === "drawing_rate_limited"
+                ? "绘图站提示上传过于频繁，已按上游要求暂停该账号绘图"
+                : "绘图站上游连续失败 3 次，已暂停该账号绘图";
+              const tooltip = `${reason}；${formatDateTime(drawing.cooldownUntil)} 自动恢复。`;
               return h(Space, { direction: "vertical", size: 2, align: "start" }, [
                 h("span", { key: "status" }, statusTag(row.status)),
                 h(Tooltip, { key: "cooldown", title: tooltip },
