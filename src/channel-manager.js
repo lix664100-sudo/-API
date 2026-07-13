@@ -992,6 +992,26 @@ async function recoverTarget(config, target) {
   return recovery;
 }
 
+export async function recoverUnavailableChatAccounts() {
+  const config = await loadRuntimeConfig();
+  const targets = selectTargets(config, "auto", "chat", { includeCooling: true });
+  const recoveryTargets = [...new Map(
+    targets
+      .filter((target) => target.channel.type === "chatplus" && targetNeedsRecovery(target))
+      .map((target) => [targetRecoveryKey(target), target])
+  ).values()];
+
+  return Promise.all(recoveryTargets.map(async (target) => {
+    const status = await recoverTarget(config, target);
+    return {
+      accountId: target.account.id,
+      channelId: target.channel.id,
+      recovered: ["ok", "quota_empty"].includes(status?.status),
+      status: status?.status || targetQuotaStatus(target).status || "unknown"
+    };
+  }));
+}
+
 async function selectReadyTargets(config, requestedChannel, taskType, options = {}) {
   const targets = selectTargets(config, requestedChannel, taskType, {
     ...options,

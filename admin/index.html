@@ -1242,7 +1242,7 @@
       function statusInfo(status) {
         const map = {
           ok: ["success", "可用"],
-          disconnected: ["warning", "掉线"],
+          disconnected: ["warning", "自动换线中"],
           quota_empty: ["warning", "额度不足"],
           error: ["error", "异常"],
           success: ["success", "成功"],
@@ -1767,6 +1767,12 @@
           return runtimeData;
         }
 
+        async function refreshAccountStatus() {
+          const nextConfig = await api("/api/config").catch(() => null);
+          if (nextConfig) setConfig(nextConfig);
+          return nextConfig;
+        }
+
         async function refresh() {
           const [nextConfig, taskList, statsData, storageData, runtimeData] = await Promise.all([
             api("/api/config"),
@@ -1818,6 +1824,13 @@
 
         useEffect(() => {
           refresh().catch((error) => message.error(error.message));
+        }, []);
+
+        useEffect(() => {
+          const timer = setInterval(() => {
+            refreshAccountStatus().catch(() => {});
+          }, 5000);
+          return () => clearInterval(timer);
         }, []);
 
         useEffect(() => {
@@ -2626,7 +2639,7 @@
                     h(Select, { value: statusFilter, onChange: setStatusFilter, options: [
                       { label: "全部状态", value: "all" },
                       { label: "可用", value: "ok" },
-                      { label: "掉线", value: "disconnected" },
+                      { label: "自动换线中", value: "disconnected" },
                       { label: "额度不足", value: "quota_empty" },
                       { label: "异常", value: "error" },
                       { label: "未检测", value: "unknown" },

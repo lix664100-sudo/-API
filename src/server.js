@@ -16,6 +16,7 @@ import {
   getRuntimeStatus,
   queueChatCompletion,
   queueImageTask,
+  recoverUnavailableChatAccounts,
   refreshProcessingTasks,
   refreshTask
 } from "./channel-manager.js";
@@ -876,6 +877,20 @@ function schedulePendingTaskRefresh() {
   timer.unref?.();
 }
 
+function scheduleAccountRecovery() {
+  const recover = async () => {
+    try {
+      await recoverUnavailableChatAccounts();
+    } catch (error) {
+      app.log.warn({ error }, "account recovery failed");
+    } finally {
+      const timer = setTimeout(recover, 30_000);
+      timer.unref?.();
+    }
+  };
+  recover();
+}
+
 const port = Number(process.env.PORT || 3210);
 const host = process.env.HOST || "127.0.0.1";
 
@@ -883,6 +898,7 @@ try {
   await app.listen({ port, host });
   scheduleResultImageCleanup();
   schedulePendingTaskRefresh();
+  scheduleAccountRecovery();
   app.log.info(`管理后台：http://${host}:${port}/admin/`);
 } catch (error) {
   app.log.error(error);

@@ -8,7 +8,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-account-recovery-"
 process.env.DATA_DIR = dataDir;
 
 const { loadConfig, saveConfig } = await import("../src/storage.js");
-const { createChatCompletion, createImageTask, createTextTask, getRuntimeStatus } = await import("../src/channel-manager.js");
+const { createChatCompletion, createImageTask, createTextTask, getRuntimeStatus, recoverUnavailableChatAccounts } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient, normalizeDrawingTask } = await import("../src/channels/drawing.js");
 
@@ -106,6 +106,56 @@ test("任务到来时会自动恢复掉线账号", async () => {
   } finally {
     ChatplusClient.prototype.check = originalCheck;
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
+  }
+});
+
+test("没有任务时后台也会自动恢复失效的聊天线路", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-background-recovery",
+      channelId: "shareai",
+      name: "后台恢复测试账号",
+      username: "background@example.com",
+      password: "test",
+      enabled: true,
+      status: "disconnected",
+      message: "共享线路失效",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", message: "绘图积分不足" },
+          chatplus: { status: "disconnected", message: "共享线路失效" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 18,
+      balance: 18,
+      message: "聊天账号可用"
+    };
+  };
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const account = stored.accounts.find((item) => item.id === "account-background-recovery");
+
+    assert.equal(checkCount, 1);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].recovered, true);
+    assert.equal(account.status, "ok");
+    assert.equal(account.meta.abilities.chatplus.status, "ok");
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
   }
 });
 
