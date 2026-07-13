@@ -14,6 +14,9 @@ const activeTaskCounts = new Map();
 const activeAccountAuthTasks = new Map();
 const clientCache = new Map();
 const accountRoutingState = new Map();
+const accountRecoveryTasks = new Map();
+const accountRecoveryRetryAt = new Map();
+const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 
 function taskRequestMeta(value = {}) {
@@ -874,11 +877,76 @@ function targetQuotaStatus(target) {
 
 function targetKnownUnavailable(target) {
   const status = String(targetQuotaStatus(target).status || "unknown").toLowerCase();
-  return ["quota_empty", "error", "failed", "disconnected", "disabled"].includes(status);
+  return ["error", "failed", "disconnected", "disabled"].includes(status);
 }
 
 function admissionTargets(targets) {
   return targets.filter((target) => !targetKnownUnavailable(target));
+}
+
+function targetRecoveryKey(target) {
+  return `${target?.channel?.id || "channel"}:${target?.account?.id || "account"}`;
+}
+
+function targetNeedsRecovery(target) {
+  const status = String(targetQuotaStatus(target).status || "unknown").toLowerCase();
+  return (
+    target?.channel?.type === "chatplus" && accountCooling(target.account)
+  ) || ["error", "failed", "disconnected"].includes(status);
+}
+
+async function recoverTarget(config, target) {
+  const key = targetRecoveryKey(target);
+  const active = accountRecoveryTasks.get(key);
+  if (active) return active;
+  if ((accountRecoveryRetryAt.get(key) || 0) > Date.now()) return null;
+
+  const recovery = (async () => {
+    try {
+      const status = await getClient(config, target.channel, target.account).check();
+      await updateTargetAccountStatus(target.account.id, target.channel, {
+        ...status,
+        cooldownUntil: null
+      });
+      if (["ok", "quota_empty"].includes(status.status)) {
+        accountRecoveryRetryAt.delete(key);
+        return status;
+      }
+      accountRecoveryRetryAt.set(key, Date.now() + ACCOUNT_RECOVERY_RETRY_MS);
+      return null;
+    } catch (error) {
+      await updateTargetAccountStatus(target.account.id, target.channel, accountStatusFromError(error));
+      accountRecoveryRetryAt.set(key, Date.now() + ACCOUNT_RECOVERY_RETRY_MS);
+      return null;
+    } finally {
+      accountRecoveryTasks.delete(key);
+    }
+  })();
+  accountRecoveryTasks.set(key, recovery);
+  return recovery;
+}
+
+async function selectReadyTargets(config, requestedChannel, taskType, options = {}) {
+  const targets = selectTargets(config, requestedChannel, taskType, {
+    ...options,
+    includeCooling: true
+  });
+  const ready = admissionTargets(targets).filter((target) => !(
+    target.channel.type === "chatplus" && accountCooling(target.account)
+  ));
+  const recoveryTargets = targets.filter(targetNeedsRecovery);
+  if (!recoveryTargets.length) return ready;
+
+  const recoveries = recoveryTargets.map((target) => recoverTarget(config, target));
+  if (ready.length) {
+    Promise.all(recoveries).catch((error) => console.error(error));
+    return ready;
+  }
+  const recovered = await Promise.all(recoveries);
+  return recoveryTargets.filter((_target, index) => (
+    recovered[index]?.status === "ok"
+      || (taskType === "chat" && recovered[index]?.status === "quota_empty")
+  ));
 }
 
 function noUsableTargetError(taskType) {
@@ -1218,7 +1286,7 @@ async function persistSubmittedTask(task, result, channel, account, attempts) {
 async function runQueuedTextTask(task, input, reserved = null) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = admissionTargets(selectTargets(config, requestedChannel, "text2img"));
+  const targets = await selectReadyTargets(config, requestedChannel, "text2img");
   const attempts = [...(reserved?.attempts || [])];
   let reservedRelease = reserved?.release || null;
   try {
@@ -1322,7 +1390,7 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = admissionTargets(selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId }));
+  const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId });
   const attempts = [...(reserved?.attempts || [])];
   let reservedRelease = reserved?.release || null;
   try {
@@ -1402,7 +1470,7 @@ async function runChatCompletionTask(task, input) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = admissionTargets(selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId }));
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId });
   const preferredTarget = requestedAccountId
     ? null
     : targets.find((target) => target.account.id === task.accountId && target.channel.id === task.channelId);
@@ -1469,7 +1537,7 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   }
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = admissionTargets(selectTargets(config, requestedChannel, "text2img", { balanced: true }));
+  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true });
   if (!targets.length) throw noUsableTargetError("text2img");
 
   const reserved = reserveFirstAvailableTarget(targets, "text2img");
@@ -1501,7 +1569,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = admissionTargets(selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: true }));
+  const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: true });
   if (!targets.length) throw noUsableTargetError("img2img");
 
   const reserved = reserveFirstAvailableTarget(targets, "img2img");
@@ -1529,7 +1597,7 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = admissionTargets(selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true }));
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
   if (!targets.length) throw noUsableTargetError("chat");
 
   const reserved = reserveFirstAvailableTarget(targets, "chat");
@@ -1741,7 +1809,7 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = admissionTargets(selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true }));
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
   if (!targets.length) throw noUsableTargetError("chat");
 
   const reserved = reserveFirstAvailableTarget(targets, "chat");
@@ -1776,7 +1844,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
   }
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = admissionTargets(selectTargets(config, requestedChannel, "text2img", { balanced: true }));
+  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true });
   if (!targets.length) throw noUsableTargetError("text2img");
 
   const attempts = [];
@@ -1818,7 +1886,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = admissionTargets(selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: wait }));
+  const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: wait });
   if (!targets.length) throw noUsableTargetError("img2img");
 
   if (wait) {

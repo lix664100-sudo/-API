@@ -957,7 +957,7 @@ export class ChatplusClient {
         model: this.channel?.settings?.defaultChatModel || "",
         preferImageCar: true,
         checkTimeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC
-      }, new Set(), 1);
+      }, new Set(), 5);
       const imageLimit = limitFromInit(init);
       const remaining = imageLimit.remaining ?? null;
       const remainingNumber = numberOrNull(remaining);
