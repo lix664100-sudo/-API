@@ -4,7 +4,7 @@ import { normalizeProxyUrl } from "../proxy.js";
 
 const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
 const ACCOUNT_CHECK_TIMEOUT_SEC = 8;
-const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 180;
+const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 300;
 const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
 const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
@@ -444,6 +444,42 @@ function extractAssistantText(events) {
   if (patchText) candidates.push(patchText);
   candidates.push(...collectAssistantText(events).filter(Boolean));
   return candidates.sort((a, b) => b.length - a.length)[0] || "";
+}
+
+function explicitConversationState(value, seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return null;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const state = explicitConversationState(item, seen);
+      if (state) return state;
+    }
+    return null;
+  }
+
+  const status = String(value.status || value.state || value.task_status || value.taskStatus || "").toLowerCase();
+  const message = String(
+    value.error_message
+      || value.errorMessage
+      || value.failure_reason
+      || value.failureReason
+      || value.error?.message
+      || value.detail?.message
+      || value.message?.error
+      || ""
+  ).trim();
+  if (["cancelled", "canceled"].includes(status)) {
+    return { status: "cancelled", message: message || "上游已取消任务。" };
+  }
+  if (["failed", "failure", "error"].includes(status)) {
+    return { status: "failed", message: message || "上游明确返回任务失败。" };
+  }
+
+  for (const item of Object.values(value)) {
+    const state = explicitConversationState(item, seen);
+    if (state) return state;
+  }
+  return null;
 }
 
 function grokTextFromValue(value) {
@@ -1182,7 +1218,7 @@ export class ChatplusClient {
     let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: options.generatedOnly });
     if (imageUrls.length || !conversationId) return imageUrls;
 
-    const timeoutMs = Math.max(5, Number(timeoutSec || this.config.waitTimeoutSec || 180)) * 1000;
+    const timeoutMs = Math.max(5, Number(timeoutSec || this.config.waitTimeoutSec || DEFAULT_CHAT_HTTP_TIMEOUT_SEC)) * 1000;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
@@ -1190,13 +1226,84 @@ export class ChatplusClient {
         throwIfImageGenerationLimit(extractAssistantText(detail));
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
+        const explicitState = explicitConversationState(detail);
+        if (explicitState) {
+          const error = new Error(explicitState.message);
+          error.upstreamExplicitFailure = true;
+          error.upstreamStatus = explicitState.status;
+          throw error;
+        }
       } catch (error) {
-        if (error.imageQuotaExhausted) throw error;
+        if (error.imageQuotaExhausted || error.upstreamExplicitFailure) throw error;
         // Images can appear shortly after the streamed response finishes.
       }
       await new Promise((resolve) => setTimeout(resolve, 5000));
     }
     return [];
+  }
+
+  async getTask(externalId, context = {}) {
+    if (!externalId) throw new Error("缺少上游任务编号。");
+    await this.loginPortal();
+    const readDetail = async () => {
+      const payload = await this.json(`/backend-api/conversation/${encodeURIComponent(externalId)}`);
+      if (!payload || typeof payload !== "object") throw new Error("上游暂时没有返回有效任务状态。");
+      return payload;
+    };
+    let detail = null;
+    try {
+      detail = await readDetail();
+    } catch (_directError) {
+      if (context.carId) {
+        this.carId = String(context.carId);
+        this.carType = String(context.carType || "chatgpt");
+        await this.enterCar(this.carId, this.carType);
+      } else if (!this.carId) {
+        await this.login();
+      }
+      detail = await readDetail();
+    }
+    const imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
+    if (imageUrls.length) {
+      return {
+        externalId,
+        status: "success",
+        imageCount: imageUrls.length,
+        imageUrls,
+        errorMessage: "",
+        raw: detail
+      };
+    }
+    const content = extractAssistantText(detail);
+    if (isImageGenerationLimitMessage(content)) {
+      return {
+        externalId,
+        status: "failed",
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: "上游明确返回图片生成额度不足。",
+        raw: detail
+      };
+    }
+    const explicitState = explicitConversationState(detail);
+    if (explicitState) {
+      return {
+        externalId,
+        status: explicitState.status,
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: explicitState.message,
+        raw: detail
+      };
+    }
+    return {
+      externalId,
+      status: "waiting_upstream",
+      imageCount: 0,
+      imageUrls: [],
+      errorMessage: "",
+      raw: detail
+    };
   }
 
   async createTextTask(input) {
@@ -1205,21 +1312,20 @@ export class ChatplusClient {
       if (!prompt) throw new Error("请输入生图描述。");
       const result = await this.withImageQuotaFallback(prompt, { ...input, preferImageCar: true }, async (conversation) => {
         const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec);
-        if (!imageUrls.length) throw new Error("聊天通道没有返回图片，已尝试切换备用渠道。");
         return { ...conversation, imageUrls };
       });
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
 
       return {
         externalId: conversationId || messageId,
-        status: "success",
+        status: imageUrls.length ? "success" : "waiting_upstream",
         prompt,
         taskType: "text2img",
         modelId: model,
         ratio: input.ratio_label || input.ratio || "",
         imageCount: imageUrls.length,
         imageUrls,
-        raw: { conversationId, eventCount: events.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy }
+        raw: { conversationId, eventCount: events.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy }
       };
     });
   }
@@ -1233,21 +1339,20 @@ export class ChatplusClient {
 
       const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: true }, async (conversation) => {
         const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true });
-        if (!imageUrls.length) throw new Error("Chat image channel did not return an edited image.");
         return { ...conversation, imageUrls };
       });
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
 
       return {
         externalId: conversationId || messageId,
-        status: "success",
+        status: imageUrls.length ? "success" : "waiting_upstream",
         prompt,
         taskType: "img2img",
         modelId: model,
         ratio: input.ratio_label || input.ratio || "",
         imageCount: imageUrls.length,
         imageUrls,
-        raw: { conversationId, eventCount: events.length, sourceImageCount: files.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy }
+        raw: { conversationId, eventCount: events.length, sourceImageCount: files.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy }
       };
     });
   }

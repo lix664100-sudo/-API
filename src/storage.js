@@ -60,7 +60,8 @@ const defaultConfig = {
   defaultModelId: 1,
   defaultRatio: "1:1",
   defaultImageCount: 1,
-  waitTimeoutSec: 180,
+  waitTimeoutSec: 300,
+  waitTimeoutVersion: 2,
   imageStorage: defaultImageStorage,
   concurrency: defaultConcurrency,
   channels: defaultChannels,
@@ -111,6 +112,13 @@ function normalizeConcurrency(value = {}) {
     drawingImage: Math.min(20, Math.max(1, Number(value.drawingImage || defaultConcurrency.drawingImage))),
     chatImage: Math.min(20, Math.max(1, Number(value.chatImage || defaultConcurrency.chatImage)))
   };
+}
+
+function normalizeWaitTimeout(stored = {}) {
+  const value = Number(stored.waitTimeoutSec);
+  const migrateLegacyDefault = stored.waitTimeoutVersion !== 2 && (!Number.isFinite(value) || value === 180);
+  const seconds = migrateLegacyDefault || !Number.isFinite(value) || value <= 0 ? defaultConfig.waitTimeoutSec : value;
+  return Math.min(3600, Math.max(30, Number.isFinite(seconds) ? seconds : defaultConfig.waitTimeoutSec));
 }
 
 function normalizeChatModels(settings = {}, migrateAutoSelection = false) {
@@ -357,6 +365,8 @@ function normalizeConfig(stored = {}) {
     defaultChannel,
     imageStorage: normalizeImageStorage(stored.imageStorage),
     concurrency: normalizeConcurrency(stored.concurrency),
+    waitTimeoutSec: normalizeWaitTimeout(stored),
+    waitTimeoutVersion: 2,
     channels,
     accounts: normalizeAccounts(stored)
   };
@@ -375,7 +385,13 @@ function redactAccount(account) {
 export async function loadConfig() {
   const stored = await readJson(configFile, {});
   const config = normalizeConfig(stored);
-  if (!stored.apiKey || !Array.isArray(stored.channels) || !Array.isArray(stored.accounts)) {
+  if (
+    !stored.apiKey
+    || !Array.isArray(stored.channels)
+    || !Array.isArray(stored.accounts)
+    || stored.waitTimeoutVersion !== 2
+    || Number(stored.waitTimeoutSec) !== config.waitTimeoutSec
+  ) {
     await writeJson(configFile, config);
   }
   return config;

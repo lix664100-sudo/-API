@@ -631,7 +631,7 @@ app.post("/api/config", async (request) => {
     defaultModelId: Number(body.defaultModelId || current.defaultModelId || 1),
     defaultRatio: body.defaultRatio || current.defaultRatio || "1:1",
     defaultImageCount: Number(body.defaultImageCount || current.defaultImageCount || 1),
-    waitTimeoutSec: Number(body.waitTimeoutSec || current.waitTimeoutSec || 180),
+    waitTimeoutSec: Number(body.waitTimeoutSec ?? current.waitTimeoutSec ?? 300),
     imageStorage: body.imageStorage || current.imageStorage,
     concurrency: body.concurrency || current.concurrency
   });
@@ -858,12 +858,30 @@ function scheduleResultImageCleanup() {
   timer.unref?.();
 }
 
+function schedulePendingTaskRefresh() {
+  let refreshing = false;
+  const refresh = async () => {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      await refreshProcessingTasks();
+    } catch (error) {
+      app.log.warn({ error }, "pending task refresh failed");
+    } finally {
+      refreshing = false;
+    }
+  };
+  const timer = setInterval(refresh, 30_000);
+  timer.unref?.();
+}
+
 const port = Number(process.env.PORT || 3210);
 const host = process.env.HOST || "127.0.0.1";
 
 try {
   await app.listen({ port, host });
   scheduleResultImageCleanup();
+  schedulePendingTaskRefresh();
   app.log.info(`管理后台：http://${host}:${port}/admin/`);
 } catch (error) {
   app.log.error(error);

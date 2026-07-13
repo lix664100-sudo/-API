@@ -124,6 +124,19 @@ function runtimeAccountConcurrency(config, concurrency, availableOnly = false) {
   };
 }
 
+function runtimeCategory(configured, available, running, slots) {
+  const sum = (source) => slots.reduce((total, slot) => total + Number(source?.[slot] || 0), 0);
+  const configuredTotal = sum(configured);
+  const availableTotal = sum(available);
+  const runningTotal = sum(running);
+  return {
+    configured: configuredTotal,
+    available: availableTotal,
+    running: runningTotal,
+    idle: Math.max(0, availableTotal - runningTotal)
+  };
+}
+
 export async function getRuntimeStatus() {
   const config = await loadConfig();
   const concurrency = normalizeTaskConcurrency(config.concurrency);
@@ -135,6 +148,12 @@ export async function getRuntimeStatus() {
     drawingImage: activeCountForSlot("drawingImage"),
     chatImage: activeCountForSlot("chatImage")
   };
+  const tasks = await listTasks();
+  const waiting = {
+    image: tasks.filter((task) => task.status === "waiting_upstream" && task.taskType !== "chat").length,
+    chat: tasks.filter((task) => task.status === "waiting_upstream" && task.taskType === "chat").length
+  };
+  waiting.total = waiting.image + waiting.chat;
   return {
     concurrency: {
       ...concurrency,
@@ -146,7 +165,12 @@ export async function getRuntimeStatus() {
     running: {
       ...running,
       total: taskConcurrencyTotal(running)
-    }
+    },
+    categories: {
+      image: runtimeCategory(configured, available, running, ["drawingImage", "chatImage"]),
+      chat: runtimeCategory(configured, available, running, ["chat"])
+    },
+    waiting
   };
 }
 
@@ -249,6 +273,14 @@ function getClient(config, channel, account) {
   return client;
 }
 
+function getWorkClient(config, channel, account) {
+  if (channel.type !== "chatplus") return getClient(config, channel, account);
+  return new ChatplusClient({
+    ...clientContext(config, channel, account),
+    sessionLock: async (work) => work()
+  });
+}
+
 function shareAIAbilityChannel(channel, ability) {
   const settings = channel?.settings || {};
   if (ability === "chatplus") {
@@ -298,7 +330,7 @@ function shareAIAbilitiesForTask(channel, requestedChannel, taskType) {
 }
 
 function isPendingTask(status) {
-  return ["processing", "queued", "pending", "unknown"].includes(status);
+  return ["processing", "queued", "pending", "unknown", "waiting_upstream"].includes(status);
 }
 
 function isFinishedTask(status) {
@@ -574,7 +606,10 @@ function mergeRefreshedTask(task, result, channel, account) {
     completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : task.completedAt || null,
     requestJson: task.requestJson || null,
     responseJson: taskResponseJson(result),
-    raw: result.raw || task.raw || result
+    raw: {
+      ...(task.raw || {}),
+      ...(result.raw || {})
+    }
   };
 }
 
@@ -585,13 +620,16 @@ export async function refreshTask(taskId) {
 
   const config = await loadRuntimeConfig();
   const { channel, account } = inferRefreshTarget(config, task);
-  const client = getClient(config, channel, account);
+  const client = getWorkClient(config, channel, account);
   if (typeof client.getTask !== "function") return task;
 
   const externalId = taskExternalId(task);
   if (!externalId || (task.raw?.queued && String(externalId).startsWith("task-"))) return task;
 
-  const result = await mirrorTaskImages(await client.getTask(externalId), config);
+  const result = await mirrorTaskImages(await client.getTask(externalId, {
+    carId: task.raw?.selectedCarId,
+    carType: task.raw?.selectedCarType
+  }), config);
   const nextTask = mergeRefreshedTask(task, result, channel, account);
   await upsertTask(nextTask);
   if (isFinishedTask(nextTask.status)) await recordTaskStat(nextTask);
@@ -768,6 +806,23 @@ function targetQuotaStatus(target) {
   const ability = channelAbilityKey(target?.channel);
   const abilityStatus = ability ? target?.account?.meta?.abilities?.[ability] || {} : null;
   return abilityStatus && Object.keys(abilityStatus).length ? abilityStatus : target?.account || {};
+}
+
+function targetKnownUnavailable(target) {
+  const status = String(targetQuotaStatus(target).status || "unknown").toLowerCase();
+  return ["quota_empty", "error", "failed", "disconnected", "disabled"].includes(status);
+}
+
+function admissionTargets(targets) {
+  return targets.filter((target) => !targetKnownUnavailable(target));
+}
+
+function noUsableTargetError(taskType) {
+  const error = new Error(taskType === "chat"
+    ? "当前没有可用的对话账号，请先检测账号状态。"
+    : "当前没有可用的生图账号，请先检测账号状态或等待额度恢复。");
+  error.status = 503;
+  return error;
 }
 
 function shouldRefreshQuotaBeforeUse(target, taskType) {
@@ -1082,7 +1137,7 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
 async function runQueuedTextTask(task, input, reserved = null) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "text2img");
+  const targets = admissionTargets(selectTargets(config, requestedChannel, "text2img"));
   const attempts = [...(reserved?.attempts || [])];
   let reservedRelease = reserved?.release || null;
   try {
@@ -1102,10 +1157,10 @@ async function runQueuedTextTask(task, input, reserved = null) {
       }
       try {
         if (!(await ensureTargetReady(config, target, "text2img", attempts))) continue;
-        const client = getClient(config, channel, account);
+        const client = getWorkClient(config, channel, account);
         let result = await client.createTextTask(input);
         if (channel.type === "drawing" && !isFinishedTask(result.status)) {
-          result = await client.waitForTask(result.externalId);
+          result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
         }
         result = await mirrorTaskImages(result, config);
         return finishQueuedTask(task, result, channel, account, attempts);
@@ -1139,11 +1194,49 @@ async function submitImageTask(client, input, files) {
   });
 }
 
+function waitingUpstreamResult(result, lastResult = null, lastError = null) {
+  const source = lastResult || result || {};
+  return {
+    ...result,
+    ...source,
+    externalId: source.externalId || result?.externalId,
+    status: "waiting_upstream",
+    imageUrls: source.imageUrls || result?.imageUrls || [],
+    errorMessage: "",
+    raw: {
+      ...(result?.raw || {}),
+      ...(source.raw || {}),
+      waitingUpstream: true,
+      waitingSince: new Date().toISOString(),
+      lastPollMessage: lastError?.message || ""
+    }
+  };
+}
+
+async function waitForUpstreamTask(client, result, timeoutSec) {
+  if (isFinishedTask(result?.status) || !result?.externalId || typeof client.getTask !== "function") return result;
+  const seconds = Math.min(3600, Math.max(30, Number(timeoutSec || 300)));
+  const deadline = Date.now() + seconds * 1000;
+  let lastResult = result;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    try {
+      lastResult = await client.getTask(result.externalId);
+      lastError = null;
+      if (isFinishedTask(lastResult?.status)) return lastResult;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  return waitingUpstreamResult(result, lastResult, lastError);
+}
+
 async function runQueuedImageTask(task, input, files, reserved = null) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId });
+  const targets = admissionTargets(selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId }));
   const attempts = [...(reserved?.attempts || [])];
   let reservedRelease = reserved?.release || null;
   try {
@@ -1163,10 +1256,10 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
       }
       try {
         if (!(await ensureTargetReady(config, target, "img2img", attempts))) continue;
-        const client = getClient(config, channel, account);
+        const client = getWorkClient(config, channel, account);
         let result = await submitImageTask(client, input, files);
         if (channel.type === "drawing" && !isFinishedTask(result.status)) {
-          result = await client.waitForTask(result.externalId);
+          result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
         }
         result = await mirrorTaskImages(result, config);
         return finishQueuedTask(task, result, channel, account, attempts);
@@ -1218,7 +1311,7 @@ async function runChatCompletionTask(task, input) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId });
+  const targets = admissionTargets(selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId }));
   const preferredTarget = requestedAccountId
     ? null
     : targets.find((target) => target.account.id === task.accountId && target.channel.id === task.channelId);
@@ -1235,7 +1328,7 @@ async function runChatCompletionTask(task, input) {
     const { channel, account } = target;
     try {
       if (!(await ensureTargetReady(config, target, "chat", attempts))) continue;
-      const client = getClient(config, channel, account);
+      const client = getWorkClient(config, channel, account);
       if (typeof client.createChatCompletion !== "function") {
         throw new Error("这个渠道暂不支持对话。");
       }
@@ -1285,8 +1378,8 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   }
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "text2img", { balanced: true });
-  if (!targets.length) throw new Error("没有可用的文生图渠道或账号。");
+  const targets = admissionTargets(selectTargets(config, requestedChannel, "text2img", { balanced: true }));
+  if (!targets.length) throw noUsableTargetError("text2img");
 
   const reserved = reserveFirstAvailableTarget(targets, "text2img");
   const task = queuedTask({ input, target: reserved.target, taskType: "text2img", requestMeta });
@@ -1312,8 +1405,8 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: true });
-  if (!targets.length) throw new Error("图生图目前没有可用渠道。");
+  const targets = admissionTargets(selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: true }));
+  if (!targets.length) throw noUsableTargetError("img2img");
 
   const reserved = reserveFirstAvailableTarget(targets, "img2img");
   const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img", requestMeta });
@@ -1335,8 +1428,8 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
-  if (!targets.length) throw noChatTargetsError(config, requestedChannel);
+  const targets = admissionTargets(selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true }));
+  if (!targets.length) throw noUsableTargetError("chat");
 
   const reserved = reserveFirstAvailableTarget(targets, "chat");
   const task = queuedTask({
@@ -1433,6 +1526,24 @@ export async function checkAccount(accountId) {
   if (!account) throw new Error("账号不存在。");
   const channel = config.channels.find((item) => item.id === account.channelId);
   if (!channel) throw new Error("账号所属渠道不存在。");
+  const activeSlots = ["chat", "drawingImage", "chatImage"].reduce((result, slot) => {
+    const count = activeTaskCounts.get(`${slot}:${account.id}`) || 0;
+    if (count) result[slot] = count;
+    return result;
+  }, {});
+  if (Object.keys(activeSlots).length) {
+    return {
+      status: account.status || "unknown",
+      quota: account.quota ?? null,
+      balance: account.balance ?? null,
+      quotaResetAt: account.quotaResetAt || "",
+      expireAt: account.expireAt || "",
+      message: "账号正在处理任务，本次检测已跳过，当前状态保持不变。",
+      busy: true,
+      checkSkipped: true,
+      activeSlots
+    };
+  }
   const proxyResult = await checkAccountProxy(
     account,
     channel.type === "shareai" ? shareAIAbilityChannel(channel, "drawing") : channel
@@ -1529,8 +1640,8 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
-  if (!targets.length) throw noChatTargetsError(config, requestedChannel);
+  const targets = admissionTargets(selectTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true }));
+  if (!targets.length) throw noUsableTargetError("chat");
 
   const reserved = reserveFirstAvailableTarget(targets, "chat");
   try {
@@ -1564,8 +1675,8 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
   }
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = selectTargets(config, requestedChannel, "text2img", { balanced: true });
-  if (!targets.length) throw new Error("没有可用的文生图渠道或账号。");
+  const targets = admissionTargets(selectTargets(config, requestedChannel, "text2img", { balanced: true }));
+  if (!targets.length) throw noUsableTargetError("text2img");
 
   const attempts = [];
   for (const target of targets) {
@@ -1577,9 +1688,9 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
     }
     try {
       if (!(await ensureTargetReady(config, target, "text2img", attempts))) continue;
-      const client = getClient(config, channel, account);
+      const client = getWorkClient(config, channel, account);
       let result = await client.createTextTask(input);
-      if (wait && channel.type === "drawing") result = await client.waitForTask(result.externalId);
+      if (wait && channel.type === "drawing") result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
       result = await mirrorTaskImages(result, config);
       const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
       await upsertTask(task);
@@ -1606,8 +1717,8 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: wait });
-  if (!targets.length) throw new Error("图生图目前没有可用渠道。");
+  const targets = admissionTargets(selectTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: wait }));
+  if (!targets.length) throw noUsableTargetError("img2img");
 
   if (wait) {
     const reserved = reserveFirstAvailableTarget(targets, "img2img");

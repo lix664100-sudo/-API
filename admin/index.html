@@ -147,7 +147,7 @@
 
       .metrics-grid {
         display: grid;
-        grid-template-columns: repeat(7, minmax(0, 1fr));
+        grid-template-columns: repeat(6, minmax(0, 1fr));
         gap: 12px;
         margin-bottom: 14px;
       }
@@ -191,6 +191,109 @@
         font-size: 15px;
         line-height: 1.35;
         white-space: normal;
+      }
+
+      .capacity-panel {
+        overflow: hidden;
+        margin-bottom: 14px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--panel);
+      }
+
+      .capacity-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 14px 18px;
+        border-bottom: 1px solid var(--line);
+        background: linear-gradient(90deg, rgba(22, 119, 255, 0.055), rgba(255, 255, 255, 0));
+      }
+
+      .capacity-title {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        font-size: 14px;
+        font-weight: 760;
+      }
+
+      .capacity-subtitle {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .capacity-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .capacity-lane {
+        min-width: 0;
+        padding: 17px 18px 16px;
+      }
+
+      .capacity-lane + .capacity-lane {
+        border-left: 1px solid var(--line);
+      }
+
+      .capacity-lane-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+
+      .capacity-lane-name {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        font-size: 14px;
+        font-weight: 740;
+      }
+
+      .capacity-lane-icon {
+        display: grid;
+        place-items: center;
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        color: #1677ff;
+        background: #eaf2ff;
+      }
+
+      .capacity-lane.chat .capacity-lane-icon {
+        color: #7c3aed;
+        background: #f3e8ff;
+      }
+
+      .capacity-stats {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+        margin-bottom: 10px;
+      }
+
+      .capacity-stat-label {
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .capacity-stat-value {
+        margin-top: 3px;
+        font-size: 18px;
+        font-weight: 760;
+        line-height: 1.1;
+      }
+
+      .capacity-stat.running .capacity-stat-value {
+        color: var(--brand);
+      }
+
+      .capacity-stat.idle .capacity-stat-value {
+        color: var(--success);
       }
 
       .workspace {
@@ -707,6 +810,19 @@
           grid-template-columns: 1fr;
         }
 
+        .capacity-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .capacity-stats {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .capacity-lane + .capacity-lane {
+          border-top: 1px solid var(--line);
+          border-left: 0;
+        }
+
         .task-summary-item {
           border-right: 0;
           border-bottom: 1px solid var(--line);
@@ -1122,6 +1238,7 @@
           failed: ["error", "失败"],
           cancelled: ["default", "已取消"],
           processing: ["processing", "处理中"],
+          waiting_upstream: ["processing", "等待上游"],
           disabled: ["default", "已停用"],
           empty: ["warning", "未绑定账号"],
           unknown: ["default", "未检测"]
@@ -1409,6 +1526,9 @@
         const [tasks, setTasks] = useState([]);
         const [statRecords, setStatRecords] = useState([]);
         const [loading, setLoading] = useState(false);
+        const [checkingAccountIds, setCheckingAccountIds] = useState([]);
+        const [checkingChannelIds, setCheckingChannelIds] = useState([]);
+        const [checkingAll, setCheckingAll] = useState(false);
         const [updating, setUpdating] = useState(false);
         const [imageStorageStats, setImageStorageStats] = useState(null);
         const [runtimeStatus, setRuntimeStatus] = useState(null);
@@ -1690,7 +1810,7 @@
         }, [selectedEditAccountValue, accounts, channels, config]);
 
         useEffect(() => {
-          if (!tasks.some((item) => ["processing", "queued", "pending", "unknown"].includes(item.status))) return undefined;
+          if (!tasks.some((item) => ["processing", "queued", "pending", "unknown", "waiting_upstream"].includes(item.status))) return undefined;
           const timer = setInterval(async () => {
             try {
               await api("/api/tasks/refresh-processing", { method: "POST", body: {} });
@@ -1713,7 +1833,7 @@
         }, [runtimeStatus?.running?.total]);
 
         useEffect(() => {
-          if (!tasks.some((item) => ["processing", "queued", "pending", "unknown"].includes(item.status))) return undefined;
+          if (!tasks.some((item) => ["processing", "queued", "pending", "unknown", "waiting_upstream"].includes(item.status))) return undefined;
           const timer = setInterval(() => setNowTick(Date.now()), 1000);
           return () => clearInterval(timer);
         }, [tasks]);
@@ -1841,16 +1961,17 @@
         }
 
         async function testAccount(id) {
-          setLoading(true);
+          setCheckingAccountIds((current) => current.includes(id) ? current : [...current, id]);
           try {
-            await api(`/api/accounts/${id}/test`, { method: "POST" });
+            const result = await api(`/api/accounts/${id}/test`, { method: "POST" });
             await refresh();
-            message.success("检测完成");
+            if (result?.checkSkipped) message.info(result.message || "账号使用中，本次检测已跳过");
+            else message.success("检测完成");
           } catch (error) {
             await refresh().catch(() => {});
             message.error(error.message);
           } finally {
-            setLoading(false);
+            setCheckingAccountIds((current) => current.filter((item) => item !== id));
           }
         }
 
@@ -1860,33 +1981,36 @@
             message.warning("这个渠道还没有绑定账号");
             return;
           }
-          setLoading(true);
+          setCheckingChannelIds((current) => current.includes(channelId) ? current : [...current, channelId]);
           let ok = 0;
           let failed = 0;
+          let skipped = 0;
           for (const account of related) {
             try {
-              await api(`/api/accounts/${account.id}/test`, { method: "POST" });
-              ok += 1;
+              const result = await api(`/api/accounts/${account.id}/test`, { method: "POST" });
+              if (result?.checkSkipped) skipped += 1;
+              else ok += 1;
             } catch (_error) {
               failed += 1;
             }
           }
           await refresh().catch(() => {});
-          setLoading(false);
-          message.info(`检测完成：${ok} 个可用，${failed} 个需处理`);
+          setCheckingChannelIds((current) => current.filter((item) => item !== channelId));
+          message.info(`检测完成：${ok} 个完成，${skipped} 个使用中已跳过，${failed} 个需处理`);
         }
 
         async function testAll() {
-          setLoading(true);
+          setCheckingAll(true);
           try {
-            await api("/api/accounts/test-all", { method: "POST" });
+            const results = await api("/api/accounts/test-all", { method: "POST" });
             await refresh();
-            message.success("全部账号检测完成");
+            const skipped = Array.isArray(results) ? results.filter((item) => item?.data?.checkSkipped || item?.skipped).length : 0;
+            message.success(skipped ? `检测完成，${skipped} 个使用中账号已跳过` : "全部账号检测完成");
           } catch (error) {
             await refresh().catch(() => {});
             message.error(error.message);
           } finally {
-            setLoading(false);
+            setCheckingAll(false);
           }
         }
 
@@ -2146,7 +2270,7 @@
             width: 230,
             render: (_, row) => h(Space, { size: 6 }, [
               h(Tooltip, { title: "检测这个渠道下的全部账号", key: "test" },
-                h(Button, { size: "small", icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null, loading, onClick: () => testChannel(row.id) }, "检测")
+                h(Button, { size: "small", icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null, loading: checkingAll || checkingChannelIds.includes(row.id), onClick: () => testChannel(row.id) }, "检测")
               ),
               h(Button, { size: "small", icon: Icon.EditOutlined ? h(Icon.EditOutlined) : null, onClick: () => openChannelModal(row), key: "edit" }, "编辑"),
               h(Popconfirm, {
@@ -2237,7 +2361,7 @@
             title: "操作",
             width: 210,
             render: (_, row) => h(Space, { size: 6 }, [
-              h(Button, { size: "small", onClick: () => testAccount(row.id), loading, icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null }, "检测"),
+              h(Button, { size: "small", onClick: () => testAccount(row.id), loading: checkingAll || checkingAccountIds.includes(row.id), icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null }, "检测"),
               h(Button, { size: "small", onClick: () => openAccountModal(row), icon: Icon.EditOutlined ? h(Icon.EditOutlined) : null }, "编辑"),
               h(Popconfirm, { title: "删除这个账号？", okText: "删除", cancelText: "取消", onConfirm: () => deleteAccount(row.id) },
                 h(Button, { size: "small", danger: true, icon: Icon.DeleteOutlined ? h(Icon.DeleteOutlined) : null }, "删除")
@@ -2319,9 +2443,34 @@
         const selectedStats = selectedChannel ? channelStats.get(selectedChannel.id) || {} : {};
         const storageSettings = imageStorageStats?.settings || config?.imageStorage || {};
         const storageDisk = imageStorageStats?.disk || null;
-        const concurrencyTotal = numberValue(runtimeStatus?.concurrency?.total);
-        const availableTotal = numberValue(runtimeStatus?.available?.total);
-        const runningTotal = numberValue(runtimeStatus?.running?.total);
+        const imageCapacity = runtimeStatus?.categories?.image || { configured: 0, available: 0, running: 0, idle: 0 };
+        const chatCapacity = runtimeStatus?.categories?.chat || { configured: 0, available: 0, running: 0, idle: 0 };
+
+        function renderCapacityLane({ key, label, icon, capacity, waiting, color }) {
+          const configured = numberValue(capacity?.configured);
+          const available = numberValue(capacity?.available);
+          const running = numberValue(capacity?.running);
+          const idle = numberValue(capacity?.idle);
+          const percent = available > 0 ? Math.min(100, Math.round((running / available) * 100)) : 0;
+          return h("div", { className: `capacity-lane ${key}` }, [
+            h("div", { className: "capacity-lane-head" }, [
+              h("div", { className: "capacity-lane-name" }, [
+                h("span", { className: "capacity-lane-icon" }, icon),
+                label
+              ]),
+              waiting > 0
+                ? h(Tag, { color: "gold" }, `等待上游 ${waiting}`)
+                : h(Tag, { color: idle > 0 ? "green" : "default" }, idle > 0 ? `空闲 ${idle}` : "暂无空闲")
+            ]),
+            h("div", { className: "capacity-stats" }, [
+              h("div", { className: "capacity-stat" }, [h("div", { className: "capacity-stat-label" }, "总配置"), h("div", { className: "capacity-stat-value" }, configured)]),
+              h("div", { className: "capacity-stat" }, [h("div", { className: "capacity-stat-label" }, "当前可用"), h("div", { className: "capacity-stat-value" }, available)]),
+              h("div", { className: "capacity-stat running" }, [h("div", { className: "capacity-stat-label" }, "调用中"), h("div", { className: "capacity-stat-value" }, running)]),
+              h("div", { className: "capacity-stat idle" }, [h("div", { className: "capacity-stat-label" }, "空闲"), h("div", { className: "capacity-stat-value" }, idle)])
+            ]),
+            h(Progress, { percent, showInfo: false, size: "small", strokeColor: color, trailColor: "#eef2f6" })
+          ]);
+        }
 
         return h("div", null, [
           h("header", { className: "topbar", key: "topbar" }, [
@@ -2336,7 +2485,7 @@
               h(Tag, { color: "blue", icon: Icon.UserOutlined ? h(Icon.UserOutlined) : null }, adminUser?.username || "已登录"),
               h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refresh }, "刷新"),
               h(Button, { icon: Icon.CloudSyncOutlined ? h(Icon.CloudSyncOutlined) : null, onClick: runUpdate, loading: updating }, updating ? "后台更新中" : "更新线上代码"),
-              h(Button, { type: "primary", icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null, onClick: testAll, loading }, "检测全部账号"),
+              h(Button, { type: "primary", icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null, onClick: testAll, loading: checkingAll }, "检测全部账号"),
               h(Button, { icon: Icon.LogoutOutlined ? h(Icon.LogoutOutlined) : null, onClick: onLogout }, "退出")
             ])
           ]),
@@ -2363,15 +2512,40 @@
                 h("div", null, [h("div", { className: "metric-label" }, "剩余额度"), h("div", { className: "metric-value" }, totals.balance)])
               ]),
               h("div", { className: "metric" }, [
-                h("div", { className: "metric-icon" }, Icon.ClusterOutlined ? h(Icon.ClusterOutlined) : null),
-                h("div", null, [
-                  h("div", { className: "metric-label" }, "并发状态"),
-                  h("div", { className: "metric-value compact" }, `配置 ${concurrencyTotal} / 可用 ${availableTotal} / 正在跑 ${runningTotal}`)
-                ])
-              ]),
-              h("div", { className: "metric" }, [
                 h("div", { className: "metric-icon" }, Icon.FileDoneOutlined ? h(Icon.FileDoneOutlined) : null),
                 h("div", null, [h("div", { className: "metric-label" }, "任务总数"), h("div", { className: "metric-value" }, tasks.length)])
+              ])
+            ]),
+            h("section", { className: "capacity-panel", key: "capacity" }, [
+              h("div", { className: "capacity-header" }, [
+                h("div", null, [
+                  h("div", { className: "capacity-title" }, [
+                    Icon.ClusterOutlined ? h(Icon.ClusterOutlined) : null,
+                    "实时并发"
+                  ]),
+                  h("div", { className: "capacity-subtitle" }, "可用数量只统计状态正常的账号；等待上游不会占用调用名额")
+                ]),
+                h(Tooltip, { title: "达到可用并发上限后，新任务会立即返回繁忙，不进入处理列表。" },
+                  h(Tag, { color: "blue" }, "满载立即拒绝")
+                )
+              ]),
+              h("div", { className: "capacity-grid" }, [
+                renderCapacityLane({
+                  key: "image",
+                  label: "生图并发",
+                  icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null,
+                  capacity: imageCapacity,
+                  waiting: numberValue(runtimeStatus?.waiting?.image),
+                  color: "#1677ff"
+                }),
+                renderCapacityLane({
+                  key: "chat",
+                  label: "对话并发",
+                  icon: Icon.MessageOutlined ? h(Icon.MessageOutlined) : null,
+                  capacity: chatCapacity,
+                  waiting: numberValue(runtimeStatus?.waiting?.chat),
+                  color: "#7c3aed"
+                })
               ])
             ]),
             h("section", { className: "workspace", key: "workspace" }, [
@@ -2501,12 +2675,13 @@
                           { label: "全部状态", value: "all" },
                           { label: "成功", value: "success" },
                           { label: "失败", value: "failed" },
-                          { label: "处理中", value: "processing" }
+                          { label: "处理中", value: "processing" },
+                          { label: "等待上游", value: "waiting_upstream" }
                         ] }),
                         h("div", { className: "toolbar-note" }, `列表 ${filteredTasks.length} 条；统计来自独立累计，不受20条记录限制`)
                       ]),
                       h("div", { className: "task-toolbar" }, [
-                        h("span", { className: "toolbar-note" }, "卡在处理中的任务，可以点这里重新查询结果"),
+                        h("span", { className: "toolbar-note" }, "处理中和等待上游的任务会自动查询，也可以手动刷新"),
                         h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refreshProcessing, loading }, "刷新处理中")
                       ]),
                       h(Table, {
@@ -2623,12 +2798,13 @@
                         h("div", { className: "form-grid" }, [
                           h(Form.Item, { label: "每账号普通聊天同时任务数", name: ["concurrency", "chat"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
                           h(Form.Item, { label: "每账号生图站同时任务数", name: ["concurrency", "drawingImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
-                          h(Form.Item, { label: "每账号聊天生图同时任务数", name: ["concurrency", "chatImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
+                          h(Form.Item, { label: "每账号聊天生图同时任务数", name: ["concurrency", "chatImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
+                          h(Form.Item, { label: "生图等待超时", name: "waitTimeoutSec", extra: "默认 300 秒，可设置 30 到 3600 秒。" }, h(InputNumber, { min: 30, max: 3600, suffix: "秒", style: { width: "100%" } }))
                         ]),
                         h(Alert, {
-                          type: "warning",
+                          type: "info",
                           showIcon: true,
-                          message: "所有并发都按启用账号单独计算。例如每账号对话 2、生图站 2、聊天生图 3：启用两个账号时总并发 14，停用一个后总并发 7。",
+                          message: "并发按启用账号单独计算；达到上限会立即返回繁忙。任务提交上游后，超过等待时间会改为“等待上游”并释放并发，只有上游明确失败才会记为失败。",
                           style: { marginBottom: 0 }
                         })
                       ]),
