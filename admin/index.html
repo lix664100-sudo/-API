@@ -1024,6 +1024,7 @@
       }
 
       function taskErrorText(row) {
+        if (row?.status === "interrupted") return "";
         const text = row?.errorMessage || row?.responseJson?.message || "";
         if (!text) return "";
         if (isChatLoginErrorText(text)) {
@@ -1033,11 +1034,13 @@
       }
 
       function taskRawErrorText(row) {
+        if (row?.status === "interrupted") return "";
         const text = row?.errorMessage || row?.responseJson?.message || "";
         return text && text !== taskErrorText(row) ? text : "";
       }
 
       function taskReturnJson(row) {
+        if (row.status === "interrupted") return null;
         if (row.status === "failed" && (row.responseJson || row.errorMessage)) {
           return { ok: false, message: taskErrorText(row) || "任务失败" };
         }
@@ -1239,6 +1242,7 @@
           cancelled: ["default", "已取消"],
           processing: ["processing", "处理中"],
           waiting_upstream: ["processing", "等待上游"],
+          interrupted: ["warning", "结果待确认"],
           disabled: ["default", "已停用"],
           empty: ["warning", "未绑定账号"],
           unknown: ["default", "未检测"]
@@ -1394,12 +1398,12 @@
       function taskDuration(task, now) {
         const start = Date.parse(task.createdAt || task.raw?.created_at || "");
         if (!Number.isFinite(start)) return "-";
-        const done = ["success", "failed", "cancelled"].includes(task.status)
+        const done = ["success", "failed", "cancelled", "interrupted"].includes(task.status)
           ? Date.parse(task.completedAt || task.updatedAt || "")
           : now;
         if (!Number.isFinite(done)) return "-";
         const text = formatDuration(done - start);
-        return ["success", "failed", "cancelled"].includes(task.status) ? text : `已耗时 ${text}`;
+        return ["success", "failed", "cancelled", "interrupted"].includes(task.status) ? text : `已耗时 ${text}`;
       }
 
       function channelName(config, channelId) {
@@ -2392,6 +2396,9 @@
             render: (_, row) => h("div", null, [
               h("div", { className: "primary-text" }, row.prompt || "-"),
               taskMetaLine(row),
+              row.status === "interrupted"
+                ? h("div", { className: "task-response" }, row.responseJson?.message || "服务重启时任务被中断，结果无法确认；此任务不计失败。")
+                : null,
               row.responseText ? h("div", { className: "task-response" }, row.responseText) : null,
               taskJsonGrid(row),
               taskErrorText(row) ? h("div", { className: "error-text" }, taskErrorText(row)) : null,
@@ -2676,12 +2683,13 @@
                           { label: "成功", value: "success" },
                           { label: "失败", value: "failed" },
                           { label: "处理中", value: "processing" },
-                          { label: "等待上游", value: "waiting_upstream" }
+                          { label: "等待上游", value: "waiting_upstream" },
+                          { label: "结果待确认", value: "interrupted" }
                         ] }),
                         h("div", { className: "toolbar-note" }, `列表 ${filteredTasks.length} 条；统计来自独立累计，不受20条记录限制`)
                       ]),
                       h("div", { className: "task-toolbar" }, [
-                        h("span", { className: "toolbar-note" }, "处理中和等待上游的任务会自动查询，也可以手动刷新"),
+                        h("span", { className: "toolbar-note" }, "处理中和等待上游会自动查询；结果待确认不会记为失败"),
                         h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refreshProcessing, loading }, "刷新处理中")
                       ]),
                       h(Table, {

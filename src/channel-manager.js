@@ -9,6 +9,7 @@ const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
 const defaultTaskConcurrency = { chat: 3, drawingImage: 2, chatImage: 2 };
 const chatAccountQueues = new Map();
 const scheduledChatTasks = new Set();
+const scheduledImageTasks = new Set();
 const activeTaskCounts = new Map();
 const activeAccountAuthTasks = new Map();
 const clientCache = new Map();
@@ -548,8 +549,19 @@ function inferRefreshTarget(config, task) {
   return { channel, account };
 }
 
+function savedTaskExternalId(task) {
+  return task.externalId
+    || task.raw?.id
+    || task.raw?.conversationId
+    || task.raw?.conversation_id
+    || task.raw?.task_id
+    || task.taskNo
+    || task.raw?.task_no
+    || "";
+}
+
 function taskExternalId(task) {
-  return task.externalId || task.raw?.id || task.id || task.raw?.task_id || task.taskNo || task.raw?.task_no;
+  return savedTaskExternalId(task) || task.id;
 }
 
 function taskErrorMessage(result, task) {
@@ -644,11 +656,44 @@ async function failLostLocalChatTask(task) {
   return failQueuedTask(task, new Error("这个旧对话任务已经没有后台执行进程，已停止。"), task.attempts || []);
 }
 
+function isLostLocalImageTask(task) {
+  return task.taskType !== "chat"
+    && isPendingTask(task.status)
+    && task.raw?.queued === true
+    && !savedTaskExternalId(task)
+    && !scheduledImageTasks.has(task.id);
+}
+
+async function interruptLostLocalImageTask(task) {
+  const interruptedAt = new Date().toISOString();
+  const message = "服务重启时任务被中断，尚未保存上游任务编号，无法确认最终结果；此任务不计失败。";
+  const interruptedTask = {
+    ...task,
+    status: "interrupted",
+    errorMessage: "",
+    responseJson: { ok: null, message },
+    raw: {
+      ...(task.raw || {}),
+      queued: false,
+      interrupted: true,
+      interruptedAt,
+      interruptedReason: message
+    },
+    completedAt: interruptedAt
+  };
+  await upsertTask(interruptedTask);
+  return interruptedTask;
+}
+
 export async function refreshProcessingTasks() {
   const tasks = await listTasks();
   const results = [];
   for (const task of tasks.filter(needsTaskRefresh)) {
     try {
+      if (isLostLocalImageTask(task)) {
+        results.push({ id: task.id, ok: true, data: await interruptLostLocalImageTask(task) });
+        continue;
+      }
       if (isLostLocalChatTask(task)) {
         results.push({ id: task.id, ok: true, data: await failLostLocalChatTask(task) });
         continue;
@@ -1134,6 +1179,22 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
   return nextTask;
 }
 
+async function persistSubmittedTask(task, result, channel, account, attempts) {
+  if (!savedTaskExternalId(result) || isFinishedTask(result?.status)) return task;
+  const submittedTask = mergeRefreshedTask(task, {
+    ...result,
+    status: result.status || "processing"
+  }, channel, account);
+  submittedTask.attempts = attempts;
+  submittedTask.raw = {
+    ...(submittedTask.raw || {}),
+    queued: false,
+    submitted: true
+  };
+  await upsertTask(submittedTask);
+  return submittedTask;
+}
+
 async function runQueuedTextTask(task, input, reserved = null) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
@@ -1158,12 +1219,17 @@ async function runQueuedTextTask(task, input, reserved = null) {
       try {
         if (!(await ensureTargetReady(config, target, "text2img", attempts))) continue;
         const client = getWorkClient(config, channel, account);
-        let result = await client.createTextTask(input);
+        let taskState = task;
+        const onSubmitted = async (submittedResult) => {
+          taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
+        };
+        let result = await client.createTextTask({ ...input, onSubmitted });
+        taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
         if (channel.type === "drawing" && !isFinishedTask(result.status)) {
           result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
         }
         result = await mirrorTaskImages(result, config);
-        return finishQueuedTask(task, result, channel, account, attempts);
+        return finishQueuedTask(taskState, result, channel, account, attempts);
       } catch (error) {
         pushAttempt(attempts, target, error.message || "调用失败");
         if (!error.busy) {
@@ -1257,12 +1323,17 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
       try {
         if (!(await ensureTargetReady(config, target, "img2img", attempts))) continue;
         const client = getWorkClient(config, channel, account);
-        let result = await submitImageTask(client, input, files);
+        let taskState = task;
+        const onSubmitted = async (submittedResult) => {
+          taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
+        };
+        let result = await submitImageTask(client, { ...input, onSubmitted }, files);
+        taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
         if (channel.type === "drawing" && !isFinishedTask(result.status)) {
           result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
         }
         result = await mirrorTaskImages(result, config);
-        return finishQueuedTask(task, result, channel, account, attempts);
+        return finishQueuedTask(taskState, result, channel, account, attempts);
       } catch (error) {
         pushAttempt(attempts, target, error.message || "调用失败");
         if (!error.busy) {
@@ -1389,8 +1460,13 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
     reserved.release();
     throw error;
   }
+  scheduledImageTasks.add(task.id);
   runInBackground(async () => {
-    await runQueuedTextTask(task, input, reserved);
+    try {
+      await runQueuedTextTask(task, input, reserved);
+    } finally {
+      scheduledImageTasks.delete(task.id);
+    }
   });
   return task;
 }
@@ -1416,8 +1492,13 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
     reserved.release();
     throw error;
   }
+  scheduledImageTasks.add(task.id);
   runInBackground(async () => {
-    await runQueuedImageTask(task, input, files, reserved);
+    try {
+      await runQueuedImageTask(task, input, files, reserved);
+    } finally {
+      scheduledImageTasks.delete(task.id);
+    }
   });
   return task;
 }

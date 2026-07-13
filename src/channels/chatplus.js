@@ -326,6 +326,36 @@ function normalizeChatFiles(input, messages) {
   return files;
 }
 
+function submittedImageTask(conversation, input, prompt, taskType, sourceImageCount = 0) {
+  const { events = [], conversationId, messageId, model, upstreamModel, route, selected } = conversation;
+  return {
+    externalId: conversationId || messageId,
+    status: "processing",
+    prompt,
+    taskType,
+    modelId: model,
+    ratio: input.ratio_label || input.ratio || "",
+    imageCount: 0,
+    imageUrls: [],
+    raw: {
+      conversationId,
+      eventCount: events.length,
+      sourceImageCount,
+      upstreamModel,
+      chatModel: route?.key,
+      selectedCarId: selected?.carId,
+      selectedCarType: selected?.carType,
+      strategy: selected?.strategy
+    }
+  };
+}
+
+async function notifyImageSubmitted(input, result) {
+  if (result.externalId && typeof input.onSubmitted === "function") {
+    await input.onSubmitted(result);
+  }
+}
+
 function chatPromptFromMessages(messages) {
   const rows = [];
   for (const message of messages) {
@@ -1311,6 +1341,8 @@ export class ChatplusClient {
       const prompt = String(input.prompt || "").trim();
       if (!prompt) throw new Error("请输入生图描述。");
       const result = await this.withImageQuotaFallback(prompt, { ...input, preferImageCar: true }, async (conversation) => {
+        throwIfImageGenerationLimit(extractAssistantText(conversation.events));
+        await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
         const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec);
         return { ...conversation, imageUrls };
       });
@@ -1338,6 +1370,8 @@ export class ChatplusClient {
       if (!files.length) throw new Error("Please upload a source image.");
 
       const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: true }, async (conversation) => {
+        throwIfImageGenerationLimit(extractAssistantText(conversation.events));
+        await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
         const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true });
         return { ...conversation, imageUrls };
       });

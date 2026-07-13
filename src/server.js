@@ -871,6 +871,7 @@ function schedulePendingTaskRefresh() {
       refreshing = false;
     }
   };
+  refresh();
   const timer = setInterval(refresh, 30_000);
   timer.unref?.();
 }
