@@ -2356,6 +2356,7 @@
             dataIndex: "status",
             width: 150,
             render: (_, row) => {
+              if (row.enabled === false) return statusTag("disabled");
               if (!drawingAccountIsCooling(row)) return statusTag(row.status);
               const drawing = drawingCooldownStatus(row);
               const reason = drawing.cooldownReason === "drawing_rate_limited"
