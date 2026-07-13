@@ -947,7 +947,7 @@ function noUsableTargetError(taskType) {
 
 function shouldRefreshQuotaBeforeUse(target, taskType) {
   if (taskType === "chat") return false;
-  return targetQuotaStatus(target).status === "quota_empty";
+  return target.channel.type === "drawing" || targetQuotaStatus(target).status === "quota_empty";
 }
 
 function pushAttempt(attempts, target, message, extra = {}) {
@@ -986,6 +986,19 @@ async function refreshQuotaBeforeUse(config, target, attempts) {
     );
     return false;
   }
+}
+
+async function refreshDrawingQuota(account, channel) {
+  if (channel.type !== "drawing") return;
+  const config = await loadRuntimeConfig();
+  const currentAccount = config.accounts.find((item) => item.id === account.id) || account;
+  const status = await getClient(config, channel, currentAccount).check();
+  await updateTargetAccountStatus(account.id, channel, status);
+}
+
+function scheduleDrawingQuotaRefresh(account, channel) {
+  if (channel.type !== "drawing") return;
+  runInBackground(() => refreshDrawingQuota(account, channel));
 }
 
 function proxyTargetUrl(channel = {}) {
@@ -1251,6 +1264,7 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
   await upsertTask(nextTask);
   if (isFinishedTask(nextTask.status)) await recordTaskStat(nextTask);
   await markAccountAvailable(account.id, channel);
+  scheduleDrawingQuotaRefresh(account, channel);
   return nextTask;
 }
 
@@ -1302,6 +1316,7 @@ async function runQueuedTextTask(task, input, reserved = null) {
           };
           let result = await client.createTextTask({ ...input, onSubmitted });
           taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
+          scheduleDrawingQuotaRefresh(account, channel);
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
             result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
           }
@@ -1409,6 +1424,7 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
           };
           let result = await submitImageTask(client, { ...input, onSubmitted }, files);
           taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
+          scheduleDrawingQuotaRefresh(account, channel);
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
             result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
           }
@@ -1865,6 +1881,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         await upsertTask(task);
         if (isFinishedTask(task.status)) await recordTaskStat(task);
         await markAccountAvailable(account.id, channel);
+        scheduleDrawingQuotaRefresh(account, channel);
         return task;
       });
       if (finishedTask) return finishedTask;

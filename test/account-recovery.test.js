@@ -8,8 +8,9 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-account-recovery-"
 process.env.DATA_DIR = dataDir;
 
 const { loadConfig, saveConfig } = await import("../src/storage.js");
-const { createChatCompletion, createImageTask } = await import("../src/channel-manager.js");
+const { createChatCompletion, createImageTask, createTextTask } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
+const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
   await rm(dataDir, { recursive: true, force: true });
@@ -187,5 +188,119 @@ test("同一聊天账号的对话和生图不会同时登录", async () => {
   } finally {
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+  }
+});
+
+test("每条绘图任务提交前检查额度，提交后更新页面额度", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-drawing-quota",
+      channelId: "shareai",
+      name: "绘图额度测试账号",
+      username: "drawing@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", balance: 9, message: "旧额度" },
+          chatplus: { status: "quota_empty", balance: 0, message: "聊天图片额度不足" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  const originalCreateTextTask = DrawingClient.prototype.createTextTask;
+  let checkCount = 0;
+  let submitCount = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    return checkCount === 1
+      ? { status: "ok", quota: 50, balance: 2, message: "绘图账号可用" }
+      : { status: "quota_empty", quota: 50, balance: 0, message: "绘图积分不足" };
+  };
+  DrawingClient.prototype.createTextTask = async (input) => {
+    submitCount += 1;
+    return {
+      externalId: "drawing-quota-task",
+      status: "processing",
+      taskType: "text2img",
+      prompt: input.prompt,
+      imageCount: 0,
+      imageUrls: [],
+      raw: {}
+    };
+  };
+
+  try {
+    const task = await createTextTask({ channel: "drawing", prompt: "测试额度刷新" });
+    let drawingStatus = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const stored = await loadConfig();
+      drawingStatus = stored.accounts[0]?.meta?.abilities?.drawing;
+      if (drawingStatus?.balance === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    assert.equal(task.externalId, "drawing-quota-task");
+    assert.equal(submitCount, 1);
+    assert.equal(checkCount, 2);
+    assert.equal(drawingStatus.status, "quota_empty");
+    assert.equal(drawingStatus.balance, 0);
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+    DrawingClient.prototype.createTextTask = originalCreateTextTask;
+  }
+});
+
+test("绘图额度为零时不会提交任务", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-drawing-empty",
+      channelId: "shareai",
+      name: "绘图零额度测试账号",
+      username: "drawing-empty@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", balance: 2, message: "旧额度" },
+          chatplus: { status: "quota_empty", balance: 0, message: "聊天图片额度不足" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  const originalCreateTextTask = DrawingClient.prototype.createTextTask;
+  let submitCount = 0;
+  DrawingClient.prototype.check = async () => ({
+    status: "quota_empty",
+    quota: 50,
+    balance: 0,
+    message: "绘图积分不足"
+  });
+  DrawingClient.prototype.createTextTask = async () => {
+    submitCount += 1;
+    throw new Error("不应提交");
+  };
+
+  try {
+    await assert.rejects(
+      createTextTask({ channel: "drawing", prompt: "零额度不能提交" }),
+      /绘图积分不足/
+    );
+    assert.equal(submitCount, 0);
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+    DrawingClient.prototype.createTextTask = originalCreateTextTask;
   }
 });
