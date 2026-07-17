@@ -9,6 +9,8 @@ const tasksFile = path.join(dataDir, "tasks.json");
 const statsFile = path.join(dataDir, "stats.json");
 const taskHistoryLimit = 20;
 const statRecordDays = 31;
+const dailyStatDays = 30;
+const imageTaskTypes = new Set(["text2img", "img2img"]);
 const statRecordLimit = 50000;
 let statsWriteQueue = Promise.resolve();
 
@@ -608,6 +610,52 @@ function pruneStats(stats) {
   };
 }
 
+export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now = Date.now()) {
+  const rangeDays = Math.min(statRecordDays, Math.max(1, Math.floor(Number(days) || dailyStatDays)));
+  const dayKeys = Array.from({ length: rangeDays }, (_, index) => (
+    dateKeyInShanghai(now - (rangeDays - index - 1) * 24 * 60 * 60 * 1000)
+  ));
+  const visibleDays = new Set(dayKeys);
+  const grouped = new Map();
+
+  for (const record of records) {
+    if (!imageTaskTypes.has(record?.taskType)) continue;
+    const day = record?.day || dateKeyInShanghai(record?.time);
+    if (!visibleDays.has(day)) continue;
+    const accountId = String(record?.accountId || "");
+    const channelGroup = String(record?.channelGroup || "other");
+    const key = `${day}\u0000${accountId}\u0000${channelGroup}`;
+    const current = grouped.get(key) || {
+      day,
+      accountId,
+      accountName: record?.accountName || "",
+      channelGroup,
+      tasks: 0,
+      successTasks: 0,
+      failedTasks: 0,
+      successImages: 0
+    };
+    const taskCount = Math.max(0, Number(record?.tasks || 1) || 0);
+    current.tasks += taskCount;
+    if (record?.status === "success") {
+      current.successTasks += taskCount;
+      current.successImages += Math.max(0, Number(record?.successImages || 0) || 0);
+    } else if (record?.status === "failed") {
+      current.failedTasks += Math.max(0, Number(record?.failedTasks || taskCount) || 0);
+    }
+    grouped.set(key, current);
+  }
+
+  return {
+    days: dayKeys,
+    records: [...grouped.values()].sort((a, b) => (
+      a.day.localeCompare(b.day)
+      || a.accountId.localeCompare(b.accountId)
+      || a.channelGroup.localeCompare(b.channelGroup)
+    ))
+  };
+}
+
 async function withStatsLock(work) {
   const run = statsWriteQueue.then(work, work);
   statsWriteQueue = run.catch(() => {});
@@ -646,11 +694,13 @@ export async function listTaskStats() {
   return withStatsLock(async () => {
     const stats = await seedStatsFromTasks(await loadStats());
     const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const records = Object.values(stats.records || {});
     return {
       updatedAt: stats.updatedAt || null,
-      records: Object.values(stats.records || {})
+      records: records
         .filter((record) => Number(record.time || 0) >= cutoff)
-        .sort((a, b) => Number(b.time || 0) - Number(a.time || 0))
+        .sort((a, b) => Number(b.time || 0) - Number(a.time || 0)),
+      daily: summarizeDailyTaskStats(records)
     };
   });
 }

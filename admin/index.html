@@ -10,6 +10,7 @@
     <script src="https://cdn.jsdelivr.net/npm/dayjs@1/dayjs.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/antd@5/dist/antd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@ant-design/icons@5/dist/index.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
     <style>
       :root {
         --page-bg: #f4f6f8;
@@ -594,6 +595,44 @@
         line-height: 1;
       }
 
+      .task-trend {
+        margin-bottom: 14px;
+        padding: 16px 0 10px;
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .task-trend-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 0 2px 8px;
+      }
+
+      .task-trend-title {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 760;
+      }
+
+      .task-trend-desc {
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .task-trend-chart {
+        width: 100%;
+        height: 300px;
+      }
+
+      .task-trend-empty {
+        display: grid;
+        min-height: 260px;
+        place-items: center;
+      }
+
       .task-filters {
         display: grid;
         grid-template-columns: 220px 180px 180px 1fr;
@@ -840,6 +879,15 @@
           grid-template-columns: 1fr;
         }
 
+        .task-trend-header {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .task-trend-chart {
+          height: 260px;
+        }
+
         .task-json-grid {
           grid-template-columns: 1fr;
         }
@@ -855,7 +903,7 @@
   <body>
     <div id="root"></div>
     <script>
-      const { useEffect, useMemo, useState } = React;
+      const { useEffect, useMemo, useRef, useState } = React;
       const {
         Alert,
         Button,
@@ -871,6 +919,7 @@
         Popconfirm,
         Progress,
         Row,
+        Segmented,
         Select,
         Slider,
         Space,
@@ -1392,6 +1441,140 @@
         };
       }
 
+      function taskTrendData(daily, rangeDays, accountFilter, channelFilter) {
+        const days = Array.isArray(daily?.days) ? daily.days.slice(-rangeDays) : [];
+        const visibleDays = new Set(days);
+        const totals = new Map(days.map((day) => [day, { day, successTasks: 0, failedTasks: 0 }]));
+        const records = Array.isArray(daily?.records) ? daily.records : [];
+        records.forEach((record) => {
+          if (!visibleDays.has(record.day)) return;
+          if (accountFilter !== "all" && record.accountId !== accountFilter) return;
+          if (channelFilter !== "all" && record.channelGroup !== channelFilter) return;
+          const current = totals.get(record.day);
+          current.successTasks += numberValue(record.successTasks);
+          current.failedTasks += numberValue(record.failedTasks);
+        });
+        return [...totals.values()];
+      }
+
+      function chartDayLabel(day) {
+        const [, month, date] = String(day || "").split("-");
+        return month && date ? `${Number(month)}月${Number(date)}日` : day || "-";
+      }
+
+      function TaskTrendChart({ data }) {
+        const containerRef = useRef(null);
+        const chartRef = useRef(null);
+
+        useEffect(() => {
+          if (!containerRef.current || !window.echarts) return undefined;
+          const chart = window.echarts.init(containerRef.current, null, { renderer: "canvas" });
+          chartRef.current = chart;
+          const resize = () => chart.resize();
+          const observer = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
+          if (observer) observer.observe(containerRef.current);
+          else window.addEventListener("resize", resize);
+          return () => {
+            if (observer) observer.disconnect();
+            else window.removeEventListener("resize", resize);
+            chart.dispose();
+            chartRef.current = null;
+          };
+        }, []);
+
+        useEffect(() => {
+          const chart = chartRef.current;
+          if (!chart) return;
+          chart.setOption({
+            animationDuration: 280,
+            color: ["#16a34a", "#dc2626"],
+            aria: {
+              enabled: true,
+              description: "每日生图成功任务和失败任务趋势"
+            },
+            tooltip: {
+              trigger: "axis",
+              backgroundColor: "rgba(16, 24, 40, 0.94)",
+              borderWidth: 0,
+              padding: [10, 12],
+              textStyle: { color: "#ffffff", fontSize: 12 },
+              formatter: (items) => {
+                const index = items?.[0]?.dataIndex ?? 0;
+                const row = data[index] || {};
+                return [
+                  `<strong>${chartDayLabel(row.day)}</strong>`,
+                  `成功任务：${numberValue(row.successTasks)}`,
+                  `失败任务：${numberValue(row.failedTasks)}`
+                ].join("<br>");
+              }
+            },
+            legend: {
+              top: 4,
+              left: 4,
+              itemWidth: 18,
+              itemHeight: 8,
+              textStyle: { color: "#475467", fontSize: 12 },
+              data: ["成功任务", "失败任务"]
+            },
+            grid: {
+              top: 48,
+              right: 18,
+              bottom: 30,
+              left: 18,
+              containLabel: true
+            },
+            xAxis: {
+              type: "category",
+              boundaryGap: false,
+              data: data.map((item) => chartDayLabel(item.day).replace("月", "/").replace("日", "")),
+              axisLine: { lineStyle: { color: "#d0d5dd" } },
+              axisTick: { show: false },
+              axisLabel: { color: "#667085", fontSize: 11, hideOverlap: true }
+            },
+            yAxis: {
+              type: "value",
+              minInterval: 1,
+              axisLabel: { color: "#667085", fontSize: 11 },
+              splitLine: { lineStyle: { color: "#eaecf0", type: "dashed" } }
+            },
+            series: [
+              {
+                name: "成功任务",
+                type: "line",
+                smooth: 0.22,
+                showSymbol: false,
+                symbolSize: 7,
+                lineStyle: { width: 2 },
+                areaStyle: { opacity: 0.06 },
+                emphasis: { focus: "series" },
+                data: data.map((item) => item.successTasks)
+              },
+              {
+                name: "失败任务",
+                type: "line",
+                smooth: 0.22,
+                showSymbol: false,
+                symbolSize: 7,
+                lineStyle: { width: 2 },
+                areaStyle: { opacity: 0.04 },
+                emphasis: { focus: "series" },
+                data: data.map((item) => item.failedTasks)
+              }
+            ]
+          }, true);
+        }, [data]);
+
+        if (!window.echarts) {
+          return h(Alert, { type: "warning", showIcon: true, message: "趋势图加载失败，请刷新页面重试。" });
+        }
+        return h("div", {
+          ref: containerRef,
+          className: "task-trend-chart",
+          role: "img",
+          "aria-label": "每日生图成功任务和失败任务折线图"
+        });
+      }
+
       function formatDuration(ms) {
         if (!Number.isFinite(ms) || ms < 0) return "-";
         const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -1537,6 +1720,7 @@
         const [config, setConfig] = useState(null);
         const [tasks, setTasks] = useState([]);
         const [statRecords, setStatRecords] = useState([]);
+        const [dailyStats, setDailyStats] = useState({ days: [], records: [] });
         const [loading, setLoading] = useState(false);
         const [checkingAccountIds, setCheckingAccountIds] = useState([]);
         const [checkingChannelIds, setCheckingChannelIds] = useState([]);
@@ -1558,6 +1742,7 @@
         const [taskAccountFilter, setTaskAccountFilter] = useState("all");
         const [taskChannelFilter, setTaskChannelFilter] = useState("all");
         const [taskStatusFilter, setTaskStatusFilter] = useState("all");
+        const [taskTrendDays, setTaskTrendDays] = useState(30);
         const [channelModalOpen, setChannelModalOpen] = useState(false);
         const [accountModalOpen, setAccountModalOpen] = useState(false);
         const [editingChannel, setEditingChannel] = useState(null);
@@ -1742,6 +1927,10 @@
         }, [statRecords, taskAccountFilter, taskChannelFilter, taskStatusFilter]);
 
         const taskStats = useMemo(() => summarizeTasks(filteredStatRecords), [filteredStatRecords]);
+        const trendData = useMemo(() => (
+          taskTrendData(dailyStats, taskTrendDays, taskAccountFilter, taskChannelFilter)
+        ), [dailyStats, taskTrendDays, taskAccountFilter, taskChannelFilter]);
+        const trendHasData = trendData.some((item) => item.successTasks > 0 || item.failedTasks > 0);
 
         const accountTodayUsage = useMemo(() => {
           const today = dateKeyInShanghai(Date.now());
@@ -1777,13 +1966,16 @@
           const [nextConfig, taskList, statsData, storageData, runtimeData] = await Promise.all([
             api("/api/config"),
             api("/api/tasks"),
-            api("/api/stats").catch(() => ({ records: [] })),
+            api("/api/stats").catch(() => ({ records: [], daily: { days: [], records: [] } })),
             api("/api/admin/image-storage").catch(() => null),
             api("/api/admin/runtime").catch(() => null)
           ]);
           setConfig(nextConfig);
           setTasks(taskList);
           setStatRecords(Array.isArray(statsData?.records) ? statsData.records : []);
+          setDailyStats(statsData?.daily && Array.isArray(statsData.daily.days) && Array.isArray(statsData.daily.records)
+            ? statsData.daily
+            : { days: [], records: [] });
           if (storageData) setImageStorageStats(storageData);
           if (runtimeData) setRuntimeStatus(runtimeData);
           globalForm.setFieldsValue(nextConfig);
@@ -2759,6 +2951,29 @@
                           { label: "结果待确认", value: "interrupted" }
                         ] }),
                         h("div", { className: "toolbar-note" }, `列表 ${filteredTasks.length} 条；统计来自独立累计，不受20条记录限制`)
+                      ]),
+                      h("div", { className: "task-trend" }, [
+                        h("div", { className: "task-trend-header" }, [
+                          h("div", null, [
+                            h("h3", { className: "task-trend-title" }, "每日生图结果"),
+                            h("div", { className: "task-trend-desc" }, "按任务完成日期统计；账号和通道筛选会同步更新")
+                          ]),
+                          h(Segmented, {
+                            value: taskTrendDays,
+                            onChange: setTaskTrendDays,
+                            options: [
+                              { label: "近7天", value: 7 },
+                              { label: "近30天", value: 30 }
+                            ],
+                            size: "small"
+                          })
+                        ]),
+                        trendHasData
+                          ? h(TaskTrendChart, { data: trendData })
+                          : h("div", { className: "task-trend-empty" }, h(Empty, {
+                              image: Empty.PRESENTED_IMAGE_SIMPLE,
+                              description: "所选范围暂无已完成的生图任务"
+                            }))
                       ]),
                       h("div", { className: "task-toolbar" }, [
                         h("span", { className: "toolbar-note" }, "处理中和等待上游会自动查询；结果待确认不会记为失败"),
