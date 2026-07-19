@@ -4,7 +4,8 @@ import { test } from "node:test";
 import {
   mergeRuntimeStatSample,
   summarizeDailyRuntimeStats,
-  summarizeDailyTaskStats
+  summarizeDailyTaskStats,
+  summarizeIntradayTaskStats
 } from "../src/storage.js";
 
 test("最近生图趋势按北京时间汇总成功和失败，并补齐没有任务的日期", () => {
@@ -139,4 +140,66 @@ test("并发统计会计算每天的平均、峰值和配置上限", () => {
     lastSampleAt: Date.parse("2026-07-18T10:00:30+08:00")
   });
   assert.deepEqual(summary.days.at(-2), { day: "2026-07-17", samples: 0 });
+});
+
+test("分时出图按北京时间每30分钟统计成功图片", () => {
+  const day = "2026-07-18";
+  const summary = summarizeIntradayTaskStats([
+    {
+      day,
+      time: Date.parse("2026-07-18T09:05:00+08:00"),
+      status: "success",
+      taskType: "text2img",
+      tasks: 1,
+      successImages: 2,
+      accountId: "account-a"
+    },
+    {
+      day,
+      time: Date.parse("2026-07-18T09:29:59+08:00"),
+      status: "failed",
+      taskType: "img2img",
+      tasks: 1,
+      failedTasks: 1,
+      accountId: "account-a"
+    },
+    {
+      day,
+      time: Date.parse("2026-07-18T09:30:00+08:00"),
+      status: "success",
+      taskType: "img2img",
+      tasks: 1,
+      successImages: 1,
+      accountId: "account-b"
+    },
+    {
+      day,
+      time: Date.parse("2026-07-18T09:15:00+08:00"),
+      status: "success",
+      taskType: "chat",
+      tasks: 1,
+      successImages: 1,
+      accountId: "account-a"
+    }
+  ], day);
+
+  assert.equal(summary.buckets.length, 48);
+  assert.equal(summary.buckets[0].start, "00:00");
+  assert.equal(summary.buckets.at(-1).end, "24:00");
+  assert.deepEqual(summary.buckets[18], {
+    index: 18,
+    startMinute: 540,
+    start: "09:00",
+    end: "09:30",
+    tasks: 2,
+    successTasks: 1,
+    failedTasks: 1,
+    successImages: 2,
+    accountCount: 1,
+    successRate: 50
+  });
+  assert.equal(summary.buckets[19].successImages, 1);
+  assert.equal(summary.totalImages, 3);
+  assert.equal(summary.failedTasks, 1);
+  assert.deepEqual(summary.peak, { start: "09:00", end: "09:30", successImages: 2 });
 });

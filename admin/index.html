@@ -674,6 +674,64 @@
         font-size: 11px;
       }
 
+      .intraday-section {
+        margin-bottom: 16px;
+        padding: 16px 2px 12px;
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .intraday-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 8px;
+      }
+
+      .intraday-header h3 {
+        margin: 0;
+        font-size: 14px;
+      }
+
+      .intraday-header p {
+        margin: 4px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .intraday-meta {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 6px 14px;
+        color: var(--muted);
+        font-size: 12px;
+        text-align: right;
+      }
+
+      .intraday-meta strong {
+        color: var(--ink);
+        font-weight: 650;
+      }
+
+      .intraday-refresh.is-error {
+        color: var(--danger);
+      }
+
+      .intraday-chart {
+        width: 100%;
+        height: 310px;
+      }
+
+      .intraday-placeholder {
+        display: grid;
+        min-height: 260px;
+        place-items: center;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
       .productivity-table-title {
         display: flex;
         align-items: baseline;
@@ -1003,9 +1061,15 @@
         }
 
         .productivity-toolbar,
-        .productivity-table-title {
+        .productivity-table-title,
+        .intraday-header {
           align-items: stretch;
           flex-direction: column;
+        }
+
+        .intraday-meta {
+          justify-content: flex-start;
+          text-align: left;
         }
 
         .task-trend-chart {
@@ -1014,6 +1078,10 @@
 
         .productivity-chart {
           height: 250px;
+        }
+
+        .intraday-chart {
+          height: 260px;
         }
 
         .task-json-grid {
@@ -1268,6 +1336,18 @@
           hour: "2-digit",
           minute: "2-digit"
         }).replace(/\//g, "-");
+      }
+
+      function formatClock(value) {
+        const date = new Date(value);
+        if (!Number.isFinite(date.getTime())) return "-";
+        return date.toLocaleTimeString("zh-CN", {
+          timeZone: "Asia/Shanghai",
+          hour12: false,
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit"
+        });
       }
 
       function taskNetworkLabel(row) {
@@ -1800,6 +1880,121 @@
         });
       }
 
+      function IntradayOutputChart({ data, day }) {
+        const containerRef = useRef(null);
+        const chartRef = useRef(null);
+        const buckets = Array.isArray(data?.buckets) ? data.buckets : [];
+        const intervalMinutes = numberValue(data?.intervalMinutes) || 30;
+        const isToday = day === dateKeyInShanghai(Date.now());
+        const timeParts = new Intl.DateTimeFormat("en-GB", {
+          timeZone: "Asia/Shanghai",
+          hour: "2-digit",
+          minute: "2-digit",
+          hourCycle: "h23"
+        }).formatToParts(new Date());
+        const currentHour = numberValue(timeParts.find((part) => part.type === "hour")?.value);
+        const currentMinute = numberValue(timeParts.find((part) => part.type === "minute")?.value);
+        const currentIndex = isToday ? Math.floor((currentHour * 60 + currentMinute) / intervalMinutes) : -1;
+
+        useEffect(() => {
+          if (!containerRef.current || !window.echarts) return undefined;
+          const chart = window.echarts.init(containerRef.current, null, { renderer: "canvas" });
+          chartRef.current = chart;
+          const resize = () => chart.resize();
+          const observer = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
+          if (observer) observer.observe(containerRef.current);
+          else window.addEventListener("resize", resize);
+          return () => {
+            if (observer) observer.disconnect();
+            else window.removeEventListener("resize", resize);
+            chart.dispose();
+            chartRef.current = null;
+          };
+        }, []);
+
+        useEffect(() => {
+          const chart = chartRef.current;
+          if (!chart) return;
+          const currentBucket = buckets[currentIndex];
+          const nextBucket = buckets[currentIndex + 1];
+          chart.setOption({
+            animationDuration: 260,
+            color: ["#69b1ff"],
+            aria: {
+              enabled: true,
+              description: `${chartDayLabel(day)}每30分钟成功出图数量`
+            },
+            tooltip: {
+              trigger: "axis",
+              axisPointer: { type: "shadow" },
+              backgroundColor: "rgba(16, 24, 40, 0.94)",
+              borderWidth: 0,
+              padding: [10, 12],
+              textStyle: { color: "#ffffff", fontSize: 12 },
+              formatter: (items) => {
+                const index = items?.[0]?.dataIndex ?? 0;
+                const row = buckets[index] || {};
+                return [
+                  `<strong>${row.start || "-"}–${row.end || "-"}</strong>`,
+                  `成功图片：${numberValue(row.successImages)}`,
+                  `失败任务：${numberValue(row.failedTasks)}`,
+                  `参与账号：${numberValue(row.accountCount)}`,
+                  `任务成功率：${row.successRate === null ? "暂无" : `${numberValue(row.successRate).toFixed(1)}%`}`
+                ].join("<br>");
+              }
+            },
+            grid: { top: 22, right: 16, bottom: 34, left: 18, containLabel: true },
+            xAxis: {
+              type: "category",
+              data: buckets.map((bucket) => bucket.start),
+              axisLine: { lineStyle: { color: "#d0d5dd" } },
+              axisTick: { show: false },
+              axisLabel: {
+                color: "#667085",
+                fontSize: 11,
+                interval: 3,
+                hideOverlap: true
+              }
+            },
+            yAxis: {
+              type: "value",
+              min: 0,
+              minInterval: 1,
+              name: "张",
+              nameTextStyle: { color: "#667085", fontSize: 11 },
+              axisLabel: { color: "#667085", fontSize: 11 },
+              splitLine: { lineStyle: { color: "#eaecf0", type: "dashed" } }
+            },
+            series: [{
+              name: "成功图片",
+              type: "bar",
+              barMaxWidth: 20,
+              data: buckets.map((bucket) => bucket.successImages),
+              itemStyle: {
+                color: (params) => params.dataIndex === currentIndex ? "#1677ff" : "#91caff",
+                borderRadius: [2, 2, 0, 0]
+              },
+              emphasis: { itemStyle: { color: "#0958d9" } },
+              markArea: currentBucket ? {
+                silent: true,
+                itemStyle: { color: "rgba(22, 119, 255, 0.06)" },
+                data: [[
+                  { xAxis: currentBucket.start },
+                  { xAxis: nextBucket?.start || currentBucket.start }
+                ]]
+              } : undefined
+            }]
+          }, true);
+        }, [buckets, currentIndex, day]);
+
+        return h("div", {
+          ref: containerRef,
+          className: "intraday-chart",
+          role: "img",
+          "aria-label": `${chartDayLabel(day)}每30分钟成功出图数量柱形图`
+        });
+      }
+
       function ProductivityTrendChart({ data, type }) {
         const containerRef = useRef(null);
         const chartRef = useRef(null);
@@ -2091,6 +2286,10 @@
         const [statRecords, setStatRecords] = useState([]);
         const [dailyStats, setDailyStats] = useState({ days: [], records: [] });
         const [concurrencyStats, setConcurrencyStats] = useState({ days: [] });
+        const [intradayStats, setIntradayStats] = useState({ day: dateKeyInShanghai(Date.now()), buckets: [] });
+        const [intradayLoading, setIntradayLoading] = useState(false);
+        const [intradayError, setIntradayError] = useState(false);
+        const [intradayRefreshedAt, setIntradayRefreshedAt] = useState(null);
         const [loading, setLoading] = useState(false);
         const [checkingAccountIds, setCheckingAccountIds] = useState([]);
         const [checkingChannelIds, setCheckingChannelIds] = useState([]);
@@ -2402,6 +2601,54 @@
         useEffect(() => {
           refresh().catch((error) => message.error(error.message));
         }, []);
+
+        useEffect(() => {
+          let cancelled = false;
+          let requesting = false;
+          const targetDay = productivityDay;
+          const loadIntraday = async (showLoading = false) => {
+            if (requesting) return;
+            requesting = true;
+            if (showLoading) setIntradayLoading(true);
+            try {
+              const data = await api(`/api/stats/intraday?day=${encodeURIComponent(targetDay)}`);
+              if (cancelled || data?.day !== targetDay) return;
+              setIntradayStats(data);
+              setIntradayError(false);
+              setIntradayRefreshedAt(Date.parse(data.generatedAt || "") || Date.now());
+              if (Array.isArray(data.dailyRecords)) {
+                setDailyStats((current) => {
+                  const days = [...new Set([...(current.days || []), targetDay])].sort().slice(-31);
+                  return {
+                    ...current,
+                    days,
+                    records: [
+                      ...(current.records || []).filter((record) => record.day !== targetDay),
+                      ...data.dailyRecords
+                    ]
+                  };
+                });
+              }
+            } catch (_error) {
+              if (!cancelled) setIntradayError(true);
+            } finally {
+              requesting = false;
+              if (!cancelled) setIntradayLoading(false);
+            }
+          };
+
+          setIntradayStats({ day: targetDay, buckets: [] });
+          setIntradayError(false);
+          setIntradayRefreshedAt(null);
+          loadIntraday(true);
+          const timer = targetDay === dateKeyInShanghai(Date.now())
+            ? setInterval(() => loadIntraday(false), 60_000)
+            : null;
+          return () => {
+            cancelled = true;
+            if (timer) clearInterval(timer);
+          };
+        }, [productivityDay]);
 
         useEffect(() => {
           const timer = setInterval(() => {
@@ -3475,6 +3722,39 @@
                         message: "平均出图时间和实际并发从本次更新后开始累计，较早日期没有记录时显示“—”。",
                         style: { marginBottom: 16 }
                       }),
+                      h("section", { className: "intraday-section" }, [
+                        h("div", { className: "intraday-header" }, [
+                          h("div", null, [
+                            h("h3", null, "当日分时出图"),
+                            h("p", null, "每30分钟统计成功图片，查看当天哪个时间段产量最高")
+                          ]),
+                          h("div", { className: "intraday-meta" }, [
+                            h("span", { key: "total" }, [
+                              "已出 ",
+                              h("strong", { key: "value" }, `${numberValue(intradayStats.totalImages).toLocaleString("zh-CN")} 张`)
+                            ]),
+                            h("span", { key: "peak" }, intradayStats.peak
+                              ? [
+                                  "高峰 ",
+                                  h("strong", { key: "value" }, `${intradayStats.peak.start}–${intradayStats.peak.end} / ${numberValue(intradayStats.peak.successImages).toLocaleString("zh-CN")} 张`)
+                                ]
+                              : "高峰 暂无"),
+                            h("span", {
+                              key: "refresh",
+                              className: `intraday-refresh${intradayError ? " is-error" : ""}`
+                            }, intradayError
+                              ? "自动更新失败，稍后重试"
+                              : intradayLoading
+                                ? "正在加载分时数据"
+                                : productivityDay === dateKeyInShanghai(Date.now())
+                                  ? `每60秒更新 · ${formatClock(intradayRefreshedAt)}`
+                                  : `历史数据 · ${formatClock(intradayRefreshedAt)}`)
+                          ])
+                        ]),
+                        intradayStats.buckets?.length
+                          ? h(IntradayOutputChart, { data: intradayStats, day: productivityDay })
+                          : h("div", { className: "intraday-placeholder" }, intradayError ? "分时数据暂时无法加载" : "正在加载分时数据")
+                      ]),
                       h("div", { className: "productivity-table-title" }, [
                         h("h3", null, `${chartDayLabel(productivityDay)}账号明细`),
                         h("span", { className: "toolbar-note" }, `总出图 ${selectedProductivity.totalImages.toLocaleString("zh-CN")} 张，失败任务 ${selectedProductivity.totalFailed.toLocaleString("zh-CN")} 个`)

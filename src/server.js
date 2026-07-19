@@ -31,6 +31,7 @@ import {
 } from "./image-store.js";
 import {
   getTask,
+  listIntradayTaskStats,
   listTaskStats,
   listTasks,
   loadConfig,
@@ -753,6 +754,11 @@ app.get("/api/models", async () => {
 app.get("/api/tasks", async () => ({ ok: true, data: await listTasks() }));
 
 app.get("/api/stats", async () => ({ ok: true, data: await listTaskStats() }));
+
+app.get("/api/stats/intraday", async (request) => ({
+  ok: true,
+  data: await listIntradayTaskStats(request.query?.day)
+}));
 
 app.get("/api/admin/runtime", async () => ({ ok: true, data: await getRuntimeStatus() }));
 

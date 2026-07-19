@@ -13,8 +13,10 @@ const statRecordDays = 31;
 const dailyStatDays = 30;
 const imageTaskTypes = new Set(["text2img", "img2img"]);
 const statRecordLimit = 50000;
+const intradayIntervalMinutes = 30;
 let statsWriteQueue = Promise.resolve();
 let runtimeStatsWriteQueue = Promise.resolve();
+const intradayStatsCache = new Map();
 
 const defaultImageStorage = {
   mode: "smart",
@@ -681,6 +683,100 @@ export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now 
   };
 }
 
+function intradayTargetDay(value, now = Date.now()) {
+  const day = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : dateKeyInShanghai(now);
+}
+
+function minutesInShanghai(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Shanghai",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+  const hour = Number(parts.find((part) => part.type === "hour")?.value);
+  const minute = Number(parts.find((part) => part.type === "minute")?.value);
+  return Number.isFinite(hour) && Number.isFinite(minute) ? hour * 60 + minute : null;
+}
+
+function intradayTimeLabel(totalMinutes) {
+  const minutes = Math.max(0, Math.min(24 * 60, totalMinutes));
+  const hour = Math.floor(minutes / 60);
+  const minute = minutes % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+export function summarizeIntradayTaskStats(records = [], day, now = Date.now()) {
+  const targetDay = intradayTargetDay(day, now);
+  const bucketCount = 24 * 60 / intradayIntervalMinutes;
+  const buckets = Array.from({ length: bucketCount }, (_, index) => {
+    const startMinute = index * intradayIntervalMinutes;
+    return {
+      index,
+      startMinute,
+      start: intradayTimeLabel(startMinute),
+      end: intradayTimeLabel(startMinute + intradayIntervalMinutes),
+      tasks: 0,
+      successTasks: 0,
+      failedTasks: 0,
+      successImages: 0,
+      accountIds: new Set()
+    };
+  });
+
+  for (const record of records) {
+    if (!imageTaskTypes.has(record?.taskType)) continue;
+    const recordDay = record?.day || dateKeyInShanghai(record?.time);
+    if (recordDay !== targetDay) continue;
+    const minute = minutesInShanghai(record?.time);
+    if (minute === null) continue;
+    const bucket = buckets[Math.min(bucketCount - 1, Math.floor(minute / intradayIntervalMinutes))];
+    const taskCount = Math.max(0, Number(record?.tasks || 1) || 0);
+    bucket.tasks += taskCount;
+    if (record?.status === "success") {
+      bucket.successTasks += taskCount;
+      bucket.successImages += Math.max(0, Number(record?.successImages || 0) || 0);
+    } else if (record?.status === "failed") {
+      bucket.failedTasks += Math.max(0, Number(record?.failedTasks || taskCount) || 0);
+    }
+    const accountId = String(record?.accountId || record?.accountName || "").trim();
+    if (taskCount > 0 && accountId) bucket.accountIds.add(accountId);
+  }
+
+  const normalizedBuckets = buckets.map((bucket) => ({
+    index: bucket.index,
+    startMinute: bucket.startMinute,
+    start: bucket.start,
+    end: bucket.end,
+    tasks: bucket.tasks,
+    successTasks: bucket.successTasks,
+    failedTasks: bucket.failedTasks,
+    successImages: bucket.successImages,
+    accountCount: bucket.accountIds.size,
+    successRate: bucket.tasks ? Number((bucket.successTasks / bucket.tasks * 100).toFixed(1)) : null
+  }));
+  const peak = normalizedBuckets.reduce((best, bucket) => (
+    bucket.successImages > best.successImages ? bucket : best
+  ), normalizedBuckets[0]);
+
+  return {
+    day: targetDay,
+    intervalMinutes: intradayIntervalMinutes,
+    totalImages: normalizedBuckets.reduce((sum, bucket) => sum + bucket.successImages, 0),
+    totalTasks: normalizedBuckets.reduce((sum, bucket) => sum + bucket.tasks, 0),
+    failedTasks: normalizedBuckets.reduce((sum, bucket) => sum + bucket.failedTasks, 0),
+    peak: peak?.successImages > 0 ? {
+      start: peak.start,
+      end: peak.end,
+      successImages: peak.successImages
+    } : null,
+    buckets: normalizedBuckets
+  };
+}
+
 function normalizeRuntimeStats(stats = {}) {
   return {
     version: 1,
@@ -805,7 +901,30 @@ export async function recordTaskStat(task) {
     stats.records[record.taskId] = record;
     const next = pruneStats(stats);
     await writeJson(statsFile, next);
+    intradayStatsCache.clear();
     return record;
+  });
+}
+
+export async function listIntradayTaskStats(day) {
+  const targetDay = intradayTargetDay(day);
+  const cached = intradayStatsCache.get(targetDay);
+  if (cached) return { ...cached, generatedAt: new Date().toISOString() };
+  return withStatsLock(async () => {
+    const currentCached = intradayStatsCache.get(targetDay);
+    if (currentCached) return { ...currentCached, generatedAt: new Date().toISOString() };
+    const stats = await seedStatsFromTasks(await loadStats());
+    const records = Object.values(stats.records || {});
+    const intraday = summarizeIntradayTaskStats(records, targetDay);
+    const targetTimestamp = Date.parse(`${targetDay}T12:00:00+08:00`);
+    const daily = summarizeDailyTaskStats(records, 1, targetTimestamp);
+    const result = {
+      ...intraday,
+      updatedAt: stats.updatedAt || null,
+      dailyRecords: daily.records
+    };
+    intradayStatsCache.set(targetDay, result);
+    return { ...result, generatedAt: new Date().toISOString() };
   });
 }
 
