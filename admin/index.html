@@ -633,6 +633,110 @@
         place-items: center;
       }
 
+      .productivity-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .productivity-summary {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        margin-bottom: 16px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel-soft);
+      }
+
+      .productivity-summary-item {
+        min-width: 0;
+        padding: 13px 14px;
+        border-right: 1px solid var(--line);
+      }
+
+      .productivity-summary-item:last-child {
+        border-right: 0;
+      }
+
+      .productivity-summary-value {
+        margin-top: 5px;
+        font-size: 21px;
+        font-weight: 760;
+        line-height: 1.1;
+      }
+
+      .productivity-summary-note {
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .productivity-table-title {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        margin: 0 0 10px;
+      }
+
+      .productivity-table-title h3 {
+        margin: 0;
+        font-size: 14px;
+      }
+
+      .productivity-share {
+        display: grid;
+        grid-template-columns: minmax(72px, 1fr) 44px;
+        align-items: center;
+        gap: 8px;
+        width: 150px;
+      }
+
+      .productivity-share span {
+        color: var(--muted);
+        font-size: 12px;
+        text-align: right;
+      }
+
+      .productivity-trends {
+        margin-top: 16px;
+        padding-top: 16px;
+        border-top: 1px solid var(--line);
+      }
+
+      .productivity-chart-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .productivity-chart-panel {
+        min-width: 0;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+
+      .productivity-chart-panel h4 {
+        margin: 0;
+        font-size: 13px;
+      }
+
+      .productivity-chart-panel p {
+        margin: 4px 0 8px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .productivity-chart {
+        width: 100%;
+        height: 280px;
+      }
+
       .task-filters {
         display: grid;
         grid-template-columns: 220px 180px 180px 1fr;
@@ -827,6 +931,10 @@
         .workspace {
           grid-template-columns: 1fr;
         }
+
+        .productivity-chart-grid {
+          grid-template-columns: 1fr;
+        }
       }
 
       @media (max-width: 780px) {
@@ -843,6 +951,7 @@
 
         .metrics-grid,
         .task-summary-grid,
+        .productivity-summary,
         .detail-grid,
         .form-grid,
         .model-route-grid {
@@ -867,6 +976,15 @@
           border-bottom: 1px solid var(--line);
         }
 
+        .productivity-summary-item {
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+
+        .productivity-summary-item:last-child {
+          border-bottom: 0;
+        }
+
         .task-summary-item:last-child {
           border-bottom: 0;
         }
@@ -884,8 +1002,18 @@
           flex-direction: column;
         }
 
+        .productivity-toolbar,
+        .productivity-table-title {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
         .task-trend-chart {
           height: 260px;
+        }
+
+        .productivity-chart {
+          height: 250px;
         }
 
         .task-json-grid {
@@ -909,6 +1037,7 @@
         Button,
         Col,
         ConfigProvider,
+        DatePicker,
         Empty,
         Form,
         Image,
@@ -1444,14 +1573,14 @@
       function taskTrendData(daily, rangeDays, accountFilter, channelFilter) {
         const days = Array.isArray(daily?.days) ? daily.days.slice(-rangeDays) : [];
         const visibleDays = new Set(days);
-        const totals = new Map(days.map((day) => [day, { day, successTasks: 0, failedTasks: 0 }]));
+        const totals = new Map(days.map((day) => [day, { day, successImages: 0, failedTasks: 0 }]));
         const records = Array.isArray(daily?.records) ? daily.records : [];
         records.forEach((record) => {
           if (!visibleDays.has(record.day)) return;
           if (accountFilter !== "all" && record.accountId !== accountFilter) return;
           if (channelFilter !== "all" && record.channelGroup !== channelFilter) return;
           const current = totals.get(record.day);
-          current.successTasks += numberValue(record.successTasks);
+          current.successImages += numberValue(record.successImages);
           current.failedTasks += numberValue(record.failedTasks);
         });
         return [...totals.values()];
@@ -1490,7 +1619,7 @@
             color: ["#16a34a", "#dc2626"],
             aria: {
               enabled: true,
-              description: "每日生图成功任务和失败任务趋势"
+              description: "每日成功图片和失败任务趋势"
             },
             tooltip: {
               trigger: "axis",
@@ -1503,7 +1632,7 @@
                 const row = data[index] || {};
                 return [
                   `<strong>${chartDayLabel(row.day)}</strong>`,
-                  `成功任务：${numberValue(row.successTasks)}`,
+                  `成功图片：${numberValue(row.successImages)}`,
                   `失败任务：${numberValue(row.failedTasks)}`
                 ].join("<br>");
               }
@@ -1514,7 +1643,7 @@
               itemWidth: 18,
               itemHeight: 8,
               textStyle: { color: "#475467", fontSize: 12 },
-              data: ["成功任务", "失败任务"]
+              data: ["成功图片", "失败任务"]
             },
             grid: {
               top: 48,
@@ -1539,7 +1668,7 @@
             },
             series: [
               {
-                name: "成功任务",
+                name: "成功图片",
                 type: "line",
                 smooth: 0.22,
                 showSymbol: false,
@@ -1547,7 +1676,7 @@
                 lineStyle: { width: 2 },
                 areaStyle: { opacity: 0.06 },
                 emphasis: { focus: "series" },
-                data: data.map((item) => item.successTasks)
+                data: data.map((item) => item.successImages)
               },
               {
                 name: "失败任务",
@@ -1571,7 +1700,247 @@
           ref: containerRef,
           className: "task-trend-chart",
           role: "img",
-          "aria-label": "每日生图成功任务和失败任务折线图"
+          "aria-label": "每日成功图片和失败任务折线图"
+        });
+      }
+
+      function productivityDayData(daily, accounts, day) {
+        const rows = new Map();
+        (Array.isArray(accounts) ? accounts : []).forEach((account) => {
+          rows.set(String(account.id), {
+            id: String(account.id),
+            name: account.name || account.username || account.id || "未命名账号",
+            tasks: 0,
+            successTasks: 0,
+            failedTasks: 0,
+            successImages: 0,
+            durationMsTotal: 0,
+            durationSamples: 0
+          });
+        });
+        (Array.isArray(daily?.records) ? daily.records : []).forEach((record) => {
+          if (record.day !== day) return;
+          const id = String(record.accountId || record.accountName || "unknown");
+          const current = rows.get(id) || {
+            id,
+            name: record.accountName || record.accountId || "未知账号",
+            tasks: 0,
+            successTasks: 0,
+            failedTasks: 0,
+            successImages: 0,
+            durationMsTotal: 0,
+            durationSamples: 0
+          };
+          current.tasks += numberValue(record.tasks);
+          current.successTasks += numberValue(record.successTasks);
+          current.failedTasks += numberValue(record.failedTasks);
+          current.successImages += numberValue(record.successImages);
+          current.durationMsTotal += numberValue(record.durationMsTotal);
+          current.durationSamples += numberValue(record.durationSamples);
+          rows.set(id, current);
+        });
+        const list = [...rows.values()];
+        const totalImages = list.reduce((sum, row) => sum + row.successImages, 0);
+        const totalTasks = list.reduce((sum, row) => sum + row.tasks, 0);
+        const totalFailed = list.reduce((sum, row) => sum + row.failedTasks, 0);
+        const durationMsTotal = list.reduce((sum, row) => sum + row.durationMsTotal, 0);
+        const durationSamples = list.reduce((sum, row) => sum + row.durationSamples, 0);
+        const activeAccounts = list.filter((row) => row.tasks > 0).length;
+        return {
+          day,
+          totalImages,
+          totalTasks,
+          totalFailed,
+          activeAccounts,
+          averagePerAccount: activeAccounts ? totalImages / activeAccounts : 0,
+          averageDurationMs: durationSamples ? durationMsTotal / durationSamples : null,
+          rows: list
+            .map((row) => ({
+              ...row,
+              share: totalImages ? row.successImages / totalImages : 0,
+              successRate: row.tasks ? row.successTasks / row.tasks : 0,
+              averageDurationMs: row.durationSamples ? row.durationMsTotal / row.durationSamples : null
+            }))
+            .sort((a, b) => b.successImages - a.successImages || b.tasks - a.tasks || a.name.localeCompare(b.name, "zh-CN"))
+        };
+      }
+
+      function productivityTrendData(daily, concurrency, rangeDays) {
+        const days = Array.isArray(daily?.days) ? daily.days.slice(-rangeDays) : [];
+        const visibleDays = new Set(days);
+        const totals = new Map(days.map((day) => [day, {
+          day,
+          totalImages: 0,
+          durationMsTotal: 0,
+          durationSamples: 0,
+          activeAccountIds: new Set()
+        }]));
+        (Array.isArray(daily?.records) ? daily.records : []).forEach((record) => {
+          if (!visibleDays.has(record.day)) return;
+          const current = totals.get(record.day);
+          current.totalImages += numberValue(record.successImages);
+          current.durationMsTotal += numberValue(record.durationMsTotal);
+          current.durationSamples += numberValue(record.durationSamples);
+          if (numberValue(record.tasks) > 0) current.activeAccountIds.add(record.accountId || record.accountName || "unknown");
+        });
+        const concurrencyByDay = new Map((Array.isArray(concurrency?.days) ? concurrency.days : []).map((item) => [item.day, item]));
+        return [...totals.values()].map((row) => {
+          const activeAccounts = row.activeAccountIds.size;
+          const runtime = concurrencyByDay.get(row.day);
+          return {
+            day: row.day,
+            totalImages: row.totalImages,
+            activeAccounts,
+            averagePerAccount: activeAccounts ? Number((row.totalImages / activeAccounts).toFixed(1)) : 0,
+            averageDurationMs: row.durationSamples ? Math.round(row.durationMsTotal / row.durationSamples) : null,
+            averageRunning: runtime?.samples ? numberValue(runtime.averageRunning) : null,
+            peakRunning: runtime?.samples ? numberValue(runtime.peakRunning) : null,
+            averageConfigured: runtime?.samples ? numberValue(runtime.averageConfigured) : null
+          };
+        });
+      }
+
+      function ProductivityTrendChart({ data, type }) {
+        const containerRef = useRef(null);
+        const chartRef = useRef(null);
+
+        useEffect(() => {
+          if (!containerRef.current || !window.echarts) return undefined;
+          const chart = window.echarts.init(containerRef.current, null, { renderer: "canvas" });
+          chartRef.current = chart;
+          const resize = () => chart.resize();
+          const observer = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
+          if (observer) observer.observe(containerRef.current);
+          else window.addEventListener("resize", resize);
+          return () => {
+            if (observer) observer.disconnect();
+            else window.removeEventListener("resize", resize);
+            chart.dispose();
+            chartRef.current = null;
+          };
+        }, []);
+
+        useEffect(() => {
+          const chart = chartRef.current;
+          if (!chart) return;
+          const output = type === "output";
+          chart.setOption({
+            animationDuration: 280,
+            color: output ? ["#1677ff", "#16a34a"] : ["#d97706", "#1677ff"],
+            aria: {
+              enabled: true,
+              description: output ? "每日总出图量和单账号平均产值" : "每日平均出图时间和实际平均并发"
+            },
+            tooltip: {
+              trigger: "axis",
+              backgroundColor: "rgba(16, 24, 40, 0.94)",
+              borderWidth: 0,
+              padding: [10, 12],
+              textStyle: { color: "#ffffff", fontSize: 12 },
+              formatter: (items) => {
+                const index = items?.[0]?.dataIndex ?? 0;
+                const row = data[index] || {};
+                return output
+                  ? [
+                      `<strong>${chartDayLabel(row.day)}</strong>`,
+                      `总出图：${numberValue(row.totalImages)}`,
+                      `参与账号：${numberValue(row.activeAccounts)}`,
+                      `单账号平均：${numberValue(row.averagePerAccount).toFixed(1)}`
+                    ].join("<br>")
+                  : [
+                      `<strong>${chartDayLabel(row.day)}</strong>`,
+                      `平均出图时间：${row.averageDurationMs === null ? "暂无" : formatDuration(row.averageDurationMs)}`,
+                      `实际平均并发：${row.averageRunning === null ? "暂无" : numberValue(row.averageRunning).toFixed(1)}`,
+                      `最高并发：${row.peakRunning === null ? "暂无" : numberValue(row.peakRunning)}`,
+                      `配置上限：${row.averageConfigured === null ? "暂无" : numberValue(row.averageConfigured).toFixed(1)}`
+                    ].join("<br>");
+              }
+            },
+            legend: {
+              top: 2,
+              left: 2,
+              itemWidth: 18,
+              itemHeight: 8,
+              textStyle: { color: "#475467", fontSize: 12 },
+              data: output ? ["总出图", "单账号平均"] : ["平均出图时间", "实际平均并发"]
+            },
+            grid: { top: 46, right: 22, bottom: 28, left: 18, containLabel: true },
+            xAxis: {
+              type: "category",
+              data: data.map((item) => chartDayLabel(item.day).replace("月", "/").replace("日", "")),
+              axisLine: { lineStyle: { color: "#d0d5dd" } },
+              axisTick: { show: false },
+              axisLabel: { color: "#667085", fontSize: 11, hideOverlap: true }
+            },
+            yAxis: [
+              {
+                type: "value",
+                min: 0,
+                minInterval: 1,
+                name: output ? "张" : "分钟",
+                nameTextStyle: { color: "#667085", fontSize: 11 },
+                axisLabel: { color: "#667085", fontSize: 11 },
+                splitLine: { lineStyle: { color: "#eaecf0", type: "dashed" } }
+              },
+              {
+                type: "value",
+                min: 0,
+                name: output ? "张/账号" : "并发",
+                nameTextStyle: { color: "#667085", fontSize: 11 },
+                axisLabel: { color: "#667085", fontSize: 11 },
+                splitLine: { show: false }
+              }
+            ],
+            series: output
+              ? [
+                  {
+                    name: "总出图",
+                    type: "bar",
+                    barMaxWidth: 28,
+                    data: data.map((item) => item.totalImages)
+                  },
+                  {
+                    name: "单账号平均",
+                    type: "line",
+                    yAxisIndex: 1,
+                    smooth: 0.2,
+                    showSymbol: false,
+                    lineStyle: { width: 2 },
+                    data: data.map((item) => item.averagePerAccount)
+                  }
+                ]
+              : [
+                  {
+                    name: "平均出图时间",
+                    type: "line",
+                    smooth: 0.2,
+                    showSymbol: false,
+                    connectNulls: false,
+                    lineStyle: { width: 2 },
+                    data: data.map((item) => item.averageDurationMs === null ? null : Number((item.averageDurationMs / 60000).toFixed(1)))
+                  },
+                  {
+                    name: "实际平均并发",
+                    type: "line",
+                    yAxisIndex: 1,
+                    smooth: 0.2,
+                    showSymbol: false,
+                    connectNulls: false,
+                    lineStyle: { width: 2 },
+                    data: data.map((item) => item.averageRunning)
+                  }
+                ]
+          }, true);
+        }, [data, type]);
+
+        if (!window.echarts) {
+          return h(Alert, { type: "warning", showIcon: true, message: "趋势图加载失败，请刷新页面重试。" });
+        }
+        return h("div", {
+          ref: containerRef,
+          className: "productivity-chart",
+          role: "img",
+          "aria-label": type === "output" ? "每日账号产值趋势图" : "每日出图时间和并发趋势图"
         });
       }
 
@@ -1721,6 +2090,7 @@
         const [tasks, setTasks] = useState([]);
         const [statRecords, setStatRecords] = useState([]);
         const [dailyStats, setDailyStats] = useState({ days: [], records: [] });
+        const [concurrencyStats, setConcurrencyStats] = useState({ days: [] });
         const [loading, setLoading] = useState(false);
         const [checkingAccountIds, setCheckingAccountIds] = useState([]);
         const [checkingChannelIds, setCheckingChannelIds] = useState([]);
@@ -1743,6 +2113,8 @@
         const [taskChannelFilter, setTaskChannelFilter] = useState("all");
         const [taskStatusFilter, setTaskStatusFilter] = useState("all");
         const [taskTrendDays, setTaskTrendDays] = useState(30);
+        const [productivityDay, setProductivityDay] = useState(dateKeyInShanghai(Date.now()));
+        const [productivityTrendDays, setProductivityTrendDays] = useState(7);
         const [channelModalOpen, setChannelModalOpen] = useState(false);
         const [accountModalOpen, setAccountModalOpen] = useState(false);
         const [editingChannel, setEditingChannel] = useState(null);
@@ -1930,7 +2302,17 @@
         const trendData = useMemo(() => (
           taskTrendData(dailyStats, taskTrendDays, taskAccountFilter, taskChannelFilter)
         ), [dailyStats, taskTrendDays, taskAccountFilter, taskChannelFilter]);
-        const trendHasData = trendData.some((item) => item.successTasks > 0 || item.failedTasks > 0);
+        const trendHasData = trendData.some((item) => item.successImages > 0 || item.failedTasks > 0);
+        const selectedProductivity = useMemo(() => (
+          productivityDayData(dailyStats, accounts, productivityDay)
+        ), [dailyStats, accounts, productivityDay]);
+        const productivityRuntime = useMemo(() => (
+          (Array.isArray(concurrencyStats?.days) ? concurrencyStats.days : [])
+            .find((item) => item.day === productivityDay) || { day: productivityDay, samples: 0 }
+        ), [concurrencyStats, productivityDay]);
+        const productivityTrend = useMemo(() => (
+          productivityTrendData(dailyStats, concurrencyStats, productivityTrendDays)
+        ), [dailyStats, concurrencyStats, productivityTrendDays]);
 
         const accountTodayUsage = useMemo(() => {
           const today = dateKeyInShanghai(Date.now());
@@ -1966,7 +2348,7 @@
           const [nextConfig, taskList, statsData, storageData, runtimeData] = await Promise.all([
             api("/api/config"),
             api("/api/tasks"),
-            api("/api/stats").catch(() => ({ records: [], daily: { days: [], records: [] } })),
+            api("/api/stats").catch(() => ({ records: [], daily: { days: [], records: [] }, concurrency: { days: [] } })),
             api("/api/admin/image-storage").catch(() => null),
             api("/api/admin/runtime").catch(() => null)
           ]);
@@ -1976,6 +2358,9 @@
           setDailyStats(statsData?.daily && Array.isArray(statsData.daily.days) && Array.isArray(statsData.daily.records)
             ? statsData.daily
             : { days: [], records: [] });
+          setConcurrencyStats(statsData?.concurrency && Array.isArray(statsData.concurrency.days)
+            ? statsData.concurrency
+            : { days: [] });
           if (storageData) setImageStorageStats(storageData);
           if (runtimeData) setRuntimeStatus(runtimeData);
           globalForm.setFieldsValue(nextConfig);
@@ -2638,6 +3023,54 @@
           }
         ];
 
+        const productivityColumns = [
+          {
+            title: "账号",
+            dataIndex: "name",
+            width: 190,
+            render: (value) => h("div", { className: "primary-text" }, value)
+          },
+          {
+            title: "成功图片",
+            dataIndex: "successImages",
+            width: 110,
+            render: (value) => h("strong", null, numberValue(value).toLocaleString("zh-CN"))
+          },
+          {
+            title: "当日占比",
+            dataIndex: "share",
+            width: 190,
+            render: (value) => {
+              const percent = Math.max(0, Math.min(100, numberValue(value) * 100));
+              return h("div", { className: "productivity-share" }, [
+                h(Progress, { key: "bar", percent, showInfo: false, strokeWidth: 6 }),
+                h("span", { key: "text" }, `${percent.toFixed(1)}%`)
+              ]);
+            }
+          },
+          {
+            title: "平均出图时间",
+            dataIndex: "averageDurationMs",
+            width: 140,
+            render: (value) => value === null ? "—" : formatDuration(value)
+          },
+          { title: "完成任务", dataIndex: "tasks", width: 100 },
+          { title: "失败任务", dataIndex: "failedTasks", width: 100 },
+          {
+            title: "任务成功率",
+            dataIndex: "successRate",
+            width: 110,
+            render: (value, row) => row.tasks ? `${(numberValue(value) * 100).toFixed(1)}%` : "—"
+          },
+          {
+            title: "参与情况",
+            width: 100,
+            render: (_, row) => row.tasks
+              ? h(Tag, { color: "blue" }, "已参与")
+              : h(Tag, null, "未参与")
+          }
+        ];
+
         const taskColumns = [
           {
             title: "预览",
@@ -2985,6 +3418,105 @@
                         dataSource: filteredTasks,
                         pagination: { pageSize: 8 }
                       })
+                    ])
+                  },
+                  {
+                    key: "productivity",
+                    label: "账号产值",
+                    children: h("div", { className: "operation-body" }, [
+                      h("div", { className: "productivity-toolbar" }, [
+                        h(Space, { size: 8, wrap: true }, [
+                          h("span", { className: "toolbar-note", key: "label" }, "查看日期"),
+                          h(DatePicker, {
+                            key: "date",
+                            value: window.dayjs(productivityDay),
+                            allowClear: false,
+                            maxDate: window.dayjs(),
+                            format: "YYYY-MM-DD",
+                            onChange: (value) => {
+                              if (value) setProductivityDay(value.format("YYYY-MM-DD"));
+                            }
+                          })
+                        ]),
+                        h("span", { className: "toolbar-note" }, "单账号平均按当天实际参与任务的账号计算")
+                      ]),
+                      h("div", { className: "productivity-summary" }, [
+                        h("div", { className: "productivity-summary-item", key: "images" }, [
+                          h("div", { className: "task-summary-label" }, "总出图"),
+                          h("div", { className: "productivity-summary-value" }, selectedProductivity.totalImages.toLocaleString("zh-CN")),
+                          h("div", { className: "productivity-summary-note" }, `完成任务 ${selectedProductivity.totalTasks.toLocaleString("zh-CN")} 个`)
+                        ]),
+                        h("div", { className: "productivity-summary-item", key: "accounts" }, [
+                          h("div", { className: "task-summary-label" }, "参与账号"),
+                          h("div", { className: "productivity-summary-value" }, selectedProductivity.activeAccounts),
+                          h("div", { className: "productivity-summary-note" }, `当前共 ${accounts.length} 个账号`)
+                        ]),
+                        h("div", { className: "productivity-summary-item", key: "average" }, [
+                          h("div", { className: "task-summary-label" }, "单账号平均产值"),
+                          h("div", { className: "productivity-summary-value" }, selectedProductivity.averagePerAccount.toFixed(1)),
+                          h("div", { className: "productivity-summary-note" }, "张 / 参与账号")
+                        ]),
+                        h("div", { className: "productivity-summary-item", key: "duration" }, [
+                          h("div", { className: "task-summary-label" }, "平均出图时间"),
+                          h("div", { className: "productivity-summary-value" }, selectedProductivity.averageDurationMs === null ? "—" : formatDuration(selectedProductivity.averageDurationMs)),
+                          h("div", { className: "productivity-summary-note" }, "按成功出图任务计算")
+                        ]),
+                        h("div", { className: "productivity-summary-item", key: "concurrency" }, [
+                          h("div", { className: "task-summary-label" }, "实际平均并发"),
+                          h("div", { className: "productivity-summary-value" }, productivityRuntime.samples ? numberValue(productivityRuntime.averageRunning).toFixed(1) : "—"),
+                          h("div", { className: "productivity-summary-note" }, productivityRuntime.samples
+                            ? `最高 ${numberValue(productivityRuntime.peakRunning)} / 上限 ${numberValue(productivityRuntime.averageConfigured).toFixed(1)}`
+                            : "该日暂无并发记录")
+                        ])
+                      ]),
+                      h(Alert, {
+                        type: "info",
+                        showIcon: true,
+                        message: "平均出图时间和实际并发从本次更新后开始累计，较早日期没有记录时显示“—”。",
+                        style: { marginBottom: 16 }
+                      }),
+                      h("div", { className: "productivity-table-title" }, [
+                        h("h3", null, `${chartDayLabel(productivityDay)}账号明细`),
+                        h("span", { className: "toolbar-note" }, `总出图 ${selectedProductivity.totalImages.toLocaleString("zh-CN")} 张，失败任务 ${selectedProductivity.totalFailed.toLocaleString("zh-CN")} 个`)
+                      ]),
+                      h(Table, {
+                        rowKey: "id",
+                        columns: productivityColumns,
+                        dataSource: selectedProductivity.rows,
+                        pagination: selectedProductivity.rows.length > 12 ? { pageSize: 12 } : false,
+                        scroll: { x: 1050 },
+                        size: "small",
+                        locale: { emptyText: "这一天还没有账号数据" }
+                      }),
+                      h("div", { className: "productivity-trends" }, [
+                        h("div", { className: "task-trend-header" }, [
+                          h("div", null, [
+                            h("h3", { className: "task-trend-title" }, "每日产值与效率"),
+                            h("div", { className: "task-trend-desc" }, "对比账号增加前后，单账号产值、出图时间和实际并发是否变化")
+                          ]),
+                          h(Segmented, {
+                            value: productivityTrendDays,
+                            onChange: setProductivityTrendDays,
+                            options: [
+                              { label: "近7天", value: 7 },
+                              { label: "近30天", value: 30 }
+                            ],
+                            size: "small"
+                          })
+                        ]),
+                        h("div", { className: "productivity-chart-grid" }, [
+                          h("section", { className: "productivity-chart-panel", key: "output" }, [
+                            h("h4", null, "总出图与单账号产值"),
+                            h("p", null, "柱形是当天总出图，折线是每个参与账号的平均出图"),
+                            h(ProductivityTrendChart, { data: productivityTrend, type: "output" })
+                          ]),
+                          h("section", { className: "productivity-chart-panel", key: "efficiency" }, [
+                            h("h4", null, "出图时间与实际并发"),
+                            h("p", null, "折线显示每日平均值；移到日期上可看最高并发和配置上限"),
+                            h(ProductivityTrendChart, { data: productivityTrend, type: "efficiency" })
+                          ])
+                        ])
+                      ])
                     ])
                   },
                   {

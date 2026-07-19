@@ -7,12 +7,14 @@ const dataDir = path.resolve(rootDir, process.env.DATA_DIR || "data");
 const configFile = path.join(dataDir, "config.json");
 const tasksFile = path.join(dataDir, "tasks.json");
 const statsFile = path.join(dataDir, "stats.json");
+const runtimeStatsFile = path.join(dataDir, "runtime-stats.json");
 const taskHistoryLimit = 20;
 const statRecordDays = 31;
 const dailyStatDays = 30;
 const imageTaskTypes = new Set(["text2img", "img2img"]);
 const statRecordLimit = 50000;
 let statsWriteQueue = Promise.resolve();
+let runtimeStatsWriteQueue = Promise.resolve();
 
 const defaultImageStorage = {
   mode: "smart",
@@ -567,6 +569,14 @@ function taskGeneratedImageCount(task) {
   return 0;
 }
 
+function taskStatDuration(task, status) {
+  if (status !== "success") return null;
+  const start = Date.parse(task?.createdAt || "");
+  const end = Date.parse(task?.completedAt || task?.updatedAt || "");
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+  return end - start;
+}
+
 function taskStatRecord(task) {
   const status = finalStatStatus(task?.status);
   if (!status || !task?.id) return null;
@@ -585,7 +595,8 @@ function taskStatRecord(task) {
     channelGroup: taskStatChannelGroup(task),
     tasks: 1,
     successImages: status === "success" ? taskGeneratedImageCount(task) : 0,
-    failedTasks: status === "failed" ? 1 : 0
+    failedTasks: status === "failed" ? 1 : 0,
+    durationMs: taskStatDuration(task, status)
   };
 }
 
@@ -633,13 +644,20 @@ export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now 
       tasks: 0,
       successTasks: 0,
       failedTasks: 0,
-      successImages: 0
+      successImages: 0,
+      durationMsTotal: 0,
+      durationSamples: 0
     };
     const taskCount = Math.max(0, Number(record?.tasks || 1) || 0);
     current.tasks += taskCount;
     if (record?.status === "success") {
       current.successTasks += taskCount;
       current.successImages += Math.max(0, Number(record?.successImages || 0) || 0);
+      const durationMs = Number(record?.durationMs);
+      if (Number.isFinite(durationMs) && durationMs >= 0 && record?.durationMs !== null) {
+        current.durationMsTotal += durationMs;
+        current.durationSamples += 1;
+      }
     } else if (record?.status === "failed") {
       current.failedTasks += Math.max(0, Number(record?.failedTasks || taskCount) || 0);
     }
@@ -648,12 +666,113 @@ export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now 
 
   return {
     days: dayKeys,
-    records: [...grouped.values()].sort((a, b) => (
-      a.day.localeCompare(b.day)
-      || a.accountId.localeCompare(b.accountId)
-      || a.channelGroup.localeCompare(b.channelGroup)
-    ))
+    records: [...grouped.values()]
+      .map((record) => ({
+        ...record,
+        averageDurationMs: record.durationSamples
+          ? Math.round(record.durationMsTotal / record.durationSamples)
+          : null
+      }))
+      .sort((a, b) => (
+        a.day.localeCompare(b.day)
+        || a.accountId.localeCompare(b.accountId)
+        || a.channelGroup.localeCompare(b.channelGroup)
+      ))
   };
+}
+
+function normalizeRuntimeStats(stats = {}) {
+  return {
+    version: 1,
+    updatedAt: stats.updatedAt || null,
+    days: stats.days && typeof stats.days === "object" ? stats.days : {}
+  };
+}
+
+function runtimeNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, number) : 0;
+}
+
+export function mergeRuntimeStatSample(stats = {}, sample = {}) {
+  const next = normalizeRuntimeStats(stats);
+  const time = Number.isFinite(Number(sample.time)) ? Number(sample.time) : Date.now();
+  const day = dateKeyInShanghai(time);
+  const running = runtimeNumber(sample.running);
+  const configured = runtimeNumber(sample.configured);
+  const available = runtimeNumber(sample.available);
+  const current = next.days[day] || {
+    day,
+    samples: 0,
+    runningTotal: 0,
+    peakRunning: 0,
+    configuredTotal: 0,
+    availableTotal: 0,
+    firstSampleAt: time,
+    lastSampleAt: time
+  };
+  current.samples += 1;
+  current.runningTotal += running;
+  current.peakRunning = Math.max(runtimeNumber(current.peakRunning), running);
+  current.configuredTotal += configured;
+  current.availableTotal += available;
+  current.firstSampleAt = Math.min(Number(current.firstSampleAt || time), time);
+  current.lastSampleAt = Math.max(Number(current.lastSampleAt || time), time);
+  next.days[day] = current;
+  next.updatedAt = new Date(time).toISOString();
+  return next;
+}
+
+function pruneRuntimeStats(stats, now = Date.now()) {
+  const visibleDays = new Set(Array.from({ length: statRecordDays }, (_, index) => (
+    dateKeyInShanghai(now - index * 24 * 60 * 60 * 1000)
+  )));
+  return {
+    version: 1,
+    updatedAt: stats.updatedAt || new Date(now).toISOString(),
+    days: Object.fromEntries(Object.entries(stats.days || {}).filter(([day]) => visibleDays.has(day)))
+  };
+}
+
+export function summarizeDailyRuntimeStats(stats = {}, days = dailyStatDays, now = Date.now()) {
+  const rangeDays = Math.min(statRecordDays, Math.max(1, Math.floor(Number(days) || dailyStatDays)));
+  const dayKeys = Array.from({ length: rangeDays }, (_, index) => (
+    dateKeyInShanghai(now - (rangeDays - index - 1) * 24 * 60 * 60 * 1000)
+  ));
+  const source = normalizeRuntimeStats(stats).days;
+  return {
+    updatedAt: stats.updatedAt || null,
+    days: dayKeys.map((day) => {
+      const record = source[day];
+      const samples = Math.max(0, Number(record?.samples || 0) || 0);
+      if (!samples) return { day, samples: 0 };
+      return {
+        day,
+        samples,
+        averageRunning: Number((runtimeNumber(record.runningTotal) / samples).toFixed(2)),
+        peakRunning: runtimeNumber(record.peakRunning),
+        averageConfigured: Number((runtimeNumber(record.configuredTotal) / samples).toFixed(2)),
+        averageAvailable: Number((runtimeNumber(record.availableTotal) / samples).toFixed(2)),
+        firstSampleAt: Number(record.firstSampleAt || 0) || null,
+        lastSampleAt: Number(record.lastSampleAt || 0) || null
+      };
+    })
+  };
+}
+
+async function loadRuntimeStats() {
+  return normalizeRuntimeStats(await readJson(runtimeStatsFile, { version: 1, days: {} }));
+}
+
+export async function recordRuntimeStat(sample) {
+  const work = async () => {
+    const next = pruneRuntimeStats(mergeRuntimeStatSample(await loadRuntimeStats(), sample));
+    await writeJson(runtimeStatsFile, next);
+    return next.days[dateKeyInShanghai(sample?.time)];
+  };
+  const run = runtimeStatsWriteQueue.then(work, work);
+  runtimeStatsWriteQueue = run.catch(() => {});
+  return run;
 }
 
 async function withStatsLock(work) {
@@ -693,6 +812,7 @@ export async function recordTaskStat(task) {
 export async function listTaskStats() {
   return withStatsLock(async () => {
     const stats = await seedStatsFromTasks(await loadStats());
+    const runtimeStats = await loadRuntimeStats();
     const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
     const records = Object.values(stats.records || {});
     return {
@@ -700,7 +820,8 @@ export async function listTaskStats() {
       records: records
         .filter((record) => Number(record.time || 0) >= cutoff)
         .sort((a, b) => Number(b.time || 0) - Number(a.time || 0)),
-      daily: summarizeDailyTaskStats(records)
+      daily: summarizeDailyTaskStats(records),
+      concurrency: summarizeDailyRuntimeStats(runtimeStats)
     };
   });
 }

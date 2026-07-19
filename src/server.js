@@ -35,6 +35,7 @@ import {
   listTasks,
   loadConfig,
   publicConfig,
+  recordRuntimeStat,
   removeAccount,
   removeChannel,
   saveAccount,
@@ -891,6 +892,30 @@ function scheduleAccountRecovery() {
   recover();
 }
 
+function scheduleRuntimeStats() {
+  let recording = false;
+  const record = async () => {
+    if (recording) return;
+    recording = true;
+    try {
+      const status = await getRuntimeStatus();
+      await recordRuntimeStat({
+        time: Date.now(),
+        running: status.categories?.image?.running,
+        configured: status.categories?.image?.configured,
+        available: status.categories?.image?.available
+      });
+    } catch (error) {
+      app.log.warn({ error }, "runtime stats recording failed");
+    } finally {
+      recording = false;
+    }
+  };
+  record();
+  const timer = setInterval(record, 30_000);
+  timer.unref?.();
+}
+
 const port = Number(process.env.PORT || 3210);
 const host = process.env.HOST || "127.0.0.1";
 
@@ -899,6 +924,7 @@ try {
   scheduleResultImageCleanup();
   schedulePendingTaskRefresh();
   scheduleAccountRecovery();
+  scheduleRuntimeStats();
   app.log.info(`管理后台：http://${host}:${port}/admin/`);
 } catch (error) {
   app.log.error(error);
