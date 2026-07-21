@@ -1196,6 +1196,25 @@ async function refreshQuotaBeforeUse(config, target, attempts) {
   }
 }
 
+async function refreshQuotaBeforeUseFast(config, target, attempts, timeoutMs = 500) {
+  const localAttempts = [];
+  const refresh = refreshQuotaBeforeUse(config, target, localAttempts)
+    .then((ready) => ({ ready }))
+    .catch((error) => ({ error }));
+  const timeout = new Promise((resolve) => {
+    setTimeout(() => resolve({ timeout: true }), timeoutMs);
+  });
+  const result = await Promise.race([refresh, timeout]);
+  if (result.timeout) {
+    pushAttempt(attempts, target, "额度检测超时，已快速跳过。", { quotaEmpty: true });
+    refresh.catch((error) => console.error(error));
+    return false;
+  }
+  attempts.push(...localAttempts);
+  if (result.error) throw result.error;
+  return result.ready;
+}
+
 async function refreshDrawingQuota(account, channel) {
   if (channel.type !== "drawing") return;
   const config = await loadRuntimeConfig();
@@ -1268,12 +1287,7 @@ async function ensureTargetReady(config, target, taskType, attempts, options = {
   if (!(await ensureProxyReady(target, attempts))) return false;
   if (!shouldRefreshQuotaBeforeUse(target, taskType)) return true;
   if (options.skipQuotaRefresh) {
-    const status = targetQuotaStatus(target);
-    if (String(status.status || "").toLowerCase() === "quota_empty") {
-      pushAttempt(attempts, target, `${status.message || "额度不足"}，已跳过。`, { quotaEmpty: true });
-      return false;
-    }
-    return true;
+    return refreshQuotaBeforeUseFast(config, target, attempts);
   }
   return refreshQuotaBeforeUse(config, target, attempts);
 }
@@ -1579,7 +1593,10 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
-        pushAttempt(attempts, target, error.message || "调用失败", { busy: Boolean(error.busy) });
+        pushAttempt(attempts, target, error.message || "调用失败", {
+          busy: Boolean(error.busy),
+          quotaEmpty: Boolean(error.quotaEmpty || isQuotaEmptyError(error))
+        });
         if (!error.busy) {
           await updateTargetStatusAfterError(account, channel, error);
         }
@@ -1698,7 +1715,10 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
-        pushAttempt(attempts, target, error.message || "调用失败", { busy: Boolean(error.busy) });
+        pushAttempt(attempts, target, error.message || "调用失败", {
+          busy: Boolean(error.busy),
+          quotaEmpty: Boolean(error.quotaEmpty || isQuotaEmptyError(error))
+        });
         if (!error.busy) {
           await updateTargetStatusAfterError(account, channel, error);
         }
@@ -2184,7 +2204,10 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
       });
       if (finishedTask) return finishedTask;
     } catch (error) {
-      pushAttempt(attempts, target, error.message || "调用失败", { busy: Boolean(error.busy) });
+      pushAttempt(attempts, target, error.message || "调用失败", {
+        busy: Boolean(error.busy),
+        quotaEmpty: Boolean(error.quotaEmpty || isQuotaEmptyError(error))
+      });
       if (!error.busy) await updateTargetStatusAfterError(account, channel, error);
     } finally {
       release();
