@@ -16,6 +16,20 @@ after(async () => {
   await rm(dataDir, { recursive: true, force: true });
 });
 
+test("drawing client accepts OpenAI image model aliases", () => {
+  const client = new DrawingClient({
+    config: { defaultModelId: 3 },
+    channel: { id: "shareai:drawing", settings: { defaultModelId: 2 } },
+    account: { id: "account-drawing-model" }
+  });
+
+  assert.equal(client.defaultModelId({ model: "gpt-image-2" }), 1);
+  assert.equal(client.defaultModelId({ model: "nano-banana-pro" }), 2);
+  assert.equal(client.defaultModelId({ model: "nano-banana" }), 3);
+  assert.equal(client.defaultModelId({ model_id: 2, model: "gpt-image-2" }), 2);
+  assert.equal(client.defaultModelId({ model: "unknown-image-model" }), 2);
+});
+
 test("重启后没有上游编号的生图任务会变成结果待确认，且不计失败", async () => {
   const id = "task-restart-without-upstream-id";
   await upsertTask({
@@ -182,6 +196,78 @@ test("聊天生图拿到上游编号后会先通知保存，再继续等待图�
   assert.equal(submitted.status, "processing");
   assert.equal(submitted.taskType, "img2img");
   assert.equal(submitted.raw.selectedCarId, "car-1");
+  assert.equal(result.status, "waiting_upstream");
+});
+
+test("chatplus image fallback ignores drawing model aliases", async () => {
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: {
+      id: "shareai:chatplus",
+      settings: {
+        baseUrl: "https://www.chatplus.cc",
+        defaultChatModel: "gpt",
+        chatModels: [{
+          key: "gpt",
+          name: "GPT",
+          carType: "chatgpt",
+          model: "gpt-chat-configured",
+          strategy: "balanced",
+          enabled: true,
+          default: true
+        }]
+      }
+    },
+    account: { id: "account-chatplus-model", username: "chatplus-model@example.com" },
+    sessionLock: async (work) => work()
+  });
+  let submitted = null;
+  let conversationBody = null;
+  client.fetchCars = async () => [{
+    id: "car-chatplus-model",
+    status: 1,
+    count: 0,
+    cooldown: 0,
+    desc: "ok",
+    label: "ok",
+    imageRemaining: 20,
+    isPro: false,
+    isVirtual: false,
+    realCarIDs: []
+  }];
+  client.enterCar = async (carId, carType) => {
+    client.carId = carId;
+    client.carType = carType;
+    client.portalLoggedIn = true;
+  };
+  client.loadInit = async () => ({
+    default_model_slug: "gpt-init-default",
+    limits_progress: [{ feature_name: "image_gen", remaining: 20 }]
+  });
+  client.uploadChatImages = async () => [];
+  client.http = async (pathName, options = {}) => {
+    assert.equal(pathName, "/backend-api/conversation");
+    conversationBody = options.body;
+    return {
+      status: 200,
+      headers: {},
+      body: `data: {"conversation_id":"conversation-chatplus-model"}\n\ndata: [DONE]\n\n`
+    };
+  };
+
+  const result = await client.createImageTask({
+    prompt: "change background",
+    model: "gpt-image-2",
+    files: [{ filename: "source.png" }],
+    waitForImages: false,
+    onSubmitted: async (value) => {
+      submitted = value;
+    }
+  });
+
+  assert.equal(conversationBody.model, "gpt-chat-configured");
+  assert.equal(submitted.externalId, "conversation-chatplus-model");
+  assert.equal(result.modelId, "gpt");
   assert.equal(result.status, "waiting_upstream");
 });
 

@@ -601,6 +601,22 @@ function chatModelKey(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+const drawingModelRequestKeys = new Set([
+  "auto",
+  "1",
+  "2",
+  "3",
+  "gpt-image-2",
+  "chatgpt-image-2",
+  "nano-banana-pro",
+  "nano-banana"
+]);
+
+function requestedChatModel(input = {}) {
+  const requested = input.model || input.chat_model || input.chatModel || "";
+  return drawingModelRequestKeys.has(chatModelKey(requested)) ? "" : requested;
+}
+
 const chatModelRoutes = [
   { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced" },
   { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced" },
@@ -898,7 +914,7 @@ export class ChatplusClient {
   }
 
   chatRouteForInput(input = {}) {
-    const resolvedRoute = resolveChatModelRoute(this.channel?.settings || {}, input.model || input.chat_model || input.chatModel || "");
+    const resolvedRoute = resolveChatModelRoute(this.channel?.settings || {}, requestedChatModel(input));
     return input.preferImageCar && resolvedRoute.key === "gpt"
       ? { ...resolvedRoute, strategy: "image" }
       : resolvedRoute;

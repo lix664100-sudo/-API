@@ -366,14 +366,27 @@ export class DrawingClient {
     return this.request("/api/v1/models");
   }
 
+  drawingModelId(value) {
+    const text = String(value ?? "").trim();
+    if (!text) return null;
+    const numericId = Number(text);
+    if (Number.isFinite(numericId) && numericId > 0) return numericId;
+    const aliases = {
+      "gpt-image-2": 1,
+      "chatgpt-image-2": 1,
+      "nano-banana-pro": 2,
+      "nano-banana": 3
+    };
+    return aliases[text.toLowerCase()] || null;
+  }
+
   defaultModelId(input = {}) {
-    return Number(
-      input.model_id ||
-      input.modelId ||
-      this.channel?.settings?.defaultModelId ||
-      this.config.defaultModelId ||
-      1
-    );
+    return this.drawingModelId(input.model_id)
+      || this.drawingModelId(input.modelId)
+      || this.drawingModelId(input.model)
+      || this.drawingModelId(this.channel?.settings?.defaultModelId)
+      || this.drawingModelId(this.config.defaultModelId)
+      || 1;
   }
 
   async createTextTask(input) {

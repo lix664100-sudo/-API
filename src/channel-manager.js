@@ -1571,7 +1571,7 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
     status: "processing",
     prompt: prompt ?? cleanPrompt(input),
     taskType,
-    modelId: input.model_id || input.modelId || "",
+    modelId: input.model_id || input.modelId || input.model || "",
     ratio: input.ratio_label || input.ratio || "",
     imageCount: imageCount ?? Number(input.image_count || input.n || 1),
     imageUrls: [],
