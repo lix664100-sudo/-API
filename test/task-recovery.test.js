@@ -431,6 +431,98 @@ test("聊天生图异步提交拿到编号后不等待图片", async () => {
   assert.equal(result.externalId, "conversation-submit-only");
 });
 
+test("聊天生图并发提交会共用一次已准备好的账号会话", async () => {
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", settings: { baseUrl: "https://www.chatplus.cc" } },
+    account: { id: "account-shared-session", username: "shared-session@example.com" },
+    sessionLock: async (work) => work()
+  });
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  let enterCarCount = 0;
+  let initCount = 0;
+  let activeSubmitSteps = 0;
+  let maxSubmitSteps = 0;
+  let conversationIndex = 0;
+  const trackSubmitStep = async (work) => {
+    activeSubmitSteps += 1;
+    maxSubmitSteps = Math.max(maxSubmitSteps, activeSubmitSteps);
+    try {
+      await delay(20);
+      return await work();
+    } finally {
+      activeSubmitSteps -= 1;
+    }
+  };
+
+  client.fetchCars = async () => [{
+    id: "car-shared-session",
+    status: 1,
+    count: 0,
+    cooldown: 0,
+    desc: "ok",
+    label: "ok",
+    imageRemaining: 20,
+    isPro: false,
+    isVirtual: false,
+    realCarIDs: []
+  }];
+  client.enterCar = async (carId, carType) => {
+    enterCarCount += 1;
+    client.carId = carId;
+    client.carType = carType;
+    await delay(20);
+  };
+  client.loadInit = async () => {
+    initCount += 1;
+    return {
+      default_model_slug: "gpt-test",
+      limits_progress: [{ feature_name: "image_gen", remaining: 20 }]
+    };
+  };
+  client.uploadChatImages = async (files = []) => trackSubmitStep(async () => files.map((file, index) => ({
+    part: {
+      content_type: "image_asset_pointer",
+      asset_pointer: `file-service://source-${index + 1}`,
+      size_bytes: 1,
+      width: 512,
+      height: 512
+    },
+    attachment: {
+      id: `source-${index + 1}`,
+      name: file.filename || `source-${index + 1}.png`,
+      mimeType: "image/png",
+      size: 1,
+      width: 512,
+      height: 512
+    }
+  })));
+  client.http = async (pathName) => {
+    if (pathName !== "/backend-api/conversation") throw new Error(`unexpected request: ${pathName}`);
+    return trackSubmitStep(async () => {
+      conversationIndex += 1;
+      return {
+        status: 200,
+        headers: {},
+        body: `data: {"conversation_id":"conversation-${conversationIndex}"}\n\ndata: [DONE]\n\n`
+      };
+    });
+  };
+
+  const results = await Promise.all(["red", "blue", "black"].map((color) => client.createImageTask({
+    prompt: `change background to ${color}`,
+    files: [{ filename: `${color}.png` }],
+    concurrentSubmit: true,
+    waitForImages: false
+  })));
+
+  assert.equal(enterCarCount, 1);
+  assert.equal(initCount, 1);
+  assert.equal(maxSubmitSteps > 1, true);
+  assert.deepEqual(results.map((result) => result.status), ["waiting_upstream", "waiting_upstream", "waiting_upstream"]);
+  assert.equal(new Set(results.map((result) => result.externalId)).size, 3);
+});
+
 test("聊天生图等待上游任务会继续占用并发名额", async () => {
   const config = await loadConfig();
   await saveConfig({
