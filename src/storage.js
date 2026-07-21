@@ -8,7 +8,8 @@ const configFile = path.join(dataDir, "config.json");
 const tasksFile = path.join(dataDir, "tasks.json");
 const statsFile = path.join(dataDir, "stats.json");
 const runtimeStatsFile = path.join(dataDir, "runtime-stats.json");
-const taskHistoryLimit = 20;
+const taskHistoryDays = 2;
+const taskHistoryLimit = 50000;
 const statRecordDays = 31;
 const dailyStatDays = 30;
 const imageTaskTypes = new Set(["text2img", "img2img"]);
@@ -498,8 +499,23 @@ function sortTasks(tasks) {
   return [...tasks].sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
 }
 
+function taskHistoryTime(task = {}) {
+  const time = Date.parse(task.createdAt || task.updatedAt || task.completedAt || "");
+  return Number.isFinite(time) ? time : null;
+}
+
+function taskStillActive(task = {}) {
+  return ["processing", "queued", "pending", "unknown", "waiting_upstream"].includes(task.status);
+}
+
 function limitTasks(tasks) {
-  return sortTasks(tasks).slice(0, taskHistoryLimit);
+  const cutoff = Date.now() - taskHistoryDays * 24 * 60 * 60 * 1000;
+  return sortTasks(tasks)
+    .filter((task) => {
+      const time = taskHistoryTime(task);
+      return time === null || time >= cutoff || taskStillActive(task);
+    })
+    .slice(0, taskHistoryLimit);
 }
 
 async function loadTasks() {

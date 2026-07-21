@@ -22,11 +22,49 @@ const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
 const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 
+function normalizeSourceTaskId(value) {
+  const text = String(Array.isArray(value) ? value[0] : value || "").trim();
+  return text.slice(0, 200);
+}
+
+function sourceTaskIdFrom(value = {}) {
+  const source = value || {};
+  return normalizeSourceTaskId(
+    source.sourceTaskId
+      || source.source_task_id
+      || source.clientTaskId
+      || source.client_task_id
+      || source.taskId
+      || source.task_id
+      || source.xtwTaskId
+      || source.xtw_task_id
+  );
+}
+
+function attachSourceTaskId(value = {}, sourceTaskId = "") {
+  if (!sourceTaskId) return value;
+  return {
+    ...value,
+    sourceTaskId,
+    client_task_id: value.client_task_id || sourceTaskId
+  };
+}
+
+function attachResponseSourceTaskId(value = {}, sourceTaskId = "") {
+  if (!sourceTaskId || !value || typeof value !== "object") return value;
+  return {
+    ...value,
+    sourceTaskId
+  };
+}
+
 function taskRequestMeta(value = {}) {
+  const sourceTaskId = sourceTaskIdFrom(value);
   return {
     callerIp: String(value.callerIp || "").trim(),
     calledAt: value.calledAt || new Date().toISOString(),
-    forwardedFor: String(value.forwardedFor || "").trim()
+    forwardedFor: String(value.forwardedFor || "").trim(),
+    ...(sourceTaskId ? { sourceTaskId } : {})
   };
 }
 
@@ -745,7 +783,7 @@ function mergeRefreshedTask(task, result, channel, account) {
     accountName: task.accountName || account.name,
     completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : task.completedAt || null,
     requestJson: task.requestJson || null,
-    responseJson: taskResponseJson(result),
+    responseJson: attachResponseSourceTaskId(taskResponseJson(result), task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson)),
     raw: {
       ...(task.raw || {}),
       ...(result.raw || {})
@@ -933,8 +971,13 @@ function noChatTargetsError(config, requestedChannel) {
 
 function wrapTask({ result, channel, account, attempts, requestJson = null, requestMeta = {} }) {
   const status = result.status || "unknown";
+  const meta = taskRequestMeta(requestMeta);
+  const sourceTaskId = meta.sourceTaskId || sourceTaskIdFrom(requestJson);
+  const requestMetaPayload = sourceTaskId && !meta.sourceTaskId ? { ...meta, sourceTaskId } : meta;
+  const requestPayload = attachSourceTaskId(requestJson, sourceTaskId);
   return {
     id: `task-${randomUUID()}`,
+    ...(sourceTaskId ? { sourceTaskId } : {}),
     externalId: result.externalId,
     status,
     prompt: result.prompt,
@@ -949,11 +992,11 @@ function wrapTask({ result, channel, account, attempts, requestJson = null, requ
     channelType: channel.type,
     accountId: account.id,
     accountName: account.name,
-    requestMeta: taskRequestMeta(requestMeta),
+    requestMeta: requestMetaPayload,
     network: taskNetworkMeta(account),
     attempts,
-    requestJson,
-    responseJson: taskResponseJson(result),
+    requestJson: requestPayload,
+    responseJson: attachResponseSourceTaskId(taskResponseJson(result), sourceTaskId),
     completedAt: isFinishedTask(status) ? new Date().toISOString() : null,
     raw: result.raw || result
   };
@@ -1073,7 +1116,7 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
     targetAbilityCooling(target)
       || (target.channel.type === "chatplus" && accountCooling(target.account))
   ));
-  const recoveryTargets = targets.filter(targetNeedsRecovery);
+  const recoveryTargets = options.skipRecovery ? [] : targets.filter(targetNeedsRecovery);
   if (!recoveryTargets.length) return ready;
 
   const recoveries = recoveryTargets.map((target) => recoverTarget(config, target));
@@ -1221,9 +1264,17 @@ async function checkAccountProxy(account, channel) {
   return result;
 }
 
-async function ensureTargetReady(config, target, taskType, attempts) {
+async function ensureTargetReady(config, target, taskType, attempts, options = {}) {
   if (!(await ensureProxyReady(target, attempts))) return false;
   if (!shouldRefreshQuotaBeforeUse(target, taskType)) return true;
+  if (options.skipQuotaRefresh) {
+    const status = targetQuotaStatus(target);
+    if (String(status.status || "").toLowerCase() === "quota_empty") {
+      pushAttempt(attempts, target, `${status.message || "额度不足"}，已跳过。`, { quotaEmpty: true });
+      return false;
+    }
+    return true;
+  }
   return refreshQuotaBeforeUse(config, target, attempts);
 }
 
@@ -1389,8 +1440,13 @@ function taskResponseJson(value = {}) {
 }
 
 function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrls, raw, requestMeta = {} }) {
+  const meta = taskRequestMeta(requestMeta);
+  const sourceTaskId = meta.sourceTaskId || sourceTaskIdFrom(input);
+  const requestMetaPayload = sourceTaskId && !meta.sourceTaskId ? { ...meta, sourceTaskId } : meta;
+  const requestJson = attachSourceTaskId(taskRequestJson(input), sourceTaskId);
   return {
     id: `task-${randomUUID()}`,
+    ...(sourceTaskId ? { sourceTaskId } : {}),
     status: "processing",
     prompt: prompt ?? cleanPrompt(input),
     taskType,
@@ -1405,10 +1461,10 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
     channelType: target.channel.type,
     accountId: target.account.id,
     accountName: target.account.name,
-    requestMeta: taskRequestMeta(requestMeta),
+    requestMeta: requestMetaPayload,
     network: taskNetworkMeta(target.account),
     attempts: [],
-    requestJson: taskRequestJson(input),
+    requestJson,
     responseJson: null,
     raw: { queued: true, ...(raw || {}) },
     completedAt: null,
@@ -1424,6 +1480,7 @@ async function failQueuedTask(task, error, attempts = []) {
   const responseMessage = error.message || readableAttemptError(attempts) || "任务失败";
   const statusCode = Number(error.status || error.statusCode || 0) || null;
   const code = error.code || (statusCode === 429 ? "CONCURRENCY_LIMIT" : "");
+  const sourceTaskId = task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson);
   const failedTask = {
     ...task,
     status: "failed",
@@ -1433,6 +1490,7 @@ async function failQueuedTask(task, error, attempts = []) {
     responseJson: {
       ok: false,
       message: responseMessage,
+      ...(sourceTaskId ? { sourceTaskId } : {}),
       ...(statusCode ? { status: statusCode } : {}),
       ...(code ? { code } : {}),
       attempts: taskResponseJson(attempts)
@@ -1617,7 +1675,9 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
       }
       try {
         const finishedTask = await runChatplusAccountWork(channel, account, async () => {
-          if (!(await ensureTargetReady(config, target, "img2img", attempts))) return null;
+          if (!(await ensureTargetReady(config, target, "img2img", attempts, {
+            skipQuotaRefresh: options.noChatplusQueue
+          }))) return null;
           const client = getWorkClient(config, channel, account);
           let taskState = task;
           const onSubmitted = async (submittedResult) => {
@@ -2143,7 +2203,11 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: wait });
+  const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
+    accountId: requestedAccountId,
+    balanced: wait,
+    skipRecovery: wait
+  });
   if (!targets.length) throw noUsableTargetError("img2img");
 
   if (wait) {

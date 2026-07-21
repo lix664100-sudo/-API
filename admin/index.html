@@ -1293,10 +1293,51 @@
         return text && text !== taskErrorText(row) ? text : "";
       }
 
+      function taskSourceId(row) {
+        const request = row?.requestJson || {};
+        const meta = row?.requestMeta || {};
+        const response = row?.responseJson || {};
+        return row?.sourceTaskId
+          || meta.sourceTaskId
+          || request.sourceTaskId
+          || request.source_task_id
+          || request.clientTaskId
+          || request.client_task_id
+          || request.taskId
+          || request.task_id
+          || request.xtwTaskId
+          || request.xtw_task_id
+          || response.sourceTaskId
+          || "";
+      }
+
+      function taskSearchHaystack(row) {
+        const request = row?.requestJson || {};
+        const response = row?.responseJson || {};
+        return [
+          row?.id,
+          row?.externalId,
+          taskSourceId(row),
+          row?.prompt,
+          row?.accountName,
+          row?.channelName,
+          row?.errorMessage,
+          response.message,
+          JSON.stringify(request)
+        ].filter(Boolean).join(" ").toLowerCase();
+      }
+
       function taskReturnJson(row) {
         if (row.status === "interrupted") return null;
         if (row.status === "failed" && (row.responseJson || row.errorMessage)) {
-          return { ok: false, message: taskErrorText(row) || "任务失败" };
+          if (row.responseJson) return row.responseJson;
+          const sourceTaskId = taskSourceId(row);
+          return {
+            ok: false,
+            message: taskErrorText(row) || "任务失败",
+            ...(sourceTaskId ? { sourceTaskId } : {}),
+            attempts: row.attempts || []
+          };
         }
         if (row.responseJson) return row.responseJson;
         if (row.errorMessage) return { ok: false, message: row.errorMessage, attempts: row.attempts || [] };
@@ -1359,7 +1400,9 @@
 
       function taskMetaLine(row) {
         const meta = row?.requestMeta || {};
+        const sourceTaskId = taskSourceId(row);
         const items = [
+          sourceTaskId ? ["任务ID", sourceTaskId] : null,
           meta.callerIp ? ["调用IP", meta.callerIp] : null,
           meta.calledAt ? ["调用时间", formatDateTime(meta.calledAt)] : null,
           taskNetworkLabel(row) ? ["代理", taskNetworkLabel(row)] : null
@@ -2458,6 +2501,7 @@
         const [taskAccountFilter, setTaskAccountFilter] = useState("all");
         const [taskChannelFilter, setTaskChannelFilter] = useState("all");
         const [taskStatusFilter, setTaskStatusFilter] = useState("all");
+        const [taskKeyword, setTaskKeyword] = useState("");
         const [taskTrendDays, setTaskTrendDays] = useState(30);
         const [productivityDay, setProductivityDay] = useState(dateKeyInShanghai(Date.now()));
         const [productivityTrendDays, setProductivityTrendDays] = useState(7);
@@ -2627,13 +2671,15 @@
         }, [accounts, tasks, statRecords]);
 
         const filteredTasks = useMemo(() => {
+          const keyword = taskKeyword.trim().toLowerCase();
           return tasks.filter((task) => {
             const accountOk = taskAccountFilter === "all" || task.accountId === taskAccountFilter;
             const channelOk = taskChannelFilter === "all" || taskChannelGroup(task) === taskChannelFilter;
             const statusOk = taskStatusFilter === "all" || task.status === taskStatusFilter;
-            return accountOk && channelOk && statusOk;
+            const keywordOk = !keyword || taskSearchHaystack(task).includes(keyword);
+            return accountOk && channelOk && statusOk && keywordOk;
           });
-        }, [tasks, taskAccountFilter, taskChannelFilter, taskStatusFilter]);
+        }, [tasks, taskAccountFilter, taskChannelFilter, taskStatusFilter, taskKeyword]);
 
         const filteredStatRecords = useMemo(() => {
           return statRecords.filter((record) => {
@@ -3766,6 +3812,14 @@
                         ])
                       ]),
                       h("div", { className: "task-filters" }, [
+                        h(Input.Search, {
+                          allowClear: true,
+                          placeholder: "搜索洗图王任务ID、错误内容",
+                          value: taskKeyword,
+                          onSearch: setTaskKeyword,
+                          onChange: (event) => setTaskKeyword(event.target.value),
+                          style: { minWidth: 260, maxWidth: 360 }
+                        }),
                         h(Select, { value: taskAccountFilter, onChange: setTaskAccountFilter, options: taskAccountOptions }),
                         h(Select, { value: taskChannelFilter, onChange: setTaskChannelFilter, options: [
                           { label: "全部通道", value: "all" },
@@ -3780,7 +3834,7 @@
                           { label: "等待上游", value: "waiting_upstream" },
                           { label: "结果待确认", value: "interrupted" }
                         ] }),
-                        h("div", { className: "toolbar-note" }, `列表 ${filteredTasks.length} 条；统计来自独立累计，不受20条记录限制`)
+                        h("div", { className: "toolbar-note" }, `列表 ${filteredTasks.length} 条；任务明细保留近2天，统计来自独立累计`)
                       ]),
                       h("div", { className: "task-trend" }, [
                         h("div", { className: "task-trend-header" }, [

@@ -336,6 +336,23 @@ test("聊天生图账号已有任务时等待接口不进入账号队列", async
     }]
   });
 
+  const queueLimitConfig = await loadConfig();
+  await saveConfig({
+    ...queueLimitConfig,
+    accounts: queueLimitConfig.accounts.map((account) => account.id === "account-chatplus-queue-limit"
+      ? {
+          ...account,
+          meta: {
+            ...(account.meta || {}),
+            abilities: {
+              ...(account.meta?.abilities || {}),
+              drawing: { status: "quota_empty", balance: 0, message: "绘图积分不足" }
+            }
+          }
+        }
+      : account)
+  });
+
   const originalDrawingCheck = DrawingClient.prototype.check;
   const originalChatCreateImageTask = ChatplusClient.prototype.createImageTask;
   let releaseActiveTask;

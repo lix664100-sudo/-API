@@ -76,12 +76,18 @@ function sendError(reply, error) {
   const status = Number(error.status || error.statusCode || 500);
   const responseJson = error.responseJson || error.task?.responseJson || {};
   const attempts = error.attempts || responseJson.attempts || error.task?.attempts || [];
+  const sourceTaskId = error.sourceTaskId
+    || responseJson.sourceTaskId
+    || error.task?.sourceTaskId
+    || error.task?.requestMeta?.sourceTaskId
+    || "";
   const payload = {
     ok: false,
     message: responseJson.message || error.message || "请求失败"
   };
   const code = error.code || responseJson.code;
   if (code) payload.code = code;
+  if (sourceTaskId) payload.sourceTaskId = sourceTaskId;
   if (Array.isArray(attempts) && attempts.length) payload.attempts = attempts;
   reply.code(status >= 400 && status < 600 ? status : 500).send(payload);
 }
@@ -95,6 +101,39 @@ function normalizeIp(value) {
   return text.startsWith("::ffff:") ? text.slice(7) : text;
 }
 
+function normalizeSourceTaskId(value) {
+  const text = String(Array.isArray(value) ? value[0] : value || "").trim();
+  return text.slice(0, 200);
+}
+
+function sourceTaskIdFrom(value = {}) {
+  const source = value || {};
+  return normalizeSourceTaskId(
+    source.sourceTaskId
+      || source.source_task_id
+      || source.clientTaskId
+      || source.client_task_id
+      || source.taskId
+      || source.task_id
+      || source.xtwTaskId
+      || source.xtw_task_id
+  );
+}
+
+function sourceTaskIdFromHeaders(headers = {}) {
+  return normalizeSourceTaskId(
+    headers["x-source-task-id"]
+      || headers["x-client-task-id"]
+      || headers["x-task-id"]
+      || headers["x-xtw-task-id"]
+  );
+}
+
+function mergeInputSourceTaskId(requestMeta, input = {}) {
+  const sourceTaskId = requestMeta.sourceTaskId || sourceTaskIdFrom(input);
+  return sourceTaskId ? { ...requestMeta, sourceTaskId } : requestMeta;
+}
+
 function requestClientIp(request) {
   return normalizeIp(
     firstHeaderValue(request.headers["x-forwarded-for"])
@@ -106,10 +145,12 @@ function requestClientIp(request) {
 }
 
 function apiRequestMeta(request) {
+  const sourceTaskId = sourceTaskIdFromHeaders(request.headers) || sourceTaskIdFrom(request.body);
   return {
     callerIp: requestClientIp(request),
     calledAt: new Date().toISOString(),
-    forwardedFor: firstHeaderValue(request.headers["x-forwarded-for"])
+    forwardedFor: firstHeaderValue(request.headers["x-forwarded-for"]),
+    ...(sourceTaskId ? { sourceTaskId } : {})
   };
 }
 
@@ -786,8 +827,9 @@ app.post("/api/tasks/:id/refresh", async (request, reply) => {
 
 app.post("/api/draw/edit", async (request, reply) => {
   try {
-    const requestMeta = apiRequestMeta(request);
+    let requestMeta = apiRequestMeta(request);
     const { input, files } = await readImageInput(request, { maxFiles: 3 });
+    requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
     let task;
     if (request.query?.wait === "1") {
@@ -826,9 +868,10 @@ function imageEditResponse(task) {
 
 app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, reply) => {
   try {
-    const requestMeta = apiRequestMeta(request);
+    let requestMeta = apiRequestMeta(request);
     if (isMultipartRequest(request)) {
       const { input, files } = await readMultipartInput(request, { maxFiles: 5, savePreview: true });
+      requestMeta = mergeInputSourceTaskId(requestMeta, input);
       if (request.query?.wait === "0") {
         const task = await queueChatCompletion({ ...input, files }, requestMeta);
         return { created: Math.floor(Date.now() / 1000), task };
@@ -836,6 +879,7 @@ app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, 
       return await createChatCompletion({ ...input, files }, requestMeta);
     }
     const input = normalizeFields(request.body || {});
+    requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (request.query?.wait === "0") {
       const task = await queueChatCompletion(input, requestMeta);
       return { created: Math.floor(Date.now() / 1000), task };
@@ -848,8 +892,9 @@ app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, 
 
 app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, reply) => {
   try {
-    const requestMeta = apiRequestMeta(request);
+    let requestMeta = apiRequestMeta(request);
     const { input, files } = await readImageInput(request, { maxFiles: 3 });
+    requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
     const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta });
     return imageEditResponse(task);
