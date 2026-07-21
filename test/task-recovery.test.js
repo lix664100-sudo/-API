@@ -151,6 +151,95 @@ test("聊天生图拿到上游编号后会先通知保存，再继续等待图�
   assert.equal(result.status, "waiting_upstream");
 });
 
+test("chatplus policy refusal is returned as a failed task with the original message", async () => {
+  const message = "We’re so sorry, but the image we created may violate our guardrails concerning similarity to third-party content. If you think we got it wrong, please retry or edit your prompt.";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", settings: { baseUrl: "https://www.chatplus.cc" } },
+    account: { id: "account-policy", username: "policy@example.com" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.json = async () => ({
+    mapping: {
+      result: {
+        message: {
+          author: { role: "assistant" },
+          content: { parts: [message] }
+        }
+      }
+    }
+  });
+  client.imageUrlsFrom = async () => [];
+
+  const result = await client.getTask("conversation-policy");
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.errorMessage, message);
+});
+
+test("wait image task returns upstream policy refusal without wrapping it as timeout", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-policy-wait",
+      channelId: "shareai",
+      name: "policy-wait@example.com",
+      username: "policy-wait@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const message = "We’re so sorry, but the image we created may violate our guardrails concerning similarity to third-party content. If you think we got it wrong, please retry or edit your prompt.";
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    await input.onSubmitted?.({
+      externalId: "conversation-policy-wait",
+      status: "processing",
+      taskType: "img2img",
+      prompt: input.prompt,
+      imageCount: 0,
+      imageUrls: [],
+      raw: { conversationId: "conversation-policy-wait" }
+    });
+    const error = new Error(message);
+    error.upstreamExplicitFailure = true;
+    error.upstreamStatus = "failed";
+    error.status = 400;
+    error.code = "content_policy";
+    throw error;
+  };
+
+  try {
+    await assert.rejects(
+      () => createImageTask({
+        input: { channel: "chatplus", prompt: "policy refusal test" },
+        files: [{ filename: "source.png", mimetype: "image/png" }],
+        wait: true
+      }),
+      (error) => {
+        assert.equal(error.message, message);
+        assert.equal(error.status, 400);
+        assert.equal(error.code, "content_policy");
+        assert.equal(error.task.status, "failed");
+        assert.equal(error.task.responseJson.message, message);
+        return true;
+      }
+    );
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+  }
+});
+
 test("有上游编号的旧任务超过等待时间后保持等待上游", async () => {
   const config = await loadConfig();
   await saveConfig({

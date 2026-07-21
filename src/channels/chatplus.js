@@ -405,6 +405,27 @@ function imageQuotaError(message = "图片生成额度已用完。") {
   return error;
 }
 
+function isTerminalImageFailureMessage(content) {
+  const text = String(content || "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  return /(?:violate|violates|violating).{0,160}(?:guardrails|policy|policies|content)/i.test(text)
+    || /(?:guardrails|content policy|safety policy|safety system).{0,160}(?:image|content|request|third-party)/i.test(text)
+    || /similarity to third-party content/i.test(text)
+    || /(?:can't|cannot|unable to|won't)\s+(?:create|generate|help with).{0,120}(?:image|content|request)/i.test(text)
+    || /(?:内容安全|安全拦截|上游渠道内容安全拦截|违规|无法生成|不能生成)/.test(text);
+}
+
+function throwIfTerminalImageFailure(content) {
+  const message = String(content || "").trim();
+  if (!isTerminalImageFailureMessage(message)) return;
+  const error = new Error(message);
+  error.upstreamExplicitFailure = true;
+  error.upstreamStatus = "failed";
+  error.status = 400;
+  error.code = "content_policy";
+  throw error;
+}
+
 function numberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
@@ -1244,18 +1265,22 @@ export class ChatplusClient {
   }
 
   async waitForConversationImages(events, conversationId, timeoutSec, options = {}) {
-    throwIfImageGenerationLimit(extractAssistantText(events));
+    const initialContent = extractAssistantText(events);
+    throwIfImageGenerationLimit(initialContent);
     let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: options.generatedOnly });
     if (imageUrls.length || !conversationId) return imageUrls;
+    throwIfTerminalImageFailure(initialContent);
 
     const timeoutMs = Math.max(5, Number(timeoutSec || this.config.waitTimeoutSec || DEFAULT_CHAT_HTTP_TIMEOUT_SEC)) * 1000;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
         const detail = await this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}`);
-        throwIfImageGenerationLimit(extractAssistantText(detail));
+        const content = extractAssistantText(detail);
+        throwIfImageGenerationLimit(content);
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
+        throwIfTerminalImageFailure(content);
         const explicitState = explicitConversationState(detail);
         if (explicitState) {
           const error = new Error(explicitState.message);
@@ -1312,6 +1337,16 @@ export class ChatplusClient {
         imageCount: 0,
         imageUrls: [],
         errorMessage: "上游明确返回图片生成额度不足。",
+        raw: detail
+      };
+    }
+    if (isTerminalImageFailureMessage(content)) {
+      return {
+        externalId,
+        status: "failed",
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: content,
         raw: detail
       };
     }

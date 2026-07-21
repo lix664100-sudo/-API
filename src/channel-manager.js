@@ -466,6 +466,10 @@ function isQuotaEmptyError(error) {
   );
 }
 
+function isTerminalTaskFailureError(error) {
+  return Boolean(error?.upstreamExplicitFailure);
+}
+
 function accountStatusFromError(error) {
   if (isDisconnectedError(error)) {
     return {
@@ -1570,11 +1574,11 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           continue;
         }
       }
+      let taskState = task;
       try {
         const finishedTask = await runChatplusAccountWork(channel, account, async () => {
           if (!(await ensureTargetReady(config, target, "text2img", attempts))) return null;
           const client = getWorkClient(config, channel, account);
-          let taskState = task;
           const onSubmitted = async (submittedResult) => {
             taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
           };
@@ -1593,6 +1597,10 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
+        if (isTerminalTaskFailureError(error)) {
+          pushAttempt(attempts, target, error.message || "调用失败");
+          return failQueuedTask(taskState, error, attempts);
+        }
         pushAttempt(attempts, target, error.message || "调用失败", {
           busy: Boolean(error.busy),
           quotaEmpty: Boolean(error.quotaEmpty || isQuotaEmptyError(error))
@@ -1690,13 +1698,13 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           continue;
         }
       }
+      let taskState = task;
       try {
         const finishedTask = await runChatplusAccountWork(channel, account, async () => {
           if (!(await ensureTargetReady(config, target, "img2img", attempts, {
             skipQuotaRefresh: options.noChatplusQueue
           }))) return null;
           const client = getWorkClient(config, channel, account);
-          let taskState = task;
           const onSubmitted = async (submittedResult) => {
             taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
           };
@@ -1715,6 +1723,10 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
+        if (isTerminalTaskFailureError(error)) {
+          pushAttempt(attempts, target, error.message || "调用失败");
+          return failQueuedTask(taskState, error, attempts);
+        }
         pushAttempt(attempts, target, error.message || "调用失败", {
           busy: Boolean(error.busy),
           quotaEmpty: Boolean(error.quotaEmpty || isQuotaEmptyError(error))
@@ -2204,6 +2216,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
       });
       if (finishedTask) return finishedTask;
     } catch (error) {
+      if (isTerminalTaskFailureError(error)) throw error;
       pushAttempt(attempts, target, error.message || "调用失败", {
         busy: Boolean(error.busy),
         quotaEmpty: Boolean(error.quotaEmpty || isQuotaEmptyError(error))
