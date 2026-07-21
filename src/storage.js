@@ -17,6 +17,8 @@ const statRecordLimit = 50000;
 const intradayIntervalMinutes = 30;
 let statsWriteQueue = Promise.resolve();
 let runtimeStatsWriteQueue = Promise.resolve();
+let tasksWriteQueue = Promise.resolve();
+let configWriteQueue = Promise.resolve();
 const intradayStatsCache = new Map();
 
 const defaultImageStorage = {
@@ -389,7 +391,8 @@ function redactAccount(account) {
   };
 }
 
-export async function loadConfig() {
+export async function loadConfig({ waitForWrites = true } = {}) {
+  if (waitForWrites) await configWriteQueue.catch(() => {});
   const stored = await readJson(configFile, {});
   const config = normalizeConfig(stored);
   if (
@@ -405,14 +408,18 @@ export async function loadConfig() {
 }
 
 export async function saveConfig(nextConfig) {
-  const current = await loadConfig();
-  const merged = normalizeConfig({
-    ...current,
-    ...nextConfig,
-    updatedAt: new Date().toISOString()
+  const write = configWriteQueue.catch(() => {}).then(async () => {
+    const current = await loadConfig({ waitForWrites: false });
+    const merged = normalizeConfig({
+      ...current,
+      ...nextConfig,
+      updatedAt: new Date().toISOString()
+    });
+    await writeJson(configFile, merged);
+    return merged;
   });
-  await writeJson(configFile, merged);
-  return merged;
+  configWriteQueue = write.catch(() => {});
+  return write;
 }
 
 export function publicConfig(config) {
@@ -518,7 +525,8 @@ function limitTasks(tasks) {
     .slice(0, taskHistoryLimit);
 }
 
-async function loadTasks() {
+async function loadTasks({ waitForWrites = true } = {}) {
+  if (waitForWrites) await tasksWriteQueue.catch(() => {});
   const tasks = await readJson(tasksFile, []);
   const limited = limitTasks(tasks);
   if (limited.length !== tasks.length) await writeJson(tasksFile, limited);
@@ -568,20 +576,24 @@ function taskIdentityIndex(tasks, task) {
 }
 
 export async function upsertTask(task) {
-  const tasks = await loadTasks();
-  const index = taskIdentityIndex(tasks, task);
-  const next = {
-    ...task,
-    updatedAt: new Date().toISOString()
-  };
-  if (index >= 0 && shouldKeepStoredTask(tasks[index], next)) return tasks[index];
-  const stored = index >= 0
-    ? { ...tasks[index], ...next, id: tasks[index].id || next.id }
-    : { ...next, createdAt: task.createdAt || new Date().toISOString() };
-  if (index >= 0) tasks[index] = stored;
-  else tasks.push(stored);
-  await writeJson(tasksFile, limitTasks(tasks));
-  return stored;
+  const write = tasksWriteQueue.catch(() => {}).then(async () => {
+    const tasks = await loadTasks({ waitForWrites: false });
+    const index = taskIdentityIndex(tasks, task);
+    const next = {
+      ...task,
+      updatedAt: new Date().toISOString()
+    };
+    if (index >= 0 && shouldKeepStoredTask(tasks[index], next)) return tasks[index];
+    const stored = index >= 0
+      ? { ...tasks[index], ...next, id: tasks[index].id || next.id }
+      : { ...next, createdAt: task.createdAt || new Date().toISOString() };
+    if (index >= 0) tasks[index] = stored;
+    else tasks.push(stored);
+    await writeJson(tasksFile, limitTasks(tasks));
+    return stored;
+  });
+  tasksWriteQueue = write.catch(() => {});
+  return write;
 }
 
 export async function getTask(id) {

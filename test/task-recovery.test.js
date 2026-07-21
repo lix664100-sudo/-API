@@ -8,7 +8,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-recovery-"));
 process.env.DATA_DIR = dataDir;
 
 const { getTask, listTasks, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
-const { createImageTask, refreshProcessingTasks, refreshTask } = await import("../src/channel-manager.js");
+const { createImageTask, queueImageTask, refreshProcessingTasks, refreshTask } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 
 after(async () => {
@@ -390,5 +390,146 @@ test("停用账号的等待上游旧任务不会继续登录刷新", async () =>
     assert.match(stored.responseJson.message, /账号已停用/);
   } finally {
     ChatplusClient.prototype.getTask = originalGetTask;
+  }
+});
+
+test("聊天生图异步提交拿到编号后不等待图片", async () => {
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", settings: { baseUrl: "https://www.chatplus.cc" } },
+    account: { id: "account-submit-only", username: "submit-only@example.com" },
+    sessionLock: async (work) => work()
+  });
+  let submitted = null;
+  let waitCount = 0;
+  client.withImageQuotaFallback = async (_prompt, _input, work) => work({
+    events: [],
+    conversationId: "conversation-submit-only",
+    messageId: "message-submit-only",
+    model: "gpt",
+    upstreamModel: "gpt-image",
+    route: { key: "gpt" },
+    selected: { carId: "car-submit-only", carType: "chatgpt", strategy: "image" }
+  });
+  client.waitForConversationImages = async () => {
+    waitCount += 1;
+    return ["https://example.com/should-not-wait.png"];
+  };
+
+  const result = await client.createImageTask({
+    prompt: "异步提交测试",
+    files: [{ filename: "source.png" }],
+    waitForImages: false,
+    onSubmitted: async (value) => {
+      submitted = value;
+    }
+  });
+
+  assert.equal(waitCount, 0);
+  assert.equal(submitted.status, "processing");
+  assert.equal(result.status, "waiting_upstream");
+  assert.equal(result.externalId, "conversation-submit-only");
+});
+
+test("聊天生图等待上游任务会继续占用并发名额", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    concurrency: { chat: 5, drawingImage: 5, chatImage: 5 },
+    accounts: [{
+      id: "account-durable-slot",
+      channelId: "shareai",
+      name: "durable-slot@example.com",
+      username: "durable-slot@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", balance: 0, message: "跳过绘图站" },
+          chatplus: { status: "ok", balance: 20, message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  const submittedJobs = [];
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    const job = String(input.prompt || "");
+    submittedJobs.push(job);
+    await input.onSubmitted?.({
+      externalId: `conversation-${job}`,
+      status: "processing",
+      taskType: "img2img",
+      prompt: job,
+      imageCount: 0,
+      imageUrls: [],
+      raw: { conversationId: `conversation-${job}` }
+    });
+    return {
+      externalId: `conversation-${job}`,
+      status: "waiting_upstream",
+      taskType: "img2img",
+      prompt: job,
+      imageCount: 0,
+      imageUrls: [],
+      raw: { conversationId: `conversation-${job}` }
+    };
+  };
+
+  try {
+    const ownWaitingTasks = (tasks) => tasks.filter((task) =>
+      task.accountId === "account-durable-slot"
+      && task.status === "waiting_upstream"
+    );
+
+    await Promise.all(Array.from({ length: 5 }, (_item, index) => queueImageTask({
+      input: { channel: "chatplus", prompt: `job-${index + 1}` },
+      files: [{ filename: `source-${index + 1}.png`, mimetype: "image/png", buffer: Buffer.from("x") }]
+    })));
+
+    let tasks = [];
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      tasks = await listTasks();
+      if (ownWaitingTasks(tasks).length >= 5) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    assert.equal(submittedJobs.length, 5);
+    assert.equal(ownWaitingTasks(tasks).length, 5);
+    await assert.rejects(
+      () => queueImageTask({
+        input: { channel: "chatplus", prompt: "job-6" },
+        files: [{ filename: "source-6.png", mimetype: "image/png", buffer: Buffer.from("x") }]
+      }),
+      (error) => error?.status === 429
+    );
+
+    const completed = tasks.find((task) => task.prompt === "job-1");
+    await upsertTask({
+      ...completed,
+      status: "success",
+      imageCount: 1,
+      imageUrls: ["https://example.com/job-1.png"],
+      completedAt: new Date().toISOString()
+    });
+
+    await queueImageTask({
+      input: { channel: "chatplus", prompt: "job-6" },
+      files: [{ filename: "source-6.png", mimetype: "image/png", buffer: Buffer.from("x") }]
+    });
+
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      tasks = await listTasks();
+      if (tasks.some((task) => task.prompt === "job-6" && task.status === "waiting_upstream")) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    assert.equal(submittedJobs.includes("job-6"), true);
+    assert.equal(ownWaitingTasks(tasks).length, 5);
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
   }
 });

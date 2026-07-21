@@ -842,6 +842,10 @@ export class ChatplusClient {
     }
   }
 
+  async runTaskWork(input, work) {
+    return input?.concurrentSubmit === true ? work() : this.runAccountWork(work);
+  }
+
   async performPortalLogin(options = {}) {
     this.assertConfigured();
     const login = await this.json("/frontend-api/login", {
@@ -1209,23 +1213,26 @@ export class ChatplusClient {
 
   async sendConversation(prompt, input = {}, ignoredCarIds = new Set()) {
     const errors = [];
+    const runSubmitStep = input.concurrentSubmit === true
+      ? async (work) => work()
+      : async (work) => this.sessionLock(work);
     for (let attempt = 0; attempt < MAX_CHAT_CAR_ATTEMPTS; attempt += 1) {
       let selected = null;
       try {
         const session = await this.prepareChatSession(input, ignoredCarIds, 1);
         const { route, init } = session;
         selected = session.selected;
-        if (route.key === "grok") return await this.sessionLock(() => this.sendGrokConversation(prompt, input, route, selected));
+        if (route.key === "grok") return await runSubmitStep(() => this.sendGrokConversation(prompt, input, route, selected));
         if (route.key === "gemini") {
           const error = new Error("Gemini 上游当前账号没有有效订阅，暂时不能作为后端 API 转发。");
           error.noRetry = true;
           throw error;
         }
         const model = route.model || init?.default_model_slug || this.defaultModel;
-        const imageAssets = await this.sessionLock(() => this.uploadChatImages(input.files || []));
+        const imageAssets = await runSubmitStep(() => this.uploadChatImages(input.files || []));
         const { body, messageId } = this.buildConversationBody(prompt, model, imageAssets);
 
-        const response = await this.sessionLock(() => this.http("/backend-api/conversation", {
+        const response = await runSubmitStep(() => this.http("/backend-api/conversation", {
           method: "POST",
           body,
           headers: {
@@ -1395,12 +1402,13 @@ export class ChatplusClient {
   }
 
   async createTextTask(input) {
-    return this.runAccountWork(async () => {
+    return this.runTaskWork(input, async () => {
       const prompt = String(input.prompt || "").trim();
       if (!prompt) throw new Error("请输入生图描述。");
       const result = await this.withImageQuotaFallback(prompt, { ...input, preferImageCar: true }, async (conversation) => {
         throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
+        if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
         const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec);
         return { ...conversation, imageUrls };
       });
@@ -1421,7 +1429,7 @@ export class ChatplusClient {
   }
 
   async createImageTask(input = {}) {
-    return this.runAccountWork(async () => {
+    return this.runTaskWork(input, async () => {
       const files = normalizeChatFiles(input, []);
       const prompt = String(input.prompt || "").trim();
       if (!prompt) throw new Error("Please enter an image edit prompt.");
@@ -1430,6 +1438,7 @@ export class ChatplusClient {
       const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: true }, async (conversation) => {
         throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
+        if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
         const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true });
         return { ...conversation, imageUrls };
       });
