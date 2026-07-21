@@ -529,6 +529,21 @@ export async function listTasks() {
   return loadTasks();
 }
 
+const durableFinalTaskStatuses = new Set(["success", "failed"]);
+const staleTaskStatuses = new Set(["processing", "queued", "pending", "unknown", "waiting_upstream", "interrupted"]);
+
+function taskStatus(value) {
+  return String(value?.status || "").trim().toLowerCase();
+}
+
+function shouldKeepStoredTask(current, incoming) {
+  const currentStatus = taskStatus(current);
+  const incomingStatus = taskStatus(incoming);
+  if (!durableFinalTaskStatuses.has(currentStatus)) return false;
+  if (incomingStatus === currentStatus) return false;
+  return staleTaskStatuses.has(incomingStatus) || durableFinalTaskStatuses.has(incomingStatus);
+}
+
 export async function upsertTask(task) {
   const tasks = await loadTasks();
   const index = tasks.findIndex((item) => String(item.id) === String(task.id));
@@ -536,6 +551,7 @@ export async function upsertTask(task) {
     ...task,
     updatedAt: new Date().toISOString()
   };
+  if (index >= 0 && shouldKeepStoredTask(tasks[index], next)) return tasks[index];
   const stored = index >= 0
     ? { ...tasks[index], ...next }
     : { ...next, createdAt: task.createdAt || new Date().toISOString() };

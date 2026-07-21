@@ -827,7 +827,9 @@ function isLostLocalChatTask(task) {
 }
 
 async function failLostLocalChatTask(task) {
-  return failQueuedTask(task, new Error("这个旧对话任务已经没有后台执行进程，已停止。"), task.attempts || []);
+  const current = await getTask(task.id);
+  if (!current || !isLostLocalChatTask(current)) return current || task;
+  return failQueuedTask(current, new Error("这个旧对话任务已经没有后台执行进程，已停止。"), current.attempts || []);
 }
 
 function isLostLocalImageTask(task) {
@@ -839,15 +841,17 @@ function isLostLocalImageTask(task) {
 }
 
 async function interruptLostLocalImageTask(task) {
+  const current = await getTask(task.id);
+  if (!current || !isLostLocalImageTask(current)) return current || task;
   const interruptedAt = new Date().toISOString();
   const message = "服务重启时任务被中断，尚未保存上游任务编号，无法确认最终结果；此任务不计失败。";
   const interruptedTask = {
-    ...task,
+    ...current,
     status: "interrupted",
     errorMessage: "",
     responseJson: { ok: null, message },
     raw: {
-      ...(task.raw || {}),
+      ...(current.raw || {}),
       queued: false,
       interrupted: true,
       interruptedAt,
