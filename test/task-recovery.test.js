@@ -431,6 +431,51 @@ test("聊天生图异步提交拿到编号后不等待图片", async () => {
   assert.equal(result.externalId, "conversation-submit-only");
 });
 
+test("聊天生图没有上游编号时不能算已提交", async () => {
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", settings: { baseUrl: "https://www.chatplus.cc" } },
+    account: { id: "account-no-upstream-id", username: "no-upstream-id@example.com" },
+    sessionLock: async (work) => work()
+  });
+  let submittedCount = 0;
+  client.prepareChatSession = async () => {
+    client.portalLoggedIn = true;
+    client.cookies = ["portal=ok", "car=car-no-upstream-id"];
+    return {
+      route: { key: "gpt", strategy: "image" },
+      selected: { carId: "car-no-upstream-id", carType: "chatgpt", strategy: "image" },
+      init: { default_model_slug: "gpt-test" }
+    };
+  };
+  const originalHttp = ChatplusClient.prototype.http;
+  ChatplusClient.prototype.http = async function (pathName) {
+    if (pathName !== "/backend-api/conversation") throw new Error(`unexpected request: ${pathName}`);
+    return {
+      status: 200,
+      headers: {},
+      body: `data: {"message":{"id":"message-only"}}\n\ndata: [DONE]\n\n`
+    };
+  };
+
+  try {
+    await assert.rejects(
+      () => client.createTextTask({
+        prompt: "no upstream id",
+        concurrentSubmit: true,
+        waitForImages: false,
+        onSubmitted: async () => {
+          submittedCount += 1;
+        }
+      }),
+      /上游任务编号/
+    );
+    assert.equal(submittedCount, 0);
+  } finally {
+    ChatplusClient.prototype.http = originalHttp;
+  }
+});
+
 test("聊天生图并发提交会共用一次已准备好的账号会话", async () => {
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
@@ -471,6 +516,8 @@ test("聊天生图并发提交会共用一次已准备好的账号会话", async
     enterCarCount += 1;
     client.carId = carId;
     client.carType = carType;
+    client.portalLoggedIn = true;
+    client.cookies = ["portal=ok", `car=${carId}`];
     await delay(20);
   };
   client.loadInit = async () => {
@@ -480,26 +527,33 @@ test("聊天生图并发提交会共用一次已准备好的账号会话", async
       limits_progress: [{ feature_name: "image_gen", remaining: 20 }]
     };
   };
-  client.uploadChatImages = async (files = []) => trackSubmitStep(async () => files.map((file, index) => ({
-    part: {
-      content_type: "image_asset_pointer",
-      asset_pointer: `file-service://source-${index + 1}`,
-      size_bytes: 1,
-      width: 512,
-      height: 512
-    },
-    attachment: {
-      id: `source-${index + 1}`,
-      name: file.filename || `source-${index + 1}.png`,
-      mimeType: "image/png",
-      size: 1,
-      width: 512,
-      height: 512
+  const originalHttp = ChatplusClient.prototype.http;
+  ChatplusClient.prototype.http = async function (pathName, options = {}) {
+    if (pathName === "/backend-api/files") {
+      assert.equal(this.cookies.includes("portal=ok"), true);
+      assert.equal(this.cookies.includes("car=car-shared-session"), true);
+      assert.equal(this.cookies.some((cookie) => cookie.startsWith("upload=")), false);
+      const fileName = options.body?.file_name || "source.png";
+      this.cookies = [...this.cookies, `upload=${fileName}`];
+      return trackSubmitStep(async () => ({
+        status: 200,
+        headers: {},
+        body: JSON.stringify({
+          file_id: `file-${fileName}`,
+          upload_url: `https://upload.example/${encodeURIComponent(fileName)}`
+        })
+      }));
     }
-  })));
-  client.http = async (pathName) => {
+    if (String(pathName).startsWith("https://upload.example/")) {
+      return trackSubmitStep(async () => ({ status: 201, headers: {}, body: "" }));
+    }
+    if (String(pathName).startsWith("/backend-api/files/") && String(pathName).endsWith("/uploaded")) {
+      return trackSubmitStep(async () => ({ status: 200, headers: {}, body: JSON.stringify({ status: "success" }) }));
+    }
     if (pathName !== "/backend-api/conversation") throw new Error(`unexpected request: ${pathName}`);
     return trackSubmitStep(async () => {
+      const uploadCookies = this.cookies.filter((cookie) => cookie.startsWith("upload="));
+      assert.equal(uploadCookies.length, 1);
       conversationIndex += 1;
       return {
         status: 200,
@@ -509,15 +563,25 @@ test("聊天生图并发提交会共用一次已准备好的账号会话", async
     });
   };
 
-  const results = await Promise.all(["red", "blue", "black"].map((color) => client.createImageTask({
-    prompt: `change background to ${color}`,
-    files: [{ filename: `${color}.png` }],
-    concurrentSubmit: true,
-    waitForImages: false
-  })));
+  let results = [];
+  try {
+    results = await Promise.all(["red", "blue", "black"].map((color) => client.createImageTask({
+      prompt: `change background to ${color}`,
+      files: [{
+        filename: `${color}.png`,
+        mimetype: "image/png",
+        toBuffer: async () => Buffer.from("image")
+      }],
+      concurrentSubmit: true,
+      waitForImages: false
+    })));
+  } finally {
+    ChatplusClient.prototype.http = originalHttp;
+  }
 
   assert.equal(enterCarCount, 1);
   assert.equal(initCount, 1);
+  assert.equal(client.cookies.some((cookie) => cookie.startsWith("upload=")), false);
   assert.equal(maxSubmitSteps > 1, true);
   assert.deepEqual(results.map((result) => result.status), ["waiting_upstream", "waiting_upstream", "waiting_upstream"]);
   assert.equal(new Set(results.map((result) => result.externalId)).size, 3);

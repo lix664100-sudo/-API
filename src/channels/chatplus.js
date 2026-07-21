@@ -327,9 +327,9 @@ function normalizeChatFiles(input, messages) {
 }
 
 function submittedImageTask(conversation, input, prompt, taskType, sourceImageCount = 0) {
-  const { events = [], conversationId, messageId, model, upstreamModel, route, selected } = conversation;
+  const { events = [], conversationId, model, upstreamModel, route, selected } = conversation;
   return {
-    externalId: conversationId || messageId,
+    externalId: conversationId,
     status: "processing",
     prompt,
     taskType,
@@ -834,6 +834,55 @@ export class ChatplusClient {
     this.concurrentChatSessions.clear();
   }
 
+  sessionSnapshot() {
+    return {
+      cookies: [...this.cookies],
+      portalLoggedIn: this.portalLoggedIn,
+      carId: this.carId,
+      carType: this.carType,
+      defaultModel: this.defaultModel
+    };
+  }
+
+  restoreSession(snapshot = {}) {
+    this.cookies = Array.isArray(snapshot.cookies) ? [...snapshot.cookies] : [];
+    this.portalLoggedIn = Boolean(snapshot.portalLoggedIn);
+    this.carId = String(snapshot.carId || "");
+    this.carType = String(snapshot.carType || "chatgpt");
+    if (snapshot.defaultModel) this.defaultModel = snapshot.defaultModel;
+  }
+
+  preparedChatSession(session = {}) {
+    return {
+      ...session,
+      snapshot: this.sessionSnapshot()
+    };
+  }
+
+  cloneChatSession(session = {}) {
+    return {
+      ...session,
+      route: session.route ? { ...session.route } : session.route,
+      selected: session.selected ? { ...session.selected } : session.selected,
+      snapshot: session.snapshot
+        ? { ...session.snapshot, cookies: [...(session.snapshot.cookies || [])] }
+        : this.sessionSnapshot()
+    };
+  }
+
+  createSubmitClient(session = {}) {
+    const snapshot = session.snapshot || session.submitSessionSnapshot;
+    if (!snapshot) return this;
+    const client = new ChatplusClient({
+      config: this.config,
+      channel: this.channel,
+      account: this.account,
+      sessionLock: async (work) => work()
+    });
+    client.restoreSession(snapshot);
+    return client;
+  }
+
   async runAccountWork(work) {
     const current = this.accountWork.catch(() => {}).then(work);
     this.accountWork = current;
@@ -872,7 +921,7 @@ export class ChatplusClient {
       const cachedCarId = cached.session.selected?.carId;
       if (!ignoredCarIds.has(cachedCarId)) {
         if (cachedCarId) ignoredCarIds.add(cachedCarId);
-        return cached.session;
+        return this.cloneChatSession(cached.session);
       }
       this.concurrentChatSessions.delete(key);
     }
@@ -881,17 +930,18 @@ export class ChatplusClient {
       const cachedCarId = session.selected?.carId;
       if (!ignoredCarIds.has(cachedCarId)) {
         if (cachedCarId) ignoredCarIds.add(cachedCarId);
-        return session;
+        return this.cloneChatSession(session);
       }
       this.concurrentChatSessions.delete(key);
     }
 
-    const promise = this.prepareChatSession(input, ignoredCarIds, maxAttempts);
+    const promise = this.prepareChatSession(input, ignoredCarIds, maxAttempts)
+      .then((session) => this.preparedChatSession(session));
     this.concurrentChatSessions.set(key, { promise });
     try {
       const session = await promise;
       this.concurrentChatSessions.set(key, { session });
-      return session;
+      return this.cloneChatSession(session);
     } catch (error) {
       if (this.concurrentChatSessions.get(key)?.promise === promise) this.concurrentChatSessions.delete(key);
       throw error;
@@ -1272,18 +1322,22 @@ export class ChatplusClient {
           ? await this.prepareReusableChatSession(input, ignoredCarIds, 1)
           : await this.prepareChatSession(input, ignoredCarIds, 1);
         const { route, init } = session;
+        const submitClient = input.concurrentSubmit === true ? this.createSubmitClient(session) : this;
         selected = session.selected;
-        if (route.key === "grok") return await runSubmitStep(() => this.sendGrokConversation(prompt, input, route, selected));
+        if (route.key === "grok") {
+          const conversation = await runSubmitStep(() => submitClient.sendGrokConversation(prompt, input, route, selected));
+          return { ...conversation, submitSessionSnapshot: submitClient.sessionSnapshot() };
+        }
         if (route.key === "gemini") {
           const error = new Error("Gemini 上游当前账号没有有效订阅，暂时不能作为后端 API 转发。");
           error.noRetry = true;
           throw error;
         }
-        const model = route.model || init?.default_model_slug || this.defaultModel;
-        const imageAssets = await runSubmitStep(() => this.uploadChatImages(input.files || []));
-        const { body, messageId } = this.buildConversationBody(prompt, model, imageAssets);
+        const model = route.model || init?.default_model_slug || submitClient.defaultModel || this.defaultModel;
+        const imageAssets = await runSubmitStep(() => submitClient.uploadChatImages(input.files || []));
+        const { body, messageId } = submitClient.buildConversationBody(prompt, model, imageAssets);
 
-        const response = await runSubmitStep(() => this.http("/backend-api/conversation", {
+        const response = await runSubmitStep(() => submitClient.http("/backend-api/conversation", {
           method: "POST",
           body,
           headers: {
@@ -1304,7 +1358,22 @@ export class ChatplusClient {
         for (const event of events) {
           if (event.conversation_id) conversationId = event.conversation_id;
         }
-        return { events, conversationId, messageId, model: route.key || model, upstreamModel: model, route, selected };
+        if (input.requireConversationId && !conversationId) {
+          const error = new Error("聊天站没有返回上游任务编号，不能算真正提交。");
+          error.status = 502;
+          error.code = "NO_UPSTREAM_TASK_ID";
+          throw error;
+        }
+        return {
+          events,
+          conversationId,
+          messageId,
+          model: route.key || model,
+          upstreamModel: model,
+          route,
+          selected,
+          submitSessionSnapshot: submitClient.sessionSnapshot()
+        };
       } catch (error) {
         if (error.noRetry || error.imageQuotaExhausted) throw error;
         if (Number(error.status || error.statusCode || 0) === 400) throw error;
@@ -1456,17 +1525,18 @@ export class ChatplusClient {
     return this.runTaskWork(input, async () => {
       const prompt = String(input.prompt || "").trim();
       if (!prompt) throw new Error("请输入生图描述。");
-      const result = await this.withImageQuotaFallback(prompt, { ...input, preferImageCar: true }, async (conversation) => {
+      const result = await this.withImageQuotaFallback(prompt, { ...input, preferImageCar: true, requireConversationId: true }, async (conversation) => {
         throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
-        const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec);
+        const waitClient = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
+        const imageUrls = await waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec);
         return { ...conversation, imageUrls };
       });
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
 
       return {
-        externalId: conversationId || messageId,
+        externalId: conversationId,
         status: imageUrls.length ? "success" : "waiting_upstream",
         prompt,
         taskType: "text2img",
@@ -1486,17 +1556,18 @@ export class ChatplusClient {
       if (!prompt) throw new Error("Please enter an image edit prompt.");
       if (!files.length) throw new Error("Please upload a source image.");
 
-      const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: true }, async (conversation) => {
+      const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: true, requireConversationId: true }, async (conversation) => {
         throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
-        const imageUrls = await this.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true });
+        const waitClient = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
+        const imageUrls = await waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true });
         return { ...conversation, imageUrls };
       });
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
 
       return {
-        externalId: conversationId || messageId,
+        externalId: conversationId,
         status: imageUrls.length ? "success" : "waiting_upstream",
         prompt,
         taskType: "img2img",
