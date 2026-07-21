@@ -426,6 +426,17 @@ function throwIfTerminalImageFailure(content) {
   throw error;
 }
 
+function throwIfTextImageResponse(content) {
+  const message = String(content || "").trim();
+  if (!message) return;
+  const error = new Error(message);
+  error.upstreamExplicitFailure = true;
+  error.upstreamStatus = "failed";
+  error.status = 400;
+  error.code = "upstream_text_response";
+  throw error;
+}
+
 function numberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
@@ -1270,6 +1281,7 @@ export class ChatplusClient {
     let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: options.generatedOnly });
     if (imageUrls.length || !conversationId) return imageUrls;
     throwIfTerminalImageFailure(initialContent);
+    throwIfTextImageResponse(initialContent);
 
     const timeoutMs = Math.max(5, Number(timeoutSec || this.config.waitTimeoutSec || DEFAULT_CHAT_HTTP_TIMEOUT_SEC)) * 1000;
     const deadline = Date.now() + timeoutMs;
@@ -1281,6 +1293,7 @@ export class ChatplusClient {
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
         throwIfTerminalImageFailure(content);
+        throwIfTextImageResponse(content);
         const explicitState = explicitConversationState(detail);
         if (explicitState) {
           const error = new Error(explicitState.message);
@@ -1341,6 +1354,16 @@ export class ChatplusClient {
       };
     }
     if (isTerminalImageFailureMessage(content)) {
+      return {
+        externalId,
+        status: "failed",
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: content,
+        raw: detail
+      };
+    }
+    if (content) {
       return {
         externalId,
         status: "failed",

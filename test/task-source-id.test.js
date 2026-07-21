@@ -9,6 +9,7 @@ process.env.DATA_DIR = dataDir;
 
 const { getTaskBySourceTaskId, listTasks, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
 const { createImageTask, getRuntimeStatus, refreshTask } = await import("../src/channel-manager.js");
+const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
@@ -262,4 +263,66 @@ test("绘图站刷新返回异常网页时任务直接失败", async () => {
   } finally {
     DrawingClient.prototype.getTask = originalGetTask;
   }
+});
+
+test("chatplus text-only image result is returned as failure message", async () => {
+  const message = "I wasn't able to generate the image due to an error on my side.";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-text-account", username: "chat@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  const originalLoginPortal = ChatplusClient.prototype.loginPortal;
+  const originalJson = ChatplusClient.prototype.json;
+  ChatplusClient.prototype.loginPortal = async function loginPortal() {
+    this.portalLoggedIn = true;
+  };
+  ChatplusClient.prototype.json = async () => ({
+    mapping: {
+      assistant: {
+        message: {
+          author: { role: "assistant" },
+          content: { parts: [message] }
+        }
+      }
+    }
+  });
+
+  try {
+    const task = await client.getTask("conversation-text-only");
+    assert.equal(task.status, "failed");
+    assert.equal(task.errorMessage, message);
+    assert.equal(task.imageUrls.length, 0);
+  } finally {
+    ChatplusClient.prototype.loginPortal = originalLoginPortal;
+    ChatplusClient.prototype.json = originalJson;
+  }
+});
+
+test("chatplus text-only image wait returns upstream text immediately", async () => {
+  const message = "I wasn't able to generate the image due to an error on my side.";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-text-account", username: "chat@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  await assert.rejects(
+    () => client.waitForConversationImages([{
+      message: {
+        author: { role: "assistant" },
+        content: { parts: [message] }
+      }
+    }], "conversation-text-only", 30, { generatedOnly: true }),
+    (error) => {
+      assert.equal(error.message, message);
+      assert.equal(error.status, 400);
+      assert.equal(error.code, "upstream_text_response");
+      assert.equal(error.upstreamExplicitFailure, true);
+      return true;
+    }
+  );
 });
