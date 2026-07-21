@@ -21,6 +21,7 @@ const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
 const DRAWING_FAILURE_LIMIT = 3;
 const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
 const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
+const FAST_QUOTA_REFRESH_TIMEOUT_MS = 5000;
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 
 function normalizeSourceTaskId(value) {
@@ -1302,7 +1303,7 @@ async function refreshQuotaBeforeUse(config, target, attempts) {
   }
 }
 
-async function refreshQuotaBeforeUseFast(config, target, attempts, timeoutMs = 500) {
+async function refreshQuotaBeforeUseFast(config, target, attempts, timeoutMs = FAST_QUOTA_REFRESH_TIMEOUT_MS) {
   const localAttempts = [];
   const refresh = refreshQuotaBeforeUse(config, target, localAttempts)
     .then((ready) => ({ ready }))

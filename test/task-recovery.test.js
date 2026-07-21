@@ -10,6 +10,7 @@ process.env.DATA_DIR = dataDir;
 const { getTask, listTasks, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
 const { createImageTask, queueImageTask, refreshProcessingTasks, refreshTask } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
+const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
   await rm(dataDir, { recursive: true, force: true });
@@ -270,6 +271,82 @@ test("wait image task returns upstream policy refusal without wrapping it as tim
     );
   } finally {
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+  }
+});
+
+test("fast drawing quota check waits long enough for normal account checks", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    concurrency: { chat: 3, drawingImage: 1, chatImage: 1 },
+    accounts: [{
+      id: "account-fast-drawing-quota",
+      channelId: "shareai",
+      name: "fast-drawing-quota@example.com",
+      username: "fast-drawing-quota@example.com",
+      password: "test",
+      enabled: true,
+      status: "quota_empty",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", balance: 0, message: "needs refresh" },
+          chatplus: { status: "quota_empty", balance: 0, message: "skip chatplus" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  const originalUploadImage = DrawingClient.prototype.uploadImage;
+  const originalCreateImageTask = DrawingClient.prototype.createImageTask;
+  let checkCount = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    if (checkCount === 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    return {
+      status: "ok",
+      balance: 50,
+      quota: 50,
+      message: "drawing account ok"
+    };
+  };
+  DrawingClient.prototype.uploadImage = async () => ({
+    uploadId: 1,
+    upload: { id: 1 }
+  });
+  DrawingClient.prototype.createImageTask = async (input) => ({
+    externalId: "drawing-fast-quota-task",
+    status: "success",
+    taskType: "img2img",
+    prompt: input.prompt,
+    imageCount: 0,
+    imageUrls: [],
+    raw: {}
+  });
+
+  try {
+    const result = await createImageTask({
+      input: { channel: "drawing", prompt: "fast quota check" },
+      files: [{
+        filename: "source.png",
+        mimetype: "image/png",
+        toBuffer: async () => Buffer.from("image")
+      }],
+      wait: true
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(checkCount >= 1, true);
+    assert.equal(result.status, "success");
+    assert.equal(result.accountId, "account-fast-drawing-quota");
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    DrawingClient.prototype.check = originalCheck;
+    DrawingClient.prototype.uploadImage = originalUploadImage;
+    DrawingClient.prototype.createImageTask = originalCreateImageTask;
   }
 });
 
