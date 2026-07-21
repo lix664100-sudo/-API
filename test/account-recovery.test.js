@@ -245,7 +245,7 @@ test("没有任务时后台也会自动恢复失效的聊天线路", async () =>
   }
 });
 
-test("同一聊天账号的对话和生图不会同时登录", async () => {
+test("同一聊天账号的对话和生图等待接口可以并行处理", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -270,20 +270,20 @@ test("同一聊天账号的对话和生图不会同时登录", async () => {
 
   const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
   const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
-  let activeLogins = 0;
-  let maxActiveLogins = 0;
-  const trackLogin = async () => {
-    activeLogins += 1;
-    maxActiveLogins = Math.max(maxActiveLogins, activeLogins);
+  let activeRequests = 0;
+  let maxActiveRequests = 0;
+  const trackRequest = async () => {
+    activeRequests += 1;
+    maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
     try {
       await new Promise((resolve) => setTimeout(resolve, 40));
     } finally {
-      activeLogins -= 1;
+      activeRequests -= 1;
     }
   };
 
   ChatplusClient.prototype.createChatCompletion = async () => {
-    await trackLogin();
+    await trackRequest();
     return {
       externalId: "conversation-exclusive",
       model: "gpt",
@@ -293,7 +293,7 @@ test("同一聊天账号的对话和生图不会同时登录", async () => {
     };
   };
   ChatplusClient.prototype.createImageTask = async (input) => {
-    await trackLogin();
+    await trackRequest();
     return {
       externalId: "image-exclusive",
       status: "success",
@@ -320,7 +320,7 @@ test("同一聊天账号的对话和生图不会同时登录", async () => {
       })
     ]);
 
-    assert.equal(maxActiveLogins, 1);
+    assert.equal(maxActiveRequests, 2);
   } finally {
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
@@ -399,7 +399,7 @@ test("绘图额度不足且聊天生图并发已满时直接提示并发上限",
   }
 });
 
-test("聊天生图账号已有任务时等待接口不进入账号队列", async () => {
+test("聊天生图等待接口按配置并发提交，超过配置才提示上限", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -441,10 +441,13 @@ test("聊天生图账号已有任务时等待接口不进入账号队列", async
 
   const originalDrawingCheck = DrawingClient.prototype.check;
   const originalChatCreateImageTask = ChatplusClient.prototype.createImageTask;
-  let releaseActiveTask;
-  let markActiveTaskStarted;
-  const activeTaskStarted = new Promise((resolve) => { markActiveTaskStarted = resolve; });
-  const holdActiveTask = new Promise((resolve) => { releaseActiveTask = resolve; });
+  let releaseActiveTasks;
+  let markAllTasksStarted;
+  let activeCount = 0;
+  let maxActiveCount = 0;
+  const concurrentSubmitFlags = [];
+  const allTasksStarted = new Promise((resolve) => { markAllTasksStarted = resolve; });
+  const holdActiveTasks = new Promise((resolve) => { releaseActiveTasks = resolve; });
 
   DrawingClient.prototype.check = async () => ({
     status: "quota_empty",
@@ -453,34 +456,43 @@ test("聊天生图账号已有任务时等待接口不进入账号队列", async
     message: "绘图积分不足"
   });
   ChatplusClient.prototype.createImageTask = async (input) => {
-    markActiveTaskStarted();
-    await holdActiveTask;
-    return {
-      externalId: "chat-image-queue-active-task",
-      status: "success",
-      taskType: "img2img",
-      prompt: input.prompt,
-      modelId: "gpt",
-      ratio: "1:1",
-      imageCount: 1,
-      imageUrls: ["https://example.com/result.png"],
-      raw: {}
-    };
+    activeCount += 1;
+    maxActiveCount = Math.max(maxActiveCount, activeCount);
+    concurrentSubmitFlags.push(input.concurrentSubmit === true);
+    if (activeCount === 4) markAllTasksStarted();
+    try {
+      await holdActiveTasks;
+      return {
+        externalId: `chat-image-${input.prompt}`,
+        status: "success",
+        taskType: "img2img",
+        prompt: input.prompt,
+        modelId: "gpt",
+        ratio: "1:1",
+        imageCount: 1,
+        imageUrls: ["https://example.com/result.png"],
+        raw: {}
+      };
+    } finally {
+      activeCount -= 1;
+    }
   };
 
   const file = { filename: "test.png", mimetype: "image/png" };
-  const activeTask = createImageTask({
-    input: { channel: "chatplus", prompt: "占用聊天生图账号" },
+  const activeTasks = Array.from({ length: 4 }, (_item, index) => createImageTask({
+    input: { prompt: `聊天生图并发-${index + 1}` },
     files: [file],
     wait: true
-  });
-  await activeTaskStarted;
+  }));
+  await allTasksStarted;
+  assert.equal(maxActiveCount, 4);
+  assert.deepEqual(concurrentSubmitFlags, [true, true, true, true]);
 
   const startedAt = Date.now();
   try {
     await assert.rejects(
       createImageTask({
-        input: { prompt: "账号忙时的新图生图任务" },
+        input: { prompt: "超过聊天生图并发的新任务" },
         files: [file],
         wait: true
       }),
@@ -488,14 +500,13 @@ test("聊天生图账号已有任务时等待接口不进入账号队列", async
         assert.equal(error?.status, 429);
         assert.match(error?.message || "", /^并发上限/);
         assert.match(error?.message || "", /绘图积分不足/);
-        assert.match(error?.message || "", /聊天排队测试账号的聊天生图任务正在处理中/);
         assert.ok(Date.now() - startedAt < 1000);
         return true;
       }
     );
   } finally {
-    releaseActiveTask();
-    await activeTask;
+    releaseActiveTasks();
+    await Promise.all(activeTasks);
     DrawingClient.prototype.check = originalDrawingCheck;
     ChatplusClient.prototype.createImageTask = originalChatCreateImageTask;
   }

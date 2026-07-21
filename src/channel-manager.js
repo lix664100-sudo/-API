@@ -1693,10 +1693,11 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           const onSubmitted = async (submittedResult) => {
             taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
           };
+          const chatplusConcurrentSubmit = channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false;
           let result = await client.createTextTask({
             ...input,
             onSubmitted,
-            ...(channel.type === "chatplus" ? { concurrentSubmit: options.noChatplusQueue !== true } : {}),
+            ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
             waitForImages: options.waitForChatplusImages === true
           });
           taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
@@ -1707,7 +1708,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           result = await mirrorTaskImages(result, config);
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
-          parallel: options.noChatplusQueue !== true,
+          parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
           noQueue: options.noChatplusQueue,
           slot: targetTaskSlot(target, "text2img"),
           blockingSlots: ["chatImage"]
@@ -1813,7 +1814,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
       let taskState = task;
       try {
         if (!(await ensureTargetReady(config, target, "img2img", attempts, {
-          skipQuotaRefresh: options.noChatplusQueue
+          skipQuotaRefresh: options.fastQuotaRefresh || options.noChatplusQueue
         }))) continue;
         if (!release) {
           release = await tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target);
@@ -1827,10 +1828,11 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           const onSubmitted = async (submittedResult) => {
             taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
           };
+          const chatplusConcurrentSubmit = channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false;
           let result = await submitImageTask(client, {
             ...input,
             onSubmitted,
-            ...(channel.type === "chatplus" ? { concurrentSubmit: options.noChatplusQueue !== true } : {}),
+            ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
             waitForImages: options.waitForChatplusImages === true
           }, files);
           taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
@@ -1841,7 +1843,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           result = await mirrorTaskImages(result, config);
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
-          parallel: options.noChatplusQueue !== true,
+          parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
           noQueue: options.noChatplusQueue,
           slot: targetTaskSlot(target, "img2img"),
           blockingSlots: ["chatImage"]
@@ -2338,7 +2340,12 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
       const finishedTask = await runChatplusAccountWork(channel, account, async () => {
         if (!(await ensureTargetReady(config, target, "text2img", attempts))) return null;
         const client = getWorkClient(config, channel, account);
-        let result = await client.createTextTask({ ...input, waitForImages: wait });
+        const chatplusConcurrentSubmit = wait && channel.type === "chatplus";
+        let result = await client.createTextTask({
+          ...input,
+          ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
+          waitForImages: wait
+        });
         if (wait && channel.type === "drawing") result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
         result = await mirrorTaskImages(result, config);
         const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
@@ -2348,7 +2355,8 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         scheduleDrawingQuotaRefresh(account, channel);
         return task;
       }, {
-        noQueue: wait,
+        parallel: wait && channel.type === "chatplus",
+        noQueue: wait && channel.type !== "chatplus",
         slot: targetTaskSlot(target, "text2img"),
         blockingSlots: ["chatImage"]
       });
@@ -2391,7 +2399,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
     let finalTask;
     try {
       finalTask = await runQueuedImageTask(task, input, files, null, {
-        noChatplusQueue: true,
+        fastQuotaRefresh: true,
         waitForChatplusImages: true
       });
     } finally {
