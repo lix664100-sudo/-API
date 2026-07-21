@@ -2933,7 +2933,7 @@
           if (!tasks.some((item) => ["processing", "queued", "pending", "unknown", "waiting_upstream"].includes(item.status))) return undefined;
           const timer = setInterval(async () => {
             try {
-              await api("/api/tasks/refresh-processing", { method: "POST", body: {} });
+              await api("/api/tasks/refresh-processing", { method: "POST", body: {} }).catch(() => null);
               const [taskList, nextConfig] = await Promise.all([
                 api("/api/tasks"),
                 api("/api/config")
@@ -3309,8 +3309,18 @@
         async function refreshProcessing() {
           setLoading(true);
           try {
-            const results = await api("/api/tasks/refresh-processing", { method: "POST", body: {} });
+            let results = [];
+            let refreshError = null;
+            try {
+              results = await api("/api/tasks/refresh-processing", { method: "POST", body: {} });
+            } catch (error) {
+              refreshError = error;
+            }
             await refresh();
+            if (refreshError) {
+              message.warning(refreshError.message);
+              return;
+            }
             if (!results.length) message.info("没有需要刷新的任务");
             else message.success(`已刷新 ${results.length} 个任务`);
           } catch (error) {

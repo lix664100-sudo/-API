@@ -7,8 +7,8 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-source-id-"));
 process.env.DATA_DIR = dataDir;
 
-const { listTasks, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
-const { createImageTask } = await import("../src/channel-manager.js");
+const { getTaskBySourceTaskId, listTasks, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
+const { createImageTask, getRuntimeStatus } = await import("../src/channel-manager.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
@@ -97,6 +97,110 @@ test("洗图王任务 ID 会保存到本地记录，失败返回也会带回去"
   } finally {
     DrawingClient.prototype.check = originalCheck;
     DrawingClient.prototype.uploadImage = originalUploadImage;
+    DrawingClient.prototype.createImageTask = originalCreateImageTask;
+  }
+});
+
+test("相同洗图王任务 ID 的失败结果会更新原任务记录", async () => {
+  const sourceTaskId = "task_xituwang_source_api_1234abcd";
+
+  await upsertTask({
+    id: "local-source-task-original",
+    sourceTaskId,
+    status: "processing",
+    taskType: "img2img",
+    requestJson: { client_task_id: sourceTaskId },
+    createdAt: "2026-07-21T12:00:00.000Z"
+  });
+
+  await upsertTask({
+    id: "local-source-task-fallback",
+    sourceTaskId,
+    status: "failed",
+    taskType: "img2img",
+    errorMessage: "并发上限",
+    responseJson: { ok: false, code: "CONCURRENCY_LIMIT", sourceTaskId },
+    completedAt: "2026-07-21T12:00:05.000Z"
+  });
+
+  const tasks = await listTasks();
+  const matched = tasks.filter((task) => task.sourceTaskId === sourceTaskId);
+
+  assert.equal(matched.length, 1);
+  assert.equal(matched[0].id, "local-source-task-original");
+  assert.equal(matched[0].status, "failed");
+  assert.equal(matched[0].responseJson.code, "CONCURRENCY_LIMIT");
+  assert.equal((await getTaskBySourceTaskId(sourceTaskId)).id, "local-source-task-original");
+});
+
+test("额度检测不会占用生图并发", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "auto",
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: { drawingBaseUrl: "https://drawing.example.test", defaultModelId: 1 }
+    }],
+    accounts: [{
+      id: "drawing-account-1",
+      name: "Drawing Account",
+      channelId: "shareai",
+      username: "drawing@example.test",
+      password: "password",
+      enabled: true,
+      status: "ok",
+      token: "test-token",
+      meta: { abilities: { drawing: { status: "ok" } } }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  const originalCreateImageTask = DrawingClient.prototype.createImageTask;
+  let releaseCheck;
+  const checkStarted = new Promise((resolve) => {
+    DrawingClient.prototype.check = async () => {
+      resolve();
+      await new Promise((release) => {
+        releaseCheck = release;
+      });
+      return { status: "quota_empty", message: "绘图积分不足" };
+    };
+  });
+  let submitted = false;
+  DrawingClient.prototype.createImageTask = async () => {
+    submitted = true;
+    throw new Error("should not submit when quota is empty");
+  };
+
+  const sourceTaskId = "task_quota_check_no_slot_api_abcd1234";
+  const taskPromise = createImageTask({
+    input: {
+      channel: "drawing",
+      prompt: "quota check no slot",
+      client_task_id: sourceTaskId
+    },
+    files: [{ filename: "source.png", mimetype: "image/png", buffer: Buffer.from("x") }],
+    wait: true
+  });
+
+  try {
+    await checkStarted;
+    const runtime = await getRuntimeStatus();
+    assert.equal(runtime.running.drawingImage, 0);
+    assert.equal(runtime.running.total, 0);
+
+    releaseCheck();
+    await assert.rejects(taskPromise, /绘图积分不足|No available compatible accounts|并发上限|调用失败/);
+
+    const stored = await getTaskBySourceTaskId(sourceTaskId);
+    assert.equal(stored.status, "failed");
+    assert.equal(submitted, false);
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
     DrawingClient.prototype.createImageTask = originalCreateImageTask;
   }
 });

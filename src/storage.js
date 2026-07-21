@@ -532,6 +532,17 @@ export async function listTasks() {
 const durableFinalTaskStatuses = new Set(["success", "failed"]);
 const staleTaskStatuses = new Set(["processing", "queued", "pending", "unknown", "waiting_upstream", "interrupted"]);
 
+function taskSourceTaskId(value = {}) {
+  return String(
+    value?.sourceTaskId
+      || value?.requestMeta?.sourceTaskId
+      || value?.requestJson?.sourceTaskId
+      || value?.requestJson?.client_task_id
+      || value?.responseJson?.sourceTaskId
+      || ""
+  ).trim();
+}
+
 function taskStatus(value) {
   return String(value?.status || "").trim().toLowerCase();
 }
@@ -544,16 +555,28 @@ function shouldKeepStoredTask(current, incoming) {
   return staleTaskStatuses.has(incomingStatus) || durableFinalTaskStatuses.has(incomingStatus);
 }
 
+function taskIdentityIndex(tasks, task) {
+  const id = String(task?.id || "").trim();
+  if (id) {
+    const idIndex = tasks.findIndex((item) => String(item.id) === id);
+    if (idIndex >= 0) return idIndex;
+  }
+  const sourceTaskId = taskSourceTaskId(task);
+  return sourceTaskId
+    ? tasks.findIndex((item) => taskSourceTaskId(item) === sourceTaskId)
+    : -1;
+}
+
 export async function upsertTask(task) {
   const tasks = await loadTasks();
-  const index = tasks.findIndex((item) => String(item.id) === String(task.id));
+  const index = taskIdentityIndex(tasks, task);
   const next = {
     ...task,
     updatedAt: new Date().toISOString()
   };
   if (index >= 0 && shouldKeepStoredTask(tasks[index], next)) return tasks[index];
   const stored = index >= 0
-    ? { ...tasks[index], ...next }
+    ? { ...tasks[index], ...next, id: tasks[index].id || next.id }
     : { ...next, createdAt: task.createdAt || new Date().toISOString() };
   if (index >= 0) tasks[index] = stored;
   else tasks.push(stored);
@@ -564,6 +587,13 @@ export async function upsertTask(task) {
 export async function getTask(id) {
   const tasks = await loadTasks();
   return tasks.find((task) => String(task.id) === String(id)) || null;
+}
+
+export async function getTaskBySourceTaskId(sourceTaskId) {
+  const normalized = String(sourceTaskId || "").trim();
+  if (!normalized) return null;
+  const tasks = await loadTasks();
+  return tasks.find((task) => taskSourceTaskId(task) === normalized) || null;
 }
 
 function finalStatStatus(status) {

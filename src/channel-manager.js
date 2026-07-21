@@ -1695,19 +1695,20 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
       if (usingReserved) {
         release = reservedRelease;
         reservedRelease = null;
-      } else {
-        release = tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target);
-        if (!release) {
-          attempts.push(targetBusyAttempt(target, "img2img"));
-          continue;
-        }
       }
       let taskState = task;
       try {
+        if (!(await ensureTargetReady(config, target, "img2img", attempts, {
+          skipQuotaRefresh: options.noChatplusQueue
+        }))) continue;
+        if (!release) {
+          release = tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target);
+          if (!release) {
+            attempts.push(targetBusyAttempt(target, "img2img"));
+            continue;
+          }
+        }
         const finishedTask = await runChatplusAccountWork(channel, account, async () => {
-          if (!(await ensureTargetReady(config, target, "img2img", attempts, {
-            skipQuotaRefresh: options.noChatplusQueue
-          }))) return null;
           const client = getWorkClient(config, channel, account);
           const onSubmitted = async (submittedResult) => {
             taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
@@ -1739,7 +1740,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           await updateTargetStatusAfterError(account, channel, error);
         }
       } finally {
-        release();
+        release?.();
       }
     }
   } finally {
@@ -2251,18 +2252,12 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   if (!targets.length) throw noUsableTargetError("img2img");
 
   if (wait) {
-    const reserved = reserveFirstAvailableTarget(targets, "img2img");
-    const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img", requestMeta });
-    try {
-      await upsertTask(task);
-    } catch (error) {
-      reserved.release();
-      throw error;
-    }
+    const task = queuedTask({ input: { ...input, files }, target: targets[0], taskType: "img2img", requestMeta });
+    await upsertTask(task);
     scheduledImageTasks.add(task.id);
     let finalTask;
     try {
-      finalTask = await runQueuedImageTask(task, input, files, reserved, { noChatplusQueue: true });
+      finalTask = await runQueuedImageTask(task, input, files, null, { noChatplusQueue: true });
     } finally {
       scheduledImageTasks.delete(task.id);
     }

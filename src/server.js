@@ -31,17 +31,20 @@ import {
 } from "./image-store.js";
 import {
   getTask,
+  getTaskBySourceTaskId,
   listIntradayTaskStats,
   listTaskStats,
   listTasks,
   loadConfig,
   publicConfig,
+  recordTaskStat,
   recordRuntimeStat,
   removeAccount,
   removeChannel,
   saveAccount,
   saveChannel,
-  saveConfig
+  saveConfig,
+  upsertTask
 } from "./storage.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -72,15 +75,100 @@ const app = Fastify({ logger: true, bodyLimit: 60 * 1024 * 1024 });
 await app.register(cors, { origin: true });
 await app.register(multipart, { limits: { fileSize: 25 * 1024 * 1024 } });
 
-function sendError(reply, error) {
+function taskFileJson(file) {
+  return {
+    filename: file?.filename || file?.name || "",
+    mimetype: file?.mimetype || file?.type || "",
+    previewUrl: file?.previewUrl || "",
+    fieldname: file?.fieldname || ""
+  };
+}
+
+function failedRequestJson(input = {}, files = [], sourceTaskId = "") {
+  const { file: _file, files: _files, ...fields } = input || {};
+  const requestJson = { ...fields };
+  const fileItems = (Array.isArray(files) ? files : []).map(taskFileJson);
+  if (fileItems.length) {
+    requestJson.received_image_count = fileItems.length;
+    requestJson.files = fileItems;
+  }
+  if (sourceTaskId) {
+    requestJson.sourceTaskId = sourceTaskId;
+    requestJson.client_task_id = requestJson.client_task_id || sourceTaskId;
+  }
+  return requestJson;
+}
+
+function errorSourceTaskId(error, responseJson = {}, context = {}) {
+  return normalizeSourceTaskId(
+    error.sourceTaskId
+      || responseJson.sourceTaskId
+      || error.task?.sourceTaskId
+      || error.task?.requestMeta?.sourceTaskId
+      || context.requestMeta?.sourceTaskId
+      || sourceTaskIdFrom(context.input)
+  );
+}
+
+async function persistReturnedErrorTask(error, context, payload, status) {
+  const responseJson = error.responseJson || error.task?.responseJson || {};
+  const sourceTaskId = errorSourceTaskId(error, responseJson, context);
+  if (!sourceTaskId) return null;
+
+  const attempts = error.attempts || responseJson.attempts || error.task?.attempts || [];
+  const existing = error.task || await getTaskBySourceTaskId(sourceTaskId);
+  const firstAttempt = Array.isArray(attempts) ? attempts[0] || {} : {};
+  const now = new Date().toISOString();
+  const responsePayload = {
+    ok: false,
+    message: payload.message,
+    sourceTaskId,
+    ...(status ? { status } : {}),
+    ...(payload.code ? { code: payload.code } : {}),
+    ...(Array.isArray(attempts) && attempts.length ? { attempts } : {})
+  };
+  const failedTask = {
+    ...(existing || {}),
+    id: existing?.id || `task-${randomUUID()}`,
+    sourceTaskId,
+    status: "failed",
+    taskType: existing?.taskType || context.taskType || "",
+    prompt: existing?.prompt || context.input?.prompt || context.input?.message || "",
+    modelId: existing?.modelId || context.input?.model_id || context.input?.modelId || context.input?.model || "",
+    ratio: existing?.ratio || context.input?.ratio_label || context.input?.ratio || "",
+    imageCount: existing?.imageCount ?? Number(context.input?.image_count || context.input?.n || 1),
+    imageUrls: Array.isArray(existing?.imageUrls) ? existing.imageUrls : [],
+    inputImageUrls: Array.isArray(existing?.inputImageUrls) ? existing.inputImageUrls : [],
+    errorMessage: payload.message,
+    statusCode: status,
+    channelId: existing?.channelId || firstAttempt.channelId || "",
+    channelName: existing?.channelName || firstAttempt.channelName || "",
+    channelType: existing?.channelType || "",
+    accountId: existing?.accountId || firstAttempt.accountId || "",
+    accountName: existing?.accountName || firstAttempt.accountName || "",
+    requestMeta: existing?.requestMeta || context.requestMeta || {},
+    attempts: Array.isArray(attempts) ? attempts : [],
+    requestJson: existing?.requestJson || failedRequestJson(context.input, context.files, sourceTaskId),
+    responseJson: responsePayload,
+    raw: {
+      ...(existing?.raw || {}),
+      returnedError: true,
+      returnedErrorAt: now
+    },
+    completedAt: now,
+    createdAt: existing?.createdAt || context.requestMeta?.calledAt || now
+  };
+  const stored = await upsertTask(failedTask);
+  await recordTaskStat(stored);
+  error.task = stored;
+  return stored;
+}
+
+async function sendError(reply, error, context = {}) {
   const status = Number(error.status || error.statusCode || 500);
   const responseJson = error.responseJson || error.task?.responseJson || {};
   const attempts = error.attempts || responseJson.attempts || error.task?.attempts || [];
-  const sourceTaskId = error.sourceTaskId
-    || responseJson.sourceTaskId
-    || error.task?.sourceTaskId
-    || error.task?.requestMeta?.sourceTaskId
-    || "";
+  const sourceTaskId = errorSourceTaskId(error, responseJson, context);
   const payload = {
     ok: false,
     message: responseJson.message || error.message || "请求失败"
@@ -89,6 +177,11 @@ function sendError(reply, error) {
   if (code) payload.code = code;
   if (sourceTaskId) payload.sourceTaskId = sourceTaskId;
   if (Array.isArray(attempts) && attempts.length) payload.attempts = attempts;
+  try {
+    await persistReturnedErrorTask(error, context, payload, status);
+  } catch (persistError) {
+    app.log.warn({ error: persistError }, "failed to persist returned task error");
+  }
   reply.code(status >= 400 && status < 600 ? status : 500).send(payload);
 }
 
@@ -826,9 +919,13 @@ app.post("/api/tasks/:id/refresh", async (request, reply) => {
 });
 
 app.post("/api/draw/edit", async (request, reply) => {
+  let requestMeta = apiRequestMeta(request);
+  let input = {};
+  let files = [];
   try {
-    let requestMeta = apiRequestMeta(request);
-    const { input, files } = await readImageInput(request, { maxFiles: 3 });
+    const parsed = await readImageInput(request, { maxFiles: 3 });
+    input = parsed.input;
+    files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
     let task;
@@ -839,7 +936,7 @@ app.post("/api/draw/edit", async (request, reply) => {
     }
     return { ok: true, data: task };
   } catch (error) {
-    return sendError(reply, error);
+    return sendError(reply, error, { requestMeta, input, files, taskType: "img2img" });
   }
 });
 
@@ -891,15 +988,19 @@ app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, 
 });
 
 app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, reply) => {
+  let requestMeta = apiRequestMeta(request);
+  let input = {};
+  let files = [];
   try {
-    let requestMeta = apiRequestMeta(request);
-    const { input, files } = await readImageInput(request, { maxFiles: 3 });
+    const parsed = await readImageInput(request, { maxFiles: 3 });
+    input = parsed.input;
+    files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
     const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta });
     return imageEditResponse(task);
   } catch (error) {
-    return sendError(reply, error);
+    return sendError(reply, error, { requestMeta, input, files, taskType: "img2img" });
   }
 });
 
