@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
-import { DrawingClient, drawingRetryAfterSeconds, drawingUpstreamFailureCode } from "./channels/drawing.js";
+import { DrawingClient, drawingRetryAfterSeconds, drawingSevereFailureReason } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
 import { checkProxyReachability, safeProxyEndpoint } from "./proxy.js";
 import { getTask, listTasks, loadConfig, recordTaskStat, updateAccountStatus, upsertTask } from "./storage.js";
@@ -18,7 +18,8 @@ const accountRecoveryTasks = new Map();
 const accountRecoveryRetryAt = new Map();
 const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
 const DRAWING_FAILURE_LIMIT = 3;
-const DRAWING_COOLDOWN_MS = 10 * 60 * 1000;
+const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
+const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 
 function taskRequestMeta(value = {}) {
@@ -628,6 +629,14 @@ function drawingRateLimitPatch(retryAfterSeconds) {
   };
 }
 
+function drawingSevereFailureText(reason) {
+  const code = String(reason || "").match(/^upstream_(\d{3})$/)?.[1];
+  if (code) return `绘图站上游服务异常（${code}）`;
+  if (reason === "relay_text") return "绘图站中转返回异常文本";
+  if (reason === "relay_timeout") return "绘图站中转请求超时";
+  return "绘图站上游服务异常";
+}
+
 async function updateTargetStatusAfterError(account, channel, error) {
   const retryAfterSeconds = channel?.type === "drawing"
     ? drawingRetryAfterSeconds(error?.message)
@@ -655,7 +664,7 @@ async function updateAccountAfterTask(account, channel, result = {}) {
 
     const failureText = result.status === "failed" ? drawingFailureTextFromResult(result) : "";
     const retryAfterSeconds = drawingRetryAfterSeconds(failureText);
-    const failureCode = drawingUpstreamFailureCode(failureText);
+    const severeFailureReason = drawingSevereFailureReason(failureText);
     const previousStreak = drawing.status === "cooldown"
       ? 0
       : Math.max(0, Number(drawing.upstreamFailureStreak || 0));
@@ -665,7 +674,8 @@ async function updateAccountAfterTask(account, channel, result = {}) {
       return true;
     }
 
-    if (failureCode) {
+    if (severeFailureReason) {
+      const severeFailureText = drawingSevereFailureText(severeFailureReason);
       const upstreamFailureStreak = previousStreak + 1;
       if (upstreamFailureStreak >= DRAWING_FAILURE_LIMIT) {
         const cooldownUntil = new Date(Date.now() + DRAWING_COOLDOWN_MS).toISOString();
@@ -673,9 +683,9 @@ async function updateAccountAfterTask(account, channel, result = {}) {
           status: "cooldown",
           cooldownUntil,
           cooldownReason: "drawing_upstream_error",
-          upstreamFailureCode: failureCode,
+          upstreamFailureCode: severeFailureReason,
           upstreamFailureStreak,
-          message: `绘图站上游连续失败 ${DRAWING_FAILURE_LIMIT} 次，绘图已冷却 10 分钟。`
+          message: `${severeFailureText}连续失败 ${DRAWING_FAILURE_LIMIT} 次，绘图已冷却 30 分钟。`
         });
         return true;
       }
@@ -684,9 +694,9 @@ async function updateAccountAfterTask(account, channel, result = {}) {
         status: "ok",
         cooldownUntil: null,
         cooldownReason: "",
-        upstreamFailureCode: failureCode,
+        upstreamFailureCode: severeFailureReason,
         upstreamFailureStreak,
-        message: `绘图站上游服务异常，连续失败 ${upstreamFailureStreak}/${DRAWING_FAILURE_LIMIT} 次。`
+        message: `${severeFailureText}，连续失败 ${upstreamFailureStreak}/${DRAWING_FAILURE_LIMIT} 次。`
       });
       return false;
     }
@@ -1479,7 +1489,7 @@ async function runQueuedTextTask(task, input, reserved = null) {
           taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
           scheduleDrawingQuotaRefresh(account, channel);
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
-            result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
+            result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
           }
           result = await mirrorTaskImages(result, config);
           return finishQueuedTask(taskState, result, channel, account, attempts);
@@ -1532,6 +1542,11 @@ function waitingUpstreamResult(result, lastResult = null, lastError = null) {
       lastPollMessage: lastError?.message || ""
     }
   };
+}
+
+function drawingSubmitWaitTimeoutSec(config = {}) {
+  const configured = Math.min(3600, Math.max(30, Number(config.waitTimeoutSec || 300)));
+  return Math.min(configured, DRAWING_SUBMIT_WAIT_TIMEOUT_SEC);
 }
 
 async function waitForUpstreamTask(client, result, timeoutSec) {
@@ -1587,7 +1602,7 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
           taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
           scheduleDrawingQuotaRefresh(account, channel);
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
-            result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
+            result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
           }
           result = await mirrorTaskImages(result, config);
           return finishQueuedTask(taskState, result, channel, account, attempts);
@@ -2065,7 +2080,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         if (!(await ensureTargetReady(config, target, "text2img", attempts))) return null;
         const client = getWorkClient(config, channel, account);
         let result = await client.createTextTask(input);
-        if (wait && channel.type === "drawing") result = await waitForUpstreamTask(client, result, config.waitTimeoutSec);
+        if (wait && channel.type === "drawing") result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
         result = await mirrorTaskImages(result, config);
         const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
         await upsertTask(task);

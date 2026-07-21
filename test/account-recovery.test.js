@@ -10,7 +10,7 @@ process.env.DATA_DIR = dataDir;
 const { loadConfig, saveConfig } = await import("../src/storage.js");
 const { createChatCompletion, createImageTask, createTextTask, getRuntimeStatus, recoverUnavailableChatAccounts } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
-const { DrawingClient, normalizeDrawingTask } = await import("../src/channels/drawing.js");
+const { DrawingClient, drawingSevereFailureReason, normalizeDrawingTask } = await import("../src/channels/drawing.js");
 
 after(async () => {
   await rm(dataDir, { recursive: true, force: true });
@@ -432,7 +432,13 @@ test("绘图站中转 500 显示准确提示", () => {
   assert.equal(task.errorMessage, "绘图站上游服务异常（500），不是额度不足，请稍后重试。");
 });
 
-test("同一账号绘图上游连续失败三次后冷却十分钟", async () => {
+test("绘图站严重中转失败会被识别为上游异常", () => {
+  assert.equal(drawingSevereFailureReason("中转接口请求失败，状态码：500"), "upstream_500");
+  assert.equal(drawingSevereFailureReason("中转返回文本"), "relay_text");
+  assert.equal(drawingSevereFailureReason("中转请求超时，已超过 1000 秒"), "relay_timeout");
+});
+
+test("同一账号绘图上游连续失败三次后冷却三十分钟", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -507,7 +513,7 @@ test("同一账号绘图上游连续失败三次后冷却十分钟", async () =>
 
     assert.equal(drawing.status, "cooldown");
     assert.equal(drawing.upstreamFailureStreak, 3);
-    assert.ok(Date.parse(drawing.cooldownUntil) - Date.now() > 9 * 60 * 1000);
+    assert.ok(Date.parse(drawing.cooldownUntil) - Date.now() > 29 * 60 * 1000);
     assert.equal(account.meta.abilities.chatplus.status, "ok");
     assert.equal(runtime.available.drawingImage, 0);
     assert.equal(runtime.available.chatImage, 2);

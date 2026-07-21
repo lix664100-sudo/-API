@@ -119,6 +119,16 @@ export function drawingUpstreamFailureCode(value) {
   return text.match(/绘图站上游服务异常[（(](\d{3})[）)]/)?.[1] || "";
 }
 
+export function drawingSevereFailureReason(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const failureCode = drawingUpstreamFailureCode(text);
+  if (failureCode) return `upstream_${failureCode}`;
+  if (/中转返回文本|返回异常文本|返回文本|relay returned text/i.test(text)) return "relay_text";
+  if (/中转请求超时|请求超时|超过\s*\d+\s*秒|relay timeout|timeout/i.test(text)) return "relay_timeout";
+  return "";
+}
+
 export function drawingRetryAfterSeconds(value) {
   const text = String(value || "").trim();
   if (!text) return 0;

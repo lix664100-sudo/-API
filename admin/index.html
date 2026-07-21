@@ -767,7 +767,7 @@
 
       .productivity-chart-grid {
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
         gap: 12px;
       }
 
@@ -1880,6 +1880,43 @@
         });
       }
 
+      function channelSuccessRateTrendData(daily, rangeDays) {
+        const days = Array.isArray(daily?.days) ? daily.days.slice(-rangeDays) : [];
+        const visibleDays = new Set(days);
+        const channelKeys = new Set();
+        const rows = new Map(days.map((day) => [day, { day, channels: {} }]));
+
+        (Array.isArray(daily?.records) ? daily.records : []).forEach((record) => {
+          if (!visibleDays.has(record.day)) return;
+          const channelGroup = record.channelGroup || "other";
+          const current = rows.get(record.day);
+          const channel = current.channels[channelGroup] || {
+            successTasks: 0,
+            failedTasks: 0,
+            totalTasks: 0,
+            rate: null
+          };
+          const successTasks = numberValue(record.successTasks);
+          const failedTasks = numberValue(record.failedTasks);
+          const totalTasks = successTasks + failedTasks || numberValue(record.tasks);
+          if (!totalTasks) return;
+          channel.successTasks += successTasks;
+          channel.failedTasks += failedTasks;
+          channel.totalTasks += totalTasks;
+          channel.rate = channel.totalTasks
+            ? Number((channel.successTasks / channel.totalTasks * 100).toFixed(1))
+            : null;
+          current.channels[channelGroup] = channel;
+          channelKeys.add(channelGroup);
+        });
+
+        const orderedKeys = [...channelKeys].sort((a, b) => {
+          const order = { drawing: 1, chatplus: 2, other: 3 };
+          return (order[a] || 99) - (order[b] || 99) || taskChannelGroupLabel(a).localeCompare(taskChannelGroupLabel(b), "zh-CN");
+        });
+        return { days: [...rows.values()], channelKeys: orderedKeys };
+      }
+
       function IntradayOutputChart({ data, day }) {
         const containerRef = useRef(null);
         const chartRef = useRef(null);
@@ -2136,6 +2173,116 @@
           className: "productivity-chart",
           role: "img",
           "aria-label": type === "output" ? "每日账号产值趋势图" : "每日出图时间和并发趋势图"
+        });
+      }
+
+      function ChannelSuccessRateChart({ data }) {
+        const containerRef = useRef(null);
+        const chartRef = useRef(null);
+        const rows = Array.isArray(data?.days) ? data.days : [];
+        const channelKeys = Array.isArray(data?.channelKeys) ? data.channelKeys : [];
+        const channelColors = {
+          drawing: "#1677ff",
+          chatplus: "#0f9f8f",
+          other: "#98a2b3"
+        };
+
+        useEffect(() => {
+          if (!containerRef.current || !window.echarts) return undefined;
+          const chart = window.echarts.init(containerRef.current, null, { renderer: "canvas" });
+          chartRef.current = chart;
+          const resize = () => chart.resize();
+          const observer = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
+          if (observer) observer.observe(containerRef.current);
+          else window.addEventListener("resize", resize);
+          return () => {
+            if (observer) observer.disconnect();
+            else window.removeEventListener("resize", resize);
+            chart.dispose();
+            chartRef.current = null;
+          };
+        }, [channelKeys.length]);
+
+        useEffect(() => {
+          const chart = chartRef.current;
+          if (!chart) return;
+          chart.setOption({
+            animationDuration: 280,
+            color: channelKeys.map((key) => channelColors[key] || channelColors.other),
+            aria: {
+              enabled: true,
+              description: "每日分渠道任务成功率折线图"
+            },
+            tooltip: {
+              trigger: "axis",
+              backgroundColor: "rgba(16, 24, 40, 0.94)",
+              borderWidth: 0,
+              padding: [10, 12],
+              textStyle: { color: "#ffffff", fontSize: 12 },
+              formatter: (items) => {
+                const index = items?.[0]?.dataIndex ?? 0;
+                const row = rows[index] || {};
+                const lines = [`<strong>${chartDayLabel(row.day)}</strong>`];
+                (items || []).forEach((item) => {
+                  const key = channelKeys.find((channelKey) => taskChannelGroupLabel(channelKey) === item.seriesName) || item.seriesId;
+                  const detail = row.channels?.[key] || {};
+                  const rateText = detail.rate === null || detail.rate === undefined
+                    ? "暂无"
+                    : `${numberValue(detail.rate).toFixed(1)}%`;
+                  lines.push(`${item.marker}${taskChannelGroupLabel(key)}：${rateText}（成功 ${numberValue(detail.successTasks)} / 失败 ${numberValue(detail.failedTasks)}）`);
+                });
+                return lines.join("<br>");
+              }
+            },
+            legend: {
+              top: 2,
+              left: 2,
+              itemWidth: 18,
+              itemHeight: 8,
+              textStyle: { color: "#475467", fontSize: 12 },
+              data: channelKeys.map((key) => taskChannelGroupLabel(key))
+            },
+            grid: { top: 46, right: 22, bottom: 28, left: 18, containLabel: true },
+            xAxis: {
+              type: "category",
+              data: rows.map((item) => chartDayLabel(item.day).replace("月", "/").replace("日", "")),
+              axisLine: { lineStyle: { color: "#d0d5dd" } },
+              axisTick: { show: false },
+              axisLabel: { color: "#667085", fontSize: 11, hideOverlap: true }
+            },
+            yAxis: {
+              type: "value",
+              min: 0,
+              max: 100,
+              name: "%",
+              nameTextStyle: { color: "#667085", fontSize: 11 },
+              axisLabel: { color: "#667085", fontSize: 11, formatter: "{value}%" },
+              splitLine: { lineStyle: { color: "#eaecf0", type: "dashed" } }
+            },
+            series: channelKeys.map((key) => ({
+              id: key,
+              name: taskChannelGroupLabel(key),
+              type: "line",
+              smooth: 0.2,
+              showSymbol: false,
+              connectNulls: false,
+              lineStyle: { width: 2 },
+              data: rows.map((row) => row.channels?.[key]?.rate ?? null)
+            }))
+          }, true);
+        }, [rows, channelKeys]);
+
+        if (!channelKeys.length) {
+          return h(Empty, { description: "暂无渠道成功率数据", image: Empty.PRESENTED_IMAGE_SIMPLE });
+        }
+        if (!window.echarts) {
+          return h(Alert, { type: "warning", showIcon: true, message: "趋势图加载失败，请刷新页面重试。" });
+        }
+        return h("div", {
+          ref: containerRef,
+          className: "productivity-chart",
+          role: "img",
+          "aria-label": "每日分渠道任务成功率折线图"
         });
       }
 
@@ -2512,6 +2659,9 @@
         const productivityTrend = useMemo(() => (
           productivityTrendData(dailyStats, concurrencyStats, productivityTrendDays)
         ), [dailyStats, concurrencyStats, productivityTrendDays]);
+        const channelSuccessRateTrend = useMemo(() => (
+          channelSuccessRateTrendData(dailyStats, productivityTrendDays)
+        ), [dailyStats, productivityTrendDays]);
 
         const accountTodayUsage = useMemo(() => {
           const today = dateKeyInShanghai(Date.now());
@@ -3794,6 +3944,11 @@
                             h("h4", null, "出图时间与实际并发"),
                             h("p", null, "折线显示每日平均值；移到日期上可看最高并发和配置上限"),
                             h(ProductivityTrendChart, { data: productivityTrend, type: "efficiency" })
+                          ]),
+                          h("section", { className: "productivity-chart-panel", key: "success-rate" }, [
+                            h("h4", null, "渠道成功率"),
+                            h("p", null, "按完成任务计算，对比绘图站和聊天生图的稳定性"),
+                            h(ChannelSuccessRateChart, { data: channelSuccessRateTrend })
                           ])
                         ])
                       ])
