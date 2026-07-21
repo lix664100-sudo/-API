@@ -1327,6 +1327,32 @@
         ].filter(Boolean).join(" ").toLowerCase();
       }
 
+      function normalizeTaskSearchKeyword(value) {
+        return String(value || "")
+          .trim()
+          .toLowerCase()
+          .replace(/[“”"']/g, " ")
+          .replace(/\s+/g, " ");
+      }
+
+      function taskSearchNeedles(value) {
+        const normalized = normalizeTaskSearchKeyword(value);
+        if (!normalized) return [];
+        return normalized
+          .split(/(?:\.{2,}|…|⋯|[\s,，;；:：]+)+/)
+          .map((part) => part.trim())
+          .filter((part) => part.length >= 4 && (part.length >= 8 || /[_-]|\d/.test(part)));
+      }
+
+      function taskMatchesKeyword(row, value) {
+        const keyword = normalizeTaskSearchKeyword(value);
+        if (!keyword) return true;
+        const haystack = taskSearchHaystack(row);
+        if (haystack.includes(keyword)) return true;
+        const needles = taskSearchNeedles(keyword);
+        return needles.length > 0 && needles.every((part) => haystack.includes(part));
+      }
+
       function taskReturnJson(row) {
         if (row.status === "interrupted") return null;
         if (row.status === "failed" && (row.responseJson || row.errorMessage)) {
@@ -2502,6 +2528,7 @@
         const [taskChannelFilter, setTaskChannelFilter] = useState("all");
         const [taskStatusFilter, setTaskStatusFilter] = useState("all");
         const [taskKeyword, setTaskKeyword] = useState("");
+        const [taskSearchLoading, setTaskSearchLoading] = useState(false);
         const [taskTrendDays, setTaskTrendDays] = useState(30);
         const [productivityDay, setProductivityDay] = useState(dateKeyInShanghai(Date.now()));
         const [productivityTrendDays, setProductivityTrendDays] = useState(7);
@@ -2670,14 +2697,16 @@
           ];
         }, [accounts, tasks, statRecords]);
 
+        function taskMatchesCurrentFilters(task) {
+          const accountOk = taskAccountFilter === "all" || task.accountId === taskAccountFilter;
+          const channelOk = taskChannelFilter === "all" || taskChannelGroup(task) === taskChannelFilter;
+          const statusOk = taskStatusFilter === "all" || task.status === taskStatusFilter;
+          return accountOk && channelOk && statusOk;
+        }
+
         const filteredTasks = useMemo(() => {
-          const keyword = taskKeyword.trim().toLowerCase();
           return tasks.filter((task) => {
-            const accountOk = taskAccountFilter === "all" || task.accountId === taskAccountFilter;
-            const channelOk = taskChannelFilter === "all" || taskChannelGroup(task) === taskChannelFilter;
-            const statusOk = taskStatusFilter === "all" || task.status === taskStatusFilter;
-            const keywordOk = !keyword || taskSearchHaystack(task).includes(keyword);
-            return accountOk && channelOk && statusOk && keywordOk;
+            return taskMatchesCurrentFilters(task) && taskMatchesKeyword(task, taskKeyword);
           });
         }, [tasks, taskAccountFilter, taskChannelFilter, taskStatusFilter, taskKeyword]);
 
@@ -2771,6 +2800,31 @@
           });
           withTimeout(api("/api/models"), 5000, { items: [] })
             .then((modelData) => setDrawingModels(Array.isArray(modelData?.items) ? modelData.items : []));
+        }
+
+        async function handleTaskSearch(value) {
+          const keyword = String(value || "").trim();
+          setTaskKeyword(keyword);
+          setTaskSearchLoading(true);
+          try {
+            const taskList = await api("/api/tasks");
+            setTasks(taskList);
+            if (!keyword) return;
+
+            const matches = taskList.filter((task) => taskMatchesKeyword(task, keyword));
+            const visibleMatches = matches.filter((task) => taskMatchesCurrentFilters(task));
+            if (matches.length > 0 && visibleMatches.length === 0) {
+              message.warning("已找到任务，但被当前账号、渠道或状态筛选隐藏。请把筛选切回全部后查看。");
+            } else if (matches.length > 0) {
+              message.success(`已刷新，找到 ${matches.length} 条任务记录`);
+            } else {
+              message.warning("已刷新，未找到匹配任务。可以只搜任务ID前半段或最后8位。");
+            }
+          } catch (error) {
+            message.error(error.message || "刷新任务记录失败");
+          } finally {
+            setTaskSearchLoading(false);
+          }
         }
 
         async function refreshImageStorage() {
@@ -3816,7 +3870,8 @@
                           allowClear: true,
                           placeholder: "搜索洗图王任务ID、错误内容",
                           value: taskKeyword,
-                          onSearch: setTaskKeyword,
+                          loading: taskSearchLoading,
+                          onSearch: handleTaskSearch,
                           onChange: (event) => setTaskKeyword(event.target.value),
                           style: { minWidth: 260, maxWidth: 360 }
                         }),
