@@ -236,17 +236,28 @@ function accountSessionKey(account = {}) {
   ].join("::");
 }
 
-async function runChatplusAccountWork(channel, account, work) {
+async function runChatplusAccountWork(channel, account, work, options = {}) {
   if (channel?.type !== "chatplus") return work();
 
   const key = accountSessionKey(account);
-  const previous = activeChatplusAccountWork.get(key) || Promise.resolve();
-  const current = previous.catch(() => {}).then(work);
-  activeChatplusAccountWork.set(key, current);
+  const active = activeChatplusAccountWork.get(key);
+  const previous = active?.promise || null;
+  const blockingSlots = Array.isArray(options.blockingSlots) ? options.blockingSlots : null;
+  const activeSlot = active?.slot || "";
+  const shouldBlock = options.noQueue && previous && (!blockingSlots || blockingSlots.includes(activeSlot));
+  if (shouldBlock) {
+    throw busyTaskError(options.slot || "chatImage", { channel, account });
+  }
+  const previousWork = previous || Promise.resolve();
+  const current = previousWork.catch(() => {}).then(work);
+  activeChatplusAccountWork.set(key, {
+    promise: current,
+    slot: options.slot || activeSlot
+  });
   try {
     return await current;
   } finally {
-    if (activeChatplusAccountWork.get(key) === current) activeChatplusAccountWork.delete(key);
+    if (activeChatplusAccountWork.get(key)?.promise === current) activeChatplusAccountWork.delete(key);
   }
 }
 
@@ -1224,8 +1235,10 @@ function reserveFirstAvailableTarget(targets, taskType) {
     if (release) return { target, release, attempts };
     attempts.push(targetBusyAttempt(target, taskType));
   }
-  const error = new Error("并发上限");
+  const details = attemptErrorMessage(attempts);
+  const error = new Error(details ? `并发上限：${details}` : "并发上限");
   error.status = 429;
+  error.code = "CONCURRENCY_LIMIT";
   error.busy = true;
   error.attempts = attempts;
   throw error;
@@ -1246,13 +1259,16 @@ function concurrencyLimitReached(attempts) {
 
 function targetsFailedError(attempts) {
   const concurrencyLimited = concurrencyLimitReached(attempts);
+  const details = attemptErrorMessage(attempts);
   const error = new Error(
     concurrencyLimited
-      ? "并发上限"
-      : `所有渠道都失败：${attemptErrorMessage(attempts)}`
+      ? (details ? `并发上限：${details}` : "并发上限")
+      : `所有渠道都失败：${details}`
   );
+  error.attempts = attempts;
   if (concurrencyLimited) {
     error.status = 429;
+    error.code = "CONCURRENCY_LIMIT";
     error.busy = true;
   }
   return error;
@@ -1406,14 +1422,19 @@ function readableAttemptError(attempts) {
 
 async function failQueuedTask(task, error, attempts = []) {
   const responseMessage = error.message || readableAttemptError(attempts) || "任务失败";
+  const statusCode = Number(error.status || error.statusCode || 0) || null;
+  const code = error.code || (statusCode === 429 ? "CONCURRENCY_LIMIT" : "");
   const failedTask = {
     ...task,
     status: "failed",
     errorMessage: error.message || readableAttemptError(attempts) || "任务失败",
+    statusCode,
     attempts,
     responseJson: {
       ok: false,
       message: responseMessage,
+      ...(statusCode ? { status: statusCode } : {}),
+      ...(code ? { code } : {}),
       attempts: taskResponseJson(attempts)
     },
     completedAt: new Date().toISOString()
@@ -1456,7 +1477,7 @@ async function persistSubmittedTask(task, result, channel, account, attempts) {
   return submittedTask;
 }
 
-async function runQueuedTextTask(task, input, reserved = null) {
+async function runQueuedTextTask(task, input, reserved = null, options = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = await selectReadyTargets(config, requestedChannel, "text2img");
@@ -1493,10 +1514,14 @@ async function runQueuedTextTask(task, input, reserved = null) {
           }
           result = await mirrorTaskImages(result, config);
           return finishQueuedTask(taskState, result, channel, account, attempts);
+        }, {
+          noQueue: options.noChatplusQueue,
+          slot: targetTaskSlot(target, "text2img"),
+          blockingSlots: ["chatImage"]
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
-        pushAttempt(attempts, target, error.message || "调用失败");
+        pushAttempt(attempts, target, error.message || "调用失败", { busy: Boolean(error.busy) });
         if (!error.busy) {
           await updateTargetStatusAfterError(account, channel, error);
         }
@@ -1568,7 +1593,7 @@ async function waitForUpstreamTask(client, result, timeoutSec) {
   return waitingUpstreamResult(result, lastResult, lastError);
 }
 
-async function runQueuedImageTask(task, input, files, reserved = null) {
+async function runQueuedImageTask(task, input, files, reserved = null, options = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
@@ -1606,10 +1631,14 @@ async function runQueuedImageTask(task, input, files, reserved = null) {
           }
           result = await mirrorTaskImages(result, config);
           return finishQueuedTask(taskState, result, channel, account, attempts);
+        }, {
+          noQueue: options.noChatplusQueue,
+          slot: targetTaskSlot(target, "img2img"),
+          blockingSlots: ["chatImage"]
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
-        pushAttempt(attempts, target, error.message || "调用失败");
+        pushAttempt(attempts, target, error.message || "调用失败", { busy: Boolean(error.busy) });
         if (!error.busy) {
           await updateTargetStatusAfterError(account, channel, error);
         }
@@ -2088,10 +2117,14 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         await updateAccountAfterTask(account, channel, task);
         scheduleDrawingQuotaRefresh(account, channel);
         return task;
+      }, {
+        noQueue: wait,
+        slot: targetTaskSlot(target, "text2img"),
+        blockingSlots: ["chatImage"]
       });
       if (finishedTask) return finishedTask;
     } catch (error) {
-      pushAttempt(attempts, target, error.message || "调用失败");
+      pushAttempt(attempts, target, error.message || "调用失败", { busy: Boolean(error.busy) });
       if (!error.busy) await updateTargetStatusAfterError(account, channel, error);
     } finally {
       release();
@@ -2125,13 +2158,19 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
     scheduledImageTasks.add(task.id);
     let finalTask;
     try {
-      finalTask = await runQueuedImageTask(task, input, files, reserved);
+      finalTask = await runQueuedImageTask(task, input, files, reserved, { noChatplusQueue: true });
     } finally {
       scheduledImageTasks.delete(task.id);
     }
     if (finalTask.status === "failed") {
-      const error = new Error(finalTask.errorMessage || "图生图任务失败。");
-      error.status = 502;
+      const responseJson = finalTask.responseJson || {};
+      const message = responseJson.message || finalTask.errorMessage || "图生图任务失败。";
+      const error = new Error(message);
+      const statusCode = Number(finalTask.statusCode || responseJson.status || responseJson.statusCode || 0);
+      error.status = statusCode || (String(message).includes("并发上限") ? 429 : 502);
+      error.code = responseJson.code || (error.status === 429 ? "CONCURRENCY_LIMIT" : undefined);
+      error.attempts = finalTask.attempts || responseJson.attempts || [];
+      error.responseJson = responseJson;
       error.task = finalTask;
       throw error;
     }

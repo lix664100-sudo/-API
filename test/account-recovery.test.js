@@ -298,13 +298,103 @@ test("绘图额度不足且聊天生图并发已满时直接提示并发上限",
   try {
     await assert.rejects(
       createTextTask({ prompt: "并发已满时的新任务" }, true),
-      (error) => error?.status === 429 && error?.message === "并发上限"
+      (error) => {
+        assert.equal(error?.status, 429);
+        assert.match(error?.message || "", /^并发上限/);
+        assert.match(error?.message || "", /绘图积分不足|任务正在处理中/);
+        return true;
+      }
     );
   } finally {
     releaseActiveTask();
     await activeTask;
     DrawingClient.prototype.check = originalDrawingCheck;
     ChatplusClient.prototype.createTextTask = originalChatCreateTextTask;
+  }
+});
+
+test("聊天生图账号已有任务时等待接口不进入账号队列", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    concurrency: { chat: 3, drawingImage: 1, chatImage: 4 },
+    accounts: [{
+      id: "account-chatplus-queue-limit",
+      channelId: "shareai",
+      name: "聊天排队测试账号",
+      username: "chatplus-queue-limit@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", balance: 1, message: "绘图账号可用" },
+          chatplus: { status: "ok", balance: 20, message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  const originalChatCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let releaseActiveTask;
+  let markActiveTaskStarted;
+  const activeTaskStarted = new Promise((resolve) => { markActiveTaskStarted = resolve; });
+  const holdActiveTask = new Promise((resolve) => { releaseActiveTask = resolve; });
+
+  DrawingClient.prototype.check = async () => ({
+    status: "quota_empty",
+    quota: 50,
+    balance: 0,
+    message: "绘图积分不足"
+  });
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    markActiveTaskStarted();
+    await holdActiveTask;
+    return {
+      externalId: "chat-image-queue-active-task",
+      status: "success",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: "gpt",
+      ratio: "1:1",
+      imageCount: 1,
+      imageUrls: ["https://example.com/result.png"],
+      raw: {}
+    };
+  };
+
+  const file = { filename: "test.png", mimetype: "image/png" };
+  const activeTask = createImageTask({
+    input: { channel: "chatplus", prompt: "占用聊天生图账号" },
+    files: [file],
+    wait: true
+  });
+  await activeTaskStarted;
+
+  const startedAt = Date.now();
+  try {
+    await assert.rejects(
+      createImageTask({
+        input: { prompt: "账号忙时的新图生图任务" },
+        files: [file],
+        wait: true
+      }),
+      (error) => {
+        assert.equal(error?.status, 429);
+        assert.match(error?.message || "", /^并发上限/);
+        assert.match(error?.message || "", /绘图积分不足/);
+        assert.match(error?.message || "", /聊天排队测试账号的聊天生图任务正在处理中/);
+        assert.ok(Date.now() - startedAt < 1000);
+        return true;
+      }
+    );
+  } finally {
+    releaseActiveTask();
+    await activeTask;
+    DrawingClient.prototype.check = originalDrawingCheck;
+    ChatplusClient.prototype.createImageTask = originalChatCreateImageTask;
   }
 });
 

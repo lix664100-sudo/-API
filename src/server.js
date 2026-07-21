@@ -74,10 +74,16 @@ await app.register(multipart, { limits: { fileSize: 25 * 1024 * 1024 } });
 
 function sendError(reply, error) {
   const status = Number(error.status || error.statusCode || 500);
-  reply.code(status >= 400 && status < 600 ? status : 500).send({
+  const responseJson = error.responseJson || error.task?.responseJson || {};
+  const attempts = error.attempts || responseJson.attempts || error.task?.attempts || [];
+  const payload = {
     ok: false,
-    message: error.message || "请求失败"
-  });
+    message: responseJson.message || error.message || "请求失败"
+  };
+  const code = error.code || responseJson.code;
+  if (code) payload.code = code;
+  if (Array.isArray(attempts) && attempts.length) payload.attempts = attempts;
+  reply.code(status >= 400 && status < 600 ? status : 500).send(payload);
 }
 
 function firstHeaderValue(value) {
