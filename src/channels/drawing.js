@@ -59,6 +59,25 @@ function isZeroOrLess(value) {
   return number !== null && number <= 0;
 }
 
+function compactText(value, limit = 300) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+function looksLikeHtml(value) {
+  return /<!doctype html|<html[\s>]|<body[\s>]|<head[\s>]/i.test(String(value || ""));
+}
+
+function invalidUpstreamResponseError(text, status = 0) {
+  const message = looksLikeHtml(text)
+    ? "绘图站返回了网页页面，不是任务结果，请检查绘图站登录状态或接口地址。"
+    : `绘图站返回异常文本：${compactText(text) || "空响应"}`;
+  const error = new Error(message);
+  error.status = status >= 400 ? status : 502;
+  error.code = "INVALID_UPSTREAM_RESPONSE";
+  error.payload = { message, bodyPreview: compactText(text) };
+  return error;
+}
+
 async function fetchWithTimeout(url, options = {}) {
   const timeoutMs = Number(options.timeoutMs || 0);
   const fetchOptions = { ...options };
@@ -296,7 +315,7 @@ export class DrawingClient {
     try {
       payload = text ? JSON.parse(text) : null;
     } catch {
-      payload = text ? { message: text } : null;
+      throw invalidUpstreamResponseError(text, response.status);
     }
     if (!response.ok || payload?.code) {
       const message = payload?.message || payload?.msg || `绘图站请求失败：${response.status}`;

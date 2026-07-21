@@ -8,7 +8,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-source-id-"))
 process.env.DATA_DIR = dataDir;
 
 const { getTaskBySourceTaskId, listTasks, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
-const { createImageTask, getRuntimeStatus } = await import("../src/channel-manager.js");
+const { createImageTask, getRuntimeStatus, refreshTask } = await import("../src/channel-manager.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
@@ -202,5 +202,64 @@ test("额度检测不会占用生图并发", async () => {
   } finally {
     DrawingClient.prototype.check = originalCheck;
     DrawingClient.prototype.createImageTask = originalCreateImageTask;
+  }
+});
+
+test("绘图站刷新返回异常网页时任务直接失败", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "auto",
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: { drawingBaseUrl: "https://drawing.example.test", defaultModelId: 1 }
+    }],
+    accounts: [{
+      id: "drawing-refresh-account",
+      name: "Drawing Refresh Account",
+      channelId: "shareai",
+      username: "drawing-refresh@example.test",
+      password: "password",
+      enabled: true,
+      status: "ok",
+      meta: { abilities: { drawing: { status: "ok" } } }
+    }]
+  });
+
+  const taskId = "waiting-drawing-html";
+  await upsertTask({
+    id: taskId,
+    sourceTaskId: "task_waiting_drawing_html_api_12345678",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    prompt: "refresh invalid upstream",
+    channelId: "shareai:drawing",
+    channelType: "drawing",
+    accountId: "drawing-refresh-account",
+    accountName: "Drawing Refresh Account",
+    externalId: "upstream-html-response",
+    raw: { submittedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() },
+    createdAt: new Date(Date.now() - 10 * 60 * 1000).toISOString()
+  });
+
+  const originalGetTask = DrawingClient.prototype.getTask;
+  DrawingClient.prototype.getTask = async () => {
+    const error = new Error("绘图站返回了网页页面，不是任务结果，请检查绘图站登录状态或接口地址。");
+    error.status = 502;
+    error.code = "INVALID_UPSTREAM_RESPONSE";
+    error.payload = { bodyPreview: "<!doctype html><html></html>" };
+    throw error;
+  };
+
+  try {
+    const refreshed = await refreshTask(taskId);
+    assert.equal(refreshed.status, "failed");
+    assert.match(refreshed.errorMessage, /网页页面/);
+    assert.equal(refreshed.raw.refreshCode, "INVALID_UPSTREAM_RESPONSE");
+  } finally {
+    DrawingClient.prototype.getTask = originalGetTask;
   }
 });

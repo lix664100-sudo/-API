@@ -640,6 +640,33 @@ function refreshedTaskWaitState(task, result, timeoutSec) {
   };
 }
 
+function isTerminalRefreshError(error) {
+  return error?.code === "INVALID_UPSTREAM_RESPONSE";
+}
+
+function failedRefreshResult(task, externalId, error) {
+  return {
+    externalId,
+    taskNo: task.taskNo || "",
+    status: "failed",
+    prompt: task.prompt || "",
+    taskType: task.taskType || "",
+    modelId: task.modelId || "",
+    ratio: task.ratio || "",
+    imageCount: task.imageCount ?? 0,
+    imageUrls: [],
+    errorMessage: error?.message || "上游任务刷新失败。",
+    raw: {
+      ...(task.raw || {}),
+      refreshError: true,
+      refreshErrorAt: new Date().toISOString(),
+      refreshStatus: error?.status || error?.statusCode || "",
+      refreshCode: error?.code || "",
+      refreshPayload: error?.payload || null
+    }
+  };
+}
+
 async function mirrorTaskImages(result, config) {
   const imageUrls = Array.isArray(result?.imageUrls) ? result.imageUrls.filter(Boolean) : [];
   if (!imageUrls.length) return result;
@@ -808,10 +835,16 @@ export async function refreshTask(taskId) {
   const externalId = taskExternalId(task);
   if (!externalId || (task.raw?.queued && String(externalId).startsWith("task-"))) return task;
 
-  const refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
-    carId: task.raw?.selectedCarId,
-    carType: task.raw?.selectedCarType
-  }));
+  let refreshedResult;
+  try {
+    refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
+      carId: task.raw?.selectedCarId,
+      carType: task.raw?.selectedCarType
+    }));
+  } catch (error) {
+    if (!isTerminalRefreshError(error)) throw error;
+    refreshedResult = failedRefreshResult(task, externalId, error);
+  }
   const result = await mirrorTaskImages(refreshedTaskWaitState(task, refreshedResult, config.waitTimeoutSec), config);
   const nextTask = mergeRefreshedTask(task, result, channel, account);
   await upsertTask(nextTask);
