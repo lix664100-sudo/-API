@@ -737,6 +737,7 @@ export class ChatplusClient {
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWork = Promise.resolve();
+    this.concurrentChatSessions = new Map();
   }
 
   makeContextSignature({ channel, account }) {
@@ -830,6 +831,7 @@ export class ChatplusClient {
     this.portalLoggedIn = false;
     this.carId = "";
     this.carType = "chatgpt";
+    this.concurrentChatSessions.clear();
   }
 
   async runAccountWork(work) {
@@ -844,6 +846,56 @@ export class ChatplusClient {
 
   async runTaskWork(input, work) {
     return input?.concurrentSubmit === true ? work() : this.runAccountWork(work);
+  }
+
+  chatRouteForInput(input = {}) {
+    const resolvedRoute = resolveChatModelRoute(this.channel?.settings || {}, input.model || input.chat_model || input.chatModel || "");
+    return input.preferImageCar && resolvedRoute.key === "gpt"
+      ? { ...resolvedRoute, strategy: "image" }
+      : resolvedRoute;
+  }
+
+  chatSessionKey(route = {}) {
+    return [
+      route.key || "",
+      route.carType || "",
+      route.model || "",
+      route.strategy || ""
+    ].join("::");
+  }
+
+  async prepareReusableChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
+    const route = this.chatRouteForInput(input);
+    const key = this.chatSessionKey(route);
+    const cached = this.concurrentChatSessions.get(key);
+    if (cached?.session) {
+      const cachedCarId = cached.session.selected?.carId;
+      if (!ignoredCarIds.has(cachedCarId)) {
+        if (cachedCarId) ignoredCarIds.add(cachedCarId);
+        return cached.session;
+      }
+      this.concurrentChatSessions.delete(key);
+    }
+    if (cached?.promise) {
+      const session = await cached.promise;
+      const cachedCarId = session.selected?.carId;
+      if (!ignoredCarIds.has(cachedCarId)) {
+        if (cachedCarId) ignoredCarIds.add(cachedCarId);
+        return session;
+      }
+      this.concurrentChatSessions.delete(key);
+    }
+
+    const promise = this.prepareChatSession(input, ignoredCarIds, maxAttempts);
+    this.concurrentChatSessions.set(key, { promise });
+    try {
+      const session = await promise;
+      this.concurrentChatSessions.set(key, { session });
+      return session;
+    } catch (error) {
+      if (this.concurrentChatSessions.get(key)?.promise === promise) this.concurrentChatSessions.delete(key);
+      throw error;
+    }
   }
 
   async performPortalLogin(options = {}) {
@@ -956,10 +1008,7 @@ export class ChatplusClient {
   }
 
   async prepareChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
-    const resolvedRoute = resolveChatModelRoute(this.channel?.settings || {}, input.model || input.chat_model || input.chatModel || "");
-    const route = input.preferImageCar && resolvedRoute.key === "gpt"
-      ? { ...resolvedRoute, strategy: "image" }
-      : resolvedRoute;
+    const route = this.chatRouteForInput(input);
     const timeoutSec = Number(input.checkTimeoutSec || 0);
     const requestOptions = timeoutSec > 0 ? { timeoutSec } : {};
     const errors = [];
@@ -1219,7 +1268,9 @@ export class ChatplusClient {
     for (let attempt = 0; attempt < MAX_CHAT_CAR_ATTEMPTS; attempt += 1) {
       let selected = null;
       try {
-        const session = await this.prepareChatSession(input, ignoredCarIds, 1);
+        const session = input.concurrentSubmit === true
+          ? await this.prepareReusableChatSession(input, ignoredCarIds, 1)
+          : await this.prepareChatSession(input, ignoredCarIds, 1);
         const { route, init } = session;
         selected = session.selected;
         if (route.key === "grok") return await runSubmitStep(() => this.sendGrokConversation(prompt, input, route, selected));

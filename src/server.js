@@ -50,6 +50,7 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const adminDir = path.join(rootDir, "admin");
+const adminVendorDir = path.join(adminDir, "vendor");
 const previewDir = path.join(rootDir, "outputs", "previews");
 const execAsync = promisify(exec);
 
@@ -451,6 +452,13 @@ function imageContentType(filename) {
   return previewContentType(filename);
 }
 
+function adminVendorContentType(filename) {
+  const ext = path.extname(filename).toLowerCase();
+  if (ext === ".css") return "text/css; charset=utf-8";
+  if (ext === ".js") return "application/javascript; charset=utf-8";
+  return "application/octet-stream";
+}
+
 function isImageInputField(fieldname) {
   const name = String(fieldname || "").trim().toLowerCase();
   return /^(image|images|file|files)(\[\d*\]|_\d+|\d+)?$/.test(name);
@@ -633,6 +641,22 @@ app.get("/admin/", async (_request, reply) => {
 app.get("/admin/index.html", async (_request, reply) => {
   const html = await readFile(path.join(adminDir, "index.html"), "utf8");
   reply.type("text/html; charset=utf-8").send(html);
+});
+
+app.get("/admin/vendor/:filename", async (request, reply) => {
+  const filename = path.basename(String(request.params.filename || ""));
+  if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) throw badRequest("File path is invalid.");
+  let file;
+  try {
+    file = await readFile(path.join(adminVendorDir, filename));
+  } catch (error) {
+    if (error.code === "ENOENT") return reply.code(404).send({ ok: false, message: "File not found." });
+    throw error;
+  }
+  reply
+    .header("cache-control", "public, max-age=31536000, immutable")
+    .type(adminVendorContentType(filename))
+    .send(file);
 });
 
 app.get("/api/health", async () => ({ ok: true, time: new Date().toISOString() }));
