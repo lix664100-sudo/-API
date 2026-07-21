@@ -8,12 +8,98 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-account-recovery-"
 process.env.DATA_DIR = dataDir;
 
 const { loadConfig, saveConfig } = await import("../src/storage.js");
-const { createChatCompletion, createImageTask, createTextTask, getRuntimeStatus, recoverUnavailableChatAccounts } = await import("../src/channel-manager.js");
+const { checkAccount, createChatCompletion, createImageTask, createTextTask, getRuntimeStatus, recoverUnavailableChatAccounts } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient, drawingSevereFailureReason, normalizeDrawingTask } = await import("../src/channels/drawing.js");
 
 after(async () => {
   await rm(dataDir, { recursive: true, force: true });
+});
+
+test("停用账号单独检测不会登录", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-disabled-check",
+      channelId: "shareai",
+      name: "停用检测账号",
+      username: "disabled-check@example.com",
+      password: "test",
+      enabled: false,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", message: "绘图账号可用" },
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalChatCheck = ChatplusClient.prototype.check;
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    throw new Error("不应该检测停用账号");
+  };
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    throw new Error("不应该检测停用账号");
+  };
+
+  try {
+    const result = await checkAccount("account-disabled-check");
+
+    assert.equal(checkCount, 0);
+    assert.equal(result.checkSkipped, true);
+    assert.equal(result.disabled, true);
+    assert.match(result.message, /账号已停用/);
+  } finally {
+    ChatplusClient.prototype.check = originalChatCheck;
+    DrawingClient.prototype.check = originalDrawingCheck;
+  }
+});
+
+test("停用账号不会被后台自动恢复登录", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-disabled-recovery",
+      channelId: "shareai",
+      name: "停用恢复账号",
+      username: "disabled-recovery@example.com",
+      password: "test",
+      enabled: false,
+      status: "disconnected",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", message: "绘图额度不足" },
+          chatplus: { status: "disconnected", message: "聊天掉线" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    throw new Error("不应该恢复停用账号");
+  };
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+
+    assert.equal(checkCount, 0);
+    assert.equal(results.length, 0);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
 });
 
 test("账号检测遇到失效车位后会自动换车", async () => {

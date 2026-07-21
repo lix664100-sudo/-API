@@ -599,6 +599,20 @@ function inferRefreshTarget(config, task) {
   return { channel, account };
 }
 
+function refreshTargetDisabled(channel, account) {
+  return channel?.enabled === false || account?.enabled === false;
+}
+
+function disabledRefreshMessage(channel, account) {
+  if (account?.enabled === false) {
+    return "账号已停用，系统已停止刷新这个旧任务，不会再登录该账号。";
+  }
+  if (channel?.enabled === false) {
+    return "渠道已停用，系统已停止刷新这个旧任务。";
+  }
+  return "任务所属账号或渠道已停用，系统已停止刷新这个旧任务。";
+}
+
 function savedTaskExternalId(task) {
   return task.externalId
     || task.raw?.id
@@ -822,6 +836,27 @@ function mergeRefreshedTask(task, result, channel, account) {
   };
 }
 
+async function interruptDisabledRefreshTask(task, channel, account) {
+  const interruptedAt = new Date().toISOString();
+  const message = disabledRefreshMessage(channel, account);
+  const interruptedTask = {
+    ...task,
+    status: "interrupted",
+    errorMessage: "",
+    responseJson: { ok: null, message },
+    raw: {
+      ...(task.raw || {}),
+      interrupted: true,
+      interruptedAt,
+      interruptedReason: message,
+      disabledRefreshSkipped: true
+    },
+    completedAt: interruptedAt
+  };
+  await upsertTask(interruptedTask);
+  return interruptedTask;
+}
+
 export async function refreshTask(taskId) {
   const task = await getTask(taskId);
   if (!task) throw new Error("任务不存在。");
@@ -829,6 +864,9 @@ export async function refreshTask(taskId) {
 
   const config = await loadRuntimeConfig();
   const { channel, account } = inferRefreshTarget(config, task);
+  if (refreshTargetDisabled(channel, account)) {
+    return interruptDisabledRefreshTask(task, channel, account);
+  }
   const client = getWorkClient(config, channel, account);
   if (typeof client.getTask !== "function") return task;
 
@@ -1094,6 +1132,7 @@ function targetNeedsRecovery(target) {
 }
 
 async function recoverTarget(config, target) {
+  if (refreshTargetDisabled(target?.channel, target?.account)) return null;
   const key = targetRecoveryKey(target);
   const active = accountRecoveryTasks.get(key);
   if (active) return active;
@@ -2071,6 +2110,18 @@ export async function checkAccount(accountId) {
   if (!account) throw new Error("账号不存在。");
   const channel = config.channels.find((item) => item.id === account.channelId);
   if (!channel) throw new Error("账号所属渠道不存在。");
+  if (account.enabled === false) {
+    return {
+      status: account.status || "disabled",
+      quota: account.quota ?? null,
+      balance: account.balance ?? null,
+      quotaResetAt: account.quotaResetAt || "",
+      expireAt: account.expireAt || "",
+      message: "账号已停用，已跳过检测，不会登录该账号。",
+      disabled: true,
+      checkSkipped: true
+    };
+  }
   const activeSlots = ["chat", "drawingImage", "chatImage"].reduce((result, slot) => {
     const count = activeTaskCounts.get(`${slot}:${account.id}`) || 0;
     if (count) result[slot] = count;

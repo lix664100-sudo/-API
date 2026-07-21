@@ -329,3 +329,66 @@ test("有上游编号的旧任务超过等待时间后保持等待上游", async
     ChatplusClient.prototype.getTask = originalGetTask;
   }
 });
+
+test("停用账号的等待上游旧任务不会继续登录刷新", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-disabled-refresh",
+      channelId: "shareai",
+      name: "停用刷新测试账号",
+      username: "disabled-refresh@example.com",
+      password: "test",
+      enabled: false,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const id = "task-disabled-refresh";
+  await upsertTask({
+    id,
+    externalId: "conversation-disabled-refresh",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    prompt: "停用账号旧任务",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-disabled-refresh",
+    accountName: "停用刷新测试账号",
+    raw: {
+      queued: false,
+      submitted: true,
+      submittedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString()
+    },
+    createdAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+    completedAt: null
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  let getTaskCount = 0;
+  ChatplusClient.prototype.getTask = async () => {
+    getTaskCount += 1;
+    throw new Error("不应该刷新停用账号任务");
+  };
+
+  try {
+    const result = await refreshTask(id);
+    const stored = await getTask(id);
+
+    assert.equal(getTaskCount, 0);
+    assert.equal(result.status, "interrupted");
+    assert.equal(stored.status, "interrupted");
+    assert.equal(stored.raw.disabledRefreshSkipped, true);
+    assert.match(stored.responseJson.message, /账号已停用/);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+  }
+});
