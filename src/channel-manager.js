@@ -1347,7 +1347,13 @@ export async function reserveImageTaskAdmission(input = {}) {
     skipRecovery: true,
     skipKnownQuotaEmpty: true
   });
-  if (!targets.length) throw noUsableTargetError("img2img");
+  if (!targets.length) {
+    throw noUsableTargetError("img2img", {
+      config,
+      requestedChannel,
+      accountId: requestedAccountId
+    });
+  }
   return reserveFirstAvailableTarget(targets, "img2img");
 }
 
@@ -1357,7 +1363,34 @@ export async function assertImageTaskAdmission(input = {}) {
   return true;
 }
 
-function noUsableTargetError(taskType) {
+function noUsableTargetError(taskType, options = {}) {
+  const allTargets = options.config
+    ? selectTargets(options.config, options.requestedChannel || "auto", taskType, {
+      accountId: options.accountId || "",
+      includeCooling: true
+    })
+    : [];
+  const chatTargets = allTargets.filter((target) => target.channel.type === "chatplus");
+  const chatUsageEmpty = chatTargets.length > 0
+    && chatTargets.length === allTargets.length
+    && chatTargets.every(targetAccountUsageEmpty);
+
+  if (chatUsageEmpty) {
+    const quotaResetAt = chatTargets
+      .map((target) => targetQuotaStatus(target).quotaResetAt || "")
+      .filter((value) => Number.isFinite(Date.parse(value)) && Date.parse(value) > Date.now())
+      .sort((left, right) => Date.parse(left) - Date.parse(right))[0] || "";
+    const resetText = quotaResetAt.replace("T", " ").replace("+08:00", "");
+    const error = new Error(resetText
+      ? `聊天额度已用完，请等待 ${resetText} 刷新后再试。`
+      : "聊天额度已用完，请等待额度刷新后再试。");
+    error.status = 429;
+    error.code = "CHAT_USAGE_LIMIT";
+    error.quotaEmpty = true;
+    error.quotaResetAt = quotaResetAt;
+    return error;
+  }
+
   const error = new Error(taskType === "chat"
     ? "当前没有可用的对话账号，请先检测账号状态。"
     : "当前没有可用的生图账号，请先检测账号状态或等待额度恢复。");
@@ -1565,17 +1598,26 @@ function concurrencyLimitReached(attempts) {
 
 function targetsFailedError(attempts) {
   const concurrencyLimited = concurrencyLimitReached(attempts);
+  const quotaExhausted = attempts.length > 0 && attempts.every((item) => item.quotaEmpty);
+  const chatUsageExhausted = quotaExhausted && attempts.every((item) => (
+    /chatplus|聊天生图/.test(`${item.channelId || ""} ${item.channelName || ""}`)
+      && /聊天(?:使用次数|额度).{0,24}(?:用完|耗尽|上限)|使用次数已达上限/.test(String(item.message || ""))
+  ));
   const details = attemptErrorMessage(attempts);
-  const error = new Error(
-    concurrencyLimited
-      ? (details ? `并发上限：${details}` : "并发上限")
-      : `所有渠道都失败：${details}`
-  );
+  let message = `所有渠道都失败：${details}`;
+  if (concurrencyLimited) message = details ? `并发上限：${details}` : "并发上限";
+  else if (chatUsageExhausted) message = "聊天额度已用完，请等待额度刷新后再试。";
+  const error = new Error(message);
   error.attempts = attempts;
   if (concurrencyLimited) {
     error.status = 429;
     error.code = "CONCURRENCY_LIMIT";
     error.busy = true;
+  }
+  if (quotaExhausted) {
+    error.status = 429;
+    error.code = chatUsageExhausted ? "CHAT_USAGE_LIMIT" : "QUOTA_EXHAUSTED";
+    error.quotaEmpty = true;
   }
   return error;
 }
@@ -2113,7 +2155,7 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true });
-  if (!targets.length) throw noUsableTargetError("text2img");
+  if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel });
 
   const reserved = await reserveFirstAvailableTarget(targets, "text2img");
   const task = queuedTask({ input, target: reserved.target, taskType: "text2img", requestMeta });
@@ -2145,7 +2187,13 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: true });
-  if (!targets.length) throw noUsableTargetError("img2img");
+  if (!targets.length) {
+    throw noUsableTargetError("img2img", {
+      config,
+      requestedChannel,
+      accountId: requestedAccountId
+    });
+  }
 
   const reserved = consumeAdmissionReservation(admission, targets)
     || await reserveFirstAvailableTarget(targets, "img2img");
@@ -2174,7 +2222,13 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
-  if (!targets.length) throw noUsableTargetError("chat");
+  if (!targets.length) {
+    throw noUsableTargetError("chat", {
+      config,
+      requestedChannel,
+      accountId: requestedAccountId
+    });
+  }
 
   const reserved = await reserveFirstAvailableTarget(targets, "chat");
   const task = queuedTask({
@@ -2429,7 +2483,13 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
-  if (!targets.length) throw noUsableTargetError("chat");
+  if (!targets.length) {
+    throw noUsableTargetError("chat", {
+      config,
+      requestedChannel,
+      accountId: requestedAccountId
+    });
+  }
 
   const reserved = await reserveFirstAvailableTarget(targets, "chat");
   try {
@@ -2464,7 +2524,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true });
-  if (!targets.length) throw noUsableTargetError("text2img");
+  if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel });
 
   const attempts = [];
   for (const target of targets) {
@@ -2528,7 +2588,13 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
     balanced: wait,
     skipRecovery: wait
   });
-  if (!targets.length) throw noUsableTargetError("img2img");
+  if (!targets.length) {
+    throw noUsableTargetError("img2img", {
+      config,
+      requestedChannel,
+      accountId: requestedAccountId
+    });
+  }
   const reserved = consumeAdmissionReservation(admission, targets);
 
   if (wait) {

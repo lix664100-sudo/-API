@@ -1265,8 +1265,33 @@
         }
       }
 
+      function isChatTaskRow(row) {
+        const attempts = Array.isArray(row?.attempts) ? row.attempts : row?.responseJson?.attempts || [];
+        return [
+          row?.channelId,
+          row?.channelType,
+          row?.channelName,
+          ...attempts.flatMap((item) => [item?.channelId, item?.channelName])
+        ].some((value) => /chatplus|聊天生图|\/聊天/.test(String(value || "")));
+      }
+
+      function isChatQuotaErrorText(row, value) {
+        const text = String(value || "");
+        if (/CHAT_USAGE_LIMIT|聊天(?:生图)?(?:使用次数|额度).{0,24}(?:用完|耗尽|上限|为\s*0)|使用次数已达上限/.test(text)) return true;
+        if (!isChatTaskRow(row)) return false;
+        return /聊天站提交失败\s*[：:]\s*403|(?:所有可用账号|聊天账号).{0,12}额度.{0,12}(?:用完|耗尽|不足)/.test(text);
+      }
+
+      function chatQuotaErrorText(value) {
+        const text = String(value || "");
+        const reset = text.match(/(?:等待|请)\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)(?:\s*后)?\s*(?:刷新|重试)/)?.[1];
+        return reset
+          ? `聊天额度已用完，请等待 ${reset.replace("T", " ")} 刷新后再试。`
+          : "聊天额度已用完，请等待额度刷新后再试。";
+      }
+
       function isChatLoginErrorText(value) {
-        return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|聊天站登录状态|掉线/.test(String(value || ""));
+        return /\b401\b|身份验证失败|认证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|聊天站登录状态|掉线/.test(String(value || ""));
       }
 
       function drawingUpstreamErrorText(value) {
@@ -1281,6 +1306,9 @@
         if (row?.status === "interrupted") return "";
         const text = row?.errorMessage || row?.responseJson?.message || "";
         if (!text) return "";
+        if (isChatQuotaErrorText(row, text)) {
+          return chatQuotaErrorText(text);
+        }
         if (isChatLoginErrorText(text)) {
           return "聊天站掉线，系统会自动重登和换车。若连续失败，请检测聊天账号后重试。";
         }

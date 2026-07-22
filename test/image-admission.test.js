@@ -245,3 +245,61 @@ test("image admission skips known empty drawing quota before upload", async () =
     }
   );
 });
+
+test("image admission reports exhausted chat usage with its reset time", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "chatplus",
+    concurrency: { chat: 3, drawingImage: 2, chatImage: 1 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        defaultModelId: 1
+      }
+    }],
+    accounts: [{
+      id: "chat-usage-empty",
+      channelId: "shareai",
+      name: "Chat Usage Empty",
+      username: "chat-usage-empty@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok" },
+          chatplus: {
+            status: "quota_empty",
+            quota: 220,
+            used: 220,
+            balance: 0,
+            quotaReason: "chat_usage_limit",
+            quotaResetAt: "2099-01-02T03:04:05+08:00"
+          }
+        }
+      }
+    }]
+  });
+
+  await assert.rejects(
+    reserveImageTaskAdmission({
+      channel: "chatplus",
+      accountId: "chat-usage-empty",
+      prompt: "quota test"
+    }),
+    (error) => {
+      assert.equal(error.status, 429);
+      assert.equal(error.code, "CHAT_USAGE_LIMIT");
+      assert.equal(error.quotaEmpty, true);
+      assert.equal(error.quotaResetAt, "2099-01-02T03:04:05+08:00");
+      assert.equal(error.message, "聊天额度已用完，请等待 2099-01-02 03:04:05 刷新后再试。");
+      return true;
+    }
+  );
+});
