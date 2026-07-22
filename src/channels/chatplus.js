@@ -443,6 +443,78 @@ function numberOrNull(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function shanghaiDateTime(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/.test(text)) {
+    return `${text.replace(/\s+/, "T")}+08:00`;
+  }
+  return text;
+}
+
+function chatUsageFromPayload(payload = {}) {
+  const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  const quota = numberOrNull(data?.limit);
+  const used = numberOrNull(data?.userUsed);
+  const balance = quota === null || used === null ? null : Math.max(0, quota - used);
+  return {
+    quota,
+    used,
+    balance,
+    quotaResetAt: shanghaiDateTime(data?.resetTimeChatgpt),
+    expireAt: shanghaiDateTime(data?.expireTime),
+    period: String(data?.per || "").trim()
+  };
+}
+
+function chatUsageLimitFromText(value) {
+  const text = String(value || "").trim();
+  if (!/使用次数已达上限|usage count has reached the limit/i.test(text)) return null;
+  const occupiedMatch = text.match(/合计占用\s*(\d+)\s*\/\s*(\d+)/);
+  const usedMatch = text.match(/已使用\s*(\d+)/);
+  const remainingMatch = text.match(/剩余\s*(\d+)/);
+  const resetMatch = text.match(/请\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*后重试/);
+  const quota = numberOrNull(occupiedMatch?.[2]);
+  const used = numberOrNull(usedMatch?.[1] ?? occupiedMatch?.[1]);
+  const balance = numberOrNull(remainingMatch?.[1]) ?? (quota === null || used === null ? 0 : Math.max(0, quota - used));
+  return {
+    quota,
+    used,
+    balance,
+    quotaResetAt: shanghaiDateTime(resetMatch?.[1]),
+    period: ""
+  };
+}
+
+function conversationSubmitError(response) {
+  let payload = null;
+  try {
+    payload = response.body ? JSON.parse(response.body) : null;
+  } catch {
+    payload = null;
+  }
+  const detail = String(payload?.detail?.message || payload?.message || "").trim();
+  const usage = chatUsageLimitFromText(detail);
+  const error = new Error(usage
+    ? `聊天使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`
+    : detail || `聊天站提交失败：${response.status}`);
+  error.status = response.status;
+  error.body = response.body;
+  if (usage) {
+    error.code = "CHAT_USAGE_LIMIT";
+    error.noRetry = true;
+    error.quotaEmpty = true;
+    error.quotaReason = "chat_usage_limit";
+    error.quota = usage.quota;
+    error.used = usage.used;
+    error.balance = usage.balance;
+    error.quotaResetAt = usage.quotaResetAt;
+    error.cooldownUntil = usage.quotaResetAt;
+    error.period = usage.period;
+  }
+  return error;
+}
+
 function imageQuotaResetAt(imageLimit = {}) {
   return imageLimit.reset_after
     || imageLimit.reset_at
@@ -986,6 +1058,17 @@ export class ChatplusClient {
     });
   }
 
+  async loadAccountUsage(options = {}) {
+    await this.loginPortal(options);
+    const payload = await this.json("/frontend-api/getme", {
+      timeoutSec: options.timeoutSec
+    });
+    if (payload?.code !== undefined && payload.code !== 1) {
+      throw new Error(payload?.msg || "读取聊天额度失败。");
+    }
+    return chatUsageFromPayload(payload);
+  }
+
   async enterCar(carId, carType, options = {}) {
     await this.sessionLock(async () => {
       if (!this.portalLoggedIn) await this.performPortalLogin(options);
@@ -1104,6 +1187,32 @@ export class ChatplusClient {
 
   async check() {
     return this.runAccountWork(async () => {
+      const requestOptions = { timeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC };
+      const usage = await this.loadAccountUsage(requestOptions);
+      const usageQuotaEmpty = usage.balance !== null && usage.balance <= 0;
+      if (usageQuotaEmpty) {
+        return {
+          status: "quota_empty",
+          quota: usage.quota,
+          balance: 0,
+          used: usage.used,
+          quotaResetAt: usage.quotaResetAt,
+          expireAt: usage.expireAt,
+          cooldownUntil: usage.quotaResetAt || null,
+          quotaReason: "chat_usage_limit",
+          message: usage.quotaResetAt
+            ? `聊天使用次数已用完，等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新`
+            : "聊天使用次数已用完，等待刷新",
+          meta: {
+            chatUsage: {
+              quota: usage.quota,
+              used: usage.used,
+              balance: 0,
+              period: usage.period
+            }
+          }
+        };
+      }
       const { init, route, selected } = await this.prepareChatSession({
         model: this.channel?.settings?.defaultChatModel || "",
         preferImageCar: true,
@@ -1113,16 +1222,27 @@ export class ChatplusClient {
       const remaining = imageLimit.remaining ?? null;
       const remainingNumber = numberOrNull(remaining);
       const quotaEmpty = remainingNumber !== null && remainingNumber <= 0;
+      const imageResetAt = imageQuotaResetAt(imageLimit);
       return {
         status: quotaEmpty ? "quota_empty" : "ok",
-        quota: remaining,
-        balance: remaining,
-        quotaResetAt: imageQuotaResetAt(imageLimit),
-        expireAt: "",
+        quota: usage.quota ?? remaining,
+        balance: usage.balance ?? remaining,
+        used: usage.used,
+        quotaResetAt: usage.quotaResetAt || imageResetAt,
+        imageQuotaResetAt: imageResetAt,
+        expireAt: usage.expireAt,
+        cooldownUntil: null,
+        quotaReason: quotaEmpty ? "image_quota" : "",
         message: quotaEmpty ? "聊天图片额度不足" : "聊天账号可用",
         meta: {
           defaultModel: init.default_model_slug || this.defaultModel,
           imageLimit,
+          chatUsage: {
+            quota: usage.quota,
+            used: usage.used,
+            balance: usage.balance,
+            period: usage.period
+          },
           chatModel: route.key,
           selectedCarId: selected.carId,
           strategy: selected.strategy
@@ -1362,10 +1482,7 @@ export class ChatplusClient {
           }
         }));
         if (response.status < 200 || response.status >= 300) {
-          const error = new Error(`聊天站提交失败：${response.status}`);
-          error.status = response.status;
-          error.body = response.body;
-          throw error;
+          throw conversationSubmitError(response);
         }
 
         const events = parseSse(response.body);

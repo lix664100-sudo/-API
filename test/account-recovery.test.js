@@ -127,12 +127,244 @@ test("账号检测遇到失效车位后会自动换车", async () => {
     default_model_slug: "auto",
     limits_progress: [{ feature_name: "image_gen", remaining: 19 }]
   });
+  client.loadAccountUsage = async () => ({
+    quota: 220,
+    used: 31,
+    balance: 189,
+    quotaResetAt: "2026-07-22T19:32:29+08:00",
+    expireAt: "2026-08-16T05:22:44+08:00",
+    period: "12h"
+  });
 
   const result = await client.check();
 
   assert.equal(result.status, "ok");
+  assert.equal(result.quota, 220);
+  assert.equal(result.balance, 189);
+  assert.equal(result.used, 31);
+  assert.equal(result.quotaResetAt, "2026-07-22T19:32:29+08:00");
+  assert.equal(result.meta.chatUsage.period, "12h");
   assert.equal(result.meta.selectedCarId, "car-3");
   assert.equal(enteredCount, 3);
+});
+
+test("聊天账号信息会换算真实总额度和剩余额度", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-usage-fields", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.json = async () => ({
+    code: 1,
+    data: {
+      limit: 220,
+      userUsed: "37",
+      per: "12h",
+      resetTimeChatgpt: "2026-07-22 19:32:29",
+      expireTime: "2026-08-16 05:22:44"
+    }
+  });
+
+  const usage = await client.loadAccountUsage({ timeoutSec: 8 });
+
+  assert.deepEqual(usage, {
+    quota: 220,
+    used: 37,
+    balance: 183,
+    quotaResetAt: "2026-07-22T19:32:29+08:00",
+    expireAt: "2026-08-16T05:22:44+08:00",
+    period: "12h"
+  });
+});
+
+test("聊天总额度用完后检测会等待刷新且不再选车", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-usage-empty", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let prepareCount = 0;
+  client.loadAccountUsage = async () => ({
+    quota: 220,
+    used: 220,
+    balance: 0,
+    quotaResetAt: "2026-07-22T19:32:29+08:00",
+    expireAt: "2026-08-16T05:22:44+08:00",
+    period: "12h"
+  });
+  client.prepareChatSession = async () => {
+    prepareCount += 1;
+    throw new Error("额度用完后不应该继续选车");
+  };
+
+  const result = await client.check();
+
+  assert.equal(prepareCount, 0);
+  assert.equal(result.status, "quota_empty");
+  assert.equal(result.quota, 220);
+  assert.equal(result.balance, 0);
+  assert.equal(result.used, 220);
+  assert.equal(result.quotaReason, "chat_usage_limit");
+  assert.equal(result.cooldownUntil, "2026-07-22T19:32:29+08:00");
+});
+
+test("聊天总额度上限返回会立即停止换车并保留刷新时间", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-submit-limit", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let prepareCount = 0;
+  client.prepareChatSession = async () => {
+    prepareCount += 1;
+    return {
+      route: { key: "gpt", model: "gpt-test" },
+      init: { default_model_slug: "gpt-test" },
+      selected: { carId: "car-limit", carType: "chatgpt" }
+    };
+  };
+  client.uploadChatImages = async () => [];
+  client.http = async () => ({
+    status: 403,
+    headers: {},
+    body: JSON.stringify({
+      detail: {
+        message: "您的账号当前的使用次数已达上限: 已使用220，预占中0，合计占用220/220，本次需要1，剩余0，请2026-07-22 19:32:29后重试或购买更高使用量的套餐。"
+      }
+    })
+  });
+
+  await assert.rejects(
+    client.sendConversation("额度测试", {}),
+    (error) => {
+      assert.equal(error.code, "CHAT_USAGE_LIMIT");
+      assert.equal(error.quotaEmpty, true);
+      assert.equal(error.quota, 220);
+      assert.equal(error.balance, 0);
+      assert.equal(error.used, 220);
+      assert.equal(error.quotaResetAt, "2026-07-22T19:32:29+08:00");
+      return true;
+    }
+  );
+  assert.equal(prepareCount, 1);
+});
+
+test("聊天额度减到零后暂停提交并在刷新时间到达后自动恢复", async () => {
+  const config = await loadConfig();
+  const resetAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-chat-usage-cycle",
+      channelId: "shareai",
+      name: "聊天额度周期测试账号",
+      username: "usage-cycle@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      cooldownUntil: null,
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", message: "绘图积分不足" },
+          chatplus: {
+            status: "ok",
+            quota: 220,
+            used: 218,
+            balance: 2,
+            quotaResetAt: resetAt,
+            cooldownUntil: null,
+            quotaReason: "",
+            message: "聊天账号可用",
+            meta: { chatUsage: { quota: 220, used: 218, balance: 2, period: "12h" } }
+          }
+        }
+      }
+    }]
+  });
+
+  const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
+  const originalCheck = ChatplusClient.prototype.check;
+  let submitCount = 0;
+  let checkCount = 0;
+  ChatplusClient.prototype.createChatCompletion = async () => ({
+    externalId: `conversation-usage-${++submitCount}`,
+    model: "gpt",
+    content: "测试成功",
+    imageUrls: [],
+    raw: {}
+  });
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 220,
+      used: 0,
+      balance: 220,
+      quotaResetAt: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString(),
+      cooldownUntil: null,
+      quotaReason: "",
+      message: "聊天账号可用",
+      meta: { chatUsage: { quota: 220, used: 0, balance: 220, period: "12h" } }
+    };
+  };
+
+  try {
+    await createChatCompletion({ channel: "chatplus", messages: [{ role: "user", content: "第一次" }] });
+    await createChatCompletion({ channel: "chatplus", messages: [{ role: "user", content: "第二次" }] });
+
+    let stored = await loadConfig();
+    let account = stored.accounts[0];
+    let chatplus = account.meta.abilities.chatplus;
+    assert.equal(submitCount, 2);
+    assert.equal(chatplus.quota, 220);
+    assert.equal(chatplus.used, 220);
+    assert.equal(chatplus.balance, 0);
+    assert.equal(chatplus.status, "quota_empty");
+    assert.equal(chatplus.quotaReason, "chat_usage_limit");
+    assert.equal(account.cooldownUntil, resetAt);
+
+    const waiting = await recoverUnavailableChatAccounts();
+    assert.equal(waiting.length, 0);
+    assert.equal(checkCount, 0);
+
+    chatplus = {
+      ...chatplus,
+      quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+      cooldownUntil: new Date(Date.now() - 1000).toISOString()
+    };
+    await saveConfig({
+      ...stored,
+      accounts: [{
+        ...account,
+        cooldownUntil: chatplus.cooldownUntil,
+        meta: {
+          ...account.meta,
+          abilities: { ...account.meta.abilities, chatplus }
+        }
+      }]
+    });
+
+    const recovered = await recoverUnavailableChatAccounts();
+    stored = await loadConfig();
+    account = stored.accounts[0];
+    chatplus = account.meta.abilities.chatplus;
+
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0].recovered, true);
+    assert.equal(checkCount, 1);
+    assert.equal(chatplus.status, "ok");
+    assert.equal(chatplus.quota, 220);
+    assert.equal(chatplus.balance, 220);
+    assert.equal(account.cooldownUntil, null);
+  } finally {
+    ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
+    ChatplusClient.prototype.check = originalCheck;
+  }
 });
 
 test("任务到来时会自动恢复掉线账号", async () => {

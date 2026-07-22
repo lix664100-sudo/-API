@@ -1469,11 +1469,11 @@
         if (channel?.type === "shareai") {
           const drawing = abilityStatus(account, "drawing");
           const chatplus = abilityStatus(account, "chatplus");
-          return `绘图 ${quotaPairText(drawing.quota ?? account.quota, drawing.balance ?? account.balance ?? account.quota)}｜聊天 剩余 ${valueText(chatplus.balance)}`;
+          return `绘图 ${quotaPairText(drawing.quota ?? account.quota, drawing.balance ?? account.balance ?? account.quota)}｜聊天 ${quotaPairText(chatplus.quota, chatplus.balance)}`;
         }
         const balance = numberValue(account.balance ?? account.quota);
         const quota = numberValue(account.quota);
-        if (channel?.type === "chatplus") return account.status === "unknown" ? "-" : `剩余 ${balance}`;
+        if (channel?.type === "chatplus") return account.status === "unknown" ? "-" : quotaPairText(account.quota, account.balance);
         return `${quota}/${balance}`;
       }
 
@@ -1501,9 +1501,9 @@
 
       function channelQuotaText(channel, stats = {}) {
         if (channel?.type === "shareai") {
-          return `绘图 ${quotaPairText(stats.drawingQuota, stats.drawingBalance)}｜聊天 剩余 ${valueText(stats.chatBalance)}`;
+          return `绘图 ${quotaPairText(stats.drawingQuota, stats.drawingBalance)}｜聊天 ${quotaPairText(stats.chatQuota, stats.chatBalance)}`;
         }
-        if (channel?.type === "chatplus") return `剩余 ${numberValue(stats.balance)}`;
+        if (channel?.type === "chatplus") return quotaPairText(stats.quota, stats.balance);
         return `${numberValue(stats.quota)}/${numberValue(stats.balance)}`;
       }
 
@@ -2402,6 +2402,7 @@
         if (channel?.type === "shareai") {
           const drawingQuota = related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "drawing").quota ?? item.quota), 0);
           const drawingBalance = related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "drawing").balance ?? item.balance ?? item.quota), 0);
+          const chatQuota = related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "chatplus").quota), 0);
           const chatBalance = related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "chatplus").balance), 0);
           return {
             accountCount: related.length,
@@ -2411,6 +2412,7 @@
             balance: drawingBalance + chatBalance,
             drawingQuota,
             drawingBalance,
+            chatQuota,
             chatBalance,
             status: getChannelStatus(channel, related)
           };
