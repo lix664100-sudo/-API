@@ -9,7 +9,6 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
-  assertImageTaskAdmission,
   checkAccount,
   checkAllAccounts,
   createChatCompletion,
@@ -18,6 +17,7 @@ import {
   queueChatCompletion,
   queueImageTask,
   recoverUnavailableChatAccounts,
+  reserveImageTaskAdmission,
   refreshProcessingTasks,
   refreshTask
 } from "./channel-manager.js";
@@ -259,8 +259,8 @@ function imageAdmissionInput(request, requestMeta = {}) {
   };
 }
 
-async function assertImageRequestAdmission(request, requestMeta = {}) {
-  await assertImageTaskAdmission(imageAdmissionInput(request, requestMeta));
+async function reserveImageRequestAdmission(request, requestMeta = {}) {
+  return reserveImageTaskAdmission(imageAdmissionInput(request, requestMeta));
 }
 
 async function requireApiKey(request, reply) {
@@ -961,8 +961,10 @@ app.post("/api/draw/edit", async (request, reply) => {
   let requestMeta = apiRequestMeta(request);
   let input = {};
   let files = [];
+  let admission = null;
+  let admissionTransferred = false;
   try {
-    await assertImageRequestAdmission(request, requestMeta);
+    admission = await reserveImageRequestAdmission(request, requestMeta);
     const parsed = await readImageInput(request, { maxFiles: 3 });
     input = parsed.input;
     files = parsed.files;
@@ -970,13 +972,16 @@ app.post("/api/draw/edit", async (request, reply) => {
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
     let task;
     if (request.query?.wait === "1") {
-      task = await createImageTask({ input, files, wait: true, requestMeta });
+      task = await createImageTask({ input, files, wait: true, requestMeta, admission });
     } else {
-      task = await queueImageTask({ input, files, requestMeta });
+      task = await queueImageTask({ input, files, requestMeta, admission });
     }
+    admissionTransferred = true;
     return { ok: true, data: task };
   } catch (error) {
     return sendError(reply, error, { requestMeta, input, files, taskType: "img2img" });
+  } finally {
+    if (!admissionTransferred) admission?.release?.();
   }
 });
 
@@ -1031,17 +1036,22 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
   let requestMeta = apiRequestMeta(request);
   let input = {};
   let files = [];
+  let admission = null;
+  let admissionTransferred = false;
   try {
-    await assertImageRequestAdmission(request, requestMeta);
+    admission = await reserveImageRequestAdmission(request, requestMeta);
     const parsed = await readImageInput(request, { maxFiles: 3 });
     input = parsed.input;
     files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
-    const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta });
+    const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta, admission });
+    admissionTransferred = true;
     return imageEditResponse(task);
   } catch (error) {
     return sendError(reply, error, { requestMeta, input, files, taskType: "img2img" });
+  } finally {
+    if (!admissionTransferred) admission?.release?.();
   }
 });
 

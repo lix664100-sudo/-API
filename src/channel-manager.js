@@ -274,13 +274,9 @@ async function durableTaskSlotState(slot, target = {}) {
 
 async function taskSlotOccupancy(slot, target = {}) {
   const key = taskSlotKey(slot, target);
-  const count = activeTaskCounts.get(key) || 0;
   const durableState = await durableTaskSlotState(slot, target);
+  const count = activeTaskCounts.get(key) || 0;
   return count + durableState.total - Math.min(durableState.active, count);
-}
-
-async function taskSlotHasCapacity(slot, target = {}) {
-  return (await taskSlotOccupancy(slot, target)) < taskSlotLimit(slot);
 }
 
 function busyTaskError(slot, target = {}) {
@@ -292,8 +288,10 @@ function busyTaskError(slot, target = {}) {
 
 async function tryReserveTaskSlot(slot, target = {}) {
   const key = taskSlotKey(slot, target);
+  const durableState = await durableTaskSlotState(slot, target);
   const count = activeTaskCounts.get(key) || 0;
-  if (!(await taskSlotHasCapacity(slot, target))) return null;
+  const occupied = count + durableState.total - Math.min(durableState.active, count);
+  if (occupied >= taskSlotLimit(slot)) return null;
   activeTaskCounts.set(key, count + 1);
   let released = false;
   return () => {
@@ -1246,7 +1244,7 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
   ));
 }
 
-export async function assertImageTaskAdmission(input = {}) {
+export async function reserveImageTaskAdmission(input = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = input.channel || config.defaultChannel || "auto";
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
@@ -1255,14 +1253,13 @@ export async function assertImageTaskAdmission(input = {}) {
     skipRecovery: true
   });
   if (!targets.length) throw noUsableTargetError("img2img");
+  return reserveFirstAvailableTarget(targets, "img2img");
+}
 
-  const attempts = [];
-  for (const target of targets) {
-    const slot = targetTaskSlot(target, "img2img");
-    if (await taskSlotHasCapacity(slot, target)) return true;
-    attempts.push(targetBusyAttempt(target, "img2img"));
-  }
-  throw targetsFailedError(attempts);
+export async function assertImageTaskAdmission(input = {}) {
+  const reserved = await reserveImageTaskAdmission(input);
+  reserved.release();
+  return true;
 }
 
 function noUsableTargetError(taskType) {
@@ -1441,6 +1438,20 @@ async function reserveFirstAvailableTarget(targets, taskType) {
   error.busy = true;
   error.attempts = attempts;
   throw error;
+}
+
+function consumeAdmissionReservation(admission, targets) {
+  if (!admission?.release) return null;
+  const target = targets.find((item) => sameTarget(item, admission.target));
+  if (!target) {
+    admission.release();
+    return null;
+  }
+  return {
+    target,
+    release: admission.release,
+    attempts: Array.isArray(admission.attempts) ? admission.attempts : []
+  };
 }
 
 function orderedTargets(targets, reserved) {
@@ -2024,7 +2035,7 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   });
   return task;
 }
-export async function queueImageTask({ input = {}, file, files: inputFiles, requestMeta = {} }) {
+export async function queueImageTask({ input = {}, file, files: inputFiles, requestMeta = {}, admission = null }) {
   if (!cleanPrompt(input)) {
     const error = new Error("请输入改图要求。");
     error.status = 400;
@@ -2038,7 +2049,8 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: true });
   if (!targets.length) throw noUsableTargetError("img2img");
 
-  const reserved = await reserveFirstAvailableTarget(targets, "img2img");
+  const reserved = consumeAdmissionReservation(admission, targets)
+    || await reserveFirstAvailableTarget(targets, "img2img");
   const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img", requestMeta });
   try {
     await upsertTask(task);
@@ -2402,7 +2414,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
   }
   throw targetsFailedError(attempts);
 }
-export async function createImageTask({ input = {}, file, files: inputFiles, wait = false, requestMeta = {} }) {
+export async function createImageTask({ input = {}, file, files: inputFiles, wait = false, requestMeta = {}, admission = null }) {
   if (!String(input.prompt || "").trim()) {
     const error = new Error("请输入改图要求。");
     error.status = 400;
@@ -2419,14 +2431,20 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
     skipRecovery: wait
   });
   if (!targets.length) throw noUsableTargetError("img2img");
+  const reserved = consumeAdmissionReservation(admission, targets);
 
   if (wait) {
-    const task = queuedTask({ input: { ...input, files }, target: targets[0], taskType: "img2img", requestMeta });
-    await upsertTask(task);
+    const task = queuedTask({ input: { ...input, files }, target: reserved?.target || targets[0], taskType: "img2img", requestMeta });
+    try {
+      await upsertTask(task);
+    } catch (error) {
+      reserved?.release();
+      throw error;
+    }
     scheduledImageTasks.add(task.id);
     let finalTask;
     try {
-      finalTask = await runQueuedImageTask(task, input, files, null, {
+      finalTask = await runQueuedImageTask(task, input, files, reserved, {
         fastQuotaRefresh: true,
         waitForChatplusImages: true
       });
@@ -2448,5 +2466,5 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
     return finalTask;
   }
 
-  return queueImageTask({ input, files, requestMeta });
+  return queueImageTask({ input, files, requestMeta, admission: reserved });
 }
