@@ -164,3 +164,84 @@ test("image admission reservation blocks another request before task creation", 
     }
   }
 });
+
+test("image admission skips known empty drawing quota before upload", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "auto",
+    concurrency: { chat: 3, drawingImage: 2, chatImage: 1 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        defaultModelId: 1
+      }
+    }],
+    accounts: [
+      {
+        id: "quota-empty-a",
+        channelId: "shareai",
+        name: "Quota Empty A",
+        username: "quota-empty-a@example.test",
+        password: "test",
+        enabled: true,
+        status: "ok",
+        meta: {
+          abilities: {
+            drawing: { status: "quota_empty", message: "quota empty" },
+            chatplus: { status: "ok" }
+          }
+        }
+      },
+      {
+        id: "quota-empty-b",
+        channelId: "shareai",
+        name: "Quota Empty B",
+        username: "quota-empty-b@example.test",
+        password: "test",
+        enabled: true,
+        status: "ok",
+        meta: {
+          abilities: {
+            drawing: { status: "quota_empty", message: "quota empty" },
+            chatplus: { status: "ok" }
+          }
+        }
+      }
+    ]
+  });
+
+  const admitted = await reserveImageTaskAdmission({ prompt: "use chat image" });
+  assert.equal(admitted.target.channel.type, "chatplus");
+  admitted.release();
+
+  const createdAt = new Date().toISOString();
+  for (const task of [
+    { id: "chatplus-quota-empty-a", accountId: "quota-empty-a", channelType: "chatplus", externalId: "chatplus-quota-empty-upstream-a" },
+    { id: "chatplus-quota-empty-b", accountId: "quota-empty-b", channelType: "chatplus", externalId: "chatplus-quota-empty-upstream-b" }
+  ]) {
+    await upsertTask({
+      ...task,
+      status: "waiting_upstream",
+      taskType: "img2img",
+      raw: { submitted: true },
+      createdAt
+    });
+  }
+
+  await assert.rejects(
+    reserveImageTaskAdmission({ prompt: "reject before upload" }),
+    (error) => {
+      assert.equal(error.status, 429);
+      assert.equal(error.code, "CONCURRENCY_LIMIT");
+      assert.equal(error.attempts.length, 2);
+      assert(error.attempts.every((attempt) => attempt.channelId === "shareai:chatplus"));
+      return true;
+    }
+  );
+});

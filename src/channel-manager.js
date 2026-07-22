@@ -1149,8 +1149,16 @@ function targetKnownUnavailable(target) {
   return ["error", "failed", "disconnected", "disabled"].includes(status);
 }
 
-function admissionTargets(targets) {
-  return targets.filter((target) => !targetKnownUnavailable(target));
+function targetQuotaEmpty(target) {
+  return String(targetQuotaStatus(target).status || "").toLowerCase() === "quota_empty";
+}
+
+function admissionTargets(targets, taskType, options = {}) {
+  const skipKnownQuotaEmpty = options.skipKnownQuotaEmpty === true;
+  return targets.filter((target) => !(
+    targetKnownUnavailable(target)
+      || (skipKnownQuotaEmpty && taskType !== "chat" && targetQuotaEmpty(target))
+  ));
 }
 
 function targetRecoveryKey(target) {
@@ -1225,7 +1233,7 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
     ...options,
     includeCooling: true
   });
-  const ready = admissionTargets(targets).filter((target) => !(
+  const ready = admissionTargets(targets, taskType, options).filter((target) => !(
     targetAbilityCooling(target)
       || (target.channel.type === "chatplus" && accountCooling(target.account))
   ));
@@ -1250,7 +1258,8 @@ export async function reserveImageTaskAdmission(input = {}) {
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
     accountId: requestedAccountId,
-    skipRecovery: true
+    skipRecovery: true,
+    skipKnownQuotaEmpty: true
   });
   if (!targets.length) throw noUsableTargetError("img2img");
   return reserveFirstAvailableTarget(targets, "img2img");
