@@ -34,7 +34,9 @@ import {
   getTask,
   getTaskBySourceTaskId,
   listIntradayTaskStats,
+  listTaskPage,
   listTaskStats,
+  listTaskStatsSummary,
   listTasks,
   loadConfig,
   publicConfig,
@@ -934,6 +936,8 @@ app.get("/api/tasks", async () => ({ ok: true, data: await listTasks() }));
 
 app.get("/api/stats", async () => ({ ok: true, data: await listTaskStats() }));
 
+app.get("/api/stats/summary", async () => ({ ok: true, data: await listTaskStatsSummary() }));
+
 app.get("/api/stats/intraday", async (request) => ({
   ok: true,
   data: await listIntradayTaskStats(request.query?.day)
@@ -944,6 +948,18 @@ app.get("/api/admin/runtime", async () => ({ ok: true, data: await getRuntimeSta
 app.post("/api/tasks/refresh-processing", async () => {
   return { ok: true, data: await refreshProcessingTasks() };
 });
+
+app.get("/api/tasks/page", async (request) => ({
+  ok: true,
+  data: await listTaskPage({
+    page: request.query?.page,
+    pageSize: request.query?.pageSize,
+    keyword: request.query?.keyword,
+    accountId: request.query?.accountId,
+    channel: request.query?.channel,
+    status: request.query?.status
+  })
+}));
 
 app.get("/api/tasks/:id", async (request) => {
   return { ok: true, data: await getTask(request.params.id) };

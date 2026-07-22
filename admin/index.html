@@ -1688,6 +1688,9 @@
 
       function taskTime(row) {
         if (Number.isFinite(Number(row?.time))) return Number(row.time);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(String(row?.day || ""))) {
+          return Date.parse(`${row.day}T12:00:00+08:00`);
+        }
         const time = Date.parse(row?.createdAt || row?.completedAt || row?.updatedAt || "");
         return Number.isFinite(time) ? time : 0;
       }
@@ -1703,9 +1706,11 @@
       function summarizeTaskRange(source, predicate) {
         const items = source.filter(predicate);
         return {
-          tasks: items.length,
+          tasks: items.reduce((sum, item) => sum + Math.max(0, numberValue(item.tasks || 1)), 0),
           successImages: items.reduce((sum, item) => sum + (item.status === "success" ? taskGeneratedImageCount(item) : 0), 0),
-          failedTasks: items.filter((item) => item.status === "failed").length
+          failedTasks: items.reduce((sum, item) => (
+            sum + (item.status === "failed" ? Math.max(0, numberValue(item.failedTasks || item.tasks || 1)) : 0)
+          ), 0)
         };
       }
 
@@ -2499,6 +2504,10 @@
       function Dashboard({ adminUser, onLogout }) {
         const [config, setConfig] = useState(null);
         const [tasks, setTasks] = useState([]);
+        const [taskTotal, setTaskTotal] = useState(0);
+        const [allTaskTotal, setAllTaskTotal] = useState(0);
+        const [taskPage, setTaskPage] = useState(1);
+        const [taskListLoading, setTaskListLoading] = useState(false);
         const [statRecords, setStatRecords] = useState([]);
         const [dailyStats, setDailyStats] = useState({ days: [], records: [] });
         const [concurrencyStats, setConcurrencyStats] = useState({ days: [] });
@@ -2529,6 +2538,7 @@
         const [taskStatusFilter, setTaskStatusFilter] = useState("all");
         const [taskKeyword, setTaskKeyword] = useState("");
         const [taskSearchLoading, setTaskSearchLoading] = useState(false);
+        const taskRequestIdRef = useRef(0);
         const [taskTrendDays, setTaskTrendDays] = useState(30);
         const [productivityDay, setProductivityDay] = useState(dateKeyInShanghai(Date.now()));
         const [productivityTrendDays, setProductivityTrendDays] = useState(7);
@@ -2710,6 +2720,13 @@
           });
         }, [tasks, taskAccountFilter, taskChannelFilter, taskStatusFilter, taskKeyword]);
 
+        function addSubmittedTask(task) {
+          setAllTaskTotal((current) => current + 1);
+          if (!taskMatchesCurrentFilters(task) || !taskMatchesKeyword(task, taskKeyword)) return;
+          setTasks((current) => [task, ...current.filter((item) => String(item.id) !== String(task.id))]);
+          setTaskTotal((current) => current + 1);
+        }
+
         const filteredStatRecords = useMemo(() => {
           return statRecords.filter((record) => {
             const accountOk = taskAccountFilter === "all" || record.accountId === taskAccountFilter;
@@ -2768,16 +2785,52 @@
           return nextConfig;
         }
 
-        async function refresh() {
-          const [nextConfig, taskList, statsData, storageData, runtimeData] = await Promise.all([
-            api("/api/config"),
-            api("/api/tasks"),
-            api("/api/stats").catch(() => ({ records: [], daily: { days: [], records: [] }, concurrency: { days: [] } })),
-            api("/api/admin/image-storage").catch(() => null),
-            api("/api/admin/runtime").catch(() => null)
-          ]);
-          setConfig(nextConfig);
-          setTasks(taskList);
+        async function loadTaskPage({
+          page = 1,
+          append = false,
+          keyword = taskKeyword,
+          accountId = taskAccountFilter,
+          channel = taskChannelFilter,
+          status = taskStatusFilter,
+          showLoading = true
+        } = {}) {
+          const requestId = ++taskRequestIdRef.current;
+          const params = new URLSearchParams({ page: String(page), pageSize: "100" });
+          if (String(keyword || "").trim()) params.set("keyword", String(keyword).trim());
+          if (accountId && accountId !== "all") params.set("accountId", accountId);
+          if (channel && channel !== "all") params.set("channel", channel);
+          if (status && status !== "all") params.set("status", status);
+          if (showLoading) setTaskListLoading(true);
+          try {
+            const data = await api(`/api/tasks/page?${params.toString()}`);
+            if (requestId !== taskRequestIdRef.current) return null;
+            const items = Array.isArray(data?.items) ? data.items : [];
+            setTasks((current) => {
+              if (!append) return items;
+              const seen = new Set();
+              return [...current, ...items].filter((item) => {
+                const id = String(item?.id || "");
+                if (!id || seen.has(id)) return false;
+                seen.add(id);
+                return true;
+              });
+            });
+            setTaskTotal(Math.max(0, numberValue(data?.total)));
+            setTaskPage(Math.max(1, numberValue(data?.page) || 1));
+            if (!String(keyword || "").trim()
+              && (!accountId || accountId === "all")
+              && (!channel || channel === "all")
+              && (!status || status === "all")) {
+              setAllTaskTotal(Math.max(0, numberValue(data?.total)));
+            }
+            return data;
+          } finally {
+            if (showLoading && requestId === taskRequestIdRef.current) setTaskListLoading(false);
+          }
+        }
+
+        async function refreshStatsSummary() {
+          const statsData = await api("/api/stats/summary");
           setStatRecords(Array.isArray(statsData?.records) ? statsData.records : []);
           setDailyStats(statsData?.daily && Array.isArray(statsData.daily.days) && Array.isArray(statsData.daily.records)
             ? statsData.daily
@@ -2785,8 +2838,16 @@
           setConcurrencyStats(statsData?.concurrency && Array.isArray(statsData.concurrency.days)
             ? statsData.concurrency
             : { days: [] });
-          if (storageData) setImageStorageStats(storageData);
-          if (runtimeData) setRuntimeStatus(runtimeData);
+        }
+
+        async function refresh() {
+          const configPromise = api("/api/config");
+          const taskPromise = loadTaskPage({ page: 1 });
+          refreshStatsSummary().catch(() => {});
+          api("/api/admin/image-storage").then(setImageStorageStats).catch(() => {});
+          api("/api/admin/runtime").then(setRuntimeStatus).catch(() => {});
+          const nextConfig = await configPromise;
+          setConfig(nextConfig);
           globalForm.setFieldsValue(nextConfig);
           chatForm.setFieldsValue({
             accountId: "auto",
@@ -2800,6 +2861,7 @@
           });
           withTimeout(api("/api/models"), 5000, { items: [] })
             .then((modelData) => setDrawingModels(Array.isArray(modelData?.items) ? modelData.items : []));
+          await taskPromise;
         }
 
         async function handleTaskSearch(value) {
@@ -2807,23 +2869,35 @@
           setTaskKeyword(keyword);
           setTaskSearchLoading(true);
           try {
-            const taskList = await api("/api/tasks");
-            setTasks(taskList);
+            const data = await loadTaskPage({ page: 1, keyword });
+            if (!data) return;
             if (!keyword) return;
-
-            const matches = taskList.filter((task) => taskMatchesKeyword(task, keyword));
-            const visibleMatches = matches.filter((task) => taskMatchesCurrentFilters(task));
-            if (matches.length > 0 && visibleMatches.length === 0) {
-              message.warning("已找到任务，但被当前账号、渠道或状态筛选隐藏。请把筛选切回全部后查看。");
-            } else if (matches.length > 0) {
-              message.success(`已刷新，找到 ${matches.length} 条任务记录`);
+            if (numberValue(data.total) > 0) {
+              message.success(`已找到 ${numberValue(data.total)} 条任务记录`);
             } else {
-              message.warning("已刷新，未找到匹配任务。可以只搜任务ID前半段或最后8位。");
+              message.warning("未找到匹配任务。可以只搜任务ID前半段或最后8位。");
             }
           } catch (error) {
             message.error(error.message || "刷新任务记录失败");
           } finally {
             setTaskSearchLoading(false);
+          }
+        }
+
+        function handleTaskFilterChange(type, value) {
+          if (type === "accountId") setTaskAccountFilter(value);
+          if (type === "channel") setTaskChannelFilter(value);
+          if (type === "status") setTaskStatusFilter(value);
+          loadTaskPage({ page: 1, [type]: value }).catch((error) => {
+            message.error(error.message || "刷新任务记录失败");
+          });
+        }
+
+        async function loadMoreTasks() {
+          try {
+            await loadTaskPage({ page: taskPage + 1, append: true });
+          } catch (error) {
+            message.error(error.message || "加载更多任务失败");
           }
         }
 
@@ -2934,11 +3008,10 @@
           const timer = setInterval(async () => {
             try {
               await api("/api/tasks/refresh-processing", { method: "POST", body: {} }).catch(() => null);
-              const [taskList, nextConfig] = await Promise.all([
-                api("/api/tasks"),
+              const [, nextConfig] = await Promise.all([
+                loadTaskPage({ page: 1, showLoading: false }),
                 api("/api/config")
               ]);
-              setTasks(taskList);
               setConfig(nextConfig);
               await refreshRuntimeStatus();
             } catch (_error) {
@@ -3264,7 +3337,7 @@
                 };
             const result = await api("/v1/chat/completions?wait=0", { method: "POST", headers, body });
             if (result.task) {
-              setTasks((current) => [result.task, ...current.filter((item) => String(item.id) !== String(result.task.id))]);
+              addSubmittedTask(result.task);
             }
             await refreshRuntimeStatus();
             setChatResult("");
@@ -3296,7 +3369,7 @@
             if (values.accountId && values.accountId !== "auto") form.append("accountId", values.accountId);
             editFileList.forEach((file) => form.append("image", file.originFileObj));
             const task = await api("/api/draw/edit", { method: "POST", body: form });
-            setTasks((current) => [task, ...current.filter((item) => String(item.id) !== String(task.id))]);
+            addSubmittedTask(task);
             await refreshRuntimeStatus();
             message.success(`已提交到 ${task.channelName}，后台生成中`);
           } catch (error) {
@@ -3724,7 +3797,7 @@
               ]),
               h("div", { className: "metric" }, [
                 h("div", { className: "metric-icon" }, Icon.FileDoneOutlined ? h(Icon.FileDoneOutlined) : null),
-                h("div", null, [h("div", { className: "metric-label" }, "任务总数"), h("div", { className: "metric-value" }, tasks.length)])
+                h("div", null, [h("div", { className: "metric-label" }, "任务总数"), h("div", { className: "metric-value" }, allTaskTotal)])
               ])
             ]),
             h("section", { className: "capacity-panel", key: "capacity" }, [
@@ -3885,13 +3958,13 @@
                           onChange: (event) => setTaskKeyword(event.target.value),
                           style: { minWidth: 260, maxWidth: 360 }
                         }),
-                        h(Select, { value: taskAccountFilter, onChange: setTaskAccountFilter, options: taskAccountOptions }),
-                        h(Select, { value: taskChannelFilter, onChange: setTaskChannelFilter, options: [
+                        h(Select, { value: taskAccountFilter, onChange: (value) => handleTaskFilterChange("accountId", value), options: taskAccountOptions }),
+                        h(Select, { value: taskChannelFilter, onChange: (value) => handleTaskFilterChange("channel", value), options: [
                           { label: "全部通道", value: "all" },
                           { label: "绘图站", value: "drawing" },
                           { label: "聊天", value: "chatplus" }
                         ] }),
-                        h(Select, { value: taskStatusFilter, onChange: setTaskStatusFilter, options: [
+                        h(Select, { value: taskStatusFilter, onChange: (value) => handleTaskFilterChange("status", value), options: [
                           { label: "全部状态", value: "all" },
                           { label: "成功", value: "success" },
                           { label: "失败", value: "failed" },
@@ -3899,7 +3972,14 @@
                           { label: "等待上游", value: "waiting_upstream" },
                           { label: "结果待确认", value: "interrupted" }
                         ] }),
-                        h("div", { className: "toolbar-note" }, `列表 ${filteredTasks.length} 条；任务明细保留近2天，统计来自独立累计`)
+                        h("div", { className: "toolbar-note" }, `已加载 ${tasks.length} / ${taskTotal} 条；任务明细保留近2天，统计来自独立累计`),
+                        tasks.length < taskTotal
+                          ? h(Button, {
+                              icon: Icon.DownOutlined ? h(Icon.DownOutlined) : null,
+                              onClick: loadMoreTasks,
+                              loading: taskListLoading
+                            }, "加载更多")
+                          : null
                       ]),
                       h("div", { className: "task-trend" }, [
                         h("div", { className: "task-trend-header" }, [
@@ -3932,6 +4012,7 @@
                         rowKey: "id",
                         columns: taskColumns,
                         dataSource: filteredTasks,
+                        loading: taskListLoading,
                         pagination: { pageSize: 8 }
                       })
                     ])

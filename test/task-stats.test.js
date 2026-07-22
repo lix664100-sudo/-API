@@ -5,8 +5,63 @@ import {
   mergeRuntimeStatSample,
   summarizeDailyRuntimeStats,
   summarizeDailyTaskStats,
-  summarizeIntradayTaskStats
+  summarizeIntradayTaskStats,
+  summarizeRecentTaskStats
 } from "../src/storage.js";
+
+test("compact task stats preserve totals while combining repeated records", () => {
+  const now = Date.parse("2026-07-22T12:00:00+08:00");
+  const records = [
+    {
+      day: "2026-07-22",
+      time: Date.parse("2026-07-22T09:00:00+08:00"),
+      status: "success",
+      taskType: "img2img",
+      accountId: "account-a",
+      channelGroup: "drawing",
+      tasks: 1,
+      successImages: 2
+    },
+    {
+      day: "2026-07-22",
+      time: Date.parse("2026-07-22T10:00:00+08:00"),
+      status: "success",
+      taskType: "img2img",
+      accountId: "account-a",
+      channelGroup: "drawing",
+      tasks: 1,
+      successImages: 1
+    },
+    {
+      day: "2026-07-22",
+      time: Date.parse("2026-07-22T11:00:00+08:00"),
+      status: "failed",
+      taskType: "img2img",
+      accountId: "account-a",
+      channelGroup: "drawing",
+      tasks: 1,
+      failedTasks: 1
+    }
+  ];
+
+  const summary = summarizeRecentTaskStats(records, 7, now);
+  assert.equal(summary.length, 2);
+  assert.deepEqual(summary.find((record) => record.status === "success"), {
+    day: "2026-07-22",
+    status: "success",
+    taskType: "img2img",
+    accountId: "account-a",
+    accountName: "",
+    channelId: "",
+    channelName: "",
+    channelType: "",
+    channelGroup: "drawing",
+    tasks: 2,
+    successImages: 3,
+    failedTasks: 0
+  });
+  assert.equal(summary.find((record) => record.status === "failed").failedTasks, 1);
+});
 
 test("最近生图趋势按北京时间汇总成功和失败，并补齐没有任务的日期", () => {
   const now = Date.parse("2026-07-18T12:00:00+08:00");

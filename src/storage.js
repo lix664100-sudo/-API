@@ -19,6 +19,7 @@ let statsWriteQueue = Promise.resolve();
 let runtimeStatsWriteQueue = Promise.resolve();
 let tasksWriteQueue = Promise.resolve();
 let configWriteQueue = Promise.resolve();
+let statsRevision = 0;
 const intradayStatsCache = new Map();
 
 const defaultImageStorage = {
@@ -555,6 +556,73 @@ function taskStatus(value) {
   return String(value?.status || "").trim().toLowerCase();
 }
 
+function normalizeTaskSearchKeyword(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[“”"']/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+function taskSearchHaystack(task = {}) {
+  const request = task.requestJson || {};
+  const response = task.responseJson || {};
+  return [
+    task.id,
+    task.externalId,
+    taskSourceTaskId(task),
+    task.prompt,
+    task.accountName,
+    task.channelName,
+    task.errorMessage,
+    response.message,
+    JSON.stringify(request)
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function taskMatchesSearch(task, value) {
+  const keyword = normalizeTaskSearchKeyword(value);
+  if (!keyword) return true;
+  const haystack = taskSearchHaystack(task);
+  if (haystack.includes(keyword)) return true;
+  const parts = keyword
+    .split(/(?:\.{2,}|…|⋯|[\s,，;；:：]+)+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 4 && (part.length >= 8 || /[_-]|\d/.test(part)));
+  return parts.length > 0 && parts.every((part) => haystack.includes(part));
+}
+
+export async function listTaskPage({ page = 1, pageSize = 100, keyword = "", accountId = "", channel = "", status = "" } = {}) {
+  const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
+  const normalizedPageSize = Math.min(500, Math.max(1, Math.floor(Number(pageSize) || 100)));
+  const normalizedAccountId = String(accountId || "").trim();
+  const normalizedChannel = String(channel || "").trim().toLowerCase();
+  const normalizedStatus = String(status || "").trim().toLowerCase();
+
+  // The file is replaced atomically, so the admin page can read a stable snapshot
+  // without waiting behind task writes that may still be queued.
+  const tasks = limitTasks(await readJson(tasksFile, []));
+  const filtered = tasks.filter((task) => (
+    taskMatchesSearch(task, keyword)
+    && (!normalizedAccountId || normalizedAccountId === "all" || String(task.accountId || "") === normalizedAccountId)
+    && (!normalizedChannel || normalizedChannel === "all" || taskStatChannelGroup(task) === normalizedChannel)
+    && (!normalizedStatus || normalizedStatus === "all" || taskStatus(task) === normalizedStatus)
+  ));
+  const total = filtered.length;
+  const pageCount = Math.ceil(total / normalizedPageSize);
+  const normalizedPage = Math.min(requestedPage, Math.max(1, pageCount));
+  const start = (normalizedPage - 1) * normalizedPageSize;
+
+  return {
+    items: filtered.slice(start, start + normalizedPageSize),
+    total,
+    page: normalizedPage,
+    pageSize: normalizedPageSize,
+    pageCount,
+    hasMore: start + normalizedPageSize < total
+  };
+}
+
 function shouldKeepStoredTask(current, incoming) {
   const currentStatus = taskStatus(current);
   const incomingStatus = taskStatus(incoming);
@@ -755,6 +823,51 @@ export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now 
         || a.channelGroup.localeCompare(b.channelGroup)
       ))
   };
+}
+
+export function summarizeRecentTaskStats(records = [], days = 7, now = Date.now()) {
+  const rangeDays = Math.min(statRecordDays, Math.max(1, Math.floor(Number(days) || 7)));
+  const visibleDays = new Set(Array.from({ length: rangeDays }, (_, index) => (
+    dateKeyInShanghai(now - index * 24 * 60 * 60 * 1000)
+  )));
+  const grouped = new Map();
+
+  for (const record of records) {
+    const status = finalStatStatus(record?.status);
+    const day = record?.day || dateKeyInShanghai(record?.time);
+    if (!status || !visibleDays.has(day)) continue;
+    const accountId = String(record?.accountId || "");
+    const channelGroup = String(record?.channelGroup || "other");
+    const taskType = String(record?.taskType || "");
+    const key = `${day}\u0000${accountId}\u0000${channelGroup}\u0000${taskType}\u0000${status}`;
+    const current = grouped.get(key) || {
+      day,
+      status,
+      taskType,
+      accountId,
+      accountName: record?.accountName || "",
+      channelId: record?.channelId || "",
+      channelName: record?.channelName || "",
+      channelType: record?.channelType || "",
+      channelGroup,
+      tasks: 0,
+      successImages: 0,
+      failedTasks: 0
+    };
+    const taskCount = Math.max(0, Number(record?.tasks || 1) || 0);
+    current.tasks += taskCount;
+    current.successImages += Math.max(0, Number(record?.successImages || 0) || 0);
+    current.failedTasks += Math.max(0, Number(record?.failedTasks || (status === "failed" ? taskCount : 0)) || 0);
+    grouped.set(key, current);
+  }
+
+  return [...grouped.values()].sort((a, b) => (
+    b.day.localeCompare(a.day)
+    || a.accountId.localeCompare(b.accountId)
+    || a.channelGroup.localeCompare(b.channelGroup)
+    || a.taskType.localeCompare(b.taskType)
+    || a.status.localeCompare(b.status)
+  ));
 }
 
 function intradayTargetDay(value, now = Date.now()) {
@@ -967,6 +1080,12 @@ async function seedStatsFromTasks(stats) {
   return next;
 }
 
+async function loadTaskStatsSnapshot() {
+  const stats = await loadStats();
+  if (Object.keys(stats.records || {}).length) return stats;
+  return withStatsLock(async () => seedStatsFromTasks(await loadStats()));
+}
+
 export async function recordTaskStat(task) {
   const record = taskStatRecord(task);
   if (!record) return null;
@@ -975,6 +1094,7 @@ export async function recordTaskStat(task) {
     stats.records[record.taskId] = record;
     const next = pruneStats(stats);
     await writeJson(statsFile, next);
+    statsRevision += 1;
     intradayStatsCache.clear();
     return record;
   });
@@ -984,37 +1104,42 @@ export async function listIntradayTaskStats(day) {
   const targetDay = intradayTargetDay(day);
   const cached = intradayStatsCache.get(targetDay);
   if (cached) return { ...cached, generatedAt: new Date().toISOString() };
-  return withStatsLock(async () => {
-    const currentCached = intradayStatsCache.get(targetDay);
-    if (currentCached) return { ...currentCached, generatedAt: new Date().toISOString() };
-    const stats = await seedStatsFromTasks(await loadStats());
-    const records = Object.values(stats.records || {});
-    const intraday = summarizeIntradayTaskStats(records, targetDay);
-    const targetTimestamp = Date.parse(`${targetDay}T12:00:00+08:00`);
-    const daily = summarizeDailyTaskStats(records, 1, targetTimestamp);
-    const result = {
-      ...intraday,
-      updatedAt: stats.updatedAt || null,
-      dailyRecords: daily.records
-    };
-    intradayStatsCache.set(targetDay, result);
-    return { ...result, generatedAt: new Date().toISOString() };
-  });
+  const revision = statsRevision;
+  const stats = await loadTaskStatsSnapshot();
+  const records = Object.values(stats.records || {});
+  const intraday = summarizeIntradayTaskStats(records, targetDay);
+  const targetTimestamp = Date.parse(`${targetDay}T12:00:00+08:00`);
+  const daily = summarizeDailyTaskStats(records, 1, targetTimestamp);
+  const result = {
+    ...intraday,
+    updatedAt: stats.updatedAt || null,
+    dailyRecords: daily.records
+  };
+  if (revision === statsRevision) intradayStatsCache.set(targetDay, result);
+  return { ...result, generatedAt: new Date().toISOString() };
 }
 
 export async function listTaskStats() {
-  return withStatsLock(async () => {
-    const stats = await seedStatsFromTasks(await loadStats());
-    const runtimeStats = await loadRuntimeStats();
-    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-    const records = Object.values(stats.records || {});
-    return {
-      updatedAt: stats.updatedAt || null,
-      records: records
-        .filter((record) => Number(record.time || 0) >= cutoff)
-        .sort((a, b) => Number(b.time || 0) - Number(a.time || 0)),
-      daily: summarizeDailyTaskStats(records),
-      concurrency: summarizeDailyRuntimeStats(runtimeStats)
-    };
-  });
+  const [stats, runtimeStats] = await Promise.all([loadTaskStatsSnapshot(), loadRuntimeStats()]);
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const records = Object.values(stats.records || {});
+  return {
+    updatedAt: stats.updatedAt || null,
+    records: records
+      .filter((record) => Number(record.time || 0) >= cutoff)
+      .sort((a, b) => Number(b.time || 0) - Number(a.time || 0)),
+    daily: summarizeDailyTaskStats(records),
+    concurrency: summarizeDailyRuntimeStats(runtimeStats)
+  };
+}
+
+export async function listTaskStatsSummary() {
+  const [stats, runtimeStats] = await Promise.all([loadTaskStatsSnapshot(), loadRuntimeStats()]);
+  const records = Object.values(stats.records || {});
+  return {
+    updatedAt: stats.updatedAt || null,
+    records: summarizeRecentTaskStats(records),
+    daily: summarizeDailyTaskStats(records),
+    concurrency: summarizeDailyRuntimeStats(runtimeStats)
+  };
 }
