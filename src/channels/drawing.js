@@ -164,12 +164,38 @@ export function userFacingDrawingErrorMessage(value) {
   return text;
 }
 
+function returnedTextValue(value) {
+  if (typeof value === "string") return value.trim() ? value : "";
+  if (value === null || value === undefined) return "";
+  if (["number", "boolean"].includes(typeof value)) return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+export function drawingUpstreamText(task = {}) {
+  const items = Array.isArray(task?.items) ? task.items : [];
+  const texts = [
+    task?.result_text,
+    task?.resultText,
+    ...items.flatMap((item) => [item?.result_text, item?.resultText])
+  ]
+    .map(returnedTextValue)
+    .filter(Boolean);
+  return [...new Set(texts)].join("\n");
+}
+
 export function normalizeDrawingTask(task, drawingBaseUrl = "") {
   const items = Array.isArray(task?.items) ? task.items : [];
+  const status = task?.status || "unknown";
   const itemError = items
     .map((item) => item?.error_message || item?.message || "")
     .filter(Boolean)
     .join("；");
+  const upstreamText = drawingUpstreamText(task);
+  const returnedError = task?.error_message || task?.message || itemError;
   const imageUrls = items
     .map((item) => item?.image_url || item?.public_url || "")
     .filter(Boolean)
@@ -178,14 +204,17 @@ export function normalizeDrawingTask(task, drawingBaseUrl = "") {
   return {
     externalId: task?.id ?? task?.task_id ?? task?.taskNo ?? task?.task_no,
     taskNo: task?.task_no || task?.taskNo || "",
-    status: task?.status || "unknown",
+    status,
     prompt: task?.prompt || "",
     taskType: task?.task_type || task?.taskType || "",
     modelId: task?.model_id ?? task?.modelId,
     ratio: task?.ratio_label || task?.ratio || "",
     imageCount: Number(task?.image_count || imageUrls.length || 1),
     imageUrls,
-    errorMessage: userFacingDrawingErrorMessage(task?.error_message || task?.message || itemError),
+    upstreamText,
+    errorMessage: userFacingDrawingErrorMessage(
+      upstreamText && ["failed", "cancelled"].includes(status) ? upstreamText : returnedError
+    ),
     raw: task
   };
 }

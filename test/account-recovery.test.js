@@ -868,6 +868,22 @@ test("绘图站中转 500 显示准确提示", () => {
   assert.equal(task.errorMessage, "绘图站上游服务异常（500），不是额度不足，请稍后重试。");
 });
 
+test("绘图站中转返回文本时保留上游原文", () => {
+  const upstreamText = "I wasn't able to generate the image due to an error on my side.";
+  const task = normalizeDrawingTask({
+    id: 45745,
+    status: "failed",
+    items: [{
+      error_message: "中转返回文本",
+      result_text: upstreamText
+    }]
+  });
+
+  assert.equal(task.errorMessage, upstreamText);
+  assert.equal(task.upstreamText, upstreamText);
+  assert.equal(task.raw.items[0].result_text, upstreamText);
+});
+
 test("绘图站严重中转失败会被识别为上游异常", () => {
   assert.equal(drawingSevereFailureReason("中转接口请求失败，状态码：500"), "upstream_500");
   assert.equal(drawingSevereFailureReason("中转返回文本"), "relay_text");

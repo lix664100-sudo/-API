@@ -114,6 +114,17 @@ function errorSourceTaskId(error, responseJson = {}, context = {}) {
   );
 }
 
+function errorUpstreamText(error, responseJson = {}) {
+  const text = String(
+    responseJson.upstreamText
+      || error.upstreamText
+      || error.task?.upstreamText
+      || error.task?.responseJson?.upstreamText
+      || ""
+  );
+  return text.trim() ? text : "";
+}
+
 async function persistReturnedErrorTask(error, context, payload, status) {
   const responseJson = error.responseJson || error.task?.responseJson || {};
   const sourceTaskId = errorSourceTaskId(error, responseJson, context);
@@ -129,6 +140,7 @@ async function persistReturnedErrorTask(error, context, payload, status) {
     sourceTaskId,
     ...(status ? { status } : {}),
     ...(payload.code ? { code: payload.code } : {}),
+    ...(payload.upstreamText ? { upstreamText: payload.upstreamText } : {}),
     ...(Array.isArray(attempts) && attempts.length ? { attempts } : {})
   };
   const failedTask = {
@@ -143,6 +155,7 @@ async function persistReturnedErrorTask(error, context, payload, status) {
     imageCount: existing?.imageCount ?? Number(context.input?.image_count || context.input?.n || 1),
     imageUrls: Array.isArray(existing?.imageUrls) ? existing.imageUrls : [],
     inputImageUrls: Array.isArray(existing?.inputImageUrls) ? existing.inputImageUrls : [],
+    upstreamText: payload.upstreamText || existing?.upstreamText || "",
     errorMessage: payload.message,
     statusCode: status,
     channelId: existing?.channelId || firstAttempt.channelId || "",
@@ -173,12 +186,14 @@ async function sendError(reply, error, context = {}) {
   const responseJson = error.responseJson || error.task?.responseJson || {};
   const attempts = error.attempts || responseJson.attempts || error.task?.attempts || [];
   const sourceTaskId = errorSourceTaskId(error, responseJson, context);
+  const upstreamText = errorUpstreamText(error, responseJson);
   const payload = {
     ok: false,
-    message: responseJson.message || error.message || "请求失败"
+    message: upstreamText || responseJson.message || error.message || "请求失败"
   };
   const code = error.code || responseJson.code;
   if (code) payload.code = code;
+  if (upstreamText) payload.upstreamText = upstreamText;
   if (sourceTaskId) payload.sourceTaskId = sourceTaskId;
   if (Array.isArray(attempts) && attempts.length) payload.attempts = attempts;
   try {

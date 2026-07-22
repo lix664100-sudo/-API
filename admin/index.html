@@ -1302,9 +1302,37 @@
           : text;
       }
 
+      function returnedTextValue(value) {
+        if (typeof value === "string") return value.trim() ? value : "";
+        if (value === null || value === undefined) return "";
+        if (["number", "boolean"].includes(typeof value)) return String(value);
+        try {
+          return JSON.stringify(value);
+        } catch {
+          return String(value);
+        }
+      }
+
+      function taskUpstreamText(row) {
+        const response = row?.responseJson || {};
+        const rawItems = Array.isArray(row?.raw?.items) ? row.raw.items : [];
+        const responseItems = Array.isArray(response?.raw?.items) ? response.raw.items : [];
+        const texts = [
+          row?.upstreamText,
+          response.upstreamText,
+          row?.raw?.result_text,
+          row?.raw?.resultText,
+          response?.raw?.result_text,
+          response?.raw?.resultText,
+          ...rawItems.flatMap((item) => [item?.result_text, item?.resultText]),
+          ...responseItems.flatMap((item) => [item?.result_text, item?.resultText])
+        ].map(returnedTextValue).filter(Boolean);
+        return [...new Set(texts)].join("\n");
+      }
+
       function taskErrorText(row) {
         if (row?.status === "interrupted") return "";
-        const text = row?.errorMessage || row?.responseJson?.message || "";
+        const text = taskUpstreamText(row) || row?.errorMessage || row?.responseJson?.message || "";
         if (!text) return "";
         if (isChatQuotaErrorText(row, text)) {
           return chatQuotaErrorText(text);
@@ -1350,6 +1378,7 @@
           row?.accountName,
           row?.channelName,
           row?.errorMessage,
+          taskUpstreamText(row),
           response.message,
           JSON.stringify(request)
         ].filter(Boolean).join(" ").toLowerCase();
@@ -1383,12 +1412,18 @@
 
       function taskReturnJson(row) {
         if (row.status === "interrupted") return null;
+        const upstreamText = taskUpstreamText(row);
         if (row.status === "failed" && (row.responseJson || row.errorMessage)) {
-          if (row.responseJson) return row.responseJson;
+          if (row.responseJson) {
+            return upstreamText
+              ? { ...row.responseJson, message: upstreamText, upstreamText }
+              : row.responseJson;
+          }
           const sourceTaskId = taskSourceId(row);
           return {
             ok: false,
-            message: taskErrorText(row) || "任务失败",
+            message: upstreamText || taskErrorText(row) || "任务失败",
+            ...(upstreamText ? { upstreamText } : {}),
             ...(sourceTaskId ? { sourceTaskId } : {}),
             attempts: row.attempts || []
           };

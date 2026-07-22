@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
-import { DrawingClient, drawingRetryAfterSeconds, drawingSevereFailureReason } from "./channels/drawing.js";
+import { DrawingClient, drawingRetryAfterSeconds, drawingSevereFailureReason, drawingUpstreamText } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
 import { checkProxyReachability, safeProxyEndpoint } from "./proxy.js";
 import { getTask, listTasks, loadConfig, recordTaskStat, updateAccountStatus, upsertTask } from "./storage.js";
@@ -667,12 +667,20 @@ function taskExternalId(task) {
   return savedTaskExternalId(task) || task.id;
 }
 
+function resultUpstreamText(result = {}) {
+  const text = String(result.upstreamText || drawingUpstreamText(result.raw) || "");
+  return text.trim() ? text : "";
+}
+
 function taskErrorMessage(result, task) {
+  const upstreamText = ["failed", "cancelled"].includes(result.status)
+    ? resultUpstreamText(result)
+    : "";
   const itemError = (result.raw?.items || [])
     .map((item) => item?.error_message || item?.message || "")
     .filter(Boolean)
     .join("；");
-  return result.errorMessage || itemError || task.errorMessage || "";
+  return upstreamText || result.errorMessage || itemError || task.errorMessage || "";
 }
 
 function refreshedTaskWaitState(task, result, timeoutSec) {
@@ -794,9 +802,9 @@ async function consumeChatUsage(account, channel) {
 
 function drawingFailureTextFromResult(result = {}) {
   const itemErrors = (result?.raw?.items || [])
-    .map((item) => item?.error_message || item?.message || "")
+    .flatMap((item) => [item?.error_message || item?.message || "", item?.result_text || item?.resultText || ""])
     .filter(Boolean);
-  return [result.errorMessage, ...itemErrors].filter(Boolean).join("；");
+  return [result.errorMessage, resultUpstreamText(result), ...itemErrors].filter(Boolean).join("；");
 }
 
 function drawingRateLimitPatch(retryAfterSeconds) {
@@ -911,6 +919,7 @@ function mergeRefreshedTask(task, result, channel, account) {
     ratio: result.ratio || task.ratio,
     imageCount: result.imageCount ?? task.imageCount,
     imageUrls: result.imageUrls || task.imageUrls || [],
+    upstreamText: resultUpstreamText(result) || task.upstreamText || "",
     errorMessage: taskErrorMessage(result, task),
     channelId: channel.id,
     channelName: channel.name,
@@ -1156,6 +1165,7 @@ function wrapTask({ result, channel, account, attempts, requestJson = null, requ
     ratio: result.ratio,
     imageCount: result.imageCount,
     imageUrls: result.imageUrls || [],
+    upstreamText: resultUpstreamText(result),
     errorMessage: taskErrorMessage(result, {}),
     channelId: channel.id,
     channelName: channel.name,
@@ -2623,6 +2633,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
       error.status = statusCode || (String(message).includes("并发上限") ? 429 : 502);
       error.code = responseJson.code || (error.status === 429 ? "CONCURRENCY_LIMIT" : undefined);
       error.attempts = finalTask.attempts || responseJson.attempts || [];
+      error.upstreamText = responseJson.upstreamText || finalTask.upstreamText || "";
       error.responseJson = responseJson;
       error.task = finalTask;
       throw error;
