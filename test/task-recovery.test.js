@@ -95,6 +95,44 @@ test("已经明确失败的任务不会被旧的结果待确认覆盖", async ()
   assert.equal(stored.responseJson.code, "CONCURRENCY_LIMIT");
 });
 
+test("later successful task result repairs an earlier failed refresh with the same task id", async () => {
+  const id = "task-failed-before-success";
+  const sourceTaskId = "source-failed-before-success";
+  const failedAt = new Date().toISOString();
+  await upsertTask({
+    id,
+    sourceTaskId,
+    status: "failed",
+    taskType: "img2img",
+    prompt: "repair failed task",
+    errorMessage: "stale refresh failed",
+    responseJson: { status: "failed", sourceTaskId, errorMessage: "stale refresh failed" },
+    imageCount: 0,
+    imageUrls: [],
+    createdAt: failedAt,
+    completedAt: failedAt
+  });
+
+  await upsertTask({
+    id,
+    sourceTaskId,
+    status: "success",
+    taskType: "img2img",
+    prompt: "repair failed task",
+    errorMessage: "",
+    responseJson: { status: "success", sourceTaskId },
+    imageCount: 1,
+    imageUrls: ["https://images.example.test/result.png"],
+    completedAt: new Date().toISOString()
+  });
+
+  const stored = await getTask(id);
+
+  assert.equal(stored.status, "success");
+  assert.equal(stored.errorMessage, "");
+  assert.equal(stored.imageUrls.length, 1);
+});
+
 test("正在执行的同步生图任务不会被刷新误判为结果待确认", async () => {
   const config = await loadConfig();
   await saveConfig({
@@ -159,6 +197,150 @@ test("正在执行的同步生图任务不会被刷新误判为结果待确认",
   } finally {
     continueUpstream?.();
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+  }
+});
+
+test("image fallback stores the real chat image channel before the final image is ready", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    waitTimeoutSec: 300,
+    imageStorage: { mode: "never", autoCleanup: false, retentionDays: 7 },
+    concurrency: { chat: 3, drawingImage: 1, chatImage: 1 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        defaultModelId: 1
+      }
+    }],
+    accounts: [{
+      id: "fallback-account",
+      channelId: "shareai",
+      name: "Fallback Account",
+      username: "fallback@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", balance: 1, message: "drawing ok" },
+          chatplus: { status: "ok", balance: 10, message: "chat ok" }
+        }
+      }
+    }]
+  });
+
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  const originalDrawingGetTask = DrawingClient.prototype.getTask;
+  const originalChatCreateImageTask = ChatplusClient.prototype.createImageTask;
+  const originalChatGetTask = ChatplusClient.prototype.getTask;
+  let markSubmitted;
+  let finishChatTask;
+  const submitted = new Promise((resolve) => {
+    markSubmitted = resolve;
+  });
+  const canFinish = new Promise((resolve) => {
+    finishChatTask = resolve;
+  });
+  let drawingRefreshCount = 0;
+  let chatRefreshCount = 0;
+
+  DrawingClient.prototype.check = async () => ({
+    status: "quota_empty",
+    quota: 50,
+    balance: 0,
+    message: "drawing quota empty"
+  });
+  DrawingClient.prototype.getTask = async () => {
+    drawingRefreshCount += 1;
+    const error = new Error("wrong drawing refresh");
+    error.code = "INVALID_UPSTREAM_RESPONSE";
+    error.status = 502;
+    throw error;
+  };
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    await input.onSubmitted?.({
+      externalId: "chat-fallback-conversation",
+      status: "processing",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: "gpt",
+      ratio: input.ratio || "",
+      imageCount: 0,
+      imageUrls: [],
+      raw: { conversationId: "chat-fallback-conversation" }
+    });
+    markSubmitted();
+    await canFinish;
+    return {
+      externalId: "chat-fallback-conversation",
+      status: "success",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: "gpt",
+      ratio: input.ratio || "",
+      imageCount: 1,
+      imageUrls: ["https://images.example.test/result.png"],
+      raw: { conversationId: "chat-fallback-conversation" }
+    };
+  };
+  ChatplusClient.prototype.getTask = async (externalId) => {
+    chatRefreshCount += 1;
+    return {
+      externalId,
+      status: "waiting_upstream",
+      taskType: "img2img",
+      prompt: "fallback stores chat channel",
+      modelId: "gpt",
+      imageCount: 0,
+      imageUrls: [],
+      raw: { conversationId: externalId }
+    };
+  };
+
+  try {
+    const sourceTaskId = "fallback-stores-chat-channel";
+    const creation = createImageTask({
+      input: {
+        channel: "auto",
+        prompt: "fallback stores chat channel",
+        client_task_id: sourceTaskId
+      },
+      files: [{ filename: "source.png", mimetype: "image/png" }],
+      wait: true
+    });
+    await submitted;
+
+    let stored = (await listTasks()).find((task) => task.sourceTaskId === sourceTaskId);
+    assert.equal(stored.channelType, "chatplus");
+    assert.equal(stored.channelId, "shareai:chatplus");
+
+    const refreshResults = await refreshProcessingTasks();
+    const refreshed = refreshResults.find((item) => item.id === stored.id);
+    assert.equal(refreshed?.ok, true);
+    assert.equal(drawingRefreshCount, 0);
+    assert.equal(chatRefreshCount, 1);
+
+    finishChatTask();
+    const result = await creation;
+    stored = await getTask(stored.id);
+
+    assert.equal(result.status, "success");
+    assert.equal(stored.status, "success");
+    assert.equal(stored.channelType, "chatplus");
+    assert.equal(stored.imageUrls.length, 1);
+  } finally {
+    finishChatTask?.();
+    DrawingClient.prototype.check = originalDrawingCheck;
+    DrawingClient.prototype.getTask = originalDrawingGetTask;
+    ChatplusClient.prototype.createImageTask = originalChatCreateImageTask;
+    ChatplusClient.prototype.getTask = originalChatGetTask;
   }
 });
 

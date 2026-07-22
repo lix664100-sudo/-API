@@ -626,9 +626,11 @@ export async function listTaskPage({ page = 1, pageSize = 100, keyword = "", acc
 function shouldKeepStoredTask(current, incoming) {
   const currentStatus = taskStatus(current);
   const incomingStatus = taskStatus(incoming);
+  if (currentStatus === "success" && incomingStatus !== "success") return true;
+  if (currentStatus === "failed" && staleTaskStatuses.has(incomingStatus)) return true;
   if (!durableFinalTaskStatuses.has(currentStatus)) return false;
   if (incomingStatus === currentStatus) return false;
-  return staleTaskStatuses.has(incomingStatus) || durableFinalTaskStatuses.has(incomingStatus);
+  return false;
 }
 
 function taskIdentityIndex(tasks, task) {
