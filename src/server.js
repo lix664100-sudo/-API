@@ -9,6 +9,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
+  assertImageTaskAdmission,
   checkAccount,
   checkAllAccounts,
   createChatCompletion,
@@ -246,6 +247,20 @@ function apiRequestMeta(request) {
     forwardedFor: firstHeaderValue(request.headers["x-forwarded-for"]),
     ...(sourceTaskId ? { sourceTaskId } : {})
   };
+}
+
+function imageAdmissionInput(request, requestMeta = {}) {
+  const queryInput = normalizeFields(request.query || {});
+  const bodyInput = isMultipartRequest(request) ? {} : normalizeFields(request.body || {});
+  return {
+    ...queryInput,
+    ...bodyInput,
+    ...(requestMeta.sourceTaskId ? { sourceTaskId: requestMeta.sourceTaskId } : {})
+  };
+}
+
+async function assertImageRequestAdmission(request, requestMeta = {}) {
+  await assertImageTaskAdmission(imageAdmissionInput(request, requestMeta));
 }
 
 async function requireApiKey(request, reply) {
@@ -947,6 +962,7 @@ app.post("/api/draw/edit", async (request, reply) => {
   let input = {};
   let files = [];
   try {
+    await assertImageRequestAdmission(request, requestMeta);
     const parsed = await readImageInput(request, { maxFiles: 3 });
     input = parsed.input;
     files = parsed.files;
@@ -1016,6 +1032,7 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
   let input = {};
   let files = [];
   try {
+    await assertImageRequestAdmission(request, requestMeta);
     const parsed = await readImageInput(request, { maxFiles: 3 });
     input = parsed.input;
     files = parsed.files;

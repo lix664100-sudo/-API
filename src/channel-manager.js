@@ -272,6 +272,17 @@ async function durableTaskSlotState(slot, target = {}) {
   };
 }
 
+async function taskSlotOccupancy(slot, target = {}) {
+  const key = taskSlotKey(slot, target);
+  const count = activeTaskCounts.get(key) || 0;
+  const durableState = await durableTaskSlotState(slot, target);
+  return count + durableState.total - Math.min(durableState.active, count);
+}
+
+async function taskSlotHasCapacity(slot, target = {}) {
+  return (await taskSlotOccupancy(slot, target)) < taskSlotLimit(slot);
+}
+
 function busyTaskError(slot, target = {}) {
   const error = new Error(`${taskSlotBusyLabel(slot, target)}任务正在处理中，请稍后再试。`);
   error.status = 429;
@@ -280,12 +291,9 @@ function busyTaskError(slot, target = {}) {
 }
 
 async function tryReserveTaskSlot(slot, target = {}) {
-  const max = taskSlotLimit(slot);
   const key = taskSlotKey(slot, target);
   const count = activeTaskCounts.get(key) || 0;
-  const durableState = await durableTaskSlotState(slot, target);
-  const occupied = count + durableState.total - Math.min(durableState.active, count);
-  if (occupied >= max) return null;
+  if (!(await taskSlotHasCapacity(slot, target))) return null;
   activeTaskCounts.set(key, count + 1);
   let released = false;
   return () => {
@@ -1236,6 +1244,25 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
     recovered[index]?.status === "ok"
       || (taskType === "chat" && recovered[index]?.status === "quota_empty")
   ));
+}
+
+export async function assertImageTaskAdmission(input = {}) {
+  const config = await loadRuntimeConfig();
+  const requestedChannel = input.channel || config.defaultChannel || "auto";
+  const requestedAccountId = String(input.accountId || input.account_id || "").trim();
+  const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
+    accountId: requestedAccountId,
+    skipRecovery: true
+  });
+  if (!targets.length) throw noUsableTargetError("img2img");
+
+  const attempts = [];
+  for (const target of targets) {
+    const slot = targetTaskSlot(target, "img2img");
+    if (await taskSlotHasCapacity(slot, target)) return true;
+    attempts.push(targetBusyAttempt(target, "img2img"));
+  }
+  throw targetsFailedError(attempts);
 }
 
 function noUsableTargetError(taskType) {
