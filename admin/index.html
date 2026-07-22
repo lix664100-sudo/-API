@@ -391,6 +391,19 @@
         color: var(--muted);
       }
 
+      .task-upstream-action {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        min-width: 0;
+      }
+
+      .task-upstream-action .ant-btn {
+        height: auto;
+        padding: 0 2px;
+        line-height: 1.2;
+      }
+
       .proxy-cell {
         display: flex;
         flex-direction: column;
@@ -1487,10 +1500,76 @@
         return "";
       }
 
-      function taskMetaLine(row) {
+      function trimUrl(value) {
+        return String(value || "").trim().replace(/\/+$/, "");
+      }
+
+      function taskConversationId(row) {
+        const rawId = row?.raw?.conversationId
+          || row?.raw?.conversation_id
+          || row?.responseJson?.conversationId
+          || row?.responseJson?.conversation_id;
+        if (rawId) return String(rawId).trim();
+        const channelText = `${row?.channelId || ""} ${row?.channelType || ""} ${row?.channelName || ""}`;
+        if (!/chatplus|聊天生图/.test(channelText)) return "";
+        return String(row?.externalId || row?.responseJson?.externalId || "").trim();
+      }
+
+      function taskChatBaseUrl(row, config) {
+        const channelId = String(row?.channelId || "");
+        const parentId = channelId.includes(":") ? channelId.split(":")[0] : "";
+        const source = config?.channels || [];
+        const channel = source.find((item) => item.id === channelId)
+          || source.find((item) => parentId && item.id === parentId)
+          || source.find((item) => item.type === "shareai")
+          || source.find((item) => item.type === "chatplus");
+        const settings = channel?.settings || {};
+        if (channel?.type === "shareai") return settings.chatBaseUrl || "https://www.chatplus.cc";
+        return settings.baseUrl || settings.chatBaseUrl || "https://www.chatplus.cc";
+      }
+
+      function taskConversationUrl(row, config) {
+        const id = taskConversationId(row);
+        const baseUrl = trimUrl(taskChatBaseUrl(row, config));
+        return id && baseUrl ? `${baseUrl}/c/${encodeURIComponent(id)}` : "";
+      }
+
+      function taskCarId(row) {
+        return String(row?.raw?.selectedCarId || row?.responseJson?.selectedCarId || "").trim();
+      }
+
+      function taskUpstreamTitle(row) {
+        return String(row?.raw?.title || row?.responseJson?.title || "").trim();
+      }
+
+      function taskConversationAction(row, config) {
+        const id = taskConversationId(row);
+        const url = taskConversationUrl(row, config);
+        if (!id) return null;
+        return h("span", { className: "task-upstream-action" }, [
+          h("span", { className: "mono", key: "id" }, id),
+          url ? h(Button, {
+            key: "open",
+            type: "link",
+            size: "small",
+            href: url,
+            target: "_blank",
+            rel: "noreferrer",
+            icon: Icon.ExportOutlined ? h(Icon.ExportOutlined) : null
+          }, "打开") : null
+        ]);
+      }
+
+      function taskMetaLine(row, config) {
         const meta = row?.requestMeta || {};
         const sourceTaskId = taskSourceId(row);
+        const conversationAction = taskConversationAction(row, config);
+        const upstreamTitle = taskUpstreamTitle(row);
+        const carId = taskCarId(row);
         const items = [
+          conversationAction ? ["上游对话", conversationAction] : null,
+          upstreamTitle ? ["上游标题", upstreamTitle] : null,
+          carId ? ["车位ID", carId] : null,
           sourceTaskId ? ["任务ID", sourceTaskId] : null,
           meta.callerIp ? ["调用IP", meta.callerIp] : null,
           meta.calledAt ? ["调用时间", formatDateTime(meta.calledAt)] : null,
@@ -3737,7 +3816,7 @@
             dataIndex: "prompt",
             render: (_, row) => h("div", null, [
               h("div", { className: "primary-text" }, row.prompt || "-"),
-              taskMetaLine(row),
+              taskMetaLine(row, config),
               row.status === "interrupted"
                 ? h("div", { className: "task-response" }, row.responseJson?.message || "服务重启时任务被中断，结果无法确认；此任务不计失败。")
                 : null,
