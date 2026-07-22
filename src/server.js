@@ -14,6 +14,7 @@ import {
   createChatCompletion,
   createImageTask,
   getRuntimeStatus,
+  inspectUpstreamTask,
   queueChatCompletion,
   queueImageTask,
   recoverUnavailableChatAccounts,
@@ -981,6 +982,17 @@ app.get("/api/tasks/page", async (request) => ({
 
 app.get("/api/tasks/:id", async (request) => {
   return { ok: true, data: await getTask(request.params.id) };
+});
+
+app.get("/api/tasks/:id/upstream", async (request, reply) => {
+  try {
+    return { ok: true, data: await inspectUpstreamTask(request.params.id) };
+  } catch (error) {
+    reply.code(Number(error.status || error.statusCode || 500)).send({
+      ok: false,
+      message: error.message || "读取上游会话详情失败。"
+    });
+  }
 });
 
 app.post("/api/tasks/:id/refresh", async (request, reply) => {

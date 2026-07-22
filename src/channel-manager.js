@@ -667,6 +667,78 @@ function taskExternalId(task) {
   return savedTaskExternalId(task) || task.id;
 }
 
+function taskConversationId(task) {
+  return task.raw?.conversationId
+    || task.raw?.conversation_id
+    || task.responseJson?.conversationId
+    || task.responseJson?.conversation_id
+    || task.externalId
+    || "";
+}
+
+function upstreamConversationUrl(channel, conversationId) {
+  const baseUrl = String(channel?.settings?.baseUrl || "https://www.chatplus.cc").trim().replace(/\/+$/, "");
+  return baseUrl && conversationId ? `${baseUrl}/c/${encodeURIComponent(conversationId)}` : "";
+}
+
+function upstreamDetailTitle(raw = {}) {
+  return String(raw.title || raw.conversation?.title || raw.mapping?.title || "").trim();
+}
+
+export async function inspectUpstreamTask(taskId) {
+  const task = await getTask(taskId);
+  if (!task) throw new Error("任务不存在。");
+
+  const config = await loadRuntimeConfig();
+  const { channel, account } = inferRefreshTarget(config, task);
+  if (channel.type !== "chatplus") {
+    const error = new Error("这个任务不是聊天生图，不能读取上游聊天详情。");
+    error.status = 400;
+    throw error;
+  }
+
+  const externalId = taskConversationId(task) || taskExternalId(task);
+  if (!externalId || (task.raw?.queued && String(externalId).startsWith("task-"))) {
+    const error = new Error("这个任务还没有保存上游对话编号。");
+    error.status = 400;
+    throw error;
+  }
+
+  const client = getWorkClient(config, channel, account);
+  if (typeof client.getTask !== "function") {
+    const error = new Error("当前上游不支持读取会话详情。");
+    error.status = 400;
+    throw error;
+  }
+
+  const result = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
+    carId: task.raw?.selectedCarId,
+    carType: task.raw?.selectedCarType
+  }));
+  const raw = result.raw || {};
+  const conversationId = String(raw.conversationId || raw.conversation_id || externalId).trim();
+
+  return {
+    taskId: task.id,
+    sourceTaskId: task.sourceTaskId || task.requestMeta?.sourceTaskId || "",
+    externalId,
+    conversationId,
+    conversationUrl: upstreamConversationUrl(channel, conversationId),
+    title: upstreamDetailTitle(raw) || upstreamDetailTitle(task.raw || {}),
+    status: result.status || task.status || "",
+    imageCount: Number(result.imageCount || 0),
+    imageUrls: result.imageUrls || [],
+    errorMessage: result.errorMessage || task.errorMessage || task.responseJson?.message || "",
+    channelId: channel.id,
+    channelName: channel.name,
+    accountId: account.id,
+    accountName: account.name,
+    carId: String(task.raw?.selectedCarId || raw.selectedCarId || "").trim(),
+    carType: String(task.raw?.selectedCarType || raw.selectedCarType || "").trim(),
+    raw
+  };
+}
+
 function resultUpstreamText(result = {}) {
   const text = String(result.upstreamText || drawingUpstreamText(result.raw) || "");
   return text.trim() ? text : "";

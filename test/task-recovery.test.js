@@ -8,7 +8,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-recovery-"));
 process.env.DATA_DIR = dataDir;
 
 const { getTask, listTasks, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
-const { createImageTask, queueImageTask, refreshProcessingTasks, refreshTask } = await import("../src/channel-manager.js");
+const { createImageTask, inspectUpstreamTask, queueImageTask, refreshProcessingTasks, refreshTask } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
@@ -735,6 +735,104 @@ test("停用账号的等待上游旧任务不会继续登录刷新", async () =>
     assert.match(stored.responseJson.message, /账号已停用/);
   } finally {
     ChatplusClient.prototype.getTask = originalGetTask;
+  }
+});
+
+test("后台可以用服务器账号读取上游聊天详情", async () => {
+  const config = await loadConfig();
+  const originalConfig = JSON.parse(JSON.stringify(config));
+  const shareAIChannel = {
+    id: "shareai",
+    name: "ShareAI账号",
+    type: "shareai",
+    enabled: true,
+    priority: 1,
+    settings: {
+      ...(config.channels.find((item) => item.id === "shareai")?.settings || {}),
+      chatBaseUrl: "https://one.aishare.icu",
+      drawingBaseUrl: "https://drawing.aishare.icu"
+    }
+  };
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    channels: [
+      shareAIChannel,
+      ...config.channels.filter((item) => item.id !== "shareai")
+    ],
+    accounts: [
+      ...config.accounts.filter((item) => item.id !== "account-upstream-detail"),
+      {
+        id: "account-upstream-detail",
+        channelId: "shareai",
+        name: "详情测试账号",
+        username: "upstream-detail@example.com",
+        password: "test",
+        enabled: true,
+        status: "ok"
+      }
+    ]
+  });
+
+  await upsertTask({
+    id: "task-upstream-detail",
+    externalId: "conversation-upstream-detail",
+    status: "failed",
+    taskType: "img2img",
+    prompt: "读取上游详情",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-upstream-detail",
+    accountName: "详情测试账号",
+    errorMessage: "本地失败记录",
+    raw: {
+      conversationId: "conversation-upstream-detail",
+      selectedCarId: "car-upstream-detail",
+      selectedCarType: "chatgpt"
+    },
+    createdAt: new Date().toISOString(),
+    completedAt: new Date().toISOString()
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  let seen = null;
+  ChatplusClient.prototype.getTask = async function getTask(externalId, context) {
+    seen = {
+      externalId,
+      context,
+      accountId: this.account.id,
+      baseUrl: this.baseUrl
+    };
+    return {
+      externalId,
+      status: "failed",
+      imageCount: 0,
+      imageUrls: [],
+      errorMessage: "上游返回了文字说明",
+      raw: {
+        conversationId: externalId,
+        title: "New chat",
+        selectedCarId: "car-upstream-detail"
+      }
+    };
+  };
+
+  try {
+    const detail = await inspectUpstreamTask("task-upstream-detail");
+
+    assert.equal(seen.externalId, "conversation-upstream-detail");
+    assert.equal(seen.context.carId, "car-upstream-detail");
+    assert.equal(seen.accountId, "account-upstream-detail");
+    assert.equal(seen.baseUrl, "https://one.aishare.icu");
+    assert.equal(detail.conversationId, "conversation-upstream-detail");
+    assert.equal(detail.title, "New chat");
+    assert.equal(detail.carId, "car-upstream-detail");
+    assert.equal(detail.errorMessage, "上游返回了文字说明");
+    assert.equal(detail.conversationUrl, "https://one.aishare.icu/c/conversation-upstream-detail");
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    await saveConfig(originalConfig);
   }
 });
 

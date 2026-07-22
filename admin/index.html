@@ -404,6 +404,68 @@
         line-height: 1.2;
       }
 
+      .upstream-detail {
+        display: grid;
+        gap: 14px;
+      }
+
+      .upstream-detail-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .upstream-detail-item {
+        min-width: 0;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel-soft);
+      }
+
+      .upstream-detail-label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .upstream-detail-value {
+        margin-top: 4px;
+        overflow-wrap: anywhere;
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .upstream-detail-block {
+        min-width: 0;
+      }
+
+      .upstream-detail-title {
+        margin-bottom: 6px;
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 760;
+      }
+
+      .upstream-image-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .upstream-image-list .ant-image,
+      .upstream-image {
+        width: 86px;
+        height: 86px;
+      }
+
+      .upstream-image {
+        object-fit: cover;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #f2f4f7;
+      }
+
       .proxy-cell {
         display: flex;
         flex-direction: column;
@@ -1024,6 +1086,7 @@
         .task-summary-grid,
         .productivity-summary,
         .detail-grid,
+        .upstream-detail-grid,
         .form-grid,
         .model-route-grid {
           grid-template-columns: 1fr;
@@ -1466,6 +1529,60 @@
         return panels.length ? h("div", { className: "task-json-grid" }, panels) : null;
       }
 
+      function upstreamDetailContent(detail = {}) {
+        const images = Array.isArray(detail.imageUrls) ? detail.imageUrls.filter(Boolean) : [];
+        const items = [
+          ["状态", statusTag(detail.status || "unknown")],
+          ["账号", detail.accountName],
+          ["渠道", detail.channelName],
+          ["上游标题", detail.title],
+          ["上游对话", detail.conversationId || detail.externalId],
+          ["车位ID", detail.carId],
+          ["任务ID", detail.sourceTaskId || detail.taskId],
+          ["图片数", detail.imageCount ?? images.length],
+          ["车位类型", detail.carType]
+        ].filter(([, value]) => value !== null && value !== undefined && value !== "");
+        return h("div", { className: "upstream-detail" }, [
+          h(Alert, {
+            key: "notice",
+            type: "info",
+            showIcon: true,
+            message: "已通过服务器保存的账号读取上游会话，不依赖当前浏览器登录状态。"
+          }),
+          h("div", { className: "upstream-detail-grid", key: "grid" }, items.map(([label, value]) =>
+            h("div", { className: "upstream-detail-item", key: label }, [
+              h("div", { className: "upstream-detail-label", key: "label" }, label),
+              h("div", { className: "upstream-detail-value", key: "value" }, valueText(value))
+            ])
+          )),
+          detail.conversationUrl ? h("div", { className: "upstream-detail-block", key: "link" }, [
+            h(Button, {
+              type: "link",
+              href: detail.conversationUrl,
+              target: "_blank",
+              rel: "noreferrer",
+              icon: Icon.ExportOutlined ? h(Icon.ExportOutlined) : null
+            }, "用当前浏览器打开上游页面")
+          ]) : null,
+          detail.errorMessage ? h("div", { className: "upstream-detail-block", key: "error" }, [
+            h("div", { className: "upstream-detail-title", key: "title" }, "上游返回内容"),
+            h("pre", { className: "update-output", key: "body" }, detail.errorMessage)
+          ]) : null,
+          images.length ? h("div", { className: "upstream-detail-block", key: "images" }, [
+            h("div", { className: "upstream-detail-title", key: "title" }, "图片结果"),
+            h("div", { className: "upstream-image-list", key: "list" }, images.map((url, index) =>
+              h(Image, {
+                key: `${url}-${index}`,
+                className: "upstream-image",
+                src: url,
+                preview: { src: url }
+              })
+            ))
+          ]) : null,
+          taskJsonPanel("上游原始 JSON", detail.raw)
+        ]);
+      }
+
       function formatDateTime(value) {
         if (value === null || value === undefined || value === "") return "-";
         const date = new Date(value);
@@ -1542,12 +1659,21 @@
         return String(row?.raw?.title || row?.responseJson?.title || "").trim();
       }
 
-      function taskConversationAction(row, config) {
+      function taskConversationAction(row, config, options = {}) {
         const id = taskConversationId(row);
         const url = taskConversationUrl(row, config);
         if (!id) return null;
+        const loading = options.upstreamLoadingTaskId && String(options.upstreamLoadingTaskId) === String(row?.id);
         return h("span", { className: "task-upstream-action" }, [
           h("span", { className: "mono", key: "id" }, id),
+          typeof options.onInspectUpstream === "function" ? h(Button, {
+            key: "detail",
+            type: "link",
+            size: "small",
+            loading,
+            icon: Icon.FileSearchOutlined ? h(Icon.FileSearchOutlined) : null,
+            onClick: () => options.onInspectUpstream(row)
+          }, "详情") : null,
           url ? h(Button, {
             key: "open",
             type: "link",
@@ -1555,15 +1681,16 @@
             href: url,
             target: "_blank",
             rel: "noreferrer",
+            title: "用当前浏览器打开，上游可能提示无权限",
             icon: Icon.ExportOutlined ? h(Icon.ExportOutlined) : null
           }, "打开") : null
         ]);
       }
 
-      function taskMetaLine(row, config) {
+      function taskMetaLine(row, config, options = {}) {
         const meta = row?.requestMeta || {};
         const sourceTaskId = taskSourceId(row);
-        const conversationAction = taskConversationAction(row, config);
+        const conversationAction = taskConversationAction(row, config, options);
         const upstreamTitle = taskUpstreamTitle(row);
         const carId = taskCarId(row);
         const items = [
@@ -2664,6 +2791,7 @@
         const [checkingChannelIds, setCheckingChannelIds] = useState([]);
         const [checkingAll, setCheckingAll] = useState(false);
         const [updating, setUpdating] = useState(false);
+        const [upstreamLoadingTaskId, setUpstreamLoadingTaskId] = useState("");
         const [imageStorageStats, setImageStorageStats] = useState(null);
         const [runtimeStatus, setRuntimeStatus] = useState(null);
         const [imageStorageCleaning, setImageStorageCleaning] = useState(false);
@@ -2970,6 +3098,26 @@
             return data;
           } finally {
             if (showLoading && requestId === taskRequestIdRef.current) setTaskListLoading(false);
+          }
+        }
+
+        async function openTaskUpstreamDetail(row) {
+          if (!row?.id || upstreamLoadingTaskId) return;
+          setUpstreamLoadingTaskId(row.id);
+          try {
+            const detail = await api(`/api/tasks/${encodeURIComponent(row.id)}/upstream`, { timeoutMs: 90000 });
+            Modal.info({
+              title: "上游会话详情",
+              width: 920,
+              okText: "知道了",
+              content: upstreamDetailContent(detail)
+            });
+          } catch (error) {
+            message.error(error?.code === "REQUEST_TIMEOUT"
+              ? "读取上游详情超时，请稍后再试。"
+              : error.message || "读取上游详情失败。");
+          } finally {
+            setUpstreamLoadingTaskId("");
           }
         }
 
@@ -3816,7 +3964,7 @@
             dataIndex: "prompt",
             render: (_, row) => h("div", null, [
               h("div", { className: "primary-text" }, row.prompt || "-"),
-              taskMetaLine(row, config),
+              taskMetaLine(row, config, { onInspectUpstream: openTaskUpstreamDetail, upstreamLoadingTaskId }),
               row.status === "interrupted"
                 ? h("div", { className: "task-response" }, row.responseJson?.message || "服务重启时任务被中断，结果无法确认；此任务不计失败。")
                 : null,
