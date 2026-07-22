@@ -934,9 +934,12 @@ app.get("/api/models", async () => {
 
 app.get("/api/tasks", async () => ({ ok: true, data: await listTasks() }));
 
-app.get("/api/stats", async () => ({ ok: true, data: await listTaskStats() }));
-
-app.get("/api/stats/summary", async () => ({ ok: true, data: await listTaskStatsSummary() }));
+app.get("/api/stats", async (request) => ({
+  ok: true,
+  data: request.query?.summary
+    ? await listTaskStatsSummary()
+    : await listTaskStats()
+}));
 
 app.get("/api/stats/intraday", async (request) => ({
   ok: true,

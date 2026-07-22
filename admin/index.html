@@ -2830,7 +2830,7 @@
         }
 
         async function refreshStatsSummary() {
-          const statsData = await api("/api/stats/summary");
+          const statsData = await api("/api/stats?summary=1");
           setStatRecords(Array.isArray(statsData?.records) ? statsData.records : []);
           setDailyStats(statsData?.daily && Array.isArray(statsData.daily.days) && Array.isArray(statsData.daily.records)
             ? statsData.daily
