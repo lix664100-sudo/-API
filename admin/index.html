@@ -1976,6 +1976,9 @@
         const items = source.filter(predicate);
         return {
           tasks: items.reduce((sum, item) => sum + Math.max(0, numberValue(item.tasks || 1)), 0),
+          successTasks: items.reduce((sum, item) => (
+            sum + (item.status === "success" ? Math.max(0, numberValue(item.tasks || 1)) : 0)
+          ), 0),
           successImages: items.reduce((sum, item) => sum + (item.status === "success" ? taskGeneratedImageCount(item) : 0), 0),
           failedTasks: items.reduce((sum, item) => (
             sum + (item.status === "failed" ? Math.max(0, numberValue(item.failedTasks || item.tasks || 1)) : 0)
@@ -1996,17 +1999,36 @@
       function taskTrendData(daily, rangeDays, accountFilter, channelFilter) {
         const days = Array.isArray(daily?.days) ? daily.days.slice(-rangeDays) : [];
         const visibleDays = new Set(days);
-        const totals = new Map(days.map((day) => [day, { day, successImages: 0, failedTasks: 0 }]));
+        const totals = new Map(days.map((day) => [day, { day, tasks: 0, successTasks: 0, successImages: 0, failedTasks: 0 }]));
         const records = Array.isArray(daily?.records) ? daily.records : [];
         records.forEach((record) => {
           if (!visibleDays.has(record.day)) return;
           if (accountFilter !== "all" && record.accountId !== accountFilter) return;
           if (channelFilter !== "all" && record.channelGroup !== channelFilter) return;
           const current = totals.get(record.day);
+          current.tasks += numberValue(record.tasks);
+          current.successTasks += numberValue(record.successTasks);
           current.successImages += numberValue(record.successImages);
           current.failedTasks += numberValue(record.failedTasks);
         });
         return [...totals.values()];
+      }
+
+      function summarizeTrendRows(rows = []) {
+        return rows.reduce((summary, row) => ({
+          tasks: summary.tasks + numberValue(row.tasks),
+          successTasks: summary.successTasks + numberValue(row.successTasks),
+          successImages: summary.successImages + numberValue(row.successImages),
+          failedTasks: summary.failedTasks + numberValue(row.failedTasks)
+        }), { tasks: 0, successTasks: 0, successImages: 0, failedTasks: 0 });
+      }
+
+      function taskSuccessRateText(stats = {}) {
+        const tasks = numberValue(stats.tasks);
+        if (!tasks) return "0%";
+        const rate = (numberValue(stats.successTasks) / tasks) * 100;
+        const rounded = Math.round(rate * 10) / 10;
+        return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`;
       }
 
       function chartDayLabel(day) {
@@ -2014,7 +2036,7 @@
         return month && date ? `${Number(month)}月${Number(date)}日` : day || "-";
       }
 
-      function TaskTrendChart({ data }) {
+      function TaskTrendChart({ data, onHoverDay }) {
         const containerRef = useRef(null);
         const chartRef = useRef(null);
 
@@ -2039,13 +2061,14 @@
           if (!chart) return;
           chart.setOption({
             animationDuration: 280,
-            color: ["#16a34a", "#dc2626"],
+            color: ["#1677ff", "#16a34a"],
             aria: {
               enabled: true,
-              description: "每日成功图片和失败任务趋势"
+              description: "每日接收任务和成功任务趋势"
             },
             tooltip: {
               trigger: "axis",
+              axisPointer: { type: "line" },
               backgroundColor: "rgba(16, 24, 40, 0.94)",
               borderWidth: 0,
               padding: [10, 12],
@@ -2053,10 +2076,13 @@
               formatter: (items) => {
                 const index = items?.[0]?.dataIndex ?? 0;
                 const row = data[index] || {};
+                if (row.day && onHoverDay) onHoverDay(row.day);
                 return [
                   `<strong>${chartDayLabel(row.day)}</strong>`,
-                  `成功图片：${numberValue(row.successImages)}`,
-                  `失败任务：${numberValue(row.failedTasks)}`
+                  `接收任务：${numberValue(row.tasks)}`,
+                  `成功任务：${numberValue(row.successTasks)}`,
+                  `失败任务：${numberValue(row.failedTasks)}`,
+                  `处理成功率：${taskSuccessRateText(row)}`
                 ].join("<br>");
               }
             },
@@ -2066,7 +2092,7 @@
               itemWidth: 18,
               itemHeight: 8,
               textStyle: { color: "#475467", fontSize: 12 },
-              data: ["成功图片", "失败任务"]
+              data: ["接收任务", "成功任务"]
             },
             grid: {
               top: 48,
@@ -2091,7 +2117,7 @@
             },
             series: [
               {
-                name: "成功图片",
+                name: "接收任务",
                 type: "line",
                 smooth: 0.22,
                 showSymbol: false,
@@ -2099,10 +2125,10 @@
                 lineStyle: { width: 2 },
                 areaStyle: { opacity: 0.06 },
                 emphasis: { focus: "series" },
-                data: data.map((item) => item.successImages)
+                data: data.map((item) => item.tasks)
               },
               {
-                name: "失败任务",
+                name: "成功任务",
                 type: "line",
                 smooth: 0.22,
                 showSymbol: false,
@@ -2110,11 +2136,20 @@
                 lineStyle: { width: 2 },
                 areaStyle: { opacity: 0.04 },
                 emphasis: { focus: "series" },
-                data: data.map((item) => item.failedTasks)
+                data: data.map((item) => item.successTasks)
               }
             ]
           }, true);
-        }, [data]);
+        }, [data, onHoverDay]);
+
+        useEffect(() => {
+          const chart = chartRef.current;
+          const zrender = chart?.getZr?.();
+          if (!zrender || !onHoverDay) return undefined;
+          const clearHover = () => onHoverDay("");
+          zrender.on("globalout", clearHover);
+          return () => zrender.off("globalout", clearHover);
+        }, [onHoverDay]);
 
         if (!window.echarts) {
           return h(Alert, { type: "warning", showIcon: true, message: "趋势图加载失败，请刷新页面重试。" });
@@ -2123,7 +2158,7 @@
           ref: containerRef,
           className: "task-trend-chart",
           role: "img",
-          "aria-label": "每日成功图片和失败任务折线图"
+          "aria-label": "每日接收任务和成功任务折线图"
         });
       }
 
@@ -2812,6 +2847,7 @@
         const [taskSearchLoading, setTaskSearchLoading] = useState(false);
         const taskRequestIdRef = useRef(0);
         const [taskTrendDays, setTaskTrendDays] = useState(30);
+        const [taskTrendHoverDay, setTaskTrendHoverDay] = useState("");
         const [productivityDay, setProductivityDay] = useState(dateKeyInShanghai(Date.now()));
         const [productivityTrendDays, setProductivityTrendDays] = useState(7);
         const [channelModalOpen, setChannelModalOpen] = useState(false);
@@ -3012,7 +3048,13 @@
         const trendData = useMemo(() => (
           taskTrendData(dailyStats, taskTrendDays, taskAccountFilter, taskChannelFilter)
         ), [dailyStats, taskTrendDays, taskAccountFilter, taskChannelFilter]);
-        const trendHasData = trendData.some((item) => item.successImages > 0 || item.failedTasks > 0);
+        const trendHasData = trendData.some((item) => item.tasks > 0 || item.successTasks > 0 || item.failedTasks > 0);
+        const taskRangeStats = useMemo(() => summarizeTrendRows(trendData), [trendData]);
+        const taskHoveredStats = useMemo(() => (
+          trendData.find((item) => item.day === taskTrendHoverDay) || null
+        ), [trendData, taskTrendHoverDay]);
+        const taskRangeTitle = taskHoveredStats ? chartDayLabel(taskHoveredStats.day) : `近${taskTrendDays}天`;
+        const taskRangeDisplay = taskHoveredStats || taskRangeStats;
         const selectedProductivity = useMemo(() => (
           productivityDayData(dailyStats, accounts, productivityDay)
         ), [dailyStats, accounts, productivityDay]);
@@ -3026,6 +3068,10 @@
         const channelSuccessRateTrend = useMemo(() => (
           channelSuccessRateTrendData(dailyStats, productivityTrendDays)
         ), [dailyStats, productivityTrendDays]);
+
+        useEffect(() => {
+          setTaskTrendHoverDay("");
+        }, [taskTrendDays, taskAccountFilter, taskChannelFilter]);
 
         const accountTodayUsage = useMemo(() => {
           const today = dateKeyInShanghai(Date.now());
@@ -4216,28 +4262,28 @@
                     children: h("div", { className: "operation-body" }, [
                       h("div", { className: "task-summary-grid" }, [
                         h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, "今日处理任务"),
+                          h("div", { className: "task-summary-label" }, "今日接收任务"),
                           h("div", { className: "task-summary-value" }, taskStats.today.tasks)
                         ]),
                         h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, "今日成功图片"),
-                          h("div", { className: "task-summary-value" }, taskStats.today.successImages)
+                          h("div", { className: "task-summary-label" }, "今日成功任务"),
+                          h("div", { className: "task-summary-value" }, taskStats.today.successTasks)
                         ]),
                         h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, "今日失败任务"),
-                          h("div", { className: "task-summary-value" }, taskStats.today.failedTasks)
+                          h("div", { className: "task-summary-label" }, "今日处理成功率"),
+                          h("div", { className: "task-summary-value" }, taskSuccessRateText(taskStats.today))
                         ]),
                         h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, "7天任务记录"),
-                          h("div", { className: "task-summary-value" }, taskStats.week.tasks)
+                          h("div", { className: "task-summary-label" }, `${taskRangeTitle}接收任务`),
+                          h("div", { className: "task-summary-value" }, taskRangeDisplay.tasks)
                         ]),
                         h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, "7天成功图片"),
-                          h("div", { className: "task-summary-value" }, taskStats.week.successImages)
+                          h("div", { className: "task-summary-label" }, `${taskRangeTitle}成功任务`),
+                          h("div", { className: "task-summary-value" }, taskRangeDisplay.successTasks)
                         ]),
                         h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, "7天失败任务"),
-                          h("div", { className: "task-summary-value" }, taskStats.week.failedTasks)
+                          h("div", { className: "task-summary-label" }, `${taskRangeTitle}处理成功率`),
+                          h("div", { className: "task-summary-value" }, taskSuccessRateText(taskRangeDisplay))
                         ])
                       ]),
                       h("div", { className: "task-filters" }, [
@@ -4277,7 +4323,7 @@
                         h("div", { className: "task-trend-header" }, [
                           h("div", null, [
                             h("h3", { className: "task-trend-title" }, "每日生图结果"),
-                            h("div", { className: "task-trend-desc" }, "按任务完成日期统计；账号和通道筛选会同步更新")
+                            h("div", { className: "task-trend-desc" }, "按任务完成日期统计接收任务、成功任务和处理成功率")
                           ]),
                           h(Segmented, {
                             value: taskTrendDays,
@@ -4290,7 +4336,7 @@
                           })
                         ]),
                         trendHasData
-                          ? h(TaskTrendChart, { data: trendData })
+                          ? h(TaskTrendChart, { data: trendData, onHoverDay: setTaskTrendHoverDay })
                           : h("div", { className: "task-trend-empty" }, h(Empty, {
                               image: Empty.PRESENTED_IMAGE_SIMPLE,
                               description: "所选范围暂无已完成的生图任务"
