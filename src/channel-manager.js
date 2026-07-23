@@ -1378,10 +1378,10 @@ async function recoverTarget(config, target) {
 
 export async function recoverUnavailableChatAccounts() {
   const config = await loadRuntimeConfig();
-  const targets = selectTargets(config, "auto", "chat", { includeCooling: true });
+  const targets = selectTargets(config, "auto", "img2img", { includeCooling: true });
   const recoveryTargets = [...new Map(
     targets
-      .filter((target) => target.channel.type === "chatplus" && targetNeedsRecovery(target))
+      .filter(targetNeedsRecovery)
       .map((target) => [targetRecoveryKey(target), target])
   ).values()];
 
@@ -1426,7 +1426,6 @@ export async function reserveImageTaskAdmission(input = {}) {
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
     accountId: requestedAccountId,
-    skipRecovery: true,
     skipKnownQuotaEmpty: true
   });
   if (!targets.length) {

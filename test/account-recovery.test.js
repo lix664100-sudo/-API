@@ -1078,3 +1078,61 @@ test("绘图站提示上传过于频繁时按上游时间立即冷却", async ()
     DrawingClient.prototype.uploadImage = originalUploadImage;
   }
 });
+
+test("background recovery refreshes expired drawing quota", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-background-drawing-recovery",
+      channelId: "shareai",
+      name: "Background Drawing Recovery",
+      username: "background-drawing@example.com",
+      password: "test",
+      enabled: true,
+      status: "quota_empty",
+      meta: {
+        abilities: {
+          drawing: {
+            status: "quota_empty",
+            quota: 50,
+            balance: 0,
+            quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+            message: "drawing quota empty"
+          },
+          chatplus: { status: "quota_empty", message: "chat image quota empty" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  let checkCount = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 50,
+      balance: 50,
+      quotaResetAt: new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString(),
+      message: "drawing ok"
+    };
+  };
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const account = stored.accounts.find((item) => item.id === "account-background-drawing-recovery");
+
+    assert.equal(checkCount, 1);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].channelId, "shareai:drawing");
+    assert.equal(results[0].recovered, true);
+    assert.equal(account.status, "ok");
+    assert.equal(account.meta.abilities.drawing.status, "ok");
+    assert.equal(account.meta.abilities.drawing.balance, 50);
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+  }
+});

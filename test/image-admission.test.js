@@ -9,6 +9,8 @@ process.env.DATA_DIR = dataDir;
 
 const { loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
 const { assertImageTaskAdmission, reserveImageTaskAdmission } = await import("../src/channel-manager.js");
+const { ChatplusClient } = await import("../src/channels/chatplus.js");
+const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
   await rm(dataDir, { recursive: true, force: true });
@@ -244,6 +246,150 @@ test("image admission skips known empty drawing quota before upload", async () =
       return true;
     }
   );
+});
+
+test("image admission refreshes expired drawing quota before upload", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "drawing",
+    concurrency: { chat: 3, drawingImage: 1, chatImage: 1 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        defaultModelId: 1
+      }
+    }],
+    accounts: [{
+      id: "expired-drawing-admission",
+      channelId: "shareai",
+      name: "Expired Drawing Admission",
+      username: "expired-drawing-admission@example.test",
+      password: "test",
+      enabled: true,
+      status: "quota_empty",
+      meta: {
+        abilities: {
+          drawing: {
+            status: "quota_empty",
+            quota: 50,
+            balance: 0,
+            quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+            message: "drawing quota empty"
+          },
+          chatplus: { status: "quota_empty", message: "chat image quota empty" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  let checkCount = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 50,
+      balance: 50,
+      quotaResetAt: new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString(),
+      message: "drawing ok"
+    };
+  };
+
+  try {
+    const admitted = await reserveImageTaskAdmission({ channel: "drawing", prompt: "recover drawing quota" });
+    admitted.release();
+
+    const stored = await loadConfig();
+    const drawing = stored.accounts[0].meta.abilities.drawing;
+    assert.equal(checkCount, 1);
+    assert.equal(admitted.target.channel.type, "drawing");
+    assert.equal(drawing.status, "ok");
+    assert.equal(drawing.balance, 50);
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+  }
+});
+
+test("image admission refreshes expired chat image quota before upload", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "chatplus",
+    concurrency: { chat: 3, drawingImage: 1, chatImage: 1 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        defaultModelId: 1
+      }
+    }],
+    accounts: [{
+      id: "expired-chat-admission",
+      channelId: "shareai",
+      name: "Expired Chat Admission",
+      username: "expired-chat-admission@example.test",
+      password: "test",
+      enabled: true,
+      status: "quota_empty",
+      cooldownUntil: new Date(Date.now() - 1000).toISOString(),
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", message: "drawing quota empty" },
+          chatplus: {
+            status: "quota_empty",
+            quota: 220,
+            used: 220,
+            balance: 0,
+            quotaReason: "chat_usage_limit",
+            quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+            cooldownUntil: new Date(Date.now() - 1000).toISOString(),
+            message: "chat usage empty"
+          }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 220,
+      used: 0,
+      balance: 220,
+      quotaResetAt: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString(),
+      cooldownUntil: null,
+      quotaReason: "",
+      message: "chat ok",
+      meta: { chatUsage: { quota: 220, used: 0, balance: 220, period: "12h" } }
+    };
+  };
+
+  try {
+    const admitted = await reserveImageTaskAdmission({ channel: "chatplus", prompt: "recover chat quota" });
+    admitted.release();
+
+    const stored = await loadConfig();
+    const chatplus = stored.accounts[0].meta.abilities.chatplus;
+    assert.equal(checkCount, 1);
+    assert.equal(admitted.target.channel.type, "chatplus");
+    assert.equal(chatplus.status, "ok");
+    assert.equal(chatplus.balance, 220);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
 });
 
 test("image admission reports exhausted chat usage with its reset time", async () => {
