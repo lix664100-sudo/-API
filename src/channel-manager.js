@@ -147,10 +147,11 @@ function taskConcurrencyTotal(value = {}) {
 function targetRuntimeAvailable(target, taskType) {
   if (!target?.channel || !target?.account) return false;
   if (target.channel.enabled === false || target.account.enabled === false) return false;
-  if (taskType === "chat" && accountCooling(target.account)) return false;
+  const cachedChatUsageLimit = targetCachedChatUsageLimit(target);
+  if (taskType === "chat" && accountCooling(target.account) && !cachedChatUsageLimit) return false;
   const status = targetQuotaStatus(target);
-  if (statusCooling(status)) return false;
-  return status.status === "ok" || status.status === "cooldown";
+  if (statusCooling(status) && !cachedChatUsageLimit) return false;
+  return cachedChatUsageLimit || status.status === "ok" || status.status === "cooldown";
 }
 
 function runtimeTargetAccountCount(config, taskType, channelType, availableOnly = false) {
@@ -844,19 +845,18 @@ async function consumeChatUsage(account, channel) {
 
     const nextBalance = Math.max(0, balance - 1);
     const nextUsed = Math.min(quota, usageNumber(current.used) === null ? quota - nextBalance : Number(current.used) + 1);
-    const exhausted = nextBalance <= 0;
     const quotaResetAt = current.quotaResetAt || "";
     await updateTargetAccountStatus(account.id, channel, {
-      status: exhausted ? "quota_empty" : "ok",
+      status: "ok",
       quota,
       balance: nextBalance,
       used: nextUsed,
       quotaResetAt,
-      cooldownUntil: exhausted ? quotaResetAt || null : null,
-      quotaReason: exhausted ? "chat_usage_limit" : "",
+      cooldownUntil: null,
+      quotaReason: "",
       period: current.period || current.meta?.chatUsage?.period || "",
-      message: exhausted
-        ? (quotaResetAt ? `聊天使用次数已用完，等待 ${quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : "聊天使用次数已用完，等待刷新")
+      message: nextBalance <= 0
+        ? "本地记录剩余次数为 0，下次任务会重新校验上游额度。"
         : "聊天账号可用",
       meta: {
         ...(current.meta || {}),
@@ -1310,12 +1310,15 @@ function targetAccountUsageEmpty(target) {
   return statusAccountUsageEmpty(targetQuotaStatus(target));
 }
 
+function targetCachedChatUsageLimit(target) {
+  return target?.channel?.type === "chatplus" && targetAccountUsageEmpty(target);
+}
+
 function admissionTargets(targets, taskType, options = {}) {
   const skipKnownQuotaEmpty = options.skipKnownQuotaEmpty === true;
   return targets.filter((target) => !(
     targetKnownUnavailable(target)
-      || targetAccountUsageEmpty(target)
-      || (skipKnownQuotaEmpty && taskType !== "chat" && targetQuotaEmpty(target))
+      || (skipKnownQuotaEmpty && taskType !== "chat" && targetQuotaEmpty(target) && !targetCachedChatUsageLimit(target))
   ));
 }
 
@@ -1402,10 +1405,12 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
     includeCooling: true
   });
   const ready = admissionTargets(targets, taskType, options).filter((target) => !(
-    targetAbilityCooling(target)
-      || (target.channel.type === "chatplus" && accountCooling(target.account))
+    (targetAbilityCooling(target) && !targetCachedChatUsageLimit(target))
+      || (target.channel.type === "chatplus" && accountCooling(target.account) && !targetCachedChatUsageLimit(target))
   ));
-  const recoveryTargets = options.skipRecovery ? [] : targets.filter(targetNeedsRecovery);
+  const recoveryTargets = options.skipRecovery
+    ? []
+    : targets.filter((target) => targetNeedsRecovery(target) && !ready.some((item) => sameTarget(item, target)));
   if (!recoveryTargets.length) return ready;
 
   const recoveries = recoveryTargets.map((target) => recoverTarget(config, target));
@@ -1435,7 +1440,13 @@ export async function reserveImageTaskAdmission(input = {}) {
       accountId: requestedAccountId
     });
   }
-  return reserveFirstAvailableTarget(targets, "img2img");
+  return reserveFirstAvailableTarget(targets, "img2img", {
+    confirmBeforeReserve: (target, attempts) => (
+      targetCachedChatUsageLimit(target)
+        ? refreshQuotaBeforeUseFast(config, target, attempts)
+        : true
+    )
+  });
 }
 
 export async function assertImageTaskAdmission(input = {}) {
@@ -1480,6 +1491,7 @@ function noUsableTargetError(taskType, options = {}) {
 }
 
 function shouldRefreshQuotaBeforeUse(target, taskType) {
+  if (targetCachedChatUsageLimit(target)) return true;
   if (targetUsageRefreshDue(target)) return true;
   if (taskType === "chat") return false;
   return target.channel.type === "drawing" || targetQuotaStatus(target).status === "quota_empty";
@@ -1633,13 +1645,17 @@ async function ensureTargetReady(config, target, taskType, attempts, options = {
   return refreshQuotaBeforeUse(config, target, attempts);
 }
 
-async function reserveFirstAvailableTarget(targets, taskType) {
+async function reserveFirstAvailableTarget(targets, taskType, options = {}) {
   const attempts = [];
   for (const target of targets) {
+    if (options.confirmBeforeReserve && !(await options.confirmBeforeReserve(target, attempts))) continue;
     const slot = targetTaskSlot(target, taskType);
     const release = await tryReserveTaskSlot(slot, target);
     if (release) return { target, release, attempts };
     attempts.push(targetBusyAttempt(target, taskType));
+  }
+  if (attempts.length && attempts.every((attempt) => attempt.quotaEmpty)) {
+    throw targetsFailedError(attempts);
   }
   const details = attemptErrorMessage(attempts);
   const error = new Error(details ? `并发上限：${details}` : "并发上限");
@@ -1682,7 +1698,7 @@ function targetsFailedError(attempts) {
   const quotaExhausted = attempts.length > 0 && attempts.every((item) => item.quotaEmpty);
   const chatUsageExhausted = quotaExhausted && attempts.every((item) => (
     /chatplus|聊天生图/.test(`${item.channelId || ""} ${item.channelName || ""}`)
-      && /聊天(?:使用次数|额度).{0,24}(?:用完|耗尽|上限)|使用次数已达上限/.test(String(item.message || ""))
+      && /聊天(?:使用次数|额度).{0,24}(?:用完|耗尽|上限)|使用次数已达上限|usage count has reached the limit|usage.*limit/i.test(String(item.message || ""))
   ));
   const details = attemptErrorMessage(attempts);
   let message = `所有渠道都失败：${details}`;

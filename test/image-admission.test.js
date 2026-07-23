@@ -392,7 +392,7 @@ test("image admission refreshes expired chat image quota before upload", async (
   }
 });
 
-test("image admission reports exhausted chat usage with its reset time", async () => {
+test("image admission refreshes cached chat usage limit before upload", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -433,19 +433,40 @@ test("image admission reports exhausted chat usage with its reset time", async (
     }]
   });
 
-  await assert.rejects(
-    reserveImageTaskAdmission({
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 220,
+      used: 190,
+      balance: 30,
+      quotaResetAt: "",
+      cooldownUntil: null,
+      quotaReason: "",
+      message: "chat ok",
+      meta: { chatUsage: { quota: 220, used: 190, balance: 30, period: "3h" } }
+    };
+  };
+
+  try {
+    const admitted = await reserveImageTaskAdmission({
       channel: "chatplus",
       accountId: "chat-usage-empty",
       prompt: "quota test"
-    }),
-    (error) => {
-      assert.equal(error.status, 429);
-      assert.equal(error.code, "CHAT_USAGE_LIMIT");
-      assert.equal(error.quotaEmpty, true);
-      assert.equal(error.quotaResetAt, "2099-01-02T03:04:05+08:00");
-      assert.equal(error.message, "聊天额度已用完，请等待 2099-01-02 03:04:05 刷新后再试。");
-      return true;
-    }
-  );
+    });
+    admitted.release();
+
+    const stored = await loadConfig();
+    const chatplus = stored.accounts[0].meta.abilities.chatplus;
+    assert.equal(checkCount, 1);
+    assert.equal(admitted.target.channel.type, "chatplus");
+    assert.equal(chatplus.status, "ok");
+    assert.equal(chatplus.used, 190);
+    assert.equal(chatplus.balance, 30);
+    assert.equal(chatplus.quotaReason, "");
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
 });
