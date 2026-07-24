@@ -1738,7 +1738,10 @@
         if (channel?.type === "shareai") {
           const drawing = abilityStatus(account, "drawing");
           const chatplus = abilityStatus(account, "chatplus");
-          return `绘图 ${quotaPairText(drawing.quota ?? account.quota, drawing.balance ?? account.balance ?? account.quota)}｜聊天 ${quotaPairText(chatplus.quota, chatplus.balance)}`;
+          const parts = [];
+          if (channelAbilityEnabled(channel, "drawing")) parts.push(`绘图 ${quotaPairText(drawing.quota ?? account.quota, drawing.balance ?? account.balance ?? account.quota)}`);
+          if (channelAbilityEnabled(channel, "chatplus")) parts.push(`聊天 ${quotaPairText(chatplus.quota, chatplus.balance)}`);
+          return parts.join("｜") || "-";
         }
         const balance = numberValue(account.balance ?? account.quota);
         const quota = numberValue(account.quota);
@@ -1751,8 +1754,8 @@
           const drawing = abilityStatus(account, "drawing");
           const chatplus = abilityStatus(account, "chatplus");
           const parts = [
-            drawing.quotaResetAt ? `绘图 ${formatDateTime(drawing.quotaResetAt)}` : "",
-            chatplus.quotaResetAt ? `聊天 ${formatDateTime(chatplus.quotaResetAt)}` : ""
+            channelAbilityEnabled(channel, "drawing") && drawing.quotaResetAt ? `绘图 ${formatDateTime(drawing.quotaResetAt)}` : "",
+            channelAbilityEnabled(channel, "chatplus") && chatplus.quotaResetAt ? `聊天 ${formatDateTime(chatplus.quotaResetAt)}` : ""
           ].filter(Boolean);
           return parts.length ? parts.join("｜") : "-";
         }
@@ -1763,14 +1766,33 @@
         if (channel?.type === "shareai") {
           const drawing = abilityStatus(account, "drawing");
           const chatplus = abilityStatus(account, "chatplus");
-          return formatDateTime(drawing.expireAt || chatplus.expireAt || account.expireAt);
+          const expireAt = channelAbilityEnabled(channel, "drawing") ? drawing.expireAt : "";
+          const chatExpireAt = channelAbilityEnabled(channel, "chatplus") ? chatplus.expireAt : "";
+          return formatDateTime(expireAt || chatExpireAt || account.expireAt);
         }
         return formatDateTime(account.expireAt);
       }
 
+      function channelAbilityEnabled(channel, ability) {
+        const enabled = channel?.settings?.enabledAbilities;
+        if (!enabled || typeof enabled !== "object") return true;
+        return enabled[ability] !== false;
+      }
+
+      function shareAIAbilityDefaults(settings = {}) {
+        const enabled = settings.enabledAbilities || {};
+        return {
+          drawing: enabled.drawing !== false,
+          chatplus: enabled.chatplus !== false
+        };
+      }
+
       function channelQuotaText(channel, stats = {}) {
         if (channel?.type === "shareai") {
-          return `绘图 ${quotaPairText(stats.drawingQuota, stats.drawingBalance)}｜聊天 ${quotaPairText(stats.chatQuota, stats.chatBalance)}`;
+          const parts = [];
+          if (channelAbilityEnabled(channel, "drawing")) parts.push(`绘图 ${quotaPairText(stats.drawingQuota, stats.drawingBalance)}`);
+          if (channelAbilityEnabled(channel, "chatplus")) parts.push(`聊天 ${quotaPairText(stats.chatQuota, stats.chatBalance)}`);
+          return parts.join("｜") || "-";
         }
         if (channel?.type === "chatplus") return quotaPairText(stats.quota, stats.balance);
         return `${numberValue(stats.quota)}/${numberValue(stats.balance)}`;
@@ -1783,7 +1805,10 @@
       function channelBaseUrl(channel) {
         if (channel?.type === "shareai") {
           const settings = channel.settings || {};
-          return `绘图 ${settings.drawingBaseUrl || "-"} / 聊天 ${settings.chatBaseUrl || "-"}`;
+          const parts = [];
+          if (channelAbilityEnabled(channel, "drawing")) parts.push(`绘图 ${settings.drawingBaseUrl || "-"}`);
+          if (channelAbilityEnabled(channel, "chatplus")) parts.push(`聊天 ${settings.chatBaseUrl || "-"}`);
+          return parts.join(" / ") || "-";
         }
         return channel?.settings?.baseUrl || "-";
       }
@@ -1801,7 +1826,8 @@
         if (channel?.type === "shareai") {
           const drawing = abilityStatus(account, "drawing");
           const chatplus = abilityStatus(account, "chatplus");
-          return numberValue(drawing.balance ?? account.balance ?? account.quota) + numberValue(chatplus.balance);
+          return (channelAbilityEnabled(channel, "drawing") ? numberValue(drawing.balance ?? account.balance ?? account.quota) : 0)
+            + (channelAbilityEnabled(channel, "chatplus") ? numberValue(chatplus.balance) : 0);
         }
         return numberValue(account.balance ?? account.quota);
       }
@@ -2693,25 +2719,45 @@
       function getChannelStatus(channel, relatedAccounts) {
         if (channel.enabled === false) return "disabled";
         if (!relatedAccounts.length) return "empty";
-        if (relatedAccounts.some((item) => item.enabled !== false && item.status === "disconnected")) return "disconnected";
-        if (relatedAccounts.some((item) => item.enabled !== false && item.status === "ok")) return "ok";
-        if (relatedAccounts.every((item) => item.status === "error" || item.status === "failed")) return "error";
-        if (relatedAccounts.some((item) => item.enabled !== false && item.status === "quota_empty")) return "quota_empty";
+        const statuses = relatedAccounts
+          .filter((item) => item.enabled !== false)
+          .map((item) => accountEffectiveStatus(item, channel));
+        if (statuses.some((status) => status === "disconnected")) return "disconnected";
+        if (statuses.some((status) => status === "error" || status === "failed")) return "error";
+        if (statuses.some((status) => status === "ok")) return "ok";
+        if (statuses.some((status) => status === "quota_empty")) return "quota_empty";
         return "unknown";
+      }
+
+      function accountEffectiveStatus(account, channel) {
+        if (account.enabled === false) return "disabled";
+        if (channel?.type !== "shareai") return account.status || "unknown";
+        const statuses = [
+          channelAbilityEnabled(channel, "drawing") ? abilityStatus(account, "drawing").status : "",
+          channelAbilityEnabled(channel, "chatplus") ? abilityStatus(account, "chatplus").status : ""
+        ].filter(Boolean);
+        if (!statuses.length) return account.status || "unknown";
+        if (statuses.includes("disconnected")) return "disconnected";
+        if (statuses.some((status) => status === "error" || status === "failed")) return "error";
+        if (statuses.includes("ok")) return "ok";
+        if (statuses.includes("quota_empty")) return "quota_empty";
+        return account.status || "unknown";
       }
 
       function getChannelStats(channel, accounts) {
         const related = accounts.filter((item) => item.channelId === channel.id);
         const enabled = related.filter((item) => item.enabled !== false);
         if (channel?.type === "shareai") {
-          const drawingQuota = related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "drawing").quota ?? item.quota), 0);
-          const drawingBalance = related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "drawing").balance ?? item.balance ?? item.quota), 0);
-          const chatQuota = related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "chatplus").quota), 0);
-          const chatBalance = related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "chatplus").balance), 0);
+          const drawingEnabled = channelAbilityEnabled(channel, "drawing");
+          const chatEnabled = channelAbilityEnabled(channel, "chatplus");
+          const drawingQuota = drawingEnabled ? related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "drawing").quota ?? item.quota), 0) : 0;
+          const drawingBalance = drawingEnabled ? related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "drawing").balance ?? item.balance ?? item.quota), 0) : 0;
+          const chatQuota = chatEnabled ? related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "chatplus").quota), 0) : 0;
+          const chatBalance = chatEnabled ? related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "chatplus").balance), 0) : 0;
           return {
             accountCount: related.length,
             enabledCount: enabled.length,
-            okCount: related.filter((item) => item.status === "ok").length,
+            okCount: related.filter((item) => accountEffectiveStatus(item, channel) === "ok").length,
             quota: drawingQuota,
             balance: drawingBalance + chatBalance,
             drawingQuota,
@@ -2861,6 +2907,9 @@
         const [accountForm] = Form.useForm();
         const [globalForm] = Form.useForm();
         const editingChannelType = Form.useWatch("type", channelForm);
+        const editingChannelAbilities = Form.useWatch(["settings", "enabledAbilities"], channelForm) || {};
+        const editingChannelDrawingEnabled = editingChannelAbilities.drawing !== false;
+        const editingChannelChatEnabled = editingChannelAbilities.chatplus !== false;
         const selectedChatAccountValue = Form.useWatch("accountId", chatForm);
         const selectedEditAccountValue = Form.useWatch("accountId", editForm);
 
@@ -3408,10 +3457,12 @@
           channelForm.resetFields();
           const chatModels = chatModelsForChannel(channel);
           const defaultChatModel = chatModels.find((item) => item.default)?.key || "gpt";
+          const enabledAbilities = shareAIAbilityDefaults(channel?.settings || {});
           channelForm.setFieldsValue(channel ? {
             ...channel,
             settings: {
               ...(channel.settings || {}),
+              enabledAbilities,
               defaultChatModel,
               chatModels
             }
@@ -3423,6 +3474,7 @@
             settings: {
               drawingBaseUrl: config?.drawingBaseUrl || "https://drawing.aishare.icu",
               chatBaseUrl: "https://www.chatplus.cc",
+              enabledAbilities: { drawing: true, chatplus: true },
               defaultModelId: config?.defaultModelId || 1,
               defaultChatModel: "gpt",
               chatModels: chatModelDefaults
@@ -3431,12 +3483,45 @@
           setChannelModalOpen(true);
         }
 
+        function normalizeChannelFormValues(values = {}) {
+          const payload = {
+            ...values,
+            settings: {
+              ...(values.settings || {})
+            }
+          };
+          if (payload.type !== "shareai") return payload;
+
+          const enabledAbilities = shareAIAbilityDefaults(payload.settings);
+          payload.settings.enabledAbilities = enabledAbilities;
+          const drawingBaseUrl = String(payload.settings.drawingBaseUrl || "").trim();
+          const chatBaseUrl = String(payload.settings.chatBaseUrl || "").trim();
+
+          if (!enabledAbilities.drawing && !enabledAbilities.chatplus) {
+            message.error("请至少启用绘图站或聊天站");
+            return null;
+          }
+          if (enabledAbilities.drawing && !drawingBaseUrl) {
+            message.error("启用绘图站时需要填写绘图站地址");
+            return null;
+          }
+          if (enabledAbilities.chatplus && !chatBaseUrl) {
+            message.error("启用聊天站时需要填写聊天站地址");
+            return null;
+          }
+          payload.settings.drawingBaseUrl = drawingBaseUrl;
+          payload.settings.chatBaseUrl = chatBaseUrl;
+          return payload;
+        }
+
         async function saveChannel(values) {
+          const payload = normalizeChannelFormValues(values);
+          if (!payload) return;
           setLoading(true);
           try {
             const beforeIds = new Set(channels.map((item) => item.id));
             const path = editingChannel ? `/api/channels/${editingChannel.id}` : "/api/channels";
-            const nextConfig = await api(path, { method: "POST", body: values });
+            const nextConfig = await api(path, { method: "POST", body: payload });
             setConfig(nextConfig);
             const added = nextConfig.channels.find((item) => !beforeIds.has(item.id));
             setSelectedChannelId(editingChannel?.id || added?.id || selectedChannelId);
@@ -3850,15 +3935,17 @@
             dataIndex: "status",
             width: 150,
             render: (_, row) => {
+              const rowChannel = channels.find((item) => item.id === row.channelId);
+              const effectiveStatus = accountEffectiveStatus(row, rowChannel);
               if (row.enabled === false) return statusTag("disabled");
-              if (!drawingAccountIsCooling(row)) return statusTag(row.status);
+              if (!channelAbilityEnabled(rowChannel, "drawing") || !drawingAccountIsCooling(row)) return statusTag(effectiveStatus);
               const drawing = drawingCooldownStatus(row);
               const reason = drawing.cooldownReason === "drawing_rate_limited"
                 ? "绘图站提示上传过于频繁，已按上游要求暂停该账号绘图"
                 : "绘图站上游连续失败 3 次，已暂停该账号绘图";
               const tooltip = `${reason}；${formatDateTime(drawing.cooldownUntil)} 自动恢复。`;
               return h(Space, { direction: "vertical", size: 2, align: "start" }, [
-                h("span", { key: "status" }, statusTag(row.status)),
+                h("span", { key: "status" }, statusTag(effectiveStatus)),
                 h(Tooltip, { key: "cooldown", title: tooltip },
                   h(Tag, { color: "orange" }, `绘图冷却中 · ${drawingCooldownText(row)}`)
                 )
@@ -3896,11 +3983,14 @@
             width: 150,
             render: (_, row) => {
               const usage = accountTodayUsage.get(row.id) || {};
-              return h("div", { className: "account-usage" }, [
-                h("strong", { key: "drawing" }, `绘图站 ${numberValue(usage.drawingImages)} 张`),
-                h("span", { key: "chatImage" }, `聊天生图 ${numberValue(usage.chatImages)} 张`),
-                h("span", { key: "dialogs" }, `对话 ${numberValue(usage.chats)} 次`)
-              ]);
+              const rowChannel = channels.find((item) => item.id === row.channelId);
+              const items = [];
+              if (channelAbilityEnabled(rowChannel, "drawing")) items.push(h("strong", { key: "drawing" }, `绘图站 ${numberValue(usage.drawingImages)} 张`));
+              if (channelAbilityEnabled(rowChannel, "chatplus")) {
+                items.push(h(items.length ? "span" : "strong", { key: "chatImage" }, `聊天生图 ${numberValue(usage.chatImages)} 张`));
+                items.push(h("span", { key: "dialogs" }, `对话 ${numberValue(usage.chats)} 次`));
+              }
+              return h("div", { className: "account-usage" }, items.length ? items : "-");
             }
           },
           {
@@ -4231,7 +4321,7 @@
                           h("div", { className: "detail-stat-value" }, channelQuotaText(selectedChannel, selectedStats))
                         ])
                       ]),
-                      (selectedChannel.type === "chatplus" || selectedChannel.type === "shareai")
+                      (selectedChannel.type === "chatplus" || (selectedChannel.type === "shareai" && channelAbilityEnabled(selectedChannel, "chatplus")))
                         ? h("div", { className: "model-tag-row" }, chatModelsForChannel(selectedChannel).map((item) => h(Tag, { key: item.key, color: item.enabled ? "blue" : "default" }, `${item.name}${item.default ? " / 默认" : ""} / ${chatStrategyOptions.find((option) => option.value === item.strategy)?.label || "智能随机"}`)))
                         : null,
                       h("div", { className: "section-title" }, [
@@ -4691,11 +4781,35 @@
             ]),
             editingChannelType === "shareai"
               ? h("div", { className: "form-grid" }, [
-                  h(Form.Item, { label: "绘图站地址", name: ["settings", "drawingBaseUrl"], rules: [{ required: true, message: "请输入绘图站地址" }] }, h(Input, { placeholder: "https://drawing.aishare.icu" })),
-                  h(Form.Item, { label: "聊天站地址", name: ["settings", "chatBaseUrl"], rules: [{ required: true, message: "请输入聊天站地址" }] }, h(Input, { placeholder: "https://www.chatplus.cc" }))
+                  h(Form.Item, {
+                    label: "启用绘图站",
+                    name: ["settings", "enabledAbilities", "drawing"],
+                    valuePropName: "checked",
+                    initialValue: true
+                  }, h(Switch, { checkedChildren: "启用", unCheckedChildren: "停用" })),
+                  h(Form.Item, {
+                    label: "启用聊天站",
+                    name: ["settings", "enabledAbilities", "chatplus"],
+                    valuePropName: "checked",
+                    initialValue: true
+                  }, h(Switch, { checkedChildren: "启用", unCheckedChildren: "停用" }))
+                ])
+              : null,
+            editingChannelType === "shareai"
+              ? h("div", { className: "form-grid" }, [
+                  h(Form.Item, {
+                    label: "绘图站地址",
+                    name: ["settings", "drawingBaseUrl"],
+                    rules: editingChannelDrawingEnabled ? [{ required: true, message: "请输入绘图站地址" }] : []
+                  }, h(Input, { disabled: !editingChannelDrawingEnabled, placeholder: "https://drawing.aishare.icu" })),
+                  h(Form.Item, {
+                    label: "聊天站地址",
+                    name: ["settings", "chatBaseUrl"],
+                    rules: editingChannelChatEnabled ? [{ required: true, message: "请输入聊天站地址" }] : []
+                  }, h(Input, { disabled: !editingChannelChatEnabled, placeholder: "https://www.chatplus.cc" }))
                 ])
               : h(Form.Item, { label: "网站地址", name: ["settings", "baseUrl"], rules: [{ required: true, message: "请输入网站地址" }] }, h(Input, { placeholder: "https://example.com" })),
-            (editingChannelType === "chatplus" || editingChannelType === "shareai")
+            (editingChannelType === "chatplus" || (editingChannelType === "shareai" && editingChannelChatEnabled))
               ? h("div", { className: "api-doc-section" }, [
                   h(Form.Item, { label: "默认对话模型", name: ["settings", "defaultChatModel"] }, h(Select, { options: chatModelDefaults.map((item) => ({ label: item.name, value: item.key })) })),
                   h("div", { className: "model-route-list" }, chatModelDefaults.map((item, index) => h("div", { className: "model-route-row", key: item.key }, [
@@ -4715,7 +4829,7 @@
                 ])
               : null
             ,
-            (editingChannelType === "drawing" || editingChannelType === "shareai")
+            (editingChannelType === "drawing" || (editingChannelType === "shareai" && editingChannelDrawingEnabled))
               ? h("div", { className: "api-doc-section" }, [
                   h(Form.Item, { label: "默认绘图模型", name: ["settings", "defaultModelId"] }, h(Select, { options: drawingModelOptions }))
                 ])

@@ -236,6 +236,9 @@ function normalizeShareAISettings(channel = {}, legacy = {}) {
     drawing: settings.enabledAbilities?.drawing !== false,
     chatplus: settings.enabledAbilities?.chatplus !== false
   };
+  if (!settings.enabledAbilities.drawing && !settings.enabledAbilities.chatplus) {
+    settings.enabledAbilities.chatplus = true;
+  }
   settings.legacyChannelIds = {
     ...(settings.legacyChannelIds || {}),
     drawing: drawing?.id || settings.legacyChannelIds?.drawing || "drawing",
