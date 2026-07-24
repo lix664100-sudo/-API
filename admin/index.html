@@ -1224,9 +1224,9 @@
       ];
 
       const chatModelDefaults = [
-        { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", enabled: true, default: true },
-        { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", enabled: true, default: false },
-        { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", enabled: true, default: false }
+        { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", carTier: "auto", enabled: true, default: true },
+        { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", carTier: "auto", enabled: true, default: false },
+        { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", carTier: "auto", enabled: true, default: false }
       ];
 
       const chatStrategyOptions = [
@@ -1236,6 +1236,17 @@
         { label: "思考能力优先", value: "thinking" },
         { label: "低负载优先", value: "speed" }
       ];
+
+      const chatCarTierOptions = [
+        { label: "自动（PRO 及以下）", value: "auto" },
+        { label: "PRO 及以下", value: "pro" },
+        { label: "仅 Ultra", value: "ultra" },
+        { label: "不限制", value: "any" }
+      ];
+
+      function optionLabel(options, value, fallback) {
+        return options.find((option) => option.value === value)?.label || fallback;
+      }
 
       const imageStorageModeOptions = [
         { label: "智能转存：临时链接才保存到本服务器", value: "smart" },
@@ -1849,6 +1860,7 @@
             carType: item?.carType || fallback.carType || "",
             model: item?.model || fallback.model || "",
             strategy: item?.strategy || fallback.strategy || "balanced",
+            carTier: item?.carTier || fallback.carTier || "auto",
             enabled: item?.enabled !== false,
             default: key === defaultKey || item?.default === true
           };
@@ -4322,7 +4334,7 @@
                         ])
                       ]),
                       (selectedChannel.type === "chatplus" || (selectedChannel.type === "shareai" && channelAbilityEnabled(selectedChannel, "chatplus")))
-                        ? h("div", { className: "model-tag-row" }, chatModelsForChannel(selectedChannel).map((item) => h(Tag, { key: item.key, color: item.enabled ? "blue" : "default" }, `${item.name}${item.default ? " / 默认" : ""} / ${chatStrategyOptions.find((option) => option.value === item.strategy)?.label || "智能随机"}`)))
+                        ? h("div", { className: "model-tag-row" }, chatModelsForChannel(selectedChannel).map((item) => h(Tag, { key: item.key, color: item.enabled ? "blue" : "default" }, `${item.name}${item.default ? " / 默认" : ""} / ${optionLabel(chatStrategyOptions, item.strategy, "智能随机")} / ${optionLabel(chatCarTierOptions, item.carTier, "自动（PRO 及以下）")}`)))
                         : null,
                       h("div", { className: "section-title" }, [
                         h("h3", null, "渠道账号"),
@@ -4822,6 +4834,7 @@
                     h(Form.Item, { name: ["settings", "chatModels", index, "carType"], hidden: true }, h(Input)),
                     h("div", { className: "model-route-grid" }, [
                       h(Form.Item, { label: "挑车策略", name: ["settings", "chatModels", index, "strategy"] }, h(Select, { options: chatStrategyOptions })),
+                      h(Form.Item, { label: "车位等级", name: ["settings", "chatModels", index, "carTier"] }, h(Select, { options: chatCarTierOptions })),
                       h(Form.Item, { label: "模型代码", name: ["settings", "chatModels", index, "model"] }, h(Input, { placeholder: "不填就用上游默认" })),
                       h(Form.Item, { label: "调用值" }, h(Typography.Text, { code: true }, item.key))
                     ])

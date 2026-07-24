@@ -120,6 +120,11 @@ function isAuthSessionError(error) {
   return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|unauthorized|forbidden/i.test(text);
 }
 
+function isCarPlanMismatchError(error) {
+  const text = `${error?.message || ""} ${error?.body || ""}`.replace(/\s+/g, " ");
+  return /\u4e0d\u662f\s*Ultra\s*\u7528\u6237|\u5347\u7ea7\u540e\u4f7f\u7528\u8be5\u8f66|not.{0,24}ultra|ultra.{0,24}user|(?:upgrade|\u5347\u7ea7).{0,24}(?:car|\u8be5\u8f66|\u8f66\u4f4d|Ultra)/i.test(text);
+}
+
 function fileNameFromMime(mimeType, fallback = "image.png") {
   const ext = {
     "image/png": ".png",
@@ -690,9 +695,9 @@ function requestedChatModel(input = {}) {
 }
 
 const chatModelRoutes = [
-  { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced" },
-  { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced" },
-  { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking" }
+  { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", carTier: "auto" },
+  { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", carTier: "auto" },
+  { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", carTier: "auto" }
 ];
 
 const carListEndpoints = {
@@ -705,6 +710,16 @@ function defaultRouteForKey(key) {
   return chatModelRoutes.find((item) => item.key === key) || chatModelRoutes[0];
 }
 
+function normalizeCarTier(value) {
+  const tier = String(value || "").trim().toLowerCase();
+  return ["auto", "pro", "ultra", "any"].includes(tier) ? tier : "auto";
+}
+
+function effectiveCarTier(route = {}) {
+  const tier = normalizeCarTier(route.carTier);
+  return tier === "auto" ? "pro" : tier;
+}
+
 function normalizeChatModelRoute(route = {}) {
   const key = chatModelKey(route.key || route.value || route.name || route.model);
   const fallback = defaultRouteForKey(key);
@@ -714,6 +729,7 @@ function normalizeChatModelRoute(route = {}) {
     carType: String(route.carType || fallback.carType || "chatgpt").trim(),
     model: String(route.model || fallback.model || "").trim(),
     strategy: String(route.strategy || fallback.strategy || "balanced").trim(),
+    carTier: normalizeCarTier(route.carTier || fallback.carTier),
     enabled: route.enabled !== false,
     default: Boolean(route.default)
   };
@@ -750,6 +766,47 @@ function numeric(value, fallback = 0) {
   return Number.isFinite(next) ? next : fallback;
 }
 
+function truthyFlag(value) {
+  if (value === true || value === 1) return true;
+  const text = String(value || "").trim().toLowerCase();
+  return ["1", "true", "yes", "y", "on"].includes(text);
+}
+
+function carFieldText(value) {
+  if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) return value.map(carFieldText).filter(Boolean).join(" ");
+  if (typeof value === "object") return "";
+  return String(value).trim();
+}
+
+function rawCarText(raw = {}, desc = "", label = "") {
+  return [
+    desc,
+    label,
+    raw.name,
+    raw.title,
+    raw.plan,
+    raw.planName,
+    raw.tier,
+    raw.level,
+    raw.badge,
+    raw.tags
+  ].map(carFieldText).filter(Boolean).join(" ");
+}
+
+function carIsUltra(raw = {}, desc = "", label = "") {
+  const text = rawCarText(raw, desc, label);
+  return truthyFlag(raw.isUltra ?? raw.is_ultra ?? raw.ultra)
+    || /\bultra\b|\u81f3\u5c0a|\u65d7\u8230/i.test(text);
+}
+
+function carIsPro(raw = {}, desc = "", label = "", isUltra = false) {
+  if (isUltra) return false;
+  const text = rawCarText(raw, desc, label);
+  return truthyFlag(raw.isPro ?? raw.is_pro ?? raw.isSuperPro ?? raw.is_super_pro ?? raw.superPro)
+    || /\bpro\b|\bplus\b|\bteam\b|\u4e13\u4e1a/i.test(text);
+}
+
 function normalizeCar(raw = {}, carType = "chatgpt") {
   const realCarIDs = Array.isArray(raw.realCarIDs)
     ? raw.realCarIDs
@@ -760,17 +817,21 @@ function normalizeCar(raw = {}, carType = "chatgpt") {
     raw.clears_in_pro,
     raw.clears_in_think
   ].map((value) => numeric(value, 0)).filter((value) => value > 0);
+  const desc = String(raw.desc || raw.statusText || raw.label || "").trim();
+  const label = String(raw.label || "").trim();
+  const isUltra = carIsUltra(raw, desc, label);
   return {
     id: String(raw.carID || raw.carId || raw.car_id || raw.id || "").trim(),
     carType,
     status: numeric(raw.status ?? raw.state ?? 1, 1),
     count: numeric(raw.count ?? raw.queue_count ?? 0, 0),
     cooldown: cooldowns.length ? Math.min(...cooldowns) : 0,
-    desc: String(raw.desc || raw.statusText || raw.label || "").trim(),
-    label: String(raw.label || "").trim(),
+    desc,
+    label,
     imageRemaining: numeric(raw.usage?.image_gen?.remaining ?? raw.model_limits?.image_gen?.remaining ?? 0, 0),
     isIQ: Boolean(raw.isIQ || raw.is_iq),
-    isPro: Boolean(raw.isPro || raw.isSuperPro || raw.isUltra),
+    isPro: carIsPro(raw, desc, label, isUltra),
+    isUltra,
     isSuper: Boolean(raw.isSuper || raw.isPlus || raw.isTeam),
     isVirtual: Boolean(raw.isVirtual || raw.is_virtual),
     realCarIDs: realCarIDs.map((item) => String(item || "").trim()).filter(Boolean),
@@ -802,6 +863,18 @@ function rankedCars(cars, strategy) {
     .map((car) => ({ car, score: carScore(car, strategy) + Math.random() }))
     .sort((a, b) => b.score - a.score)
     .map((item) => item.car);
+}
+
+function carMatchesTier(car, tier) {
+  if (tier === "any") return true;
+  if (tier === "ultra") return car.isUltra;
+  return !car.isUltra;
+}
+
+function carTierDisplayName(tier) {
+  if (tier === "ultra") return " Ultra";
+  if (tier === "any") return "";
+  return " PRO 及以下";
 }
 
 function concreteCarId(car) {
@@ -997,7 +1070,8 @@ export class ChatplusClient {
       route.key || "",
       route.carType || "",
       route.model || "",
-      route.strategy || ""
+      route.strategy || "",
+      route.carTier || ""
     ].join("::");
   }
 
@@ -1133,14 +1207,17 @@ export class ChatplusClient {
 
   async selectCar(route, ignoredCarIds = new Set(), options = {}) {
     const cars = await this.fetchCars(route.carType, options);
+    const tier = effectiveCarTier(route);
     const candidates = rankedCars(cars, route.strategy)
       .map((car) => ({ car, carId: concreteCarId(car) }))
       .filter((item) => !ignoredCarIds.has(item.carId))
       .filter((item) => !isBadCar(this.account?.id, route.carType, item.carId));
     if (!candidates.length) throw new Error(`${route.name} 暂时没有可用车辆。`);
+    const tierCandidates = candidates.filter((item) => carMatchesTier(item.car, tier));
+    if (!tierCandidates.length) throw new Error(`${route.name} 暂时没有可用的${carTierDisplayName(tier)}车位。`);
     const usableCars = route.strategy === "image"
-      ? candidates.filter((item) => item.car.imageRemaining > 0 && !item.car.isPro)
-      : candidates;
+      ? tierCandidates.filter((item) => item.car.imageRemaining > 0 && !item.car.isPro)
+      : tierCandidates;
     if (!usableCars.length) throw imageQuotaError("暂时没有图片额度可用的 GPT 账号。");
     const selected = usableCars[0];
     return {
@@ -1148,7 +1225,8 @@ export class ChatplusClient {
       carType: route.carType,
       car: selected.car,
       candidateCount: usableCars.length,
-      strategy: route.strategy || "balanced"
+      strategy: route.strategy || "balanced",
+      carTier: tier
     };
   }
 
@@ -1171,13 +1249,14 @@ export class ChatplusClient {
         const init = route.key === "gpt" ? await this.loadInit(requestOptions) : {};
         return { route, selected, init };
       } catch (error) {
-        if (route.key === "gemini") {
-          error.noRetry = true;
-          throw error;
-        }
-        if (isAuthSessionError(error)) {
+        const retryableCarError = isAuthSessionError(error) || isCarPlanMismatchError(error);
+        if (retryableCarError) {
           this.rememberAuthFailedCar(selected);
           await this.sessionLock(async () => this.resetSession());
+        }
+        if (route.key === "gemini" && !retryableCarError) {
+          error.noRetry = true;
+          throw error;
         }
         errors.push(`${selected.carId}：${error.message || "进入失败"}`);
       }
@@ -1509,6 +1588,13 @@ export class ChatplusClient {
         };
       } catch (error) {
         if (error.noRetry || error.imageQuotaExhausted) throw error;
+        const retryableCarError = selected && (isAuthSessionError(error) || isCarPlanMismatchError(error));
+        if (retryableCarError) {
+          this.rememberAuthFailedCar(selected);
+          await this.sessionLock(async () => this.resetSession());
+          errors.push(error.message || "调用失败");
+          continue;
+        }
         if (Number(error.status || error.statusCode || 0) === 400) throw error;
         if (isAuthSessionError(error)) {
           this.rememberAuthFailedCar(selected);

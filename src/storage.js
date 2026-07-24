@@ -35,9 +35,9 @@ const defaultConcurrency = {
 };
 
 const defaultChatModels = [
-  { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", enabled: true, default: true },
-  { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", enabled: true, default: false },
-  { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", enabled: true, default: false }
+  { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", carTier: "auto", enabled: true, default: true },
+  { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", carTier: "auto", enabled: true, default: false },
+  { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", carTier: "auto", enabled: true, default: false }
 ];
 
 const defaultShareAISettings = {
@@ -108,6 +108,11 @@ function normalizeChatModelKey(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function normalizeCarTier(value) {
+  const tier = String(value || "").trim().toLowerCase();
+  return ["auto", "pro", "ultra", "any"].includes(tier) ? tier : "auto";
+}
+
 function normalizeImageStorage(value = {}) {
   const mode = ["smart", "always", "never"].includes(value.mode) ? value.mode : defaultImageStorage.mode;
   return {
@@ -153,6 +158,7 @@ function normalizeChatModels(settings = {}, migrateAutoSelection = false) {
       carType: String(item?.carType || (key === "gpt" ? legacy.carType : base.carType || "")).trim(),
       model: String(item?.model || (key === "gpt" ? legacy.model : base.model || "")).trim(),
       strategy: String(item?.strategy || base.strategy || "balanced").trim(),
+      carTier: normalizeCarTier(item?.carTier || base.carTier),
       enabled: migratedEnabled,
       default: Boolean(item?.default || item?.key === settings.defaultChatModel || item?.value === settings.defaultChatModel)
     };
