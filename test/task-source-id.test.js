@@ -104,6 +104,8 @@ test("洗图王任务 ID 会保存到本地记录，失败返回也会带回去"
 
 test("相同洗图王任务 ID 的失败结果会更新原任务记录", async () => {
   const sourceTaskId = "task_xituwang_source_api_1234abcd";
+  const createdAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const completedAt = new Date(Date.now() - 60 * 60 * 1000 + 5000).toISOString();
 
   await upsertTask({
     id: "local-source-task-original",
@@ -111,7 +113,7 @@ test("相同洗图王任务 ID 的失败结果会更新原任务记录", async (
     status: "processing",
     taskType: "img2img",
     requestJson: { client_task_id: sourceTaskId },
-    createdAt: "2026-07-21T12:00:00.000Z"
+    createdAt
   });
 
   await upsertTask({
@@ -121,7 +123,7 @@ test("相同洗图王任务 ID 的失败结果会更新原任务记录", async (
     taskType: "img2img",
     errorMessage: "并发上限",
     responseJson: { ok: false, code: "CONCURRENCY_LIMIT", sourceTaskId },
-    completedAt: "2026-07-21T12:00:05.000Z"
+    completedAt
   });
 
   const tasks = await listTasks();

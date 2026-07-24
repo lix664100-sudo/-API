@@ -1138,3 +1138,137 @@ test("background recovery refreshes expired drawing quota", async () => {
     DrawingClient.prototype.check = originalCheck;
   }
 });
+
+async function saveChatUsageRecoveryFixture({ lastCheckAt, quotaResetAt }) {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-chat-usage-background-recovery",
+      channelId: "shareai",
+      name: "Chat Usage Background Recovery",
+      username: "chat-usage-background@example.com",
+      password: "test",
+      enabled: true,
+      status: "quota_empty",
+      lastCheckAt,
+      meta: {
+        abilities: {
+          drawing: { status: "ok", message: "drawing ok" },
+          chatplus: {
+            status: "quota_empty",
+            quota: 220,
+            used: 220,
+            balance: 0,
+            quotaReason: "chat_usage_limit",
+            quotaResetAt,
+            cooldownUntil: quotaResetAt,
+            lastCheckAt,
+            message: "chat usage empty"
+          }
+        }
+      }
+    }]
+  });
+}
+
+test("聊天额度不足未满 1 小时不会后台复查", async () => {
+  await saveChatUsageRecoveryFixture({
+    lastCheckAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+    quotaResetAt: new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString()
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    throw new Error("不应该复查");
+  };
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+
+    assert.equal(checkCount, 0);
+    assert.equal(results.length, 0);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
+});
+
+test("聊天额度不足超过 1 小时会后台复查并按上游恢复", async () => {
+  await saveChatUsageRecoveryFixture({
+    lastCheckAt: new Date(Date.now() - 61 * 60 * 1000).toISOString(),
+    quotaResetAt: new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString()
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 220,
+      used: 180,
+      balance: 40,
+      quotaResetAt: new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString(),
+      cooldownUntil: null,
+      quotaReason: "",
+      message: "chat ok",
+      meta: { chatUsage: { quota: 220, used: 180, balance: 40, period: "12h" } }
+    };
+  };
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const chatplus = stored.accounts[0].meta.abilities.chatplus;
+
+    assert.equal(checkCount, 1);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].channelId, "shareai:chatplus");
+    assert.equal(results[0].recovered, true);
+    assert.equal(chatplus.status, "ok");
+    assert.equal(chatplus.balance, 40);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
+});
+
+test("聊天额度上游恢复时间到了会立刻后台复查", async () => {
+  await saveChatUsageRecoveryFixture({
+    lastCheckAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+    quotaResetAt: new Date(Date.now() - 1000).toISOString()
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 220,
+      used: 0,
+      balance: 220,
+      quotaResetAt: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString(),
+      cooldownUntil: null,
+      quotaReason: "",
+      message: "chat ok",
+      meta: { chatUsage: { quota: 220, used: 0, balance: 220, period: "12h" } }
+    };
+  };
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const chatplus = stored.accounts[0].meta.abilities.chatplus;
+
+    assert.equal(checkCount, 1);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].channelId, "shareai:chatplus");
+    assert.equal(chatplus.status, "ok");
+    assert.equal(chatplus.balance, 220);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
+});

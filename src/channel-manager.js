@@ -18,6 +18,7 @@ const accountRoutingState = new Map();
 const accountRecoveryTasks = new Map();
 const accountRecoveryRetryAt = new Map();
 const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
+const CHAT_USAGE_RECOVERY_CHECK_MS = 60 * 60 * 1000;
 const DRAWING_FAILURE_LIMIT = 3;
 const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
 const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
@@ -1314,6 +1315,11 @@ function targetCachedChatUsageLimit(target) {
   return target?.channel?.type === "chatplus" && targetAccountUsageEmpty(target);
 }
 
+function targetLastCheckAt(target, status = {}) {
+  const checkedAt = Date.parse(status.lastCheckAt || target?.account?.lastCheckAt || "");
+  return Number.isFinite(checkedAt) ? checkedAt : 0;
+}
+
 function admissionTargets(targets, taskType, options = {}) {
   const skipKnownQuotaEmpty = options.skipKnownQuotaEmpty === true;
   return targets.filter((target) => !(
@@ -1335,7 +1341,11 @@ function targetNeedsRecovery(target) {
         ? quotaStatus.imageQuotaResetAt || quotaStatus.quotaResetAt || ""
         : quotaStatus.quotaResetAt || quotaStatus.cooldownUntil || ""
     );
-    return Number.isFinite(resetAt) && resetAt <= Date.now();
+    if (Number.isFinite(resetAt) && resetAt <= Date.now()) return true;
+    if (targetCachedChatUsageLimit(target)) {
+      return Date.now() - targetLastCheckAt(target, quotaStatus) >= CHAT_USAGE_RECOVERY_CHECK_MS;
+    }
+    return false;
   }
   if (status === "ok" && targetUsageRefreshDue(target)) return true;
   return (
