@@ -421,6 +421,12 @@ function shareAIAbilityChannel(channel, ability) {
   };
 }
 
+function channelAbilityEnabled(channel, ability) {
+  const enabled = channel?.settings?.enabledAbilities;
+  if (!enabled || typeof enabled !== "object") return true;
+  return enabled[ability] !== false;
+}
+
 function requestedAbility(channel, requestedChannel) {
   const requested = String(requestedChannel || "");
   const legacy = channel?.settings?.legacyChannelIds || {};
@@ -431,9 +437,8 @@ function requestedAbility(channel, requestedChannel) {
 
 function shareAIAbilitiesForTask(channel, requestedChannel, taskType) {
   const requested = requestedAbility(channel, requestedChannel);
-  if (requested) return [requested];
-  if (taskType === "chat") return ["chatplus"];
-  return ["drawing", "chatplus"];
+  const abilities = requested ? [requested] : taskType === "chat" ? ["chatplus"] : ["drawing", "chatplus"];
+  return abilities.filter((ability) => channelAbilityEnabled(channel, ability));
 }
 
 function isPendingTask(status) {
@@ -607,17 +612,20 @@ function firstAccountForChannel(config, channelId) {
 }
 
 function shareAIRefreshChannel(config, task) {
-  const channel = config.channels.find((item) => item.type === "shareai" && item.enabled !== false)
+  const requested = task.channelId || task.channelType || "";
+  const channel = config.channels.find((item) =>
+    item.type === "shareai"
+      && [item.id, `${item.id}:drawing`, `${item.id}:chatplus`].includes(String(requested))
+  ) || config.channels.find((item) => item.type === "shareai" && item.enabled !== false)
     || config.channels.find((item) => item.type === "shareai");
   if (!channel) return null;
-  const requested = task.channelId || task.channelType || "";
   const ability = requestedAbility(channel, requested) || (task.channelType === "chatplus" ? "chatplus" : task.channelType === "drawing" ? "drawing" : "");
-  return ability ? shareAIAbilityChannel(channel, ability) : null;
+  return ability && channelAbilityEnabled(channel, ability) ? shareAIAbilityChannel(channel, ability) : null;
 }
 
 function inferRefreshTarget(config, task) {
   let channel = config.channels.find((item) => item.id === task.channelId);
-  if (!channel && String(task.channelId || "").startsWith("shareai:")) {
+  if (!channel && String(task.channelId || "").includes(":")) {
     channel = shareAIRefreshChannel(config, task);
   }
   if (!channel) {
@@ -1136,7 +1144,7 @@ function channelMatchesRequest(channel, requestedChannel = "auto") {
 
 function accountMatchesChannel(account, channel) {
   if (account.channelId === channel.id) return true;
-  return channel.type === "shareai" && account.channelId === "shareai";
+  return channel.type === "shareai" && channel.id === "shareai" && account.channelId === "shareai";
 }
 
 function accountRoutingWeight(account) {
@@ -2428,6 +2436,36 @@ function combinedShareAIStatus(results) {
   };
 }
 
+function combinedEnabledShareAIStatus(results) {
+  const drawing = results.drawing?.data || {};
+  const chatplus = results.chatplus?.data || {};
+  const statuses = [drawing.status, chatplus.status].filter(Boolean);
+  const disconnected = statuses.includes("disconnected");
+  const ok = statuses.includes("ok");
+  const failed = statuses.some((status) => ["error", "failed"].includes(status));
+  const quotaEmpty = statuses.includes("quota_empty");
+  const messages = [
+    results.drawing ? `绘图站：${drawing.message || (results.drawing.ok ? "可用" : "不可用")}` : "",
+    results.chatplus ? `聊天：${chatplus.message || (results.chatplus.ok ? "可用" : "不可用")}` : ""
+  ].filter(Boolean);
+
+  return {
+    status: disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : "error",
+    quota: drawing.quota ?? chatplus.quota ?? null,
+    balance: drawing.balance ?? chatplus.balance ?? null,
+    quotaResetAt: drawing.quotaResetAt || chatplus.quotaResetAt || "",
+    expireAt: drawing.expireAt || chatplus.expireAt || "",
+    message: messages.join("；") || "检测失败",
+    cooldownUntil: chatplus.status === "ok" ? null : chatplus.cooldownUntil || undefined,
+    meta: {
+      abilities: {
+        ...(results.drawing ? { drawing } : {}),
+        ...(results.chatplus ? { chatplus } : {})
+      }
+    }
+  };
+}
+
 function preserveDrawingCooldown(account, status) {
   const currentDrawing = account.meta?.abilities?.drawing || {};
   if (!statusCooling(currentDrawing)) return status;
@@ -2490,19 +2528,23 @@ export async function checkAccount(accountId) {
       activeSlots
     };
   }
+  const proxyAbility = channel.type === "shareai"
+    ? channelAbilityEnabled(channel, "drawing") ? "drawing" : "chatplus"
+    : "";
   const proxyResult = await checkAccountProxy(
     account,
-    channel.type === "shareai" ? shareAIAbilityChannel(channel, "drawing") : channel
+    channel.type === "shareai" ? shareAIAbilityChannel(channel, proxyAbility) : channel
   );
   if (channel.type === "shareai") {
-    const [drawing, chatplus] = await Promise.all([
-      checkShareAIAbility(config, channel, account, "drawing"),
-      checkShareAIAbility(config, channel, account, "chatplus")
-    ]);
-    const results = { drawing, chatplus };
+    const abilities = ["drawing", "chatplus"].filter((ability) => channelAbilityEnabled(channel, ability));
+    const checked = await Promise.all(abilities.map(async (ability) => [
+      ability,
+      await checkShareAIAbility(config, channel, account, ability)
+    ]));
+    const results = Object.fromEntries(checked);
     const status = preserveDrawingCooldown(
       account,
-      withProxyCheckMeta(combinedShareAIStatus(results), proxyResult)
+      withProxyCheckMeta(combinedEnabledShareAIStatus(results), proxyResult)
     );
     await updateAccountStatus(account.id, status);
     if (status.status !== "ok") throw new Error(status.message || "检测失败");

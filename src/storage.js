@@ -44,6 +44,7 @@ const defaultShareAISettings = {
   mainBaseUrl: "https://ikun.aishare.icu",
   drawingBaseUrl: "https://drawing.aishare.icu",
   chatBaseUrl: "https://www.chatplus.cc",
+  enabledAbilities: { drawing: true, chatplus: true },
   defaultModelId: 1,
   defaultChatModel: "gpt",
   chatModels: defaultChatModels,
@@ -209,6 +210,72 @@ function normalizeShareAIChannel(channels = []) {
   }];
 }
 
+function normalizeShareAISettings(channel = {}, legacy = {}) {
+  const settings = {
+    ...defaultShareAISettings,
+    ...(channel?.settings || {})
+  };
+  const drawing = legacy.drawing || null;
+  const chatplus = legacy.chatplus || null;
+
+  if (drawing?.settings?.baseUrl) settings.drawingBaseUrl = drawing.settings.baseUrl;
+  if (drawing?.settings?.defaultModelId) settings.defaultModelId = Number(drawing.settings.defaultModelId || 1);
+  if (chatplus?.settings?.baseUrl) settings.chatBaseUrl = chatplus.settings.baseUrl;
+  if (chatplus?.settings) {
+    settings.defaultChatModel = chatplus.settings.defaultChatModel || settings.defaultChatModel;
+    settings.chatModels = chatplus.settings.chatModels || settings.chatModels;
+  }
+
+  const migrateAutoSelection = settings.autoCarSelectionMigrated !== true;
+  settings.chatModels = normalizeChatModels(settings, migrateAutoSelection);
+  settings.defaultChatModel = settings.chatModels.find((item) => item.default && item.enabled)?.key || settings.chatModels[0]?.key || "gpt";
+  settings.defaultModelId = Number(settings.defaultModelId || 1);
+  settings.autoCarSelection = true;
+  settings.autoCarSelectionMigrated = true;
+  settings.enabledAbilities = {
+    drawing: settings.enabledAbilities?.drawing !== false,
+    chatplus: settings.enabledAbilities?.chatplus !== false
+  };
+  settings.legacyChannelIds = {
+    ...(settings.legacyChannelIds || {}),
+    drawing: drawing?.id || settings.legacyChannelIds?.drawing || "drawing",
+    chatplus: chatplus?.id || settings.legacyChannelIds?.chatplus || "chatplus"
+  };
+  delete settings.baseUrl;
+  delete settings.carId;
+  delete settings.carType;
+  return settings;
+}
+
+function normalizeShareAIChannelEntry(channel = {}, index = 0, legacy = {}) {
+  const drawing = legacy.drawing || null;
+  const chatplus = legacy.chatplus || null;
+  const legacyPriority = Math.min(Number(drawing?.priority || 99), Number(chatplus?.priority || 99));
+  return {
+    id: String(channel?.id || (index === 0 ? "shareai" : `shareai-${randomUUID()}`)),
+    name: channel?.name || "ShareAI账号",
+    type: "shareai",
+    enabled: channel?.enabled !== false && drawing?.enabled !== false && chatplus?.enabled !== false,
+    priority: Number(channel?.priority || (Number.isFinite(legacyPriority) ? legacyPriority : index + 1) || index + 1),
+    settings: normalizeShareAISettings(channel, legacy)
+  };
+}
+
+function normalizeChannels(channels = []) {
+  const source = Array.isArray(channels) ? channels : [];
+  const drawing = legacyChannelByType(source, "drawing");
+  const chatplus = legacyChannelByType(source, "chatplus");
+  const shareAIChannels = source.filter((channel) => channel?.type === "shareai");
+
+  if (!shareAIChannels.length) {
+    return [normalizeShareAIChannelEntry({ id: "shareai", name: "ShareAI账号" }, 0, { drawing, chatplus })];
+  }
+
+  return shareAIChannels.map((channel, index) =>
+    normalizeShareAIChannelEntry(channel, index, index === 0 ? { drawing, chatplus } : {})
+  );
+}
+
 function makeDefaultAccounts(stored) {
   if (!stored?.username || !stored?.password) return [];
   const username = stored.username;
@@ -238,6 +305,26 @@ function legacyChannelTypeMap(stored) {
   return map;
 }
 
+function legacyChannelMap(stored, channels = []) {
+  const map = new Map();
+  const shareAIChannels = channels.filter((channel) => channel.type === "shareai");
+  const primaryShareAI = shareAIChannels[0] || { id: "shareai" };
+
+  for (const channel of shareAIChannels) {
+    map.set(String(channel.id), { type: "shareai", channelId: channel.id });
+  }
+  for (const channel of Array.isArray(stored.channels) ? stored.channels : []) {
+    if (!channel?.id || channel.type === "shareai") continue;
+    if (channel.type === "drawing" || channel.type === "chatplus") {
+      map.set(String(channel.id), { type: channel.type, channelId: primaryShareAI.id });
+    }
+  }
+  map.set("shareai", { type: "shareai", channelId: primaryShareAI.id });
+  map.set("drawing", { type: "drawing", channelId: primaryShareAI.id });
+  map.set("chatplus", { type: "chatplus", channelId: primaryShareAI.id });
+  return map;
+}
+
 function accountAbilityStatus(account) {
   return {
     status: account.status || "unknown",
@@ -254,6 +341,7 @@ function accountAbilityStatus(account) {
 
 function accountGroupKey(account) {
   return [
+    String(account.channelId || "shareai"),
     String(account.username || "").trim().toLowerCase(),
     String(account.password || ""),
     String(account.proxyUrl || account.proxy || "").trim()
@@ -263,7 +351,7 @@ function accountGroupKey(account) {
 function mergeAccountIntoGroup(group, account, type) {
   const next = group || {
     id: account.id || `account-${randomUUID()}`,
-    channelId: "shareai",
+    channelId: account.channelId || "shareai",
     name: "",
     username: account.username || "",
     password: account.password || "",
@@ -312,7 +400,7 @@ function finalizeShareAIAccount(account) {
   const quotaEmpty = [drawing.status, chatplus.status].includes("quota_empty");
   return {
     ...account,
-    channelId: "shareai",
+    channelId: account.channelId || "shareai",
     name: account.name || account.username || "ShareAI账号",
     status: disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : account.status || "unknown",
     lastCheckAt: account.lastCheckAt || drawing.lastCheckAt || chatplus.lastCheckAt || null,
@@ -366,9 +454,44 @@ function normalizeAccounts(stored) {
   return [...groups.values()].map(finalizeShareAIAccount);
 }
 
+function normalizeAccountsForChannels(stored, channels = []) {
+  const source = Array.isArray(stored.accounts) && stored.accounts.length ? stored.accounts : makeDefaultAccounts(stored);
+  const channelMap = legacyChannelMap(stored, channels);
+  const fallbackChannelId = channels.find((channel) => channel.type === "shareai")?.id || "shareai";
+  const groups = new Map();
+
+  for (const account of source) {
+    const mapped = channelMap.get(String(account.channelId || "shareai")) || { type: "shareai", channelId: fallbackChannelId };
+    const normalized = {
+      id: account.id || `account-${randomUUID()}`,
+      channelId: mapped.channelId,
+      name: account.name || "未命名账号",
+      username: account.username || "",
+      password: account.password || "",
+      proxyUrl: account.proxyUrl || account.proxy || "",
+      enabled: account.enabled !== false,
+      priority: Number(account.priority || 1),
+      routingWeight: normalizeRoutingWeight(account.routingWeight),
+      status: account.status || "unknown",
+      lastCheckAt: account.lastCheckAt || null,
+      cooldownUntil: account.cooldownUntil || null,
+      quota: account.quota ?? null,
+      balance: account.balance ?? null,
+      quotaResetAt: account.quotaResetAt || null,
+      expireAt: account.expireAt || null,
+      message: account.message || "",
+      meta: account.meta || {}
+    };
+    const key = accountGroupKey(normalized) || normalized.id;
+    groups.set(key, mergeAccountIntoGroup(groups.get(key), normalized, mapped.type));
+  }
+
+  return [...groups.values()].map(finalizeShareAIAccount);
+}
+
 function normalizeConfig(stored = {}) {
-  const channels = normalizeShareAIChannel(stored.channels);
-  const defaultChannel = stored.defaultChannel === channels[0]?.id ? stored.defaultChannel : "auto";
+  const channels = normalizeChannels(stored.channels);
+  const defaultChannel = channels.some((channel) => channel.id === stored.defaultChannel) ? stored.defaultChannel : "auto";
   const config = {
     ...defaultConfig,
     ...stored,
@@ -378,7 +501,7 @@ function normalizeConfig(stored = {}) {
     waitTimeoutSec: normalizeWaitTimeout(stored),
     waitTimeoutVersion: 2,
     channels,
-    accounts: normalizeAccounts(stored)
+    accounts: normalizeAccountsForChannels(stored, channels)
   };
   if (!config.apiKey) config.apiKey = randomBytes(24).toString("hex");
   return config;

@@ -2867,7 +2867,6 @@
         const channels = config?.channels || [];
         const accounts = config?.accounts || [];
         const chatChannels = channels.filter((item) => item.type === "chatplus" || item.type === "shareai");
-        const hasShareAIChannel = channels.some((item) => item.type === "shareai");
         const selectedChannel = channels.find((item) => item.id === selectedChannelId) || channels[0] || null;
         const selectedAccounts = selectedChannel ? accounts.filter((item) => item.channelId === selectedChannel.id) : [];
 
@@ -4177,7 +4176,7 @@
                     h("h2", { className: "panel-title" }, "渠道列表"),
                     h("p", { className: "panel-desc" }, "一个网站渠道一行，账号挂在渠道下面")
                   ]),
-                  h(Button, { type: "primary", icon: Icon.PlusOutlined ? h(Icon.PlusOutlined) : null, onClick: () => openChannelModal(null), disabled: hasShareAIChannel }, "新增渠道")
+                  h(Button, { type: "primary", icon: Icon.PlusOutlined ? h(Icon.PlusOutlined) : null, onClick: () => openChannelModal(null) }, "新增渠道")
                 ]),
                 h("div", { className: "table-wrap" }, [
                   h("div", { className: "filters" }, [
