@@ -148,6 +148,14 @@ function normalizeConcurrency(value = {}) {
   };
 }
 
+function normalizeAccountConcurrency(value = {}, fallback = defaultConcurrency) {
+  return normalizeConcurrency({
+    chat: value.chat ?? fallback.chat,
+    drawingImage: value.drawingImage ?? fallback.drawingImage,
+    chatImage: value.chatImage ?? fallback.chatImage
+  });
+}
+
 function normalizeWaitTimeout(stored = {}) {
   const value = Number(stored.waitTimeoutSec);
   const migrateLegacyDefault = stored.waitTimeoutVersion !== 2 && (!Number.isFinite(value) || value === 180);
@@ -386,6 +394,7 @@ function mergeAccountIntoGroup(group, account, type) {
     enabled: account.enabled !== false,
     priority: Number(account.priority || 1),
     routingWeight: normalizeRoutingWeight(account.routingWeight),
+    concurrency: normalizeAccountConcurrency(account.concurrency),
     status: "unknown",
     lastCheckAt: null,
     cooldownUntil: null,
@@ -404,6 +413,14 @@ function mergeAccountIntoGroup(group, account, type) {
   if (!next.proxyUrl && (account.proxyUrl || account.proxy)) next.proxyUrl = account.proxyUrl || account.proxy;
   next.enabled = next.enabled && account.enabled !== false;
   next.priority = Math.min(Number(next.priority || 99), Number(account.priority || 1));
+  if (type === "drawing") {
+    next.concurrency.drawingImage = account.concurrency.drawingImage;
+  } else if (type === "chatplus") {
+    next.concurrency.chat = account.concurrency.chat;
+    next.concurrency.chatImage = account.concurrency.chatImage;
+  } else {
+    next.concurrency = normalizeAccountConcurrency(account.concurrency, next.concurrency);
+  }
   next.meta = {
     ...(next.meta || {}),
     ...(account.meta || {}),
@@ -450,6 +467,7 @@ function finalizeShareAIAccount(account) {
 function normalizeAccounts(stored) {
   const source = Array.isArray(stored.accounts) && stored.accounts.length ? stored.accounts : makeDefaultAccounts(stored);
   const typeMap = legacyChannelTypeMap(stored);
+  const fallbackConcurrency = normalizeConcurrency(stored.concurrency);
   const groups = new Map();
 
   for (const account of source) {
@@ -463,6 +481,7 @@ function normalizeAccounts(stored) {
       enabled: account.enabled !== false,
       priority: Number(account.priority || 1),
       routingWeight: normalizeRoutingWeight(account.routingWeight),
+      concurrency: normalizeAccountConcurrency(account.concurrency, fallbackConcurrency),
       status: account.status || "unknown",
       lastCheckAt: account.lastCheckAt || null,
       cooldownUntil: account.cooldownUntil || null,
@@ -485,6 +504,7 @@ function normalizeAccountsForChannels(stored, channels = []) {
   const source = Array.isArray(stored.accounts) && stored.accounts.length ? stored.accounts : makeDefaultAccounts(stored);
   const channelMap = legacyChannelMap(stored, channels);
   const fallbackChannelId = channels.find((channel) => channel.type === "shareai")?.id || "shareai";
+  const fallbackConcurrency = normalizeConcurrency(stored.concurrency);
   const groups = new Map();
 
   for (const account of source) {
@@ -499,6 +519,7 @@ function normalizeAccountsForChannels(stored, channels = []) {
       enabled: account.enabled !== false,
       priority: Number(account.priority || 1),
       routingWeight: normalizeRoutingWeight(account.routingWeight),
+      concurrency: normalizeAccountConcurrency(account.concurrency, fallbackConcurrency),
       status: account.status || "unknown",
       lastCheckAt: account.lastCheckAt || null,
       cooldownUntil: account.cooldownUntil || null,
@@ -630,7 +651,11 @@ export async function saveAccount(accountInput) {
     id: accountInput.id || `account-${randomUUID()}`,
     enabled: accountInput.enabled !== false,
     priority: Number(accountInput.priority || current.priority || 1),
-    routingWeight: normalizeRoutingWeight(accountInput.routingWeight ?? current.routingWeight)
+    routingWeight: normalizeRoutingWeight(accountInput.routingWeight ?? current.routingWeight),
+    concurrency: normalizeAccountConcurrency(
+      accountInput.concurrency,
+      current.concurrency || config.concurrency
+    )
   };
   if (!accountInput.password && current.password) next.password = current.password;
   if (index >= 0) accounts[index] = next;

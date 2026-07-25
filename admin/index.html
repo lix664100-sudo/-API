@@ -3107,6 +3107,9 @@
         const chatChannels = channels.filter((item) => item.type === "chatplus" || item.type === "shareai");
         const selectedChannel = channels.find((item) => item.id === selectedChannelId) || channels[0] || null;
         const selectedAccounts = selectedChannel ? accounts.filter((item) => item.channelId === selectedChannel.id) : [];
+        const accountModalChannel = channels.find((item) => item.id === (editingAccount?.channelId || selectedChannel?.id)) || selectedChannel;
+        const accountModalDrawingEnabled = channelAbilityEnabled(accountModalChannel, "drawing");
+        const accountModalChatEnabled = channelAbilityEnabled(accountModalChannel, "chatplus");
 
         function channelForAccount(account) {
           return channels.find((item) => item.id === account?.channelId) || null;
@@ -3814,6 +3817,7 @@
         async function patchChannel(channel, patch) {
           try {
             setConfig(await api(`/api/channels/${channel.id}`, { method: "POST", body: patch }));
+            await refreshRuntimeStatus();
             message.success("渠道已更新");
           } catch (error) {
             message.error(error.message);
@@ -3895,6 +3899,7 @@
             setSelectedChannelId(editingChannel?.id || added?.id || selectedChannelId);
             setChannelModalOpen(false);
             setEditingChannel(null);
+            await refreshRuntimeStatus();
             message.success(editingChannel ? "渠道已保存" : "渠道已新增");
           } catch (error) {
             message.error(error.message);
@@ -3909,6 +3914,7 @@
             const nextConfig = await api(`/api/channels/${id}`, { method: "DELETE" });
             setConfig(nextConfig);
             setSelectedChannelId(nextConfig.channels[0]?.id || null);
+            await refreshRuntimeStatus();
             message.success("渠道已删除");
           } catch (error) {
             message.error(error.message);
@@ -3920,9 +3926,13 @@
         function openAccountModal(account) {
           setEditingAccount(account || null);
           accountForm.resetFields();
+          const concurrency = {
+            ...(config?.concurrency || { chat: 3, drawingImage: 2, chatImage: 2 }),
+            ...(account?.concurrency || {})
+          };
           accountForm.setFieldsValue(account
-            ? { ...account, password: "" }
-            : { channelId: selectedChannel?.id, name: "", username: "", password: "", proxyUrl: "", priority: 1, routingWeight: 1, enabled: true }
+            ? { ...account, password: "", concurrency }
+            : { channelId: selectedChannel?.id, name: "", username: "", password: "", proxyUrl: "", priority: 1, routingWeight: 1, concurrency, enabled: true }
           );
           setAccountModalOpen(true);
         }
@@ -3937,6 +3947,7 @@
             setSelectedChannelId(channelId || selectedChannelId);
             setAccountModalOpen(false);
             setEditingAccount(null);
+            await refreshRuntimeStatus();
             message.success("账号已保存");
           } catch (error) {
             message.error(error.message);
@@ -3948,6 +3959,7 @@
         async function deleteAccount(id) {
           try {
             setConfig(await api(`/api/accounts/${id}`, { method: "DELETE" }));
+            await refreshRuntimeStatus();
             message.success("账号已删除");
           } catch (error) {
             message.error(error.message);
@@ -4401,6 +4413,23 @@
             }
           },
           {
+            title: "并发",
+            width: 150,
+            render: (_, row) => {
+              const rowChannel = channels.find((item) => item.id === row.channelId);
+              const concurrency = row.concurrency || config?.concurrency || {};
+              const items = [];
+              if (channelAbilityEnabled(rowChannel, "drawing")) {
+                items.push(h("strong", { key: "drawing" }, `绘图站 ${numberValue(concurrency.drawingImage)}`));
+              }
+              if (channelAbilityEnabled(rowChannel, "chatplus")) {
+                items.push(h(items.length ? "span" : "strong", { key: "chatImage" }, `聊天生图 ${numberValue(concurrency.chatImage)}`));
+                items.push(h("span", { key: "chat" }, `对话 ${numberValue(concurrency.chat)}`));
+              }
+              return h("div", { className: "account-usage" }, items.length ? items : "-");
+            }
+          },
+          {
             title: "额度",
             width: 230,
             render: (_, row) => accountQuotaText(row, channels.find((item) => item.id === row.channelId))
@@ -4798,7 +4827,7 @@
                         columns: accountColumns,
                         dataSource: selectedAccounts,
                         pagination: selectedAccounts.length > 5 ? { pageSize: 5 } : false,
-                        scroll: { x: 1660 },
+                        scroll: { x: 1810 },
                         size: "small",
                         locale: { emptyText: "这个渠道还没有绑定账号" }
                       })
@@ -5148,17 +5177,14 @@
                         h(Form.Item, { label: "API 密钥", name: "apiKey" }, h(Input, { readOnly: true, addonAfter: h(Button, { type: "link", size: "small", onClick: copyApiKey }, "复制") }))
                       ]),
                       h("div", { className: "api-doc-section", style: { marginBottom: 14 } }, [
-                        h("div", { className: "section-title" }, h("h3", null, "并发设置")),
+                        h("div", { className: "section-title" }, h("h3", null, "任务处理")),
                         h("div", { className: "form-grid" }, [
-                          h(Form.Item, { label: "每账号普通聊天同时任务数", name: ["concurrency", "chat"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
-                          h(Form.Item, { label: "每账号生图站同时任务数", name: ["concurrency", "drawingImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
-                          h(Form.Item, { label: "每账号聊天生图同时任务数", name: ["concurrency", "chatImage"] }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } })),
                           h(Form.Item, { label: "生图等待超时", name: "waitTimeoutSec", extra: "默认 300 秒，可设置 30 到 3600 秒。" }, h(InputNumber, { min: 30, max: 3600, suffix: "秒", style: { width: "100%" } }))
                         ]),
                         h(Alert, {
                           type: "info",
                           showIcon: true,
-                          message: "并发按启用账号单独计算；达到上限会立即返回繁忙。任务提交上游后，超过等待时间会改为“等待上游”并释放并发，只有上游明确失败才会记为失败。",
+                          message: "任务提交上游后，超过等待时间会改为“等待上游”并释放并发，只有上游明确失败才会记为失败。",
                           style: { marginBottom: 0 }
                         })
                       ]),
@@ -5309,7 +5335,7 @@
             okText: editingAccount ? "保存账号" : "新增账号",
             cancelText: "取消",
             confirmLoading: loading,
-            width: 620,
+            width: 680,
             destroyOnClose: true
           }, h(Form, { form: accountForm, layout: "vertical", onFinish: saveAccount }, [
             h("div", { className: "form-grid" }, [
@@ -5327,7 +5353,37 @@
                 extra: "相同数值就是平均分；例如 10 和 1，大约按 10:1 分配。"
               }, h(RoutingWeightInput)),
               h(Form.Item, { label: "启用", name: "enabled", valuePropName: "checked", initialValue: true }, h(Switch))
-            ])
+            ]),
+            h("div", { className: "section-title" }, h("h3", null, "并发设置")),
+            h("div", { className: "form-grid" }, [
+              accountModalChatEnabled
+                ? h(Form.Item, {
+                    label: "普通对话并发",
+                    name: ["concurrency", "chat"],
+                    rules: [{ required: true, message: "请输入普通对话并发" }]
+                  }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
+                : null,
+              accountModalDrawingEnabled
+                ? h(Form.Item, {
+                    label: "绘图站并发",
+                    name: ["concurrency", "drawingImage"],
+                    rules: [{ required: true, message: "请输入绘图站并发" }]
+                  }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
+                : null,
+              accountModalChatEnabled
+                ? h(Form.Item, {
+                    label: "聊天生图并发",
+                    name: ["concurrency", "chatImage"],
+                    rules: [{ required: true, message: "请输入聊天生图并发" }]
+                  }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
+                : null
+            ]),
+            h(Alert, {
+              type: "info",
+              showIcon: true,
+              message: "每个账号单独限制；首页只把该账号所属渠道已启用的模型计入对应并发。",
+              style: { marginBottom: 0 }
+            })
           ]))
         ]);
       }

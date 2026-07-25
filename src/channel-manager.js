@@ -128,7 +128,9 @@ async function loadRuntimeConfig() {
   return config;
 }
 
-function taskSlotLimit(slot) {
+function taskSlotLimit(slot, target = {}) {
+  const accountLimit = Number(target?.account?.concurrency?.[slot]);
+  if (Number.isFinite(accountLimit) && accountLimit > 0) return accountLimit;
   return activeTaskConcurrency[slot] || defaultTaskConcurrency[slot] || 1;
 }
 
@@ -150,6 +152,19 @@ function activeCountForModelSlot(slot, modelKey) {
   return total;
 }
 
+function activeCountForAccountSlot(slot, accountId) {
+  const prefix = `${slot}:`;
+  const suffix = `:${accountId}`;
+  let total = 0;
+  for (const [key, count] of activeTaskCounts.entries()) {
+    const text = String(key);
+    if (text === `${slot}:${accountId}` || (text.startsWith(prefix) && text.endsWith(suffix))) {
+      total += count;
+    }
+  }
+  return total;
+}
+
 function taskConcurrencyTotal(value = {}) {
   return Number(value.chat || 0) + Number(value.drawingImage || 0) + Number(value.chatImage || 0);
 }
@@ -164,20 +179,43 @@ function targetRuntimeAvailable(target, taskType) {
   return cachedChatUsageLimit || status.status === "ok" || status.status === "cooldown";
 }
 
-function runtimeTargetAccountCount(config, taskType, channelType, availableOnly = false, modelKey = "") {
-  const accountIds = selectTargets(config, "auto", taskType, { includeCooling: true })
-    .filter((target) => target.channel.type === channelType)
-    .filter((target) => !modelKey || targetChatModelKey(target, { model: modelKey }) === modelKey)
-    .filter((target) => !availableOnly || targetRuntimeAvailable(target, taskType))
-    .map((target) => target.account.id);
-  return new Set(accountIds).size;
+function targetSupportsChatModel(target, modelKey) {
+  if (target?.channel?.type !== "chatplus") return false;
+  const requestedKey = modelRequestKey(modelKey);
+  if (!requestedKey) return true;
+  const settings = target.channel.settings || {};
+  const routes = Array.isArray(settings.chatModels) ? settings.chatModels : [];
+  if (routes.length) {
+    return routes.some((route) =>
+      route?.enabled !== false
+      && [
+        route?.key,
+        route?.name,
+        route?.model
+      ].some((value) => modelRequestKey(value) === requestedKey)
+    );
+  }
+  return requestedKey === (modelRequestKey(settings.defaultChatModel) || "gpt");
 }
 
-function runtimeAccountConcurrency(config, concurrency, availableOnly = false) {
+function runtimeTargets(config, taskType, channelType, availableOnly = false, modelKey = "") {
+  const targets = selectTargets(config, "auto", taskType, { includeCooling: true })
+    .filter((target) => target.channel.type === channelType)
+    .filter((target) => !modelKey || targetSupportsChatModel(target, modelKey))
+    .filter((target) => !availableOnly || targetRuntimeAvailable(target, taskType));
+  return [...new Map(targets.map((target) => [target.account.id, target])).values()];
+}
+
+function runtimeSlotCapacity(config, taskType, channelType, slot, availableOnly = false, modelKey = "") {
+  return runtimeTargets(config, taskType, channelType, availableOnly, modelKey)
+    .reduce((total, target) => total + taskSlotLimit(slot, target), 0);
+}
+
+function runtimeAccountConcurrency(config, availableOnly = false) {
   const capacity = {
-    chat: runtimeTargetAccountCount(config, "chat", "chatplus", availableOnly) * concurrency.chat,
-    drawingImage: runtimeTargetAccountCount(config, "text2img", "drawing", availableOnly) * concurrency.drawingImage,
-    chatImage: runtimeTargetAccountCount(config, "text2img", "chatplus", availableOnly) * concurrency.chatImage
+    chat: runtimeSlotCapacity(config, "chat", "chatplus", "chat", availableOnly),
+    drawingImage: runtimeSlotCapacity(config, "text2img", "drawing", "drawingImage", availableOnly),
+    chatImage: runtimeSlotCapacity(config, "text2img", "chatplus", "chatImage", availableOnly)
   };
   return {
     ...capacity,
@@ -199,23 +237,25 @@ function runtimeChatModelKeys(config) {
       const key = modelRequestKey(route?.key || route?.name || route?.model);
       if (key && route?.enabled !== false) keys.add(key);
     }
-    const defaultKey = modelRequestKey(settings.defaultChatModel);
-    if (defaultKey) keys.add(defaultKey);
+    if (!routes.length) {
+      const defaultKey = modelRequestKey(settings.defaultChatModel);
+      if (defaultKey) keys.add(defaultKey);
+    }
   }
-  return keys.size ? [...keys] : ["gpt"];
+  return [...keys];
 }
 
-function runtimeModelConcurrency(config, concurrency, availableOnly = false) {
+function runtimeModelConcurrency(config, availableOnly = false) {
   return Object.fromEntries(runtimeChatModelKeys(config).map((modelKey) => {
     const configured = {
-      chat: runtimeTargetAccountCount(config, "chat", "chatplus", availableOnly, modelKey) * concurrency.chat,
-      chatImage: runtimeTargetAccountCount(config, "text2img", "chatplus", availableOnly, modelKey) * concurrency.chatImage
+      chat: runtimeSlotCapacity(config, "chat", "chatplus", "chat", availableOnly, modelKey),
+      chatImage: runtimeSlotCapacity(config, "text2img", "chatplus", "chatImage", availableOnly, modelKey)
     };
     const available = availableOnly
       ? configured
       : {
-          chat: runtimeTargetAccountCount(config, "chat", "chatplus", true, modelKey) * concurrency.chat,
-          chatImage: runtimeTargetAccountCount(config, "text2img", "chatplus", true, modelKey) * concurrency.chatImage
+          chat: runtimeSlotCapacity(config, "chat", "chatplus", "chat", true, modelKey),
+          chatImage: runtimeSlotCapacity(config, "text2img", "chatplus", "chatImage", true, modelKey)
         };
     const running = {
       chat: activeCountForModelSlot("chat", modelKey),
@@ -259,9 +299,9 @@ export async function getRuntimeStatus() {
   const config = await loadConfig();
   const concurrency = normalizeTaskConcurrency(config.concurrency);
   activeTaskConcurrency = concurrency;
-  const configured = runtimeAccountConcurrency(config, concurrency);
-  const available = runtimeAccountConcurrency(config, concurrency, true);
-  const models = runtimeModelConcurrency(config, concurrency);
+  const configured = runtimeAccountConcurrency(config);
+  const available = runtimeAccountConcurrency(config, true);
+  const models = runtimeModelConcurrency(config);
   const running = {
     chat: activeCountForSlot("chat"),
     drawingImage: activeCountForSlot("drawingImage"),
@@ -290,10 +330,7 @@ export async function getRuntimeStatus() {
     };
   }
   return {
-    concurrency: {
-      ...concurrency,
-      total: configured.total
-    },
+    concurrency: configured,
     available: {
       ...available
     },
@@ -408,7 +445,7 @@ async function tryReserveTaskSlot(slot, target = {}, input = {}) {
   const durableState = await durableTaskSlotState(slot, target, input);
   const count = activeTaskCounts.get(key) || 0;
   const occupied = count + durableState.total - Math.min(durableState.active, count);
-  if (occupied >= taskSlotLimit(slot)) return null;
+  if (occupied >= taskSlotLimit(slot, target)) return null;
   activeTaskCounts.set(key, count + 1);
   let released = false;
   return () => {
@@ -1333,11 +1370,18 @@ function requestedChannelForInput(config, input = {}) {
 }
 
 function targetMatchesRequestedModel(target, taskType, input = {}) {
-  if (taskType === "chat") return true;
   const lock = requestedModelLock(input);
+  if (taskType === "chat") {
+    return lock.type !== "chat" || targetSupportsChatModel(target, lock.key);
+  }
   if (lock.type === "auto") return true;
-  if (lock.type === "chat") return target.channel.type === "chatplus";
-  if (lock.type === "gpt-image") return ["drawing", "chatplus"].includes(target.channel.type);
+  if (lock.type === "chat") {
+    return target.channel.type === "chatplus" && targetSupportsChatModel(target, lock.key);
+  }
+  if (lock.type === "gpt-image") {
+    return target.channel.type === "drawing"
+      || (target.channel.type === "chatplus" && targetSupportsChatModel(target, "gpt"));
+  }
   if (lock.type === "drawing") return target.channel.type === "drawing";
   return true;
 }
@@ -2722,7 +2766,7 @@ export async function checkAccount(accountId) {
     };
   }
   const activeSlots = ["chat", "drawingImage", "chatImage"].reduce((result, slot) => {
-    const count = activeTaskCounts.get(`${slot}:${account.id}`) || 0;
+    const count = activeCountForAccountSlot(slot, account.id);
     if (count) result[slot] = count;
     return result;
   }, {});
