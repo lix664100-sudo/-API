@@ -3101,33 +3101,72 @@
         const selectedChannel = channels.find((item) => item.id === selectedChannelId) || channels[0] || null;
         const selectedAccounts = selectedChannel ? accounts.filter((item) => item.channelId === selectedChannel.id) : [];
 
+        function channelForAccount(account) {
+          return channels.find((item) => item.id === account?.channelId) || null;
+        }
+
+        function accountSupportsAbility(account, ability) {
+          const channel = channelForAccount(account);
+          if (!channel) return false;
+          if (channel.type === "shareai") return channelAbilityEnabled(channel, ability);
+          return channel.type === ability;
+        }
+
+        function testChannelForAccount(accountId, ability) {
+          const selectedAccountId = String(accountId || "").trim();
+          if (!selectedAccountId || selectedAccountId === "auto") return "auto";
+          const account = accounts.find((item) => item.id === selectedAccountId);
+          const channel = channelForAccount(account);
+          if (!channel) return "";
+          if (channel.type === "shareai") {
+            return channelAbilityEnabled(channel, ability) ? `${channel.id}:${ability}` : "";
+          }
+          return channel.type === ability ? channel.id : "";
+        }
+
+        function selectedTestTarget(values, ability) {
+          const accountId = String(values?.accountId || "").trim();
+          const channel = testChannelForAccount(accountId, ability);
+          return {
+            channel,
+            accountId: accountId && accountId !== "auto" ? accountId : ""
+          };
+        }
+
+        function selectedTestSearch(values, ability) {
+          const target = selectedTestTarget(values, ability);
+          const params = new URLSearchParams();
+          params.set("channel", target.channel || "auto");
+          if (target.accountId) params.set("accountId", target.accountId);
+          return params;
+        }
+
         const channelOptions = useMemo(() => [
           { label: "自动选择", value: "auto" },
           ...channels.map((item) => ({ label: item.name, value: item.id }))
         ], [channels]);
 
         const chatAccountOptions = useMemo(() => {
-          const chatIds = new Set(chatChannels.map((item) => item.id));
           return [
             { label: "自动选择", value: "auto" },
             ...accounts
-              .filter((account) => account.enabled !== false && chatIds.has(account.channelId))
+              .filter((account) => account.enabled !== false && accountSupportsAbility(account, "chatplus"))
               .map((account) => ({
                 label: `${account.name || account.username || "未命名账号"} / ${channelName(config, account.channelId)}`,
                 value: account.id
               }))
           ];
-        }, [accounts, chatChannels, config]);
+        }, [accounts, channels, config]);
 
         const imageAccountOptions = useMemo(() => [
           { label: "自动选择", value: "auto" },
           ...accounts
-            .filter((account) => account.enabled !== false)
+            .filter((account) => account.enabled !== false && accountSupportsAbility(account, "drawing"))
             .map((account) => ({
               label: `${account.name || account.username || "未命名账号"} / ${channelName(config, account.channelId)}`,
               value: account.id
             }))
-        ], [accounts, config]);
+        ], [accounts, channels, config]);
 
         const chatTestModelOptions = useMemo(() => {
           const selectedAccount = selectedChatAccountValue && selectedChatAccountValue !== "auto"
@@ -3936,21 +3975,26 @@
           setChatSubmitting(true);
           setLoading(true);
           try {
+            const target = selectedTestTarget(values, "chatplus");
+            if (!target.channel) {
+              message.warning("这个账号不能用于对话测试。");
+              return;
+            }
             const headers = { Authorization: `Bearer ${config?.apiKey || ""}` };
             const body = chatFileList.length
               ? (() => {
                   const form = new FormData();
                   form.append("message", text);
-                  form.append("channel", "auto");
-                  if (values.accountId && values.accountId !== "auto") form.append("accountId", values.accountId);
+                  form.append("channel", target.channel);
+                  if (target.accountId) form.append("accountId", target.accountId);
                   if (values.model) form.append("model", values.model);
                   chatFileList.forEach((file) => form.append("image", file.originFileObj));
                   return form;
                 })()
               : {
                   message: text,
-                  channel: "auto",
-                  ...(values.accountId && values.accountId !== "auto" ? { accountId: values.accountId } : {}),
+                  channel: target.channel,
+                  ...(target.accountId ? { accountId: target.accountId } : {}),
                   ...(values.model ? { model: values.model } : {})
                 };
             const result = await api("/v1/chat/completions?wait=0", { method: "POST", headers, body });
@@ -3979,14 +4023,20 @@
           }
           setLoading(true);
           try {
+            const target = selectedTestTarget(values, "drawing");
+            if (!target.channel) {
+              message.warning("这个账号不能用于图生图测试。");
+              return;
+            }
             const form = new FormData();
             Object.entries(values).forEach(([key, value]) => {
               if (key !== "accountId") form.append(key, value ?? "");
             });
-            form.set("channel", "auto");
-            if (values.accountId && values.accountId !== "auto") form.append("accountId", values.accountId);
+            form.set("channel", target.channel);
+            if (target.accountId) form.append("accountId", target.accountId);
             editFileList.forEach((file) => form.append("image", file.originFileObj));
-            const task = await api("/api/draw/edit", { method: "POST", body: form });
+            const params = selectedTestSearch(values, "drawing");
+            const task = await api(`/api/draw/edit?${params.toString()}`, { method: "POST", body: form });
             addSubmittedTask(task);
             await refreshRuntimeStatus();
             message.success(`已提交到 ${task.channelName}，后台生成中`);
@@ -4348,9 +4398,9 @@
           { key: "message", name: "message", required: "可选", scene: "对话", desc: "简单对话直接传字符串；如果只传图，会默认让 AI 描述图片。" },
           { key: "prompt", name: "prompt", required: "图生图必填", scene: "图生图", desc: "用户要怎么改图。" },
           { key: "image", name: "image", required: "按场景", scene: "对话、图生图", desc: "对话最多 5 张；图生图 1 到 3 张；多张图重复传 image 字段。" },
-          { key: "channel", name: "channel", required: "可选", scene: "对话、图生图", desc: "传 auto 自动选择；图生图会先绘图站，忙了再走聊天生图；也兼容旧的 drawing、chatplus。" },
-          { key: "model", name: "model", required: "可选", scene: "对话", desc: "传 gpt、grok、gemini；后台会自动去对应列表挑一辆可用车。" },
-          { key: "model_id", name: "model_id", required: "可选", scene: "图生图", desc: "绘图模型；用户传了就用用户的，没传就用渠道默认模型。" },
+          { key: "channel", name: "channel", required: "可选", scene: "对话、图生图", desc: "传 auto 自动选择；传具体渠道时只在该渠道内处理，也兼容旧的 drawing、chatplus。" },
+          { key: "model", name: "model", required: "可选", scene: "对话", desc: "传 gpt、grok、gemini；后台只会在对应模型的可用账号里选择。" },
+          { key: "model_id", name: "model_id", required: "可选", scene: "图生图", desc: "传 1 使用 GPT 图生图；传 2 或 3 使用绘图模型；没传才用渠道默认模型。" },
           { key: "ratio_label", name: "ratio_label", required: "可选", scene: "图生图", desc: "比如 1:1、16:9、9:16；没传才用兜底比例。" },
           { key: "image_count", name: "image_count", required: "可选", scene: "图生图", desc: "生成张数；没传才用兜底张数。" },
           { key: "wait-query", name: "wait=0", required: "可选", scene: "对话、图生图", desc: "写在地址后面，先创建任务，不等待结果：/v1/chat/completions?wait=0。" }
@@ -4798,7 +4848,7 @@
                     label: "对话测试",
                     children: h("div", { className: "operation-body" }, [
                       h(Form, { layout: "vertical", form: chatForm, onFinish: submitChat }, [
-                        h(Alert, { type: "info", showIcon: true, message: "对话可以只发文字，也可以上传图片让 AI 理解内容，最多 5 张。", style: { marginBottom: 14 } }),
+                        h(Alert, { type: "info", showIcon: true, message: "选择具体账号时，只使用该账号和所选模型；失败会直接显示原因，不会自动切换到其他模型。", style: { marginBottom: 14 } }),
                         chatSubmitBlocked
                           ? h(Alert, { type: "warning", showIcon: true, message: `聊天账号冷却中，约 ${accountCooldownText(coolingChatAccount)} 后再试。`, style: { marginBottom: 14 } })
                           : null,
@@ -4828,7 +4878,7 @@
                     key: "edit",
                     label: "图生图测试",
                     children: h("div", { className: "operation-body" }, h(Form, { layout: "vertical", form: editForm, onFinish: submitEdit }, [
-                      h(Alert, { type: "info", showIcon: true, message: "图生图会先走绘图站；绘图站忙或失败时，自动改走聊天生图；两边都不可用才失败。", style: { marginBottom: 14 } }),
+                      h(Alert, { type: "info", showIcon: true, message: "选择具体账号时，只使用该账号的绘图能力和所选模型；失败会直接显示原因，不会自动改走聊天生图。", style: { marginBottom: 14 } }),
                       h("div", { className: "form-grid" }, [
                         h(Form.Item, { label: "账号", name: "accountId" }, h(Select, { options: imageAccountOptions })),
                         h(Form.Item, { label: "绘图模型", name: "model_id" }, h(Select, { options: drawingModelOptions }))

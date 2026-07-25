@@ -470,3 +470,148 @@ test("image admission refreshes cached chat usage limit before upload", async ()
     ChatplusClient.prototype.check = originalCheck;
   }
 });
+
+test("Gemini image admission uses chat image even when default channel is drawing", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "drawing",
+    concurrency: { chat: 3, drawingImage: 5, chatImage: 5 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        defaultModelId: 1,
+        defaultChatModel: "gpt",
+        chatModels: [
+          { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-test", strategy: "image", enabled: true, default: true },
+          { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", enabled: true, default: false }
+        ]
+      }
+    }],
+    accounts: [{
+      id: "gemini-admission-account",
+      channelId: "shareai",
+      name: "Gemini Admission",
+      username: "gemini-admission@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok" },
+          chatplus: { status: "ok" }
+        }
+      }
+    }]
+  });
+
+  const admitted = await reserveImageTaskAdmission({
+    prompt: "gemini should stay in chat image",
+    model: "gemini"
+  });
+  try {
+    assert.equal(admitted.target.channel.type, "chatplus");
+    assert.equal(admitted.target.channel.id, "shareai:chatplus");
+  } finally {
+    admitted.release();
+  }
+});
+
+test("Nano-Banana image admission uses drawing even when default channel is chat", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "chatplus",
+    concurrency: { chat: 3, drawingImage: 5, chatImage: 5 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        defaultModelId: 1
+      }
+    }],
+    accounts: [{
+      id: "nano-banana-admission-account",
+      channelId: "shareai",
+      name: "Nano Banana Admission",
+      username: "nano-banana-admission@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok" },
+          chatplus: { status: "ok" }
+        }
+      }
+    }]
+  });
+
+  const admitted = await reserveImageTaskAdmission({
+    prompt: "nano banana should stay in drawing",
+    model_id: 2
+  });
+  try {
+    assert.equal(admitted.target.channel.type, "drawing");
+    assert.equal(admitted.target.channel.id, "shareai:drawing");
+  } finally {
+    admitted.release();
+  }
+});
+
+test("Gemini image admission fails instead of using drawing when chat image is disabled", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "auto",
+    concurrency: { chat: 3, drawingImage: 5, chatImage: 5 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        enabledAbilities: { drawing: true, chatplus: false },
+        defaultModelId: 1
+      }
+    }],
+    accounts: [{
+      id: "gemini-no-chat-account",
+      channelId: "shareai",
+      name: "Gemini No Chat",
+      username: "gemini-no-chat@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok" },
+          chatplus: { status: "ok" }
+        }
+      }
+    }]
+  });
+
+  await assert.rejects(
+    reserveImageTaskAdmission({
+      prompt: "gemini should not use drawing",
+      model: "gemini"
+    }),
+    (error) => {
+      assert.equal(error.status, 503);
+      assert.match(error.message, /生图账号/);
+      return true;
+    }
+  );
+});

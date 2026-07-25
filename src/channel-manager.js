@@ -1177,6 +1177,55 @@ function accountMatchesChannel(account, channel) {
   return channel.type === "shareai" && channel.id === "shareai" && account.channelId === "shareai";
 }
 
+function modelRequestKey(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+const chatModelRequestKeys = new Set(["gpt", "grok", "gemini"]);
+const gptImageModelRequestKeys = new Set(["1", "gpt-image-2", "chatgpt-image-2"]);
+const drawingModelRequestKeys = new Set([
+  "1",
+  "2",
+  "3",
+  "gpt-image-2",
+  "chatgpt-image-2",
+  "nano-banana-pro",
+  "nano-banana"
+]);
+
+function requestedModelLock(input = {}) {
+  const explicitModel = input.model || input.chat_model || input.chatModel || "";
+  const explicitKey = modelRequestKey(explicitModel);
+  if (explicitKey && explicitKey !== "auto") {
+    if (chatModelRequestKeys.has(explicitKey)) return { type: "chat", key: explicitKey };
+    if (gptImageModelRequestKeys.has(explicitKey)) return { type: "gpt-image", key: "gpt" };
+    if (drawingModelRequestKeys.has(explicitKey)) return { type: "drawing" };
+    return { type: "chat", key: explicitKey };
+  }
+
+  const imageModelKey = modelRequestKey(input.model_id ?? input.modelId ?? "");
+  if (!imageModelKey || imageModelKey === "auto") return { type: "auto" };
+  return gptImageModelRequestKeys.has(imageModelKey)
+    ? { type: "gpt-image", key: "gpt" }
+    : { type: "drawing" };
+}
+
+function requestedChannelForInput(config, input = {}) {
+  const requestedChannel = String(input.channel || "").trim();
+  if (requestedChannel) return requestedChannel;
+  return requestedModelLock(input).type === "auto" ? config.defaultChannel || "auto" : "auto";
+}
+
+function targetMatchesRequestedModel(target, taskType, input = {}) {
+  if (taskType === "chat") return true;
+  const lock = requestedModelLock(input);
+  if (lock.type === "auto") return true;
+  if (lock.type === "chat") return target.channel.type === "chatplus";
+  if (lock.type === "gpt-image") return ["drawing", "chatplus"].includes(target.channel.type);
+  if (lock.type === "drawing") return target.channel.type === "drawing";
+  return true;
+}
+
 function accountRoutingWeight(account) {
   const weight = Math.round(Number(account?.routingWeight || 1));
   return Math.min(100, Math.max(1, Number.isFinite(weight) ? weight : 1));
@@ -1250,7 +1299,7 @@ function selectTargets(config, requestedChannel = "auto", taskType = "text2img",
       targets.push({ channel, account });
     }
   }
-  return targets;
+  return targets.filter((target) => targetMatchesRequestedModel(target, taskType, options.input));
 }
 
 function noChatTargetsError(config, requestedChannel) {
@@ -1475,17 +1524,19 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
 
 export async function reserveImageTaskAdmission(input = {}) {
   const config = await loadRuntimeConfig();
-  const requestedChannel = input.channel || config.defaultChannel || "auto";
+  const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
     accountId: requestedAccountId,
-    skipKnownQuotaEmpty: true
+    skipKnownQuotaEmpty: true,
+    input
   });
   if (!targets.length) {
     throw noUsableTargetError("img2img", {
       config,
       requestedChannel,
-      accountId: requestedAccountId
+      accountId: requestedAccountId,
+      input
     });
   }
   return reserveFirstAvailableTarget(targets, "img2img", {
@@ -1507,7 +1558,8 @@ function noUsableTargetError(taskType, options = {}) {
   const allTargets = options.config
     ? selectTargets(options.config, options.requestedChannel || "auto", taskType, {
       accountId: options.accountId || "",
-      includeCooling: true
+      includeCooling: true,
+      input: options.input || {}
     })
     : [];
   const chatTargets = allTargets.filter((target) => target.channel.type === "chatplus");
@@ -1988,8 +2040,8 @@ async function persistSubmittedTask(task, result, channel, account, attempts) {
 
 async function runQueuedTextTask(task, input, reserved = null, options = {}) {
   const config = await loadRuntimeConfig();
-  const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = await selectReadyTargets(config, requestedChannel, "text2img");
+  const requestedChannel = requestedChannelForInput(config, input);
+  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { input });
   const attempts = [...(reserved?.attempts || [])];
   let reservedRelease = reserved?.release || null;
   try {
@@ -2119,9 +2171,9 @@ async function waitForUpstreamTask(client, result, timeoutSec) {
 
 async function runQueuedImageTask(task, input, files, reserved = null, options = {}) {
   const config = await loadRuntimeConfig();
-  const requestedChannel = input.channel || config.defaultChannel || "auto";
+  const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId });
+  const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, input });
   const attempts = [...(reserved?.attempts || [])];
   let reservedRelease = reserved?.release || null;
   try {
@@ -2225,9 +2277,9 @@ async function finishChatTask(task, result, channel, account, attempts, response
 
 async function runChatCompletionTask(task, input) {
   const config = await loadRuntimeConfig();
-  const requestedChannel = input.channel || config.defaultChannel || "auto";
+  const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId });
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, input });
   const preferredTarget = requestedAccountId
     ? null
     : targets.find((target) => target.account.id === task.accountId && target.channel.id === task.channelId);
@@ -2298,9 +2350,9 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
     throw error;
   }
   const config = await loadRuntimeConfig();
-  const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true });
-  if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel });
+  const requestedChannel = requestedChannelForInput(config, input);
+  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true, input });
+  if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel, input });
 
   const reserved = await reserveFirstAvailableTarget(targets, "text2img");
   const task = queuedTask({ input, target: reserved.target, taskType: "text2img", requestMeta });
@@ -2329,14 +2381,15 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files, 3);
   const config = await loadRuntimeConfig();
-  const requestedChannel = input.channel || config.defaultChannel || "auto";
+  const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: true });
+  const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: true, input });
   if (!targets.length) {
     throw noUsableTargetError("img2img", {
       config,
       requestedChannel,
-      accountId: requestedAccountId
+      accountId: requestedAccountId,
+      input
     });
   }
 
@@ -2364,14 +2417,15 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
   assertChatInput(input);
 
   const config = await loadRuntimeConfig();
-  const requestedChannel = input.channel || config.defaultChannel || "auto";
+  const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true, input });
   if (!targets.length) {
     throw noUsableTargetError("chat", {
       config,
       requestedChannel,
-      accountId: requestedAccountId
+      accountId: requestedAccountId,
+      input
     });
   }
 
@@ -2659,14 +2713,15 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
   assertChatInput(input);
 
   const config = await loadRuntimeConfig();
-  const requestedChannel = input.channel || config.defaultChannel || "auto";
+  const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true });
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true, input });
   if (!targets.length) {
     throw noUsableTargetError("chat", {
       config,
       requestedChannel,
-      accountId: requestedAccountId
+      accountId: requestedAccountId,
+      input
     });
   }
 
@@ -2701,9 +2756,9 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
     throw error;
   }
   const config = await loadRuntimeConfig();
-  const requestedChannel = input.channel || config.defaultChannel || "auto";
-  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true });
-  if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel });
+  const requestedChannel = requestedChannelForInput(config, input);
+  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true, input });
+  if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel, input });
 
   const attempts = [];
   for (const target of targets) {
@@ -2760,18 +2815,20 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files, 3);
   const config = await loadRuntimeConfig();
-  const requestedChannel = input.channel || config.defaultChannel || "auto";
+  const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
     accountId: requestedAccountId,
     balanced: wait,
-    skipRecovery: wait
+    skipRecovery: wait,
+    input
   });
   if (!targets.length) {
     throw noUsableTargetError("img2img", {
       config,
       requestedChannel,
-      accountId: requestedAccountId
+      accountId: requestedAccountId,
+      input
     });
   }
   const reserved = consumeAdmissionReservation(admission, targets);

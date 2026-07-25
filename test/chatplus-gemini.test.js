@@ -99,6 +99,93 @@ test("GPT 图生图模型不会因为渠道默认值而转到 Gemini", async () 
   assert.equal(route.strategy, "image");
 });
 
+test("显式选择 Gemini 时不会被 model_id 改成 GPT", async () => {
+  const testClient = client();
+
+  const route = testClient.chatRouteForInput({
+    model: "gemini",
+    model_id: 1,
+    preferImageCar: true
+  });
+
+  assert.equal(route.key, "gemini");
+  assert.equal(route.carType, "gemini");
+});
+
+test("GPT 图片模型明确走 GPT 图片车位", async () => {
+  const testClient = client();
+
+  const route = testClient.chatRouteForInput({
+    model: "gpt-image-2",
+    preferImageCar: true
+  });
+
+  assert.equal(route.key, "gpt");
+  assert.equal(route.carType, "chatgpt");
+  assert.equal(route.strategy, "image");
+});
+
+test("GPT 自动换车只会继续找 GPT 车队", async () => {
+  const testClient = client();
+  const carTypes = [];
+  testClient.fetchCars = async (carType) => {
+    carTypes.push(carType);
+    return [{
+      id: "same-gpt-car",
+      status: 1,
+      count: 0,
+      cooldown: 0,
+      desc: "ok",
+      label: "ok",
+      imageRemaining: 20,
+      isPro: false,
+      isUltra: false,
+      isVirtual: false,
+      realCarIDs: []
+    }];
+  };
+  testClient.enterCar = async () => {
+    throw new Error("身份验证失败");
+  };
+
+  await assert.rejects(() => testClient.prepareChatSession({ model: "gpt" }, new Set(), 2));
+
+  assert.deepEqual(carTypes, ["chatgpt", "chatgpt"]);
+});
+
+test("Gemini 失败时不会改找 GPT 车队", async () => {
+  const testClient = client();
+  const carTypes = [];
+  testClient.fetchCars = async (carType) => {
+    carTypes.push(carType);
+    return [{
+      id: "gemini-car",
+      status: 1,
+      count: 0,
+      cooldown: 0,
+      desc: "ok",
+      label: "ok",
+      imageRemaining: 0,
+      isPro: false,
+      isUltra: false,
+      isVirtual: false,
+      realCarIDs: []
+    }];
+  };
+  testClient.enterCar = async () => {
+    const error = new Error("Gemini 上游失败");
+    error.status = 502;
+    throw error;
+  };
+
+  await assert.rejects(
+    () => testClient.prepareChatSession({ model: "gemini" }, new Set(), 2),
+    (error) => error.noRetry === true
+  );
+
+  assert.deepEqual(carTypes, ["gemini"]);
+});
+
 test("Gemini 返回图片时直接算成功，不再走 GPT 详情接口", async () => {
   const testClient = client();
   testClient.geminiSession = {
