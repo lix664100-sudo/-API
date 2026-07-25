@@ -1502,8 +1502,12 @@
         return [...new Set(texts)].join("\n");
       }
 
+      function isFailedTaskRow(row) {
+        return String(row?.status || "").toLowerCase() === "failed";
+      }
+
       function taskErrorText(row) {
-        if (row?.status === "interrupted") return "";
+        if (!isFailedTaskRow(row)) return "";
         const attempts = taskAttempts(row);
         const attemptText = attempts.map((item) => String(item.message || "")).filter(Boolean).join("；");
         const text = taskUpstreamText(row) || row?.errorMessage || row?.responseJson?.message || attemptText || "";
@@ -1520,7 +1524,7 @@
       }
 
       function taskRawErrorText(row) {
-        if (row?.status === "interrupted") return "";
+        if (!isFailedTaskRow(row)) return "";
         const text = row?.errorMessage || row?.responseJson?.message || "";
         return text && text !== taskErrorText(row) ? text : "";
       }
