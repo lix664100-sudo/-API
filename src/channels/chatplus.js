@@ -8,6 +8,11 @@ const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 300;
 const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
 const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
+const GEMINI_REQUEST_PATH = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
+const GEMINI_UPLOAD_URL = "https://content-push.googleapis.com/upload/";
+const GEMINI_UPLOAD_AUTHORIZATION = "Basic c2F2ZXM6cyNMdGhlNmxzd2F2b0RsN3J1d1U=";
+const GEMINI_DEFAULT_BUILD_LABEL = "boq_assistant-bard-web-server_20260525.09_p0";
+const GEMINI_DEFAULT_PUSH_ID = "feeds/mcudyrk2a4khkz";
 const badCarUntil = new Map();
 
 function trimSlash(value) {
@@ -276,6 +281,150 @@ function parseJsonLines(text) {
     }
   }
   return events;
+}
+
+function parseGeminiJsonLines(text) {
+  const events = [];
+  for (const line of String(text || "").split(/\r?\n/)) {
+    let data = line.trim().replace(/^data:\s*/i, "");
+    if (!data || data === "[DONE]" || data === ")]}'") continue;
+    if (data.startsWith(")]}'")) data = data.slice(4).trim();
+    try {
+      events.push(JSON.parse(data));
+    } catch {
+      // Gemini occasionally sends a non-json preamble before the response lines.
+    }
+  }
+  return events;
+}
+
+function nestedGeminiJson(value, output = []) {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text.startsWith("[") && !text.startsWith("{")) return output;
+    try {
+      const parsed = JSON.parse(text);
+      output.push(parsed);
+      nestedGeminiJson(parsed, output);
+    } catch {
+      // Ignore ordinary text fields.
+    }
+    return output;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => nestedGeminiJson(item, output));
+    return output;
+  }
+  if (value && typeof value === "object") {
+    Object.values(value).forEach((item) => nestedGeminiJson(item, output));
+  }
+  return output;
+}
+
+function geminiResponseParts(value, output = []) {
+  if (Array.isArray(value)) {
+    if (value.length >= 5 && Array.isArray(value[4])) output.push(value);
+    value.forEach((item) => geminiResponseParts(item, output));
+    return output;
+  }
+  if (value && typeof value === "object") {
+    Object.values(value).forEach((item) => geminiResponseParts(item, output));
+  }
+  return output;
+}
+
+function geminiTextFromResponsePart(part) {
+  const rows = Array.isArray(part?.[4]) ? part[4] : [];
+  const values = [];
+  for (const row of rows) {
+    const content = row?.[1];
+    if (typeof content === "string") values.push(content);
+    if (Array.isArray(content)) values.push(...content.filter((item) => typeof item === "string"));
+  }
+  return values.join("").trim();
+}
+
+function extractGeminiText(events) {
+  const candidates = [];
+  for (const value of nestedGeminiJson(events)) {
+    for (const part of geminiResponseParts(value)) {
+      const text = geminiTextFromResponsePart(part);
+      if (text) candidates.push(text);
+    }
+  }
+  return candidates.sort((a, b) => b.length - a.length)[0] || "";
+}
+
+function extractGeminiConversationId(events) {
+  const ids = [];
+  for (const value of nestedGeminiJson(events)) {
+    for (const part of geminiResponseParts(value)) {
+      const conversationId = Array.isArray(part?.[1]) ? part[1][0] : "";
+      if (conversationId) ids.push(String(conversationId));
+    }
+  }
+  return ids[ids.length - 1] || "";
+}
+
+function normalizeGeminiImageUrl(value, baseUrl) {
+  const text = String(value || "").trim().replace(/[),.;]+$/, "");
+  if (!text) return "";
+  if (text.startsWith("//")) return `https:${text}`;
+  if (text.startsWith("/")) return `${baseUrl}${text}`;
+  return /^https?:\/\//i.test(text) ? text : "";
+}
+
+function scanGeminiImageRefs(value, baseUrl, output = new Set()) {
+  if (typeof value === "string") {
+    const direct = value.match(/https?:\/\/[^\s"'<>\\]+/gi) || [];
+    direct.forEach((url) => {
+      if (/\/gemini\/images\/|googleusercontent\.com|image_generation/i.test(url)) {
+        output.add(normalizeGeminiImageUrl(url, baseUrl));
+      }
+    });
+    const local = value.match(/\/gemini\/images\/gg-dl\/[A-Za-z0-9._~+/=-]+/g) || [];
+    local.forEach((url) => output.add(normalizeGeminiImageUrl(url, baseUrl)));
+    const protocolRelative = value.match(/\/\/[A-Za-z0-9.-]+\/(?:gemini\/images\/|image_generation\/)[^\s"'<>\\]+/gi) || [];
+    protocolRelative.forEach((url) => output.add(normalizeGeminiImageUrl(url, baseUrl)));
+    return output;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => scanGeminiImageRefs(item, baseUrl, output));
+    return output;
+  }
+  if (value && typeof value === "object") {
+    Object.values(value).forEach((item) => scanGeminiImageRefs(item, baseUrl, output));
+  }
+  return output;
+}
+
+function extractGeminiImageUrls(events, baseUrl) {
+  const urls = new Set();
+  for (const value of nestedGeminiJson(events)) {
+    for (const part of geminiResponseParts(value)) {
+      scanGeminiImageRefs(part?.[4], baseUrl, urls);
+    }
+  }
+  return [...urls].filter(Boolean);
+}
+
+function extractGeminiErrorText(events) {
+  const values = [];
+  const collect = (value) => {
+    if (typeof value === "string") {
+      if (/(?:error|failed|failure|quota|limit|unavailable|not allowed|无法|失败|额度|上限)/i.test(value)) {
+        values.push(value.trim());
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(collect);
+      return;
+    }
+    if (value && typeof value === "object") Object.values(value).forEach(collect);
+  };
+  collect(events);
+  return values.sort((a, b) => b.length - a.length)[0] || "";
 }
 
 function contentPartToText(part) {
@@ -884,6 +1033,41 @@ function concreteCarId(car) {
   return car.id;
 }
 
+function firstGeminiToken(body, name) {
+  const text = String(body || "");
+  const escaped = new RegExp(`${name}.{0,80}?:(?:\\\\?"|")([^"\\\\]*)(?:\\\\?"|")`, "s").exec(text);
+  if (escaped?.[1]) return escaped[1];
+  const plain = new RegExp(`${name}.{0,80}?[:=]\\s*["']([^"']+)["']`, "s").exec(text);
+  return plain?.[1] || "";
+}
+
+function geminiSessionFromPage(body, previous = {}) {
+  const text = String(body || "");
+  const buildLabel = text.match(/boq_assistant-bard-web-server_[A-Za-z0-9_.-]+/)?.[0] || "";
+  return {
+    at: firstGeminiToken(text, "SNlM0e") || previous.at || "",
+    sid: firstGeminiToken(text, "FdrFJe") || previous.sid || "",
+    bl: buildLabel || previous.bl || GEMINI_DEFAULT_BUILD_LABEL,
+    pushId: firstGeminiToken(text, "qKIAYe") || previous.pushId || GEMINI_DEFAULT_PUSH_ID,
+    sourcePath: "/app"
+  };
+}
+
+function geminiModeForRoute(route = {}) {
+  const requested = String(route.model || "").trim().toLowerCase();
+  if (/^\d+$/.test(requested)) {
+    const mode = Number(requested);
+    if (mode >= 1 && mode <= 6) return mode;
+  }
+  if (requested.includes("pro")) return 3;
+  if (requested.includes("lite")) return 5;
+  return 1;
+}
+
+function geminiThinkingModeForRoute(route = {}) {
+  return String(route.strategy || "").toLowerCase() === "thinking" ? 0 : 4;
+}
+
 export class ChatplusClient {
   constructor({ config, channel, account, sessionLock }) {
     this.config = config;
@@ -895,6 +1079,13 @@ export class ChatplusClient {
     this.cookies = [];
     this.portalLoggedIn = false;
     this.defaultModel = "gpt-5-5-thinking";
+    this.geminiSession = {
+      at: "",
+      sid: "",
+      bl: GEMINI_DEFAULT_BUILD_LABEL,
+      pushId: GEMINI_DEFAULT_PUSH_ID,
+      sourcePath: "/app"
+    };
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWork = Promise.resolve();
@@ -992,6 +1183,13 @@ export class ChatplusClient {
     this.portalLoggedIn = false;
     this.carId = "";
     this.carType = "chatgpt";
+    this.geminiSession = {
+      at: "",
+      sid: "",
+      bl: GEMINI_DEFAULT_BUILD_LABEL,
+      pushId: GEMINI_DEFAULT_PUSH_ID,
+      sourcePath: "/app"
+    };
     this.concurrentChatSessions.clear();
   }
 
@@ -1001,7 +1199,8 @@ export class ChatplusClient {
       portalLoggedIn: this.portalLoggedIn,
       carId: this.carId,
       carType: this.carType,
-      defaultModel: this.defaultModel
+      defaultModel: this.defaultModel,
+      geminiSession: { ...this.geminiSession }
     };
   }
 
@@ -1011,6 +1210,10 @@ export class ChatplusClient {
     this.carId = String(snapshot.carId || "");
     this.carType = String(snapshot.carType || "chatgpt");
     if (snapshot.defaultModel) this.defaultModel = snapshot.defaultModel;
+    this.geminiSession = {
+      ...this.geminiSession,
+      ...(snapshot.geminiSession || {})
+    };
   }
 
   preparedChatSession(session = {}) {
@@ -1026,7 +1229,11 @@ export class ChatplusClient {
       route: session.route ? { ...session.route } : session.route,
       selected: session.selected ? { ...session.selected } : session.selected,
       snapshot: session.snapshot
-        ? { ...session.snapshot, cookies: [...(session.snapshot.cookies || [])] }
+        ? {
+            ...session.snapshot,
+            cookies: [...(session.snapshot.cookies || [])],
+            geminiSession: { ...(session.snapshot.geminiSession || {}) }
+          }
         : this.sessionSnapshot()
     };
   }
@@ -1163,6 +1370,9 @@ export class ChatplusClient {
         error.status = page.status;
         error.body = page.body;
         throw error;
+      }
+      if (carType === "gemini") {
+        this.geminiSession = geminiSessionFromPage(page.body, this.geminiSession);
       }
     });
   }
@@ -1439,12 +1649,195 @@ export class ChatplusClient {
   }
 
   async imageUrlsFrom(value, options = {}) {
+    if (options.gemini) return extractGeminiImageUrls(value, this.baseUrl);
     const refs = options.generatedOnly
       ? scanForGeneratedImageRefs(value, this.baseUrl)
       : scanForImageRefs(value, this.baseUrl);
     const urls = [...refs.urls];
     for (const fileId of refs.fileIds) urls.push(await this.imageDownloadUrl(fileId));
     return [...new Set(urls)];
+  }
+
+  buildGeminiRequest(prompt, route, uploads = []) {
+    const request = Array(80).fill(null);
+    request[0] = [
+      prompt,
+      0,
+      null,
+      uploads.map(([identifier, filename]) => [[identifier, 1], filename]),
+      null,
+      null,
+      0
+    ];
+    request[1] = ["zh"];
+    request[2] = ["", "", "", null, null, null, null, null, null, ""];
+    request[6] = [0];
+    request[7] = 1;
+    request[9] = [];
+    request[10] = 1;
+    request[11] = 0;
+    request[17] = [[geminiThinkingModeForRoute(route)]];
+    request[18] = 0;
+    request[27] = 1;
+    request[30] = [4];
+    request[41] = [2];
+    request[53] = 0;
+    request[59] = randomUUID().toUpperCase();
+    request[61] = [];
+    request[68] = 1;
+    request[79] = geminiModeForRoute(route);
+    return request;
+  }
+
+  async uploadGeminiImage(file) {
+    const buffer = await file.toBuffer();
+    const mimetype = String(file.mimetype || "image/png").toLowerCase();
+    if (!mimetype.startsWith("image/")) {
+      const error = new Error("对话只能上传图片文件。");
+      error.status = 400;
+      throw error;
+    }
+    const filename = fileNameFromMime(mimetype, file.filename || `gemini-image-${randomUUID()}`);
+    const commonHeaders = {
+      accept: "*/*",
+      authorization: GEMINI_UPLOAD_AUTHORIZATION,
+      origin: this.baseUrl,
+      referer: `${this.baseUrl}/app`,
+      "push-id": this.geminiSession.pushId || GEMINI_DEFAULT_PUSH_ID,
+      "x-goog-upload-header-content-length": String(buffer.length),
+      "x-goog-upload-protocol": "resumable",
+      "x-tenant-id": "bard-storage"
+    };
+
+    const start = await this.http(GEMINI_UPLOAD_URL, {
+      method: "POST",
+      body: `File name: ${filename}`,
+      rawBody: true,
+      headers: {
+        ...commonHeaders,
+        "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "x-goog-upload-command": "start"
+      }
+    });
+    if (start.status < 200 || start.status >= 300) {
+      const error = new Error(`Gemini 图片上传初始化失败：${start.status}`);
+      error.status = start.status;
+      error.body = start.body;
+      throw error;
+    }
+    const uploadUrl = start.headers["x-goog-upload-url"]?.[0] || "";
+    if (!uploadUrl) throw new Error("Gemini 图片上传没有返回上传地址。");
+
+    const uploaded = await this.http(uploadUrl, {
+      method: "POST",
+      body: buffer,
+      rawBody: true,
+      headers: {
+        ...commonHeaders,
+        "content-type": mimetype,
+        "x-goog-upload-command": "upload, finalize",
+        "x-goog-upload-offset": "0"
+      }
+    });
+    if (uploaded.status < 200 || uploaded.status >= 300) {
+      const error = new Error(`Gemini 图片上传失败：${uploaded.status}`);
+      error.status = uploaded.status;
+      error.body = uploaded.body;
+      throw error;
+    }
+    let identifier = String(uploaded.body || "").trim();
+    try {
+      const payload = JSON.parse(identifier);
+      identifier = String(payload?.file_id || payload?.id || payload?.name || payload?.url || identifier).trim();
+    } catch {
+      // Gemini upload commonly returns the identifier as plain text.
+    }
+    if (!identifier) throw new Error("Gemini 图片上传没有返回图片编号。");
+    return [identifier, filename];
+  }
+
+  async uploadGeminiImages(files = []) {
+    return Promise.all(files.map((file) => this.uploadGeminiImage(file)));
+  }
+
+  async sendGeminiConversation(prompt, input, route, selected) {
+    if (!this.geminiSession.bl) {
+      const error = new Error("Gemini 页面参数还没有准备好，请重新进入车位后再试。");
+      error.noRetry = true;
+      throw error;
+    }
+    const uploads = await this.uploadGeminiImages(input.files || []);
+    const request = this.buildGeminiRequest(prompt, route, uploads);
+    const params = new URLSearchParams({
+      bl: this.geminiSession.bl,
+      hl: "zh",
+      _reqid: String(Math.floor(100000 + Math.random() * 900000)),
+      rt: "c"
+    });
+    if (this.geminiSession.sid) params.set("f.sid", this.geminiSession.sid);
+    const form = new URLSearchParams({
+      "f.req": JSON.stringify([null, JSON.stringify(request)])
+    });
+    if (this.geminiSession.at) form.set("at", this.geminiSession.at);
+    const response = await this.http(`${GEMINI_REQUEST_PATH}?${params.toString()}`, {
+      method: "POST",
+      body: form.toString(),
+      rawBody: true,
+      headers: {
+        accept: "*/*",
+        "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "x-same-domain": "1",
+        referer: `${this.baseUrl}/app`
+      }
+    });
+    if ([401, 403].includes(response.status)) {
+      const error = new Error("Gemini 上游拒绝了当前登录会话，请重新检测账号。");
+      error.status = response.status;
+      error.body = response.body;
+      throw error;
+    }
+    if (response.status < 200 || response.status >= 300) {
+      const error = new Error(`Gemini 提交失败：${response.status}`);
+      error.status = response.status;
+      error.body = response.body;
+      throw error;
+    }
+
+    const events = parseGeminiJsonLines(response.body);
+    const directContent = extractGeminiText(events);
+    const imageUrls = extractGeminiImageUrls(events, this.baseUrl);
+    throwIfImageGenerationLimit(directContent);
+    const upstreamError = extractGeminiErrorText(events);
+    if (isImageGenerationLimitMessage(upstreamError) || /usage count has reached the limit|使用次数已达上限/i.test(upstreamError)) {
+      const error = imageQuotaError("当前 Gemini 账号的使用次数已用完。");
+      error.quotaReason = "chat_usage_limit";
+      error.noRetry = true;
+      throw error;
+    }
+    if (!directContent && !imageUrls.length && upstreamError) {
+      const error = new Error(upstreamError);
+      error.status = 400;
+      error.upstreamExplicitFailure = true;
+      throw error;
+    }
+    if (!directContent && !imageUrls.length) {
+      const error = new Error("Gemini 上游没有返回文字或图片结果。");
+      error.status = 502;
+      error.code = "INVALID_UPSTREAM_RESPONSE";
+      throw error;
+    }
+    const messageId = randomUUID();
+    return {
+      events,
+      conversationId: extractGeminiConversationId(events),
+      messageId,
+      model: route.key,
+      upstreamModel: route.model || "gemini",
+      route,
+      selected,
+      directContent,
+      imageUrls
+    };
   }
 
   async sendGrokConversation(prompt, input, route, selected) {
@@ -1508,7 +1901,7 @@ export class ChatplusClient {
   }
 
   async deleteConversation(conversationId, route) {
-    if (!conversationId) return;
+    if (!conversationId || route?.key === "gemini") return;
     const isGrok = route?.key === "grok";
     const response = await this.http(
       isGrok
@@ -1544,9 +1937,8 @@ export class ChatplusClient {
           return { ...conversation, submitSessionSnapshot: submitClient.sessionSnapshot() };
         }
         if (route.key === "gemini") {
-          const error = new Error("Gemini 上游当前账号没有有效订阅，暂时不能作为后端 API 转发。");
-          error.noRetry = true;
-          throw error;
+          const conversation = await runSubmitStep(() => submitClient.sendGeminiConversation(prompt, input, route, selected));
+          return { ...conversation, submitSessionSnapshot: submitClient.sessionSnapshot() };
         }
         const model = route.model || init?.default_model_slug || submitClient.defaultModel || this.defaultModel;
         const imageAssets = await runSubmitStep(() => submitClient.uploadChatImages(input.files || []));
@@ -1747,6 +2139,9 @@ export class ChatplusClient {
       const result = await this.withImageQuotaFallback(prompt, { ...input, preferImageCar: true, requireConversationId: true }, async (conversation) => {
         throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
+        if (conversation.route?.key === "gemini") {
+          return { ...conversation, imageUrls: conversation.imageUrls || [] };
+        }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
         const waitClient = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
         const imageUrls = await waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec);
@@ -1755,7 +2150,7 @@ export class ChatplusClient {
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
 
       return {
-        externalId: conversationId,
+        externalId: conversationId || messageId,
         status: imageUrls.length ? "success" : "waiting_upstream",
         prompt,
         taskType: "text2img",
@@ -1778,6 +2173,9 @@ export class ChatplusClient {
       const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: true, requireConversationId: true }, async (conversation) => {
         throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
+        if (conversation.route?.key === "gemini") {
+          return { ...conversation, imageUrls: conversation.imageUrls || [] };
+        }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
         const waitClient = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
         const imageUrls = await waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true });
@@ -1786,7 +2184,7 @@ export class ChatplusClient {
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
 
       return {
-        externalId: conversationId,
+        externalId: conversationId || messageId,
         status: imageUrls.length ? "success" : "waiting_upstream",
         prompt,
         taskType: "img2img",
@@ -1816,9 +2214,11 @@ export class ChatplusClient {
           conversationToDelete = conversation;
           const { events, conversationId, route, directContent } = conversation;
           const streamContent = extractAssistantText(events);
-          let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: files.length > 0 });
+          let imageUrls = route?.key === "gemini"
+            ? conversation.imageUrls || []
+            : await this.imageUrlsFrom(events, { generatedOnly: files.length > 0 });
           let detailContent = "";
-          if (conversationId && route?.key !== "grok") {
+          if (conversationId && !["grok", "gemini"].includes(route?.key)) {
             try {
               const detail = await this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}`);
               detailContent = extractAssistantText(detail);
