@@ -984,6 +984,55 @@
         line-height: 1.45;
       }
 
+      .task-error-card {
+        max-width: 860px;
+        margin-top: 8px;
+        padding: 10px 12px;
+        border: 1px solid #fecaca;
+        border-radius: 8px;
+        background: #fff7f7;
+        color: #7f1d1d;
+        font-size: 12px;
+        line-height: 1.55;
+      }
+
+      .task-error-title {
+        font-weight: 760;
+        color: #991b1b;
+      }
+
+      .task-error-list {
+        display: grid;
+        gap: 6px;
+        margin: 8px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .task-error-item {
+        display: grid;
+        grid-template-columns: minmax(150px, 240px) minmax(220px, 1fr);
+        gap: 10px;
+        padding-top: 6px;
+        border-top: 1px solid #fee2e2;
+      }
+
+      .task-error-target {
+        color: #991b1b;
+        font-weight: 650;
+        word-break: break-word;
+      }
+
+      .task-error-reason {
+        color: #7f1d1d;
+        word-break: break-word;
+      }
+
+      .task-error-next {
+        margin-top: 8px;
+        color: #7f1d1d;
+      }
+
       .task-error-detail {
         max-width: 980px;
         margin-top: 6px;
@@ -1022,8 +1071,20 @@
         display: grid;
         grid-template-columns: repeat(2, minmax(260px, 1fr));
         gap: 8px;
+        margin-top: 8px;
+      }
+
+      .task-json-detail {
         max-width: 980px;
         margin-top: 8px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .task-json-detail summary {
+        cursor: pointer;
+        color: #475569;
+        user-select: none;
       }
 
       .task-json-panel {
@@ -1089,6 +1150,11 @@
         .upstream-detail-grid,
         .form-grid,
         .model-route-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .task-error-item,
+        .task-json-grid {
           grid-template-columns: 1fr;
         }
 
@@ -1352,8 +1418,13 @@
         }
       }
 
-      function isChatTaskRow(row) {
+      function taskAttempts(row) {
         const attempts = Array.isArray(row?.attempts) ? row.attempts : row?.responseJson?.attempts || [];
+        return attempts.filter((item) => item && String(item.message || "").trim());
+      }
+
+      function isChatTaskRow(row) {
+        const attempts = taskAttempts(row);
         return [
           row?.channelId,
           row?.channelType,
@@ -1389,6 +1460,20 @@
           : text;
       }
 
+      function taskFailureSummaryText(row, value) {
+        const attempts = taskAttempts(row);
+        if (!attempts.length) return "";
+        const text = String(value || "");
+        const messages = attempts.map((item) => String(item.message || "")).join("；");
+        if (/并发上限/.test(text) || attempts.every((item) => item.busy || /正在处理中/.test(String(item.message || "")))) {
+          return "任务失败：可用账号正在处理其他任务。";
+        }
+        if (/额度|积分不足|用完|耗尽|暂时没有图片额度/.test(messages)) {
+          return "任务失败：可用账号额度不足或暂不可用。";
+        }
+        return "任务失败：所有可用渠道都没有成功提交。";
+      }
+
       function returnedTextValue(value) {
         if (typeof value === "string") return value.trim() ? value : "";
         if (value === null || value === undefined) return "";
@@ -1419,8 +1504,12 @@
 
       function taskErrorText(row) {
         if (row?.status === "interrupted") return "";
-        const text = taskUpstreamText(row) || row?.errorMessage || row?.responseJson?.message || "";
+        const attempts = taskAttempts(row);
+        const attemptText = attempts.map((item) => String(item.message || "")).filter(Boolean).join("；");
+        const text = taskUpstreamText(row) || row?.errorMessage || row?.responseJson?.message || attemptText || "";
         if (!text) return "";
+        const summary = taskFailureSummaryText(row, text);
+        if (summary) return summary;
         if (isChatQuotaErrorText(row, text)) {
           return chatQuotaErrorText(text);
         }
@@ -1434,6 +1523,79 @@
         if (row?.status === "interrupted") return "";
         const text = row?.errorMessage || row?.responseJson?.message || "";
         return text && text !== taskErrorText(row) ? text : "";
+      }
+
+      function compactErrorText(value) {
+        return String(value || "").replace(/\s+/g, " ").trim();
+      }
+
+      function compactChannelName(value) {
+        return compactErrorText(value)
+          .replace(/\/\/(?=聊天生图)/g, "/")
+          .replace(/\/+/g, (match, offset, source) => source.slice(Math.max(0, offset - 6), offset) === "https:" ? match : "/");
+      }
+
+      function cleanAttemptReason(value) {
+        const text = compactErrorText(value)
+          .replace(/[，,]\s*已自动刷新额度后跳过。?$/u, "")
+          .replace(/^自动刷新额度失败[：:]\s*/u, "");
+        const model = text.match(/这个聊天模型没有配置[：:]\s*([^。；]+)/)?.[1];
+        if (model) return `这个渠道未启用 ${model}。`;
+        if (/正在处理中/.test(text)) return "这个账号还有任务正在处理，请稍后再试。";
+        if (/额度检测超时/.test(text)) return "额度检测超时，已跳过这个账号。";
+        if (/聊天站响应慢|请求超时/.test(text)) return "聊天站响应慢，请稍后重试，或检查代理。";
+        if (/暂时没有图片额度可用的 GPT 账号|图片生成额度都已用完|聊天图片额度不足/.test(text)) return "GPT 图片额度暂不可用。";
+        if (/聊天使用次数已用完|聊天额度已用完|使用次数已达上限/.test(text)) return "聊天额度已用完。";
+        if (/绘图积分不足|绘图额度不足|积分不足/.test(text)) return "绘图额度不足。";
+        return text;
+      }
+
+      function taskAttemptTargetText(attempt) {
+        const channel = compactChannelName(attempt.channelName || attempt.channelId || "渠道");
+        const account = compactErrorText(attempt.accountName || attempt.accountId || "");
+        return account ? `${channel} / ${account}` : channel;
+      }
+
+      function readableTaskAttempts(row) {
+        const seen = new Set();
+        const items = [];
+        for (const attempt of taskAttempts(row)) {
+          const reason = cleanAttemptReason(attempt.message);
+          const target = taskAttemptTargetText(attempt);
+          const key = `${target}::${reason}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          items.push({ target, reason, source: compactErrorText(attempt.message) });
+        }
+        return items;
+      }
+
+      function taskFailureNextAction(items) {
+        const text = items.map((item) => `${item.reason} ${item.source}`).join("；");
+        const actions = [];
+        if (/正在处理/.test(text)) actions.push("等待正在处理的任务完成后重试");
+        if (/额度|积分不足|用完|暂不可用/.test(text)) actions.push("检测账号额度，或等待额度刷新");
+        if (/未启用|没有配置/.test(text)) actions.push("检查渠道启用的聊天模型");
+        if (/响应慢|超时|代理/.test(text)) actions.push("稍后重试，或检查代理");
+        const unique = [...new Set(actions)];
+        return `建议：${(unique.length ? unique : ["查看原始错误后确认账号和渠道状态"]).slice(0, 2).join("；")}。`;
+      }
+
+      function taskErrorDisplay(row) {
+        const text = taskErrorText(row);
+        if (!text) return null;
+        const attempts = readableTaskAttempts(row);
+        if (!attempts.length) return h("div", { className: "error-text" }, text);
+        return h("div", { className: "task-error-card" }, [
+          h("div", { className: "task-error-title", key: "title" }, text),
+          h("ul", { className: "task-error-list", key: "list" },
+            attempts.map((item, index) => h("li", { className: "task-error-item", key: `${item.target}-${index}` }, [
+              h("span", { className: "task-error-target", key: "target" }, item.target),
+              h("span", { className: "task-error-reason", key: "reason" }, item.reason)
+            ]))
+          ),
+          h("div", { className: "task-error-next", key: "next" }, taskFailureNextAction(attempts))
+        ]);
       }
 
       function taskSourceId(row) {
@@ -1537,7 +1699,10 @@
           taskJsonPanel("发送 JSON", row.requestJson),
           taskJsonPanel("返回 JSON", taskReturnJson(row))
         ].filter(Boolean);
-        return panels.length ? h("div", { className: "task-json-grid" }, panels) : null;
+        return panels.length ? h("details", { className: "task-json-detail" }, [
+          h("summary", null, "查看请求和返回 JSON"),
+          h("div", { className: "task-json-grid" }, panels)
+        ]) : null;
       }
 
       function upstreamDetailContent(detail = {}) {
@@ -4147,8 +4312,8 @@
                 ? h("div", { className: "task-response" }, row.responseJson?.message || "服务重启时任务被中断，结果无法确认；此任务不计失败。")
                 : null,
               row.responseText ? h("div", { className: "task-response" }, row.responseText) : null,
+              taskErrorDisplay(row),
               taskJsonGrid(row),
-              taskErrorText(row) ? h("div", { className: "error-text" }, taskErrorText(row)) : null,
               taskRawErrorText(row) ? h("details", { className: "task-error-detail" }, [
                 h("summary", null, "查看原始错误"),
                 h("pre", null, taskRawErrorText(row))
