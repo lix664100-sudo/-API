@@ -63,6 +63,8 @@ function looksTemporaryImageUrl(source) {
     const pathname = url.pathname.toLowerCase();
     const keys = [...url.searchParams.keys()].map((key) => key.toLowerCase());
     if (host.includes("chatplus.cc") && pathname.startsWith("/backend-api/")) return true;
+    if (pathname.startsWith("/gemini/images/")) return true;
+    if (pathname.includes("/image_generation_content/")) return true;
     if (pathname.includes("/backend-api/estuary/content")) return true;
     return keys.some((key) => [
       "sig",
@@ -95,12 +97,13 @@ async function downloadImage(url) {
       "user-agent": "ShareAI-API/1.0"
     }
   });
-  if (!response.ok) throw new Error(`图片转存失败：${response.status}`);
+  if (!response.ok) throw new Error(`图片保存失败：上游图片地址返回 ${response.status}。`);
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.toLowerCase().startsWith("image/")) {
-    throw new Error("图片转存失败：上游返回的不是图片。");
+    throw new Error("图片保存失败：上游返回的不是图片。");
   }
   const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error("图片保存失败：上游返回了空文件。");
   return { buffer, contentType };
 }
 
@@ -217,11 +220,7 @@ export async function mirrorImageUrls(urls = [], config = {}) {
       results.push(url);
       continue;
     }
-    try {
-      results.push(await mirrorImageUrl(url, config));
-    } catch {
-      results.push(url);
-    }
+    results.push(await mirrorImageUrl(url, config));
   }
   return results;
 }

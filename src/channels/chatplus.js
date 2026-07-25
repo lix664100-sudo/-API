@@ -370,9 +370,27 @@ function extractGeminiConversationId(events) {
 function normalizeGeminiImageUrl(value, baseUrl) {
   const text = String(value || "").trim().replace(/[),.;]+$/, "");
   if (!text) return "";
-  if (text.startsWith("//")) return `https:${text}`;
-  if (text.startsWith("/")) return `${baseUrl}${text}`;
-  return /^https?:\/\//i.test(text) ? text : "";
+  let normalized = "";
+  if (text.startsWith("//")) normalized = `https:${text}`;
+  else if (text.startsWith("/")) normalized = `${baseUrl}${text}`;
+  else if (/^https?:\/\//i.test(text)) normalized = text;
+  return isPlaceholderGeminiImageUrl(normalized) ? "" : normalized;
+}
+
+function isPlaceholderGeminiImageUrl(value) {
+  const source = String(value || "").trim();
+  if (!source) return false;
+  try {
+    const url = new URL(source);
+    return url.pathname.replace(/\/+$/, "").toLowerCase() === "/image_generation_content/404";
+  } catch {
+    return /(?:^|\/)image_generation_content\/404(?:$|[?#])/i.test(source);
+  }
+}
+
+function addGeminiImageUrl(output, value, baseUrl) {
+  const normalized = normalizeGeminiImageUrl(value, baseUrl);
+  if (normalized) output.add(normalized);
 }
 
 function scanGeminiImageRefs(value, baseUrl, output = new Set()) {
@@ -380,13 +398,13 @@ function scanGeminiImageRefs(value, baseUrl, output = new Set()) {
     const direct = value.match(/https?:\/\/[^\s"'<>\\]+/gi) || [];
     direct.forEach((url) => {
       if (/\/gemini\/images\/|googleusercontent\.com|image_generation/i.test(url)) {
-        output.add(normalizeGeminiImageUrl(url, baseUrl));
+        addGeminiImageUrl(output, url, baseUrl);
       }
     });
     const local = value.match(/\/gemini\/images\/gg-dl\/[A-Za-z0-9._~+/=-]+/g) || [];
-    local.forEach((url) => output.add(normalizeGeminiImageUrl(url, baseUrl)));
+    local.forEach((url) => addGeminiImageUrl(output, url, baseUrl));
     const protocolRelative = value.match(/\/\/[A-Za-z0-9.-]+\/(?:gemini\/images\/|image_generation\/)[^\s"'<>\\]+/gi) || [];
-    protocolRelative.forEach((url) => output.add(normalizeGeminiImageUrl(url, baseUrl)));
+    protocolRelative.forEach((url) => addGeminiImageUrl(output, url, baseUrl));
     return output;
   }
   if (Array.isArray(value)) {
