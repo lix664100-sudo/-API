@@ -52,6 +52,39 @@ function geminiResponse({ text = "", imageUrl = "", error = "" } = {}) {
   return JSON.stringify([["wrb.fr", "StreamGenerate", JSON.stringify(responsePart), null, null]]);
 }
 
+function fakeImageFile() {
+  return {
+    filename: "source.png",
+    mimetype: "image/png",
+    toBuffer: async () => Buffer.from("image-bytes")
+  };
+}
+
+test("Gemini 进页时会顺手拿到镜像站上传参数", async () => {
+  const testClient = client();
+  testClient.portalLoggedIn = true;
+  testClient.json = async () => ({ code: 1 });
+  testClient.http = async () => ({
+    status: 200,
+    headers: {},
+    body: `
+      "SNlM0e":"token-at"
+      "FdrFJe":"123456"
+      "qKIAYe":"feeds/test"
+      "Ylro7b":"CgcSBWjK7pYx"
+      boq_assistant-bard-web-server_test
+    `
+  });
+
+  await testClient.enterCar("car-test", "gemini");
+
+  assert.equal(testClient.geminiSession.at, "token-at");
+  assert.equal(testClient.geminiSession.sid, "123456");
+  assert.equal(testClient.geminiSession.pushId, "feeds/test");
+  assert.equal(testClient.geminiSession.uploadClientPctx, "CgcSBWjK7pYx");
+  assert.equal(testClient.geminiSession.bl, "boq_assistant-bard-web-server_test");
+});
+
 test("Gemini 文字请求会提交网页协议并返回文字", async () => {
   const testClient = client();
   testClient.geminiSession = {
@@ -59,6 +92,7 @@ test("Gemini 文字请求会提交网页协议并返回文字", async () => {
     sid: "123456",
     bl: "boq_assistant-bard-web-server_test",
     pushId: "feeds/test",
+    uploadClientPctx: "CgcSBWjK7pYx",
     sourcePath: "/app"
   };
   testClient.uploadGeminiImages = async () => [];
@@ -193,6 +227,7 @@ test("Gemini 返回图片时直接算成功，不再走 GPT 详情接口", async
     sid: "123456",
     bl: "boq_assistant-bard-web-server_test",
     pushId: "feeds/test",
+    uploadClientPctx: "CgcSBWjK7pYx",
     sourcePath: "/app"
   };
   testClient.uploadGeminiImages = async () => [["uploaded-image", "source.png"]];
@@ -266,5 +301,97 @@ test("Gemini 上游明确返回用量上限时标记为额度不足", async () =
       { carId: "car-test", carType: "gemini" }
     ),
     (error) => error.imageQuotaExhausted === true && error.quotaReason === "chat_usage_limit"
+  );
+});
+test("Gemini 传图会改走镜像站自己的上传链路", async () => {
+  const testClient = client();
+  testClient.geminiSession = {
+    at: "token-at",
+    sid: "123456",
+    bl: "boq_assistant-bard-web-server_test",
+    pushId: "feeds/test",
+    uploadClientPctx: "CgcSBWjK7pYx",
+    sourcePath: "/app"
+  };
+  const calls = [];
+  testClient.http = async (path, options = {}) => {
+    calls.push({ path, options });
+    if (String(path).startsWith("/_/BardChatUi/data/batchexecute?")) {
+      return { status: 200, headers: {}, body: "ok" };
+    }
+    if (path === "/gemini/push/upload/") {
+      return {
+        status: 200,
+        headers: {
+          "x-goog-upload-url": [
+            "https://claude.midjourneye.com/gemini/push/upload?upload_id=test&upload_protocol=resumable"
+          ]
+        },
+        body: ""
+      };
+    }
+    if (String(path).startsWith("https://claude.midjourneye.com/gemini/push/upload?upload_id=test")) {
+      return {
+        status: 200,
+        headers: {},
+        body: "/contrib_service/ttl_1d/uploaded-image"
+      };
+    }
+    throw new Error(`unexpected request: ${path}`);
+  };
+
+  const [identifier, filename] = await testClient.uploadGeminiImage(fakeImageFile());
+
+  assert.equal(identifier, "/contrib_service/ttl_1d/uploaded-image");
+  assert.equal(filename, "source.png");
+  assert.equal(calls.length, 3);
+  assert.match(calls[0].path, /^\/_\/BardChatUi\/data\/batchexecute\?/);
+  assert.match(calls[0].path, /rpcids=ESY5D/);
+  assert.match(calls[0].path, /source-path=%2Fapp/);
+  assert.match(calls[0].path, /bl=boq_assistant-bard-web-server_test/);
+  assert.match(calls[0].path, /f\.sid=123456/);
+  const preflightBody = decodeURIComponent(calls[0].options.body);
+  assert.match(preflightBody, /ESY5D/);
+  assert.match(preflightBody, /bard_activity_enabled/);
+  assert.match(preflightBody, /token-at/);
+  assert.equal(calls[1].path, "/gemini/push/upload/");
+  assert.equal(calls[1].options.headers["push-id"], "feeds/test");
+  assert.equal(calls[1].options.headers["x-client-pctx"], "CgcSBWjK7pYx");
+  assert.equal(calls[1].options.headers["x-goog-upload-command"], "start");
+  assert.equal(calls[1].options.headers["x-tenant-id"], "bard-storage");
+  assert.equal(calls[1].options.headers.authorization, undefined);
+  assert.equal(
+    calls[2].path,
+    "https://claude.midjourneye.com/gemini/push/upload?upload_id=test&upload_protocol=resumable"
+  );
+  assert.equal(calls[2].options.headers["x-client-pctx"], "CgcSBWjK7pYx");
+  assert.equal(calls[2].options.headers["x-goog-upload-command"], "upload, finalize");
+  assert.equal(calls[2].options.headers["x-goog-upload-offset"], "0");
+  assert.equal(calls[2].options.headers["content-type"], undefined);
+});
+
+test("Gemini 传图上传失败会直接停掉，不再继续重试", async () => {
+  const testClient = client();
+  testClient.geminiSession = {
+    at: "token-at",
+    sid: "123456",
+    bl: "boq_assistant-bard-web-server_test",
+    pushId: "feeds/test",
+    uploadClientPctx: "CgcSBWjK7pYx",
+    sourcePath: "/app"
+  };
+  testClient.http = async (path) => {
+    if (String(path).startsWith("/_/BardChatUi/data/batchexecute?")) {
+      return { status: 200, headers: {}, body: "ok" };
+    }
+    if (path === "/gemini/push/upload/") {
+      return { status: 502, headers: {}, body: "upload failed" };
+    }
+    throw new Error(`unexpected request: ${path}`);
+  };
+
+  await assert.rejects(
+    () => testClient.uploadGeminiImage(fakeImageFile()),
+    (error) => error.noRetry === true && error.status === 502
   );
 });

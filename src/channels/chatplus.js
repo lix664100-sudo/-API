@@ -9,8 +9,9 @@ const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
 const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
 const GEMINI_REQUEST_PATH = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
-const GEMINI_UPLOAD_URL = "https://content-push.googleapis.com/upload/";
-const GEMINI_UPLOAD_AUTHORIZATION = "Basic c2F2ZXM6cyNMdGhlNmxzd2F2b0RsN3J1d1U=";
+const GEMINI_UPLOAD_PREFLIGHT_PATH = "/_/BardChatUi/data/batchexecute";
+const GEMINI_UPLOAD_PREFLIGHT_RPC_ID = "ESY5D";
+const GEMINI_UPLOAD_START_PATH = "/gemini/push/upload/";
 const GEMINI_DEFAULT_BUILD_LABEL = "boq_assistant-bard-web-server_20260525.09_p0";
 const GEMINI_DEFAULT_PUSH_ID = "feeds/mcudyrk2a4khkz";
 const badCarUntil = new Map();
@@ -1080,6 +1081,11 @@ function geminiSessionFromPage(body, previous = {}) {
     sid: firstGeminiToken(text, "FdrFJe") || previous.sid || "",
     bl: buildLabel || previous.bl || GEMINI_DEFAULT_BUILD_LABEL,
     pushId: firstGeminiToken(text, "qKIAYe") || previous.pushId || GEMINI_DEFAULT_PUSH_ID,
+    uploadClientPctx:
+      firstGeminiToken(text, "Ylro7b")
+      || firstGeminiToken(text, "uploadClientPctx")
+      || previous.uploadClientPctx
+      || "",
     sourcePath: "/app"
   };
 }
@@ -1115,6 +1121,7 @@ export class ChatplusClient {
       sid: "",
       bl: GEMINI_DEFAULT_BUILD_LABEL,
       pushId: GEMINI_DEFAULT_PUSH_ID,
+      uploadClientPctx: "",
       sourcePath: "/app"
     };
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
@@ -1219,6 +1226,7 @@ export class ChatplusClient {
       sid: "",
       bl: GEMINI_DEFAULT_BUILD_LABEL,
       pushId: GEMINI_DEFAULT_PUSH_ID,
+      uploadClientPctx: "",
       sourcePath: "/app"
     };
     this.concurrentChatSessions.clear();
@@ -1732,18 +1740,53 @@ export class ChatplusClient {
       throw error;
     }
     const filename = fileNameFromMime(mimetype, file.filename || `gemini-image-${randomUUID()}`);
+    const preflightPayload = JSON.stringify([[[
+      GEMINI_UPLOAD_PREFLIGHT_RPC_ID,
+      JSON.stringify([[[["bard_activity_enabled"]]]]),
+      null,
+      "generic"
+    ]]]);
+    const preflightParams = new URLSearchParams({
+      rpcids: GEMINI_UPLOAD_PREFLIGHT_RPC_ID,
+      "source-path": this.geminiSession.sourcePath || "/app",
+      bl: this.geminiSession.bl || GEMINI_DEFAULT_BUILD_LABEL,
+      hl: "zh-CN",
+      _reqid: String(Math.floor(100000 + Math.random() * 900000)),
+      rt: "c"
+    });
+    if (this.geminiSession.sid) preflightParams.set("f.sid", this.geminiSession.sid);
+    const preflightForm = new URLSearchParams({ "f.req": preflightPayload });
+    if (this.geminiSession.at) preflightForm.set("at", this.geminiSession.at);
+    const preflight = await this.http(`${GEMINI_UPLOAD_PREFLIGHT_PATH}?${preflightParams.toString()}`, {
+      method: "POST",
+      body: preflightForm.toString(),
+      rawBody: true,
+      headers: {
+        accept: "*/*",
+        "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "x-same-domain": "1",
+        referer: `${this.baseUrl}/app`
+      }
+    });
+    if (preflight.status < 200 || preflight.status >= 300) {
+      const error = new Error(`Gemini 鍥剧墖涓婁紶鍓嶇疆璇锋眰澶辫触锛?{preflight.status}`);
+      error.status = preflight.status;
+      error.body = preflight.body;
+      error.noRetry = true;
+      throw error;
+    }
     const commonHeaders = {
       accept: "*/*",
-      authorization: GEMINI_UPLOAD_AUTHORIZATION,
       origin: this.baseUrl,
       referer: `${this.baseUrl}/app`,
       "push-id": this.geminiSession.pushId || GEMINI_DEFAULT_PUSH_ID,
+      ...(this.geminiSession.uploadClientPctx ? { "x-client-pctx": this.geminiSession.uploadClientPctx } : {}),
       "x-goog-upload-header-content-length": String(buffer.length),
       "x-goog-upload-protocol": "resumable",
       "x-tenant-id": "bard-storage"
     };
 
-    const start = await this.http(GEMINI_UPLOAD_URL, {
+    const start = await this.http(GEMINI_UPLOAD_START_PATH, {
       method: "POST",
       body: `File name: ${filename}`,
       rawBody: true,
@@ -1757,9 +1800,17 @@ export class ChatplusClient {
       const error = new Error(`Gemini 图片上传初始化失败：${start.status}`);
       error.status = start.status;
       error.body = start.body;
+      error.noRetry = true;
       throw error;
     }
-    const uploadUrl = start.headers["x-goog-upload-url"]?.[0] || "";
+    const uploadUrl = start.headers["x-goog-upload-url"]?.[0]
+      || start.headers["x-goog-upload-control-url"]?.[0]
+      || "";
+    if (!uploadUrl) {
+      const error = new Error("Gemini 鍥剧墖涓婁紶娌℃湁杩斿洖涓婁紶鍦板潃銆?");
+      error.noRetry = true;
+      throw error;
+    }
     if (!uploadUrl) throw new Error("Gemini 图片上传没有返回上传地址。");
 
     const uploaded = await this.http(uploadUrl, {
@@ -1768,7 +1819,6 @@ export class ChatplusClient {
       rawBody: true,
       headers: {
         ...commonHeaders,
-        "content-type": mimetype,
         "x-goog-upload-command": "upload, finalize",
         "x-goog-upload-offset": "0"
       }
@@ -1777,6 +1827,7 @@ export class ChatplusClient {
       const error = new Error(`Gemini 图片上传失败：${uploaded.status}`);
       error.status = uploaded.status;
       error.body = uploaded.body;
+      error.noRetry = true;
       throw error;
     }
     let identifier = String(uploaded.body || "").trim();
