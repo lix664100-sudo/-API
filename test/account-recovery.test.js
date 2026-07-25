@@ -179,6 +179,64 @@ test("聊天账号信息会换算真实总额度和剩余额度", async () => {
   });
 });
 
+test("PLUS 车位有图片额度时账号检测不会误判为无额度", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-plus-image", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  client.loadAccountUsage = async () => ({
+    quota: 220,
+    used: 106,
+    balance: 114,
+    quotaResetAt: "2026-07-26T07:36:45+08:00",
+    expireAt: "2026-08-16T05:22:44+08:00",
+    period: "12h"
+  });
+  client.loginPortal = async () => {};
+  client.json = async (pathName) => {
+    assert.equal(pathName, "/frontend-api/carpage");
+    return {
+      code: 1,
+      data: {
+        list: [{
+          carID: "plus-image-car",
+          status: 1,
+          count: 0,
+          desc: "空闲|推荐",
+          label: "PLUS",
+          isPro: false,
+          usage: {
+            image_gen: {
+              remaining: 48,
+              reset_at_ts: 1785028472,
+              reset_in: 44696
+            }
+          }
+        }]
+      }
+    };
+  };
+  client.enterCar = async (carId, carType) => {
+    client.carId = carId;
+    client.carType = carType;
+    client.portalLoggedIn = true;
+  };
+  client.loadInit = async () => ({
+    default_model_slug: "gpt-5-6-thinking",
+    limits_progress: [{ feature_name: "image_gen", remaining: 48, reset_after: "2026-07-26T07:36:45+00:00" }]
+  });
+
+  const result = await client.check();
+
+  assert.equal(result.status, "ok");
+  assert.equal(result.balance, 114);
+  assert.equal(result.quotaResetAt, "2026-07-26T07:36:45+08:00");
+  assert.equal(result.meta.selectedCarId, "plus-image-car");
+  assert.equal(result.meta.imageLimit.remaining, 48);
+});
+
 test("聊天账号到期时间优先使用共享套餐有效期", async () => {
   const client = new ChatplusClient({
     config: {},

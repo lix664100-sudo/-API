@@ -12,15 +12,27 @@ function client() {
       settings: {
         baseUrl: "https://claude.midjourneye.com",
         defaultChatModel: "gemini",
-        chatModels: [{
-          key: "gemini",
-          name: "Gemini",
-          carType: "gemini",
-          strategy: "thinking",
-          carTier: "auto",
-          enabled: true,
-          default: true
-        }]
+        chatModels: [
+          {
+            key: "gpt",
+            name: "GPT",
+            carType: "chatgpt",
+            model: "gpt-5-5-instant",
+            strategy: "balanced",
+            carTier: "auto",
+            enabled: true,
+            default: false
+          },
+          {
+            key: "gemini",
+            name: "Gemini",
+            carType: "gemini",
+            strategy: "thinking",
+            carTier: "auto",
+            enabled: true,
+            default: true
+          }
+        ]
       }
     },
     account: { id: "gemini-test", username: "test@example.test", password: "test" },
@@ -72,6 +84,19 @@ test("Gemini 文字请求会提交网页协议并返回文字", async () => {
   assert.match(decodedBody, /token-at/);
   assert.match(decodedBody, /请回复测试成功/);
   assert.equal(request.options.headers["content-type"], "application/x-www-form-urlencoded;charset=UTF-8");
+});
+
+test("GPT 图生图模型不会因为渠道默认值而转到 Gemini", async () => {
+  const testClient = client();
+
+  const route = testClient.chatRouteForInput({
+    model_id: 1,
+    preferImageCar: true
+  });
+
+  assert.equal(route.key, "gpt");
+  assert.equal(route.carType, "chatgpt");
+  assert.equal(route.strategy, "image");
 });
 
 test("Gemini 返回图片时直接算成功，不再走 GPT 详情接口", async () => {

@@ -857,9 +857,20 @@ const drawingModelRequestKeys = new Set([
   "nano-banana"
 ]);
 
+const gptImageModelRequestKeys = new Set([
+  "1",
+  "gpt-image-2",
+  "chatgpt-image-2"
+]);
+
 function requestedChatModel(input = {}) {
   const requested = input.model || input.chat_model || input.chatModel || "";
-  return drawingModelRequestKeys.has(chatModelKey(requested)) ? "" : requested;
+  const requestedKey = chatModelKey(requested);
+  if (gptImageModelRequestKeys.has(requestedKey)) return "gpt";
+  if (requested) return drawingModelRequestKeys.has(requestedKey) ? "" : requested;
+
+  const imageModel = input.model_id ?? input.modelId ?? "";
+  return gptImageModelRequestKeys.has(chatModelKey(imageModel)) ? "gpt" : "";
 }
 
 const chatModelRoutes = [
@@ -970,9 +981,10 @@ function carIsUltra(raw = {}, desc = "", label = "") {
 
 function carIsPro(raw = {}, desc = "", label = "", isUltra = false) {
   if (isUltra) return false;
+  const explicit = raw.isPro ?? raw.is_pro ?? raw.isSuperPro ?? raw.is_super_pro ?? raw.superPro;
+  if (explicit !== null && explicit !== undefined && explicit !== "") return truthyFlag(explicit);
   const text = rawCarText(raw, desc, label);
-  return truthyFlag(raw.isPro ?? raw.is_pro ?? raw.isSuperPro ?? raw.is_super_pro ?? raw.superPro)
-    || /\bpro\b|\bplus\b|\bteam\b|\u4e13\u4e1a/i.test(text);
+  return /\bpro\b|\bteam\b|\u4e13\u4e1a/i.test(text);
 }
 
 function normalizeCar(raw = {}, carType = "chatgpt") {
