@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const rootDir = process.cwd();
@@ -21,6 +21,14 @@ let tasksWriteQueue = Promise.resolve();
 let configWriteQueue = Promise.resolve();
 let statsRevision = 0;
 const intradayStatsCache = new Map();
+let tasksLoadPromise = null;
+let tasksSnapshot = {
+  ready: false,
+  stamp: "",
+  tasks: [],
+  queryCache: new Map(),
+  searchTextCache: new WeakMap()
+};
 
 const defaultImageStorage = {
   mode: "smart",
@@ -102,6 +110,16 @@ async function writeJson(file, value) {
   const tempFile = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tempFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
   await rename(tempFile, file);
+}
+
+async function fileStamp(file) {
+  try {
+    const info = await stat(file);
+    return `${info.size}:${info.mtimeMs}`;
+  } catch (error) {
+    if (error.code === "ENOENT") return "missing";
+    throw error;
+  }
 }
 
 function normalizeChatModelKey(value) {
@@ -658,12 +676,34 @@ function limitTasks(tasks) {
     .slice(0, taskHistoryLimit);
 }
 
-async function loadTasks({ waitForWrites = true } = {}) {
-  if (waitForWrites) await tasksWriteQueue.catch(() => {});
+function setTasksSnapshot(tasks, stamp = "") {
+  tasksSnapshot = {
+    ready: true,
+    stamp,
+    tasks,
+    queryCache: new Map(),
+    searchTextCache: new WeakMap()
+  };
+  return tasks;
+}
+
+async function loadTasksFromDisk() {
   const tasks = await readJson(tasksFile, []);
   const limited = limitTasks(tasks);
   if (limited.length !== tasks.length) await writeJson(tasksFile, limited);
-  return limited;
+  return setTasksSnapshot(limited, await fileStamp(tasksFile));
+}
+
+async function loadTasks({ waitForWrites = true } = {}) {
+  if (waitForWrites) await tasksWriteQueue.catch(() => {});
+  const currentStamp = tasksSnapshot.ready ? await fileStamp(tasksFile) : "";
+  if (tasksSnapshot.ready && currentStamp === tasksSnapshot.stamp) return tasksSnapshot.tasks;
+  if (!tasksLoadPromise) {
+    tasksLoadPromise = loadTasksFromDisk().finally(() => {
+      tasksLoadPromise = null;
+    });
+  }
+  return tasksLoadPromise;
 }
 
 export async function listTasks() {
@@ -696,10 +736,11 @@ function normalizeTaskSearchKeyword(value) {
     .replace(/\s+/g, " ");
 }
 
-function taskSearchHaystack(task = {}) {
+function taskSearchHaystack(task = {}, searchTextCache = null) {
+  if (searchTextCache?.has(task)) return searchTextCache.get(task);
   const request = task.requestJson || {};
   const response = task.responseJson || {};
-  return [
+  const haystack = [
     task.id,
     task.externalId,
     taskSourceTaskId(task),
@@ -710,12 +751,14 @@ function taskSearchHaystack(task = {}) {
     response.message,
     JSON.stringify(request)
   ].filter(Boolean).join(" ").toLowerCase();
+  if (searchTextCache) searchTextCache.set(task, haystack);
+  return haystack;
 }
 
-function taskMatchesSearch(task, value) {
+function taskMatchesSearch(task, value, searchTextCache = null) {
   const keyword = normalizeTaskSearchKeyword(value);
   if (!keyword) return true;
-  const haystack = taskSearchHaystack(task);
+  const haystack = taskSearchHaystack(task, searchTextCache);
   if (haystack.includes(keyword)) return true;
   const parts = keyword
     .split(/(?:\.{2,}|…|⋯|[\s,，;；:：]+)+/)
@@ -727,19 +770,28 @@ function taskMatchesSearch(task, value) {
 export async function listTaskPage({ page = 1, pageSize = 100, keyword = "", accountId = "", channel = "", status = "" } = {}) {
   const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
   const normalizedPageSize = Math.min(500, Math.max(1, Math.floor(Number(pageSize) || 100)));
+  const normalizedKeyword = normalizeTaskSearchKeyword(keyword);
   const normalizedAccountId = String(accountId || "").trim();
   const normalizedChannel = String(channel || "").trim().toLowerCase();
   const normalizedStatus = String(status || "").trim().toLowerCase();
 
-  // The file is replaced atomically, so the admin page can read a stable snapshot
-  // without waiting behind task writes that may still be queued.
-  const tasks = limitTasks(await readJson(tasksFile, []));
-  const filtered = tasks.filter((task) => (
-    taskMatchesSearch(task, keyword)
-    && (!normalizedAccountId || normalizedAccountId === "all" || String(task.accountId || "") === normalizedAccountId)
-    && (!normalizedChannel || normalizedChannel === "all" || taskStatChannelGroup(task) === normalizedChannel)
-    && (!normalizedStatus || normalizedStatus === "all" || taskStatus(task) === normalizedStatus)
-  ));
+  const tasks = await loadTasks({ waitForWrites: false });
+  const cacheKey = [
+    normalizedKeyword,
+    normalizedAccountId,
+    normalizedChannel,
+    normalizedStatus
+  ].join("\u0000");
+  let filtered = tasksSnapshot.queryCache.get(cacheKey);
+  if (!filtered) {
+    filtered = tasks.filter((task) => {
+      if (normalizedAccountId && normalizedAccountId !== "all" && String(task.accountId || "") !== normalizedAccountId) return false;
+      if (normalizedChannel && normalizedChannel !== "all" && taskStatChannelGroup(task) !== normalizedChannel) return false;
+      if (normalizedStatus && normalizedStatus !== "all" && taskStatus(task) !== normalizedStatus) return false;
+      return taskMatchesSearch(task, normalizedKeyword, tasksSnapshot.searchTextCache);
+    });
+    tasksSnapshot.queryCache.set(cacheKey, filtered);
+  }
   const total = filtered.length;
   const pageCount = Math.ceil(total / normalizedPageSize);
   const normalizedPage = Math.min(requestedPage, Math.max(1, pageCount));
@@ -779,7 +831,7 @@ function taskIdentityIndex(tasks, task) {
 
 export async function upsertTask(task) {
   const write = tasksWriteQueue.catch(() => {}).then(async () => {
-    const tasks = await loadTasks({ waitForWrites: false });
+    const tasks = [...await loadTasks({ waitForWrites: false })];
     const index = taskIdentityIndex(tasks, task);
     const next = {
       ...task,
@@ -791,7 +843,9 @@ export async function upsertTask(task) {
       : { ...next, createdAt: task.createdAt || new Date().toISOString() };
     if (index >= 0) tasks[index] = stored;
     else tasks.push(stored);
-    await writeJson(tasksFile, limitTasks(tasks));
+    const limited = limitTasks(tasks);
+    await writeJson(tasksFile, limited);
+    setTasksSnapshot(limited, await fileStamp(tasksFile));
     return stored;
   });
   tasksWriteQueue = write.catch(() => {});

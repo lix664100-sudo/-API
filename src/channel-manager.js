@@ -141,6 +141,15 @@ function activeCountForSlot(slot) {
   return total;
 }
 
+function activeCountForModelSlot(slot, modelKey) {
+  const prefix = `${slot}:${modelKey}:`;
+  let total = activeTaskCounts.get(`${slot}:${modelKey}`) || 0;
+  for (const [key, count] of activeTaskCounts.entries()) {
+    if (String(key).startsWith(prefix)) total += count;
+  }
+  return total;
+}
+
 function taskConcurrencyTotal(value = {}) {
   return Number(value.chat || 0) + Number(value.drawingImage || 0) + Number(value.chatImage || 0);
 }
@@ -155,9 +164,10 @@ function targetRuntimeAvailable(target, taskType) {
   return cachedChatUsageLimit || status.status === "ok" || status.status === "cooldown";
 }
 
-function runtimeTargetAccountCount(config, taskType, channelType, availableOnly = false) {
+function runtimeTargetAccountCount(config, taskType, channelType, availableOnly = false, modelKey = "") {
   const accountIds = selectTargets(config, "auto", taskType, { includeCooling: true })
     .filter((target) => target.channel.type === channelType)
+    .filter((target) => !modelKey || targetChatModelKey(target, { model: modelKey }) === modelKey)
     .filter((target) => !availableOnly || targetRuntimeAvailable(target, taskType))
     .map((target) => target.account.id);
   return new Set(accountIds).size;
@@ -173,6 +183,63 @@ function runtimeAccountConcurrency(config, concurrency, availableOnly = false) {
     ...capacity,
     total: taskConcurrencyTotal(capacity)
   };
+}
+
+function runtimeChatModelKeys(config) {
+  const keys = new Set();
+  for (const channel of config.channels || []) {
+    if (channel.enabled === false) continue;
+    const chatChannel = channel.type === "shareai"
+      ? (channelAbilityEnabled(channel, "chatplus") ? shareAIAbilityChannel(channel, "chatplus") : null)
+      : channel.type === "chatplus" ? channel : null;
+    if (!chatChannel) continue;
+    const settings = chatChannel.settings || {};
+    const routes = Array.isArray(settings.chatModels) ? settings.chatModels : [];
+    for (const route of routes) {
+      const key = modelRequestKey(route?.key || route?.name || route?.model);
+      if (key && route?.enabled !== false) keys.add(key);
+    }
+    const defaultKey = modelRequestKey(settings.defaultChatModel);
+    if (defaultKey) keys.add(defaultKey);
+  }
+  return keys.size ? [...keys] : ["gpt"];
+}
+
+function runtimeModelConcurrency(config, concurrency, availableOnly = false) {
+  return Object.fromEntries(runtimeChatModelKeys(config).map((modelKey) => {
+    const configured = {
+      chat: runtimeTargetAccountCount(config, "chat", "chatplus", availableOnly, modelKey) * concurrency.chat,
+      chatImage: runtimeTargetAccountCount(config, "text2img", "chatplus", availableOnly, modelKey) * concurrency.chatImage
+    };
+    const available = availableOnly
+      ? configured
+      : {
+          chat: runtimeTargetAccountCount(config, "chat", "chatplus", true, modelKey) * concurrency.chat,
+          chatImage: runtimeTargetAccountCount(config, "text2img", "chatplus", true, modelKey) * concurrency.chatImage
+        };
+    const running = {
+      chat: activeCountForModelSlot("chat", modelKey),
+      chatImage: activeCountForModelSlot("chatImage", modelKey)
+    };
+    return [modelKey, {
+      concurrency: {
+        ...configured,
+        total: taskConcurrencyTotal(configured)
+      },
+      available: {
+        ...available,
+        total: taskConcurrencyTotal(available)
+      },
+      running: {
+        ...running,
+        total: taskConcurrencyTotal(running)
+      },
+      categories: {
+        chat: runtimeCategory(configured, available, running, ["chat"]),
+        image: runtimeCategory(configured, available, running, ["chatImage"])
+      }
+    }];
+  }));
 }
 
 function runtimeCategory(configured, available, running, slots) {
@@ -194,6 +261,7 @@ export async function getRuntimeStatus() {
   activeTaskConcurrency = concurrency;
   const configured = runtimeAccountConcurrency(config, concurrency);
   const available = runtimeAccountConcurrency(config, concurrency, true);
+  const models = runtimeModelConcurrency(config, concurrency);
   const running = {
     chat: activeCountForSlot("chat"),
     drawingImage: activeCountForSlot("drawingImage"),
@@ -205,6 +273,22 @@ export async function getRuntimeStatus() {
     chat: tasks.filter((task) => task.status === "waiting_upstream" && task.taskType === "chat").length
   };
   waiting.total = waiting.image + waiting.chat;
+  for (const [modelKey, modelStatus] of Object.entries(models)) {
+    modelStatus.waiting = {
+      image: tasks.filter((task) =>
+        task.status === "waiting_upstream"
+        && task.taskType !== "chat"
+        && task.channelType === "chatplus"
+        && storedTaskChatModelKey(task) === modelKey
+      ).length,
+      chat: tasks.filter((task) =>
+        task.status === "waiting_upstream"
+        && task.taskType === "chat"
+        && task.channelType === "chatplus"
+        && storedTaskChatModelKey(task) === modelKey
+      ).length
+    };
+  }
   return {
     concurrency: {
       ...concurrency,
@@ -221,6 +305,7 @@ export async function getRuntimeStatus() {
       image: runtimeCategory(configured, available, running, ["drawingImage", "chatImage"]),
       chat: runtimeCategory(configured, available, running, ["chat"])
     },
+    models,
     waiting
   };
 }
@@ -231,9 +316,37 @@ function taskSlotLabel(slot) {
   return "生图站";
 }
 
-function taskSlotKey(slot, target = {}) {
+function targetChatModelKey(target = {}, input = {}) {
+  if (target?.channel?.type !== "chatplus") return "";
+  const lock = requestedModelLock(input);
+  if (lock.type === "gpt-image") return "gpt";
+  if (lock.type === "chat" && lock.key) return modelRequestKey(lock.key);
+  const settings = target.channel.settings || {};
+  const defaultKey = modelRequestKey(settings.defaultChatModel);
+  if (defaultKey) return defaultKey;
+  const route = (Array.isArray(settings.chatModels) ? settings.chatModels : []).find((item) => item?.default && item?.enabled !== false)
+    || (Array.isArray(settings.chatModels) ? settings.chatModels.find((item) => item?.enabled !== false) : null);
+  return modelRequestKey(route?.key || route?.name || route?.model) || "gpt";
+}
+
+function storedTaskChatModelKey(task = {}) {
+  const rawKey = modelRequestKey(task.raw?.chatModel || task.chatModel);
+  if (rawKey === "gpt" || rawKey === "grok" || rawKey === "gemini") return rawKey;
+  if (rawKey.includes("gemini")) return "gemini";
+  if (rawKey.includes("grok")) return "grok";
+  if (rawKey.includes("gpt")) return "gpt";
+  const modelKey = modelRequestKey(task.modelId);
+  if (modelKey === "gpt" || modelKey === "grok" || modelKey === "gemini") return modelKey;
+  if (modelKey.includes("gemini")) return "gemini";
+  if (modelKey.includes("grok")) return "grok";
+  if (modelKey.includes("gpt")) return "gpt";
+  return "gpt";
+}
+
+function taskSlotKey(slot, target = {}, input = {}) {
   const accountId = String(target?.account?.id || "").trim();
-  return accountId ? `${slot}:${accountId}` : slot;
+  const modelKey = ["chat", "chatImage"].includes(slot) ? targetChatModelKey(target, input) : "";
+  return [slot, modelKey, accountId].filter(Boolean).join(":") || slot;
 }
 
 function taskSlotBusyLabel(slot, target = {}) {
@@ -259,13 +372,15 @@ function taskHoldsDurableSlot(task = {}) {
     && savedTaskExternalId(task);
 }
 
-async function durableTaskSlotState(slot, target = {}) {
+async function durableTaskSlotState(slot, target = {}, input = {}) {
   const accountId = String(target?.account?.id || "").trim();
   if (!accountId) return { total: 0, active: 0 };
+  const modelKey = ["chat", "chatImage"].includes(slot) ? targetChatModelKey(target, input) : "";
   const tasks = await listTasks();
   const holdingTasks = tasks.filter((task) =>
     String(task.accountId || "") === accountId
     && storedTaskSlot(task) === slot
+    && (!modelKey || storedTaskChatModelKey(task) === modelKey)
     && taskHoldsDurableSlot(task)
   );
   return {
@@ -274,9 +389,9 @@ async function durableTaskSlotState(slot, target = {}) {
   };
 }
 
-async function taskSlotOccupancy(slot, target = {}) {
-  const key = taskSlotKey(slot, target);
-  const durableState = await durableTaskSlotState(slot, target);
+async function taskSlotOccupancy(slot, target = {}, input = {}) {
+  const key = taskSlotKey(slot, target, input);
+  const durableState = await durableTaskSlotState(slot, target, input);
   const count = activeTaskCounts.get(key) || 0;
   return count + durableState.total - Math.min(durableState.active, count);
 }
@@ -288,9 +403,9 @@ function busyTaskError(slot, target = {}) {
   return error;
 }
 
-async function tryReserveTaskSlot(slot, target = {}) {
-  const key = taskSlotKey(slot, target);
-  const durableState = await durableTaskSlotState(slot, target);
+async function tryReserveTaskSlot(slot, target = {}, input = {}) {
+  const key = taskSlotKey(slot, target, input);
+  const durableState = await durableTaskSlotState(slot, target, input);
   const count = activeTaskCounts.get(key) || 0;
   const occupied = count + durableState.total - Math.min(durableState.active, count);
   if (occupied >= taskSlotLimit(slot)) return null;
@@ -305,18 +420,19 @@ async function tryReserveTaskSlot(slot, target = {}) {
   };
 }
 
-function accountSessionKey(account = {}) {
-  return [
+function accountSessionKey(account = {}, modelKey = "") {
+  const baseKey = [
     String(account.username || account.id || "").trim().toLowerCase(),
     String(account.proxyUrl || account.proxy || "").trim()
   ].join("::");
+  return modelKey ? `${baseKey}::${modelKey}` : baseKey;
 }
 
 async function runChatplusAccountWork(channel, account, work, options = {}) {
   if (channel?.type !== "chatplus") return work();
   if (options.parallel === true) return work();
 
-  const key = accountSessionKey(account);
+  const key = accountSessionKey(account, options.modelKey);
   const active = activeChatplusAccountWork.get(key);
   const previous = active?.promise || null;
   const blockingSlots = Array.isArray(options.blockingSlots) ? options.blockingSlots : null;
@@ -1540,6 +1656,7 @@ export async function reserveImageTaskAdmission(input = {}) {
     });
   }
   return reserveFirstAvailableTarget(targets, "img2img", {
+    input,
     confirmBeforeReserve: (target, attempts) => (
       targetCachedChatUsageLimit(target)
         ? refreshQuotaBeforeUseFast(config, target, attempts)
@@ -1750,7 +1867,7 @@ async function reserveFirstAvailableTarget(targets, taskType, options = {}) {
   for (const target of targets) {
     if (options.confirmBeforeReserve && !(await options.confirmBeforeReserve(target, attempts))) continue;
     const slot = targetTaskSlot(target, taskType);
-    const release = await tryReserveTaskSlot(slot, target);
+    const release = await tryReserveTaskSlot(slot, target, options.input || {});
     if (release) return { target, release, attempts };
     attempts.push(targetBusyAttempt(target, taskType));
   }
@@ -1960,7 +2077,13 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
     attempts: [],
     requestJson,
     responseJson: null,
-    raw: { queued: true, ...(raw || {}) },
+    raw: {
+      queued: true,
+      ...(raw || {}),
+      ...(target.channel.type === "chatplus"
+        ? { chatModel: targetChatModelKey(target, input) }
+        : {})
+    },
     completedAt: null,
     createdAt: new Date().toISOString()
   };
@@ -2053,7 +2176,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         release = reservedRelease;
         reservedRelease = null;
       } else {
-        release = await tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target);
+        release = await tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target, input);
         if (!release) {
           attempts.push(targetBusyAttempt(target, "text2img"));
           continue;
@@ -2085,6 +2208,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
           noQueue: options.noChatplusQueue,
           slot: targetTaskSlot(target, "text2img"),
+          modelKey: targetChatModelKey(target, input),
           blockingSlots: ["chatImage"]
         });
         if (finishedTask) return finishedTask;
@@ -2191,7 +2315,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           skipQuotaRefresh: options.fastQuotaRefresh || options.noChatplusQueue
         }))) continue;
         if (!release) {
-          release = await tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target);
+          release = await tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target, input);
           if (!release) {
             attempts.push(targetBusyAttempt(target, "img2img"));
             continue;
@@ -2220,6 +2344,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
           noQueue: options.noChatplusQueue,
           slot: targetTaskSlot(target, "img2img"),
+          modelKey: targetChatModelKey(target, input),
           blockingSlots: ["chatImage"]
         });
         if (finishedTask) return finishedTask;
@@ -2304,7 +2429,9 @@ async function runChatCompletionTask(task, input) {
         const result = await mirrorTaskImages(await client.createChatCompletion(input), config);
         const responseJson = chatCompletionResponseJson({ result, channel });
         const finishedTask = await finishChatTask(task, result, channel, account, attempts, responseJson);
-        return { result, channel, account, task: finishedTask, responseJson };
+          return { result, channel, account, task: finishedTask, responseJson };
+      }, {
+        modelKey: targetChatModelKey(target, input)
       });
       if (finished) return finished;
     } catch (error) {
@@ -2354,7 +2481,7 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true, input });
   if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel, input });
 
-  const reserved = await reserveFirstAvailableTarget(targets, "text2img");
+  const reserved = await reserveFirstAvailableTarget(targets, "text2img", { input });
   const task = queuedTask({ input, target: reserved.target, taskType: "text2img", requestMeta });
   try {
     await upsertTask(task);
@@ -2394,7 +2521,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   }
 
   const reserved = consumeAdmissionReservation(admission, targets)
-    || await reserveFirstAvailableTarget(targets, "img2img");
+    || await reserveFirstAvailableTarget(targets, "img2img", { input });
   const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img", requestMeta });
   try {
     await upsertTask(task);
@@ -2429,7 +2556,7 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
     });
   }
 
-  const reserved = await reserveFirstAvailableTarget(targets, "chat");
+  const reserved = await reserveFirstAvailableTarget(targets, "chat", { input });
   const task = queuedTask({
     input,
     target: reserved.target,
@@ -2725,7 +2852,7 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
     });
   }
 
-  const reserved = await reserveFirstAvailableTarget(targets, "chat");
+  const reserved = await reserveFirstAvailableTarget(targets, "chat", { input });
   try {
     const task = queuedTask({
       input,
@@ -2763,7 +2890,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
   const attempts = [];
   for (const target of targets) {
     const { channel, account } = target;
-    const release = await tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target);
+    const release = await tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target, input);
     if (!release) {
       attempts.push(targetBusyAttempt(target, "text2img"));
       continue;
@@ -2790,6 +2917,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         parallel: wait && channel.type === "chatplus",
         noQueue: wait && channel.type !== "chatplus",
         slot: targetTaskSlot(target, "text2img"),
+        modelKey: targetChatModelKey(target, input),
         blockingSlots: ["chatImage"]
       });
       if (finishedTask) return finishedTask;

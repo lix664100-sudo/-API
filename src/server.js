@@ -75,6 +75,7 @@ const publicAdminApiPaths = new Set([
 ]);
 const activeAdminSessions = new Map();
 let updateRunning = false;
+let refreshProcessingPromise = null;
 
 const app = Fastify({ logger: true, bodyLimit: 60 * 1024 * 1024 });
 
@@ -181,6 +182,15 @@ async function persistReturnedErrorTask(error, context, payload, status) {
   await recordTaskStat(stored);
   error.task = stored;
   return stored;
+}
+
+async function runRefreshProcessingTasks() {
+  if (refreshProcessingPromise) return refreshProcessingPromise;
+  const current = refreshProcessingTasks().finally(() => {
+    if (refreshProcessingPromise === current) refreshProcessingPromise = null;
+  });
+  refreshProcessingPromise = current;
+  return current;
 }
 
 async function sendError(reply, error, context = {}) {
@@ -975,7 +985,7 @@ app.get("/api/stats/intraday", async (request) => ({
 app.get("/api/admin/runtime", async () => ({ ok: true, data: await getRuntimeStatus() }));
 
 app.post("/api/tasks/refresh-processing", async () => {
-  return { ok: true, data: await refreshProcessingTasks() };
+  return { ok: true, data: await runRefreshProcessingTasks() };
 });
 
 app.get("/api/tasks/page", async (request) => ({
@@ -1131,7 +1141,7 @@ function schedulePendingTaskRefresh() {
     if (refreshing) return;
     refreshing = true;
     try {
-      await refreshProcessingTasks();
+      await runRefreshProcessingTasks();
     } catch (error) {
       app.log.warn({ error }, "pending task refresh failed");
     } finally {

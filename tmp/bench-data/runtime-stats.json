@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "updatedAt": "2026-07-25T16:13:50.399Z",
+  "days": {
+    "2026-07-26": {
+      "day": "2026-07-26",
+      "samples": 7,
+      "runningTotal": 0,
+      "peakRunning": 0,
+      "configuredTotal": 0,
+      "availableTotal": 0,
+      "firstSampleAt": 1784995850473,
+      "lastSampleAt": 1784996030399
+    }
+  }
+}

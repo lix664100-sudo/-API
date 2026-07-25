@@ -1,0 +1,80 @@
+{
+  "mainBaseUrl": "https://ikun.aishare.icu",
+  "drawingBaseUrl": "https://drawing.aishare.icu",
+  "apiKey": "a6d415d2558a1e52906539a51622810b7748358b825208ac",
+  "defaultChannel": "auto",
+  "defaultModelId": 1,
+  "defaultRatio": "1:1",
+  "defaultImageCount": 1,
+  "waitTimeoutSec": 300,
+  "waitTimeoutVersion": 2,
+  "imageStorage": {
+    "mode": "smart",
+    "autoCleanup": true,
+    "retentionDays": 7
+  },
+  "concurrency": {
+    "chat": 3,
+    "drawingImage": 2,
+    "chatImage": 2
+  },
+  "channels": [
+    {
+      "id": "shareai",
+      "name": "ShareAI账号",
+      "type": "shareai",
+      "enabled": true,
+      "priority": 99,
+      "settings": {
+        "mainBaseUrl": "https://ikun.aishare.icu",
+        "drawingBaseUrl": "https://drawing.aishare.icu",
+        "chatBaseUrl": "https://www.chatplus.cc",
+        "enabledAbilities": {
+          "drawing": true,
+          "chatplus": true
+        },
+        "defaultModelId": 1,
+        "defaultChatModel": "gpt",
+        "chatModels": [
+          {
+            "key": "gpt",
+            "name": "GPT",
+            "carType": "chatgpt",
+            "model": "gpt-5-5-instant",
+            "strategy": "balanced",
+            "carTier": "auto",
+            "enabled": true,
+            "default": true
+          },
+          {
+            "key": "grok",
+            "name": "Grok",
+            "carType": "grok",
+            "model": "",
+            "strategy": "balanced",
+            "carTier": "auto",
+            "enabled": true,
+            "default": false
+          },
+          {
+            "key": "gemini",
+            "name": "Gemini",
+            "carType": "gemini",
+            "model": "",
+            "strategy": "thinking",
+            "carTier": "auto",
+            "enabled": true,
+            "default": false
+          }
+        ],
+        "autoCarSelection": true,
+        "autoCarSelectionMigrated": true,
+        "legacyChannelIds": {
+          "drawing": "drawing",
+          "chatplus": "chatplus"
+        }
+      }
+    }
+  ],
+  "accounts": []
+}

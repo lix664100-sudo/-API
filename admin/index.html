@@ -1342,6 +1342,11 @@
           return data?.data ?? data;
         } catch (error) {
           if (error?.name === "AbortError") {
+            if (requestOptions.signal?.aborted) {
+              const abortError = new Error("请求已取消");
+              abortError.code = "REQUEST_ABORTED";
+              throw abortError;
+            }
             const timeoutError = new Error("服务器更新时间较长，页面已停止等待，请稍后刷新查看结果。");
             timeoutError.code = "REQUEST_TIMEOUT";
             throw timeoutError;
@@ -3074,6 +3079,8 @@
         const [taskKeyword, setTaskKeyword] = useState("");
         const [taskSearchLoading, setTaskSearchLoading] = useState(false);
         const taskRequestIdRef = useRef(0);
+        const taskPageAbortRef = useRef(null);
+        const taskManualActionAtRef = useRef(0);
         const [taskTrendDays, setTaskTrendDays] = useState(30);
         const [taskTrendHoverDay, setTaskTrendHoverDay] = useState("");
         const [productivityDay, setProductivityDay] = useState(dateKeyInShanghai(Date.now()));
@@ -3110,6 +3117,57 @@
           if (!channel) return false;
           if (channel.type === "shareai") return channelAbilityEnabled(channel, ability);
           return channel.type === ability;
+        }
+
+        function accountImageAbilities(account) {
+          return {
+            drawing: accountSupportsAbility(account, "drawing"),
+            chatplus: accountSupportsAbility(account, "chatplus")
+          };
+        }
+
+        function accountSupportsImageTest(account) {
+          const abilities = accountImageAbilities(account);
+          return abilities.drawing || abilities.chatplus;
+        }
+
+        function parseEditRoute(value) {
+          const text = String(value || "").trim();
+          const divider = text.indexOf(":");
+          if (divider <= 0) return { ability: "", model: "" };
+          return {
+            ability: text.slice(0, divider),
+            model: text.slice(divider + 1) || "auto"
+          };
+        }
+
+        function defaultEditRouteForAccount(account, sourceChannels = channels, sourceConfig = config) {
+          const channel = channelForAccount(account);
+          const abilities = accountImageAbilities(account);
+          if (abilities.chatplus && !abilities.drawing) return "chatplus:auto";
+          const channelId = channel?.id || sourceConfig?.defaultChannel || "auto";
+          return `drawing:${defaultModelForChannel(channelId, sourceChannels, sourceConfig)}`;
+        }
+
+        function defaultEditRouteValue(defaultChannel, sourceChannels = channels, sourceConfig = config) {
+          const channel = sourceChannels.find((item) => item.id === defaultChannel);
+          if (channel?.type === "chatplus") return "chatplus:auto";
+          if (channel?.type === "shareai" && !channelAbilityEnabled(channel, "drawing") && channelAbilityEnabled(channel, "chatplus")) {
+            return "chatplus:auto";
+          }
+          return `drawing:${defaultModelForChannel(defaultChannel, sourceChannels, sourceConfig)}`;
+        }
+
+        function editAbilityForValues(values) {
+          const route = parseEditRoute(values?.routeModel);
+          if (route.ability === "drawing" || route.ability === "chatplus") return route.ability;
+          const accountId = String(values?.accountId || "").trim();
+          const account = accountId && accountId !== "auto"
+            ? accounts.find((item) => item.id === accountId)
+            : null;
+          const abilities = accountImageAbilities(account);
+          if (abilities.chatplus && !abilities.drawing) return "chatplus";
+          return "drawing";
         }
 
         function testChannelForAccount(accountId, ability) {
@@ -3161,7 +3219,7 @@
         const imageAccountOptions = useMemo(() => [
           { label: "自动选择", value: "auto" },
           ...accounts
-            .filter((account) => account.enabled !== false && accountSupportsAbility(account, "drawing"))
+            .filter((account) => account.enabled !== false && accountSupportsImageTest(account))
             .map((account) => ({
               label: `${account.name || account.username || "未命名账号"} / ${channelName(config, account.channelId)}`,
               value: account.id
@@ -3194,6 +3252,36 @@
             };
           }).filter((item) => Number.isFinite(Number(item.value)));
         }, [drawingModels]);
+
+        const editTestModelOptions = useMemo(() => {
+          const selectedAccount = selectedEditAccountValue && selectedEditAccountValue !== "auto"
+            ? accounts.find((item) => item.id === selectedEditAccountValue)
+            : null;
+          const selectedEditChannel = selectedAccount ? channelForAccount(selectedAccount) : null;
+          const abilities = accountImageAbilities(selectedAccount);
+          const chatSources = selectedEditChannel && abilities.chatplus ? [selectedEditChannel] : chatChannels;
+          const chatOptions = (selectedAccount ? abilities.chatplus : true)
+            ? [
+                { label: "自动使用聊天默认 / 聊天生图", value: "chatplus:auto" },
+                ...[...new Map(chatSources.flatMap(chatModelSelectOptions).map((item) => [item.value, item])).values()]
+                  .map((item) => ({
+                    label: `${item.label} / 聊天生图`,
+                    value: `chatplus:${item.value}`
+                  }))
+              ]
+            : [];
+          const drawingOptions = (selectedAccount ? abilities.drawing : true)
+            ? drawingModelOptions.map((item) => ({
+                label: `${item.label} / 绘图站`,
+                value: `drawing:${item.value}`
+              }))
+            : [];
+          if (selectedAccount) {
+            if (abilities.chatplus && !abilities.drawing) return chatOptions;
+            if (abilities.drawing && !abilities.chatplus) return drawingOptions;
+          }
+          return [...chatOptions, ...drawingOptions];
+        }, [accounts, channels, config, chatChannels, drawingModelOptions, selectedEditAccountValue]);
 
         function defaultModelForChannel(channelId, sourceChannels = channels, sourceConfig = config) {
           const channel = sourceChannels.find((item) => item.id === channelId);
@@ -3360,6 +3448,27 @@
           return usage;
         }, [statRecords]);
 
+        function markTaskListInteraction() {
+          taskManualActionAtRef.current = Date.now();
+        }
+
+        function taskListRequestActive() {
+          return Boolean(taskPageAbortRef.current && !taskPageAbortRef.current.signal.aborted);
+        }
+
+        function shouldPauseTaskAutoRefresh() {
+          return taskListLoading
+            || taskListRequestActive()
+            || Date.now() - taskManualActionAtRef.current < 8000
+            || document.visibilityState === "hidden";
+        }
+
+        function taskListErrorMessage(error, fallback) {
+          if (error?.code === "REQUEST_ABORTED") return "";
+          if (error?.code === "REQUEST_TIMEOUT") return "任务记录刷新超时，请稍后再试。";
+          return error?.message || fallback;
+        }
+
         async function refreshRuntimeStatus() {
           const runtimeData = await api("/api/admin/runtime").catch(() => null);
           if (runtimeData) setRuntimeStatus(runtimeData);
@@ -3379,9 +3488,14 @@
           accountId = taskAccountFilter,
           channel = taskChannelFilter,
           status = taskStatusFilter,
-          showLoading = true
+          showLoading = true,
+          background = false
         } = {}) {
+          if (background && taskListRequestActive()) return null;
           const requestId = ++taskRequestIdRef.current;
+          const controller = new AbortController();
+          if (!background && taskListRequestActive()) taskPageAbortRef.current.abort();
+          taskPageAbortRef.current = controller;
           const params = new URLSearchParams({ page: String(page), pageSize: "100" });
           if (String(keyword || "").trim()) params.set("keyword", String(keyword).trim());
           if (accountId && accountId !== "all") params.set("accountId", accountId);
@@ -3389,8 +3503,11 @@
           if (status && status !== "all") params.set("status", status);
           if (showLoading) setTaskListLoading(true);
           try {
-            const data = await api(`/api/tasks/page?${params.toString()}`);
-            if (requestId !== taskRequestIdRef.current) return null;
+            const data = await api(`/api/tasks/page?${params.toString()}`, {
+              signal: controller.signal,
+              timeoutMs: background ? 8000 : 15000
+            });
+            if (controller.signal.aborted || requestId !== taskRequestIdRef.current) return null;
             const items = Array.isArray(data?.items) ? data.items : [];
             setTasks((current) => {
               if (!append) return items;
@@ -3411,7 +3528,11 @@
               setAllTaskTotal(Math.max(0, numberValue(data?.total)));
             }
             return data;
+          } catch (error) {
+            if (error?.code === "REQUEST_ABORTED") return null;
+            throw error;
           } finally {
+            if (taskPageAbortRef.current === controller) taskPageAbortRef.current = null;
             if (showLoading && requestId === taskRequestIdRef.current) setTaskListLoading(false);
           }
         }
@@ -3462,7 +3583,7 @@
           });
           editForm.setFieldsValue({
             accountId: "auto",
-            model_id: defaultModelForChannel(nextConfig.defaultChannel, nextConfig.channels || [], nextConfig),
+            routeModel: defaultEditRouteValue(nextConfig.defaultChannel, nextConfig.channels || [], nextConfig),
             ratio_label: nextConfig.defaultRatio || "1:1",
             image_count: 1
           });
@@ -3473,6 +3594,7 @@
 
         async function handleTaskSearch(value) {
           const keyword = String(value || "").trim();
+          markTaskListInteraction();
           setTaskKeyword(keyword);
           setTaskSearchLoading(true);
           try {
@@ -3485,26 +3607,31 @@
               message.warning("未找到匹配任务。可以只搜任务ID前半段或最后8位。");
             }
           } catch (error) {
-            message.error(error.message || "刷新任务记录失败");
+            const text = taskListErrorMessage(error, "刷新任务记录失败");
+            if (text) message.error(text);
           } finally {
             setTaskSearchLoading(false);
           }
         }
 
         function handleTaskFilterChange(type, value) {
+          markTaskListInteraction();
           if (type === "accountId") setTaskAccountFilter(value);
           if (type === "channel") setTaskChannelFilter(value);
           if (type === "status") setTaskStatusFilter(value);
           loadTaskPage({ page: 1, [type]: value }).catch((error) => {
-            message.error(error.message || "刷新任务记录失败");
+            const text = taskListErrorMessage(error, "刷新任务记录失败");
+            if (text) message.error(text);
           });
         }
 
         async function loadMoreTasks() {
+          markTaskListInteraction();
           try {
             await loadTaskPage({ page: taskPage + 1, append: true });
           } catch (error) {
-            message.error(error.message || "加载更多任务失败");
+            const text = taskListErrorMessage(error, "加载更多任务失败");
+            if (text) message.error(text);
           }
         }
 
@@ -3531,6 +3658,11 @@
 
         useEffect(() => {
           refresh().catch((error) => message.error(error.message));
+          return () => {
+            if (taskPageAbortRef.current && !taskPageAbortRef.current.signal.aborted) {
+              taskPageAbortRef.current.abort();
+            }
+          };
         }, []);
 
         useEffect(() => {
@@ -3605,28 +3737,43 @@
         useEffect(() => {
           if (!selectedEditAccountValue) return;
           const account = accounts.find((item) => item.id === selectedEditAccountValue);
-          const channelId = account?.channelId || config?.defaultChannel || "auto";
-          const nextModel = defaultModelForChannel(channelId);
-          if (nextModel) editForm.setFieldValue("model_id", nextModel);
+          const nextRoute = account
+            ? defaultEditRouteForAccount(account)
+            : defaultEditRouteValue(config?.defaultChannel, channels, config);
+          if (nextRoute) editForm.setFieldValue("routeModel", nextRoute);
         }, [selectedEditAccountValue, accounts, channels, config]);
+
+        useEffect(() => {
+          const currentRoute = editForm.getFieldValue("routeModel");
+          if (currentRoute && editTestModelOptions.some((item) => item.value === currentRoute)) return;
+          const account = selectedEditAccountValue && selectedEditAccountValue !== "auto"
+            ? accounts.find((item) => item.id === selectedEditAccountValue)
+            : null;
+          const fallbackRoute = account
+            ? defaultEditRouteForAccount(account)
+            : defaultEditRouteValue(config?.defaultChannel, channels, config);
+          if (fallbackRoute) editForm.setFieldValue("routeModel", fallbackRoute);
+        }, [editForm, editTestModelOptions, selectedEditAccountValue, accounts, channels, config]);
 
         useEffect(() => {
           if (!tasks.some((item) => ["processing", "queued", "pending", "unknown", "waiting_upstream"].includes(item.status))) return undefined;
           const timer = setInterval(async () => {
+            if (shouldPauseTaskAutoRefresh()) return;
             try {
-              await api("/api/tasks/refresh-processing", { method: "POST", body: {} }).catch(() => null);
+              await api("/api/tasks/refresh-processing", { method: "POST", body: {}, timeoutMs: 15000 }).catch(() => null);
+              if (shouldPauseTaskAutoRefresh()) return;
               const [, nextConfig] = await Promise.all([
-                loadTaskPage({ page: 1, showLoading: false }),
-                api("/api/config")
+                loadTaskPage({ page: 1, showLoading: false, background: true }),
+                api("/api/config").catch(() => null)
               ]);
-              setConfig(nextConfig);
+              if (nextConfig) setConfig(nextConfig);
               await refreshRuntimeStatus();
             } catch (_error) {
               // 下一轮继续刷新，避免临时网络波动打断页面。
             }
           }, 5000);
           return () => clearInterval(timer);
-        }, [tasks]);
+        }, [tasks, taskListLoading]);
 
         useEffect(() => {
           if (numberValue(runtimeStatus?.running?.total) <= 0) return undefined;
@@ -4023,19 +4170,33 @@
           }
           setLoading(true);
           try {
-            const target = selectedTestTarget(values, "drawing");
+            const ability = editAbilityForValues(values);
+            const usingAutoAccount = !values?.accountId || values.accountId === "auto";
+            const target = usingAutoAccount && ability === "chatplus"
+              ? { channel: "chatplus", accountId: "" }
+              : selectedTestTarget(values, ability);
             if (!target.channel) {
               message.warning("这个账号不能用于图生图测试。");
               return;
             }
+            const route = parseEditRoute(values.routeModel);
             const form = new FormData();
-            Object.entries(values).forEach(([key, value]) => {
-              if (key !== "accountId") form.append(key, value ?? "");
-            });
+            form.append("prompt", values.prompt ?? "");
+            if (values.ratio_label) form.append("ratio_label", values.ratio_label);
+            if (values.image_count !== undefined && values.image_count !== null && values.image_count !== "") {
+              form.append("image_count", values.image_count);
+            }
+            if (ability === "chatplus") {
+              if (route.model && route.model !== "auto") form.append("model", route.model);
+            } else if (route.model) {
+              form.append("model_id", route.model);
+            }
             form.set("channel", target.channel);
             if (target.accountId) form.append("accountId", target.accountId);
             editFileList.forEach((file) => form.append("image", file.originFileObj));
-            const params = selectedTestSearch(values, "drawing");
+            const params = new URLSearchParams();
+            params.set("channel", target.channel || "auto");
+            if (target.accountId) params.set("accountId", target.accountId);
             const task = await api(`/api/draw/edit?${params.toString()}`, { method: "POST", body: form });
             addSubmittedTask(task);
             await refreshRuntimeStatus();
@@ -4418,6 +4579,17 @@
         const storageDisk = imageStorageStats?.disk || null;
         const imageCapacity = runtimeStatus?.categories?.image || { configured: 0, available: 0, running: 0, idle: 0 };
         const chatCapacity = runtimeStatus?.categories?.chat || { configured: 0, available: 0, running: 0, idle: 0 };
+        const runtimeModelEntries = Object.entries(runtimeStatus?.models || {});
+        const drawingCapacity = {
+          configured: numberValue(runtimeStatus?.concurrency?.drawingImage),
+          available: numberValue(runtimeStatus?.available?.drawingImage),
+          running: numberValue(runtimeStatus?.running?.drawingImage),
+          idle: Math.max(0, numberValue(runtimeStatus?.available?.drawingImage) - numberValue(runtimeStatus?.running?.drawingImage))
+        };
+
+        function runtimeModelName(modelKey) {
+          return chatModelDefaults.find((item) => item.key === modelKey)?.name || String(modelKey || "").toUpperCase();
+        }
 
         function renderCapacityLane({ key, label, icon, capacity, waiting, color }) {
           const configured = numberValue(capacity?.configured);
@@ -4503,22 +4675,53 @@
                 )
               ]),
               h("div", { className: "capacity-grid" }, [
-                renderCapacityLane({
-                  key: "image",
-                  label: "生图并发",
-                  icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null,
-                  capacity: imageCapacity,
-                  waiting: numberValue(runtimeStatus?.waiting?.image),
-                  color: "#1677ff"
-                }),
-                renderCapacityLane({
-                  key: "chat",
-                  label: "对话并发",
-                  icon: Icon.MessageOutlined ? h(Icon.MessageOutlined) : null,
-                  capacity: chatCapacity,
-                  waiting: numberValue(runtimeStatus?.waiting?.chat),
-                  color: "#7c3aed"
-                })
+                ...(runtimeModelEntries.length
+                  ? [
+                      renderCapacityLane({
+                        key: "drawing",
+                        label: "绘图站并发",
+                        icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null,
+                        capacity: drawingCapacity,
+                        waiting: 0,
+                        color: "#1677ff"
+                      }),
+                      ...runtimeModelEntries.flatMap(([modelKey, modelStatus]) => [
+                        renderCapacityLane({
+                          key: `${modelKey}-image`,
+                          label: `${runtimeModelName(modelKey)} 生图并发`,
+                          icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null,
+                          capacity: modelStatus?.categories?.image,
+                          waiting: numberValue(modelStatus?.waiting?.image),
+                          color: "#0f9f8f"
+                        }),
+                        renderCapacityLane({
+                          key: `${modelKey}-chat`,
+                          label: `${runtimeModelName(modelKey)} 对话并发`,
+                          icon: Icon.MessageOutlined ? h(Icon.MessageOutlined) : null,
+                          capacity: modelStatus?.categories?.chat,
+                          waiting: numberValue(modelStatus?.waiting?.chat),
+                          color: "#7c3aed"
+                        })
+                      ])
+                    ]
+                  : [
+                      renderCapacityLane({
+                        key: "image",
+                        label: "生图并发",
+                        icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null,
+                        capacity: imageCapacity,
+                        waiting: numberValue(runtimeStatus?.waiting?.image),
+                        color: "#1677ff"
+                      }),
+                      renderCapacityLane({
+                        key: "chat",
+                        label: "对话并发",
+                        icon: Icon.MessageOutlined ? h(Icon.MessageOutlined) : null,
+                        capacity: chatCapacity,
+                        waiting: numberValue(runtimeStatus?.waiting?.chat),
+                        color: "#7c3aed"
+                      })
+                    ])
               ])
             ]),
             h("section", { className: "workspace", key: "workspace" }, [
@@ -4878,10 +5081,10 @@
                     key: "edit",
                     label: "图生图测试",
                     children: h("div", { className: "operation-body" }, h(Form, { layout: "vertical", form: editForm, onFinish: submitEdit }, [
-                      h(Alert, { type: "info", showIcon: true, message: "选择具体账号时，只使用该账号的绘图能力和所选模型；失败会直接显示原因，不会自动改走聊天生图。", style: { marginBottom: 14 } }),
+                      h(Alert, { type: "info", showIcon: true, message: "选择具体账号后，系统会按所选模型走对应通道：聊天模型走聊天生图，绘图模型走绘图站。失败会直接显示原因。", style: { marginBottom: 14 } }),
                       h("div", { className: "form-grid" }, [
                         h(Form.Item, { label: "账号", name: "accountId" }, h(Select, { options: imageAccountOptions })),
-                        h(Form.Item, { label: "绘图模型", name: "model_id" }, h(Select, { options: drawingModelOptions }))
+                        h(Form.Item, { label: "生成模型", name: "routeModel" }, h(Select, { options: editTestModelOptions }))
                       ]),
                       h(Form.Item, { label: "源图", extra: "必填，最多 3 张" }, h(Upload, {
                         accept: "image/*",

@@ -1119,7 +1119,7 @@ export class ChatplusClient {
     };
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     this.contextSignature = this.makeContextSignature({ channel, account });
-    this.accountWork = Promise.resolve();
+    this.accountWorks = new Map();
     this.concurrentChatSessions = new Map();
   }
 
@@ -1282,18 +1282,21 @@ export class ChatplusClient {
     return client;
   }
 
-  async runAccountWork(work) {
-    const current = this.accountWork.catch(() => {}).then(work);
-    this.accountWork = current;
+  async runAccountWork(work, modelKey = "") {
+    const key = modelKey || "__account__";
+    const previous = this.accountWorks.get(key) || Promise.resolve();
+    const current = previous.catch(() => {}).then(work);
+    this.accountWorks.set(key, current);
     try {
       return await current;
     } finally {
-      if (this.accountWork === current) this.accountWork = Promise.resolve();
+      if (this.accountWorks.get(key) === current) this.accountWorks.delete(key);
     }
   }
 
   async runTaskWork(input, work) {
-    return input?.concurrentSubmit === true ? work() : this.runAccountWork(work);
+    if (input?.concurrentSubmit === true) return work();
+    return this.runAccountWork(work, this.chatRouteForInput(input).key);
   }
 
   chatRouteForInput(input = {}) {
@@ -2238,6 +2241,10 @@ export class ChatplusClient {
       throw error;
     }
 
+    const modelKey = this.chatRouteForInput({
+      ...input,
+      preferImageCar: files.length > 0
+    }).key;
     return this.runAccountWork(async () => {
       let conversationToDelete = null;
       try {
@@ -2282,6 +2289,6 @@ export class ChatplusClient {
           }
         }
       }
-    });
+    }, modelKey);
   }
 }
