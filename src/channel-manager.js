@@ -593,6 +593,36 @@ async function updateTargetAccountStatus(accountId, channel, patch) {
   });
 }
 
+export async function clearAccountCooldown(accountId) {
+  const config = await loadRuntimeConfig();
+  const account = config.accounts.find((item) => item.id === accountId);
+  if (!account) throw new Error("账号不存在。");
+  const channel = config.channels.find((item) => item.id === account.channelId);
+  if (!channel) throw new Error("账号所属渠道不存在。");
+
+  const patch = {
+    status: "ok",
+    cooldownUntil: null,
+    cooldownReason: "",
+    upstreamFailureCode: "",
+    upstreamFailureStreak: 0,
+    message: "已手动解除绘图冷却"
+  };
+
+  if (channel.type === "shareai") {
+    if (!channelAbilityEnabled(channel, "drawing")) throw new Error("这个渠道没有启用绘图站。");
+    await updateTargetAccountStatus(account.id, shareAIAbilityChannel(channel, "drawing"), patch);
+    return { accountId: account.id, ability: "drawing", status: "ok" };
+  }
+
+  if (channel.type === "drawing") {
+    await updateTargetAccountStatus(account.id, channel, patch);
+    return { accountId: account.id, ability: "drawing", status: "ok" };
+  }
+
+  throw new Error("这个账号不是绘图账号，不能解除绘图冷却。");
+}
+
 async function markChatCooldown(accountId, channel, error) {
   const cooldownUntil = new Date(Date.now() + CHAT_COOLDOWN_MS).toISOString();
   const disconnected = isDisconnectedError(error);

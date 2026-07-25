@@ -606,6 +606,14 @@ function shanghaiDateTime(value) {
   return text;
 }
 
+function firstPayloadField(data = {}, names = []) {
+  for (const name of names) {
+    const value = data?.[name];
+    if (value !== null && value !== undefined && String(value).trim() !== "") return value;
+  }
+  return "";
+}
+
 function chatUsageFromPayload(payload = {}) {
   const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
   const quota = numberOrNull(data?.limit);
@@ -616,7 +624,18 @@ function chatUsageFromPayload(payload = {}) {
     used,
     balance,
     quotaResetAt: shanghaiDateTime(data?.resetTimeChatgpt),
-    expireAt: shanghaiDateTime(data?.expireTime),
+    expireAt: shanghaiDateTime(firstPayloadField(data, [
+      "expireTimeGemini",
+      "geminiExpireTime",
+      "geminiExpireAt",
+      "expireAtGemini",
+      "expireTimeChatgpt",
+      "chatgptExpireTime",
+      "chatgptExpireAt",
+      "expireAtChatgpt",
+      "expireTime",
+      "expireAt"
+    ])),
     period: String(data?.per || "").trim()
   };
 }

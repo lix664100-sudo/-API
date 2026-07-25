@@ -8,7 +8,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-account-recovery-"
 process.env.DATA_DIR = dataDir;
 
 const { loadConfig, saveConfig } = await import("../src/storage.js");
-const { checkAccount, createChatCompletion, createImageTask, createTextTask, getRuntimeStatus, recoverUnavailableChatAccounts } = await import("../src/channel-manager.js");
+const { checkAccount, clearAccountCooldown, createChatCompletion, createImageTask, createTextTask, getRuntimeStatus, recoverUnavailableChatAccounts } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient, drawingSevereFailureReason, normalizeDrawingTask } = await import("../src/channels/drawing.js");
 
@@ -177,6 +177,30 @@ test("聊天账号信息会换算真实总额度和剩余额度", async () => {
     expireAt: "2026-08-16T05:22:44+08:00",
     period: "12h"
   });
+});
+
+test("聊天账号到期时间优先使用共享套餐有效期", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gemini" } },
+    account: { id: "account-gemini-expire", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.json = async () => ({
+    code: 1,
+    data: {
+      limit: 70,
+      userUsed: "8",
+      per: "1d",
+      expireTime: "2026-07-24 23:41:00",
+      expireTimeChatgpt: "2026-07-25 23:42:03"
+    }
+  });
+
+  const usage = await client.loadAccountUsage({ timeoutSec: 8 });
+
+  assert.equal(usage.expireAt, "2026-07-25T23:42:03+08:00");
 });
 
 test("聊天总额度用完后检测会等待刷新且不再选车", async () => {
@@ -1004,6 +1028,90 @@ test("同一账号绘图上游连续失败三次后冷却三十分钟", async ()
     assert.equal(drawing.status, "ok");
     assert.equal(drawing.upstreamFailureStreak, 0);
     assert.equal(drawing.cooldownUntil, null);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+    DrawingClient.prototype.createTextTask = originalCreateTextTask;
+  }
+});
+
+test("手动解除绘图冷却后账号会立即恢复可用", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    concurrency: { chat: 3, drawingImage: 2, chatImage: 2 },
+    accounts: [{
+      id: "account-manual-clear-drawing-cooldown",
+      channelId: "shareai",
+      name: "manual clear drawing cooldown",
+      username: "manual-clear-drawing-cooldown@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: {
+            status: "cooldown",
+            quota: 50,
+            balance: 8,
+            cooldownUntil: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+            cooldownReason: "drawing_upstream_error",
+            upstreamFailureCode: "upstream_500",
+            upstreamFailureStreak: 3,
+            message: "drawing cooling"
+          },
+          chatplus: { status: "ok", balance: 20, message: "chat ok" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  const originalCreateTextTask = DrawingClient.prototype.createTextTask;
+  let submitCount = 0;
+  DrawingClient.prototype.check = async () => ({
+    status: "ok",
+    quota: 50,
+    balance: 8,
+    message: "drawing ok"
+  });
+  DrawingClient.prototype.createTextTask = async (input) => {
+    submitCount += 1;
+    return normalizeDrawingTask({
+      id: 36000 + submitCount,
+      status: "success",
+      task_type: "text2img",
+      prompt: input.prompt,
+      items: [{ image_url: "https://example.com/manual-clear-result.png" }]
+    });
+  };
+
+  try {
+    const before = await getRuntimeStatus();
+    assert.equal(before.available.drawingImage, 0);
+    await assert.rejects(
+      createTextTask({ channel: "drawing", prompt: "still cooling" }, true),
+      (error) => error?.status === 503
+    );
+    assert.equal(submitCount, 0);
+
+    await clearAccountCooldown("account-manual-clear-drawing-cooldown");
+
+    const stored = await loadConfig();
+    const drawing = stored.accounts[0].meta.abilities.drawing;
+    assert.equal(stored.accounts[0].status, "ok");
+    assert.equal(drawing.status, "ok");
+    assert.equal(drawing.cooldownUntil, null);
+    assert.equal(drawing.cooldownReason, "");
+    assert.equal(drawing.upstreamFailureCode, "");
+    assert.equal(drawing.upstreamFailureStreak, 0);
+
+    const after = await getRuntimeStatus();
+    assert.equal(after.available.drawingImage, 2);
+    const task = await createTextTask({ channel: "drawing", prompt: "after manual clear" }, true);
+    assert.equal(task.status, "success");
+    assert.equal(submitCount, 1);
     await new Promise((resolve) => setTimeout(resolve, 30));
   } finally {
     DrawingClient.prototype.check = originalCheck;

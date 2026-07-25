@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import {
   checkAccount,
   checkAllAccounts,
+  clearAccountCooldown,
   createChatCompletion,
   createImageTask,
   getRuntimeStatus,
@@ -866,6 +867,15 @@ app.delete("/api/accounts/:id", async (request) => {
 app.post("/api/accounts/:id/test", async (request, reply) => {
   try {
     return { ok: true, data: await checkAccount(request.params.id) };
+  } catch (error) {
+    return sendError(reply, error);
+  }
+});
+
+app.post("/api/accounts/:id/clear-cooldown", async (request, reply) => {
+  try {
+    await clearAccountCooldown(request.params.id);
+    return { ok: true, data: publicConfig(await loadConfig()) };
   } catch (error) {
     return sendError(reply, error);
   }

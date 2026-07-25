@@ -2883,6 +2883,7 @@
         const [checkingAccountIds, setCheckingAccountIds] = useState([]);
         const [checkingChannelIds, setCheckingChannelIds] = useState([]);
         const [checkingAll, setCheckingAll] = useState(false);
+        const [clearingCooldownAccountIds, setClearingCooldownAccountIds] = useState([]);
         const [updating, setUpdating] = useState(false);
         const [upstreamLoadingTaskId, setUpstreamLoadingTaskId] = useState("");
         const [imageStorageStats, setImageStorageStats] = useState(null);
@@ -3613,6 +3614,20 @@
           }
         }
 
+        async function clearDrawingCooldown(id) {
+          setClearingCooldownAccountIds((current) => current.includes(id) ? current : [...current, id]);
+          try {
+            const nextConfig = await api(`/api/accounts/${id}/clear-cooldown`, { method: "POST" });
+            setConfig(nextConfig);
+            message.success("绘图冷却已解除");
+          } catch (error) {
+            await refresh().catch(() => {});
+            message.error(error.message);
+          } finally {
+            setClearingCooldownAccountIds((current) => current.filter((item) => item !== id));
+          }
+        }
+
         async function testChannel(channelId) {
           const related = accounts.filter((item) => item.channelId === channelId);
           if (!related.length) {
@@ -4031,14 +4046,30 @@
           },
           {
             title: "操作",
-            width: 210,
-            render: (_, row) => h(Space, { size: 6 }, [
-              h(Button, { size: "small", onClick: () => testAccount(row.id), loading: checkingAll || checkingAccountIds.includes(row.id), icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null }, "检测"),
-              h(Button, { size: "small", onClick: () => openAccountModal(row), icon: Icon.EditOutlined ? h(Icon.EditOutlined) : null }, "编辑"),
-              h(Popconfirm, { title: "删除这个账号？", okText: "删除", cancelText: "取消", onConfirm: () => deleteAccount(row.id) },
-                h(Button, { size: "small", danger: true, icon: Icon.DeleteOutlined ? h(Icon.DeleteOutlined) : null }, "删除")
-              )
-            ])
+            width: 310,
+            render: (_, row) => {
+              const cooling = drawingAccountIsCooling(row);
+              return h(Space, { size: 6 }, [
+                h(Button, { size: "small", onClick: () => testAccount(row.id), loading: checkingAll || checkingAccountIds.includes(row.id), icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null }, "检测"),
+                cooling ? h(Popconfirm, {
+                  key: "clear-cooldown",
+                  title: "确认解除绘图冷却？",
+                  description: "解除后该账号会立即参与绘图任务分配。",
+                  okText: "解除",
+                  cancelText: "取消",
+                  onConfirm: () => clearDrawingCooldown(row.id)
+                }, h(Button, {
+                  size: "small",
+                  loading: clearingCooldownAccountIds.includes(row.id),
+                  disabled: checkingAll || checkingAccountIds.includes(row.id),
+                  icon: Icon.UnlockOutlined ? h(Icon.UnlockOutlined) : null
+                }, "解除冷却")) : null,
+                h(Button, { size: "small", onClick: () => openAccountModal(row), icon: Icon.EditOutlined ? h(Icon.EditOutlined) : null }, "编辑"),
+                h(Popconfirm, { title: "删除这个账号？", okText: "删除", cancelText: "取消", onConfirm: () => deleteAccount(row.id) },
+                  h(Button, { size: "small", danger: true, icon: Icon.DeleteOutlined ? h(Icon.DeleteOutlined) : null }, "删除")
+                )
+              ]);
+            }
           }
         ];
 
