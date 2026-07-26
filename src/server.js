@@ -34,6 +34,11 @@ import {
   setRuntimePublicBaseUrl
 } from "./image-store.js";
 import {
+  inspectGitUpdateState,
+  redactGitProxyCredentials,
+  updateCommandEnvironment
+} from "./git-update.js";
+import {
   closeStorage,
   getTask,
   getTaskBySourceTaskId,
@@ -415,46 +420,6 @@ function shortCommit(value) {
   return String(value || "").trim().slice(0, 7);
 }
 
-async function currentGitUpdateState(cwd) {
-  const execOptions = {
-    cwd,
-    timeout: updateTimeoutMs,
-    windowsHide: true,
-    maxBuffer: 1024 * 1024 * 2
-  };
-  try {
-    const inside = await execAsync("git rev-parse --is-inside-work-tree", execOptions);
-    if (String(inside.stdout || "").trim() !== "true") {
-      return { checked: false, message: "当前目录不是代码仓库，未执行更新。" };
-    }
-
-    const local = await execAsync("git rev-parse HEAD", execOptions);
-    const upstream = await execAsync('git rev-parse --abbrev-ref --symbolic-full-name "@{u}"', execOptions);
-    await execAsync("git fetch --quiet", execOptions);
-    const remote = await execAsync('git rev-parse "@{u}"', execOptions);
-
-    const localCommit = String(local.stdout || "").trim();
-    const remoteCommit = String(remote.stdout || "").trim();
-    return {
-      checked: true,
-      upToDate: localCommit && remoteCommit && localCommit === remoteCommit,
-      localCommit,
-      remoteCommit,
-      upstream: String(upstream.stdout || "").trim()
-    };
-  } catch (error) {
-    const stderr = shortenOutput(error.stderr || error.message);
-    if (/not a git repository/i.test(stderr)) {
-      return { checked: false, message: "当前目录不是代码仓库，未执行更新。", stderr };
-    }
-    return {
-      checked: false,
-      message: "无法确认当前是否为最新版，未执行更新。",
-      stderr
-    };
-  }
-}
-
 function badRequest(message) {
   const error = new Error(message);
   error.status = 400;
@@ -748,8 +713,14 @@ app.post("/api/admin/update", async (_request, reply) => {
     return reply.code(409).send({ ok: false, message: "更新正在执行，请稍后再试。" });
   }
   updateRunning = true;
+  let gitEnv = null;
   try {
-    const gitState = await currentGitUpdateState(cwd);
+    const gitState = await inspectGitUpdateState({
+      cwd,
+      config: await loadConfig(),
+      timeoutMs: updateTimeoutMs
+    });
+    gitEnv = gitState.gitEnv;
     if (!gitState.checked) {
       return {
         ok: true,
@@ -779,14 +750,18 @@ app.post("/api/admin/update", async (_request, reply) => {
       cwd,
       timeout: updateTimeoutMs,
       windowsHide: true,
-      maxBuffer: 1024 * 1024 * 5
+      maxBuffer: 1024 * 1024 * 5,
+      env: updateCommandEnvironment(
+        gitState.gitEnv,
+        process.env.ADMIN_UPDATE_NPM_REGISTRY
+      )
     });
     return {
       ok: true,
       data: {
         success: true,
-        stdout: shortenOutput(result.stdout),
-        stderr: shortenOutput(result.stderr)
+        stdout: shortenOutput(redactGitProxyCredentials(result.stdout, gitEnv)),
+        stderr: shortenOutput(redactGitProxyCredentials(result.stderr, gitEnv))
       }
     };
   } catch (error) {
@@ -795,8 +770,8 @@ app.post("/api/admin/update", async (_request, reply) => {
       data: {
         success: false,
         message: error.killed ? "更新命令超时。" : "更新命令执行失败。",
-        stdout: shortenOutput(error.stdout),
-        stderr: shortenOutput(error.stderr || error.message)
+        stdout: shortenOutput(redactGitProxyCredentials(error.stdout, gitEnv)),
+        stderr: shortenOutput(redactGitProxyCredentials(error.stderr || error.message, gitEnv))
       }
     };
   } finally {
