@@ -13,6 +13,7 @@ const activeTaskCounts = new Map();
 const activeSubmittedTaskIds = new Set();
 const activeAccountAuthTasks = new Map();
 const activeChatplusAccountWork = new Map();
+const activeChatQuotaProbes = new Set();
 const clientCache = new Map();
 const accountRoutingState = new Map();
 const accountRecoveryTasks = new Map();
@@ -172,11 +173,18 @@ function taskConcurrencyTotal(value = {}) {
 function targetRuntimeAvailable(target, taskType) {
   if (!target?.channel || !target?.account) return false;
   if (target.channel.enabled === false || target.account.enabled === false) return false;
-  const cachedChatUsageLimit = targetCachedChatUsageLimit(target);
-  if (taskType === "chat" && accountCooling(target.account) && !cachedChatUsageLimit) return false;
   const status = targetQuotaStatus(target);
-  if (statusCooling(status) && !cachedChatUsageLimit) return false;
-  return cachedChatUsageLimit || status.status === "ok" || status.status === "cooldown";
+  const confirmedQuotaBlocks = targetConfirmedQuotaBlocksTask(target, taskType);
+  const quotaProbeReady = target?.channel?.type === "chatplus"
+    && String(status.status || "").toLowerCase() === "quota_empty"
+    && (
+      !confirmedQuotaBlocks
+      || targetConfirmedQuotaRetryDue(target)
+    );
+  if (confirmedQuotaBlocks && !quotaProbeReady) return false;
+  if (taskType === "chat" && accountCooling(target.account) && !quotaProbeReady) return false;
+  if (statusCooling(status) && !quotaProbeReady) return false;
+  return quotaProbeReady || status.status === "ok" || status.status === "cooldown";
 }
 
 function targetSupportsChatModel(target, modelKey) {
@@ -467,27 +475,37 @@ function accountSessionKey(account = {}, modelKey = "") {
 
 async function runChatplusAccountWork(channel, account, work, options = {}) {
   if (channel?.type !== "chatplus") return work();
-  if (options.parallel === true) return work();
-
-  const key = accountSessionKey(account, options.modelKey);
-  const active = activeChatplusAccountWork.get(key);
-  const previous = active?.promise || null;
-  const blockingSlots = Array.isArray(options.blockingSlots) ? options.blockingSlots : null;
-  const activeSlot = active?.slot || "";
-  const shouldBlock = options.noQueue && previous && (!blockingSlots || blockingSlots.includes(activeSlot));
-  if (shouldBlock) {
-    throw busyTaskError(options.slot || "chatImage", { channel, account });
+  const quotaProbeKey = options.quotaProbe === true ? accountSessionKey(account) : "";
+  if (quotaProbeKey && activeChatQuotaProbes.has(quotaProbeKey)) {
+    throw busyTaskError(options.slot || "chat", { channel, account });
   }
-  const previousWork = previous || Promise.resolve();
-  const current = previousWork.catch(() => {}).then(work);
-  activeChatplusAccountWork.set(key, {
-    promise: current,
-    slot: options.slot || activeSlot
-  });
+  if (quotaProbeKey) activeChatQuotaProbes.add(quotaProbeKey);
+
   try {
-    return await current;
+    if (options.parallel === true) return await work();
+
+    const key = accountSessionKey(account, options.modelKey);
+    const active = activeChatplusAccountWork.get(key);
+    const previous = active?.promise || null;
+    const blockingSlots = Array.isArray(options.blockingSlots) ? options.blockingSlots : null;
+    const activeSlot = active?.slot || "";
+    const shouldBlock = options.noQueue && previous && (!blockingSlots || blockingSlots.includes(activeSlot));
+    if (shouldBlock) {
+      throw busyTaskError(options.slot || "chatImage", { channel, account });
+    }
+    const previousWork = previous || Promise.resolve();
+    const current = previousWork.catch(() => {}).then(work);
+    activeChatplusAccountWork.set(key, {
+      promise: current,
+      slot: options.slot || activeSlot
+    });
+    try {
+      return await current;
+    } finally {
+      if (activeChatplusAccountWork.get(key)?.promise === current) activeChatplusAccountWork.delete(key);
+    }
   } finally {
-    if (activeChatplusAccountWork.get(key)?.promise === current) activeChatplusAccountWork.delete(key);
+    if (quotaProbeKey) activeChatQuotaProbes.delete(quotaProbeKey);
   }
 }
 
@@ -659,20 +677,44 @@ function isQuotaEmptyError(error) {
   );
 }
 
+function isExplicitChatQuotaError(error) {
+  return Boolean(
+    error?.quotaConfirmedByUpstream === true
+      && (error?.quotaEmpty || error?.imageQuotaExhausted)
+  );
+}
+
 function isTerminalTaskFailureError(error) {
   return Boolean(error?.upstreamExplicitFailure);
 }
 
-function accountStatusFromError(error) {
-  if (isQuotaEmptyError(error)) {
+function accountStatusFromError(error, options = {}) {
+  const explicitChatQuotaOnly = options.explicitChatQuotaOnly === true;
+  const quotaEmpty = explicitChatQuotaOnly
+    ? isExplicitChatQuotaError(error)
+    : isQuotaEmptyError(error);
+  if (quotaEmpty) {
+    const requestedCooldown = error?.cooldownUntil || error?.quotaResetAt || null;
+    const requestedCooldownTime = Date.parse(requestedCooldown || "");
+    const cooldownUntil = explicitChatQuotaOnly && (
+      !Number.isFinite(requestedCooldownTime)
+      || requestedCooldownTime <= Date.now()
+    )
+      ? new Date(Date.now() + CHAT_USAGE_RECOVERY_CHECK_MS).toISOString()
+      : requestedCooldown;
     return {
       status: "quota_empty",
-      ...(error?.quota !== null && error?.quota !== undefined ? { quota: error.quota } : {}),
-      ...(error?.balance !== null && error?.balance !== undefined ? { balance: error.balance } : { balance: 0 }),
-      ...(error?.used !== null && error?.used !== undefined ? { used: error.used } : {}),
+      ...(explicitChatQuotaOnly
+        ? { quota: null, balance: null, used: null }
+        : {
+            ...(error?.quota !== null && error?.quota !== undefined ? { quota: error.quota } : {}),
+            ...(error?.balance !== null && error?.balance !== undefined ? { balance: error.balance } : { balance: 0 }),
+            ...(error?.used !== null && error?.used !== undefined ? { used: error.used } : {})
+          }),
       quotaResetAt: error?.quotaResetAt || "",
-      cooldownUntil: error?.cooldownUntil || error?.quotaResetAt || null,
+      cooldownUntil,
       quotaReason: error?.quotaReason || "",
+      quotaConfirmedByUpstream: explicitChatQuotaOnly || error?.quotaConfirmedByUpstream === true,
       period: error?.period || "",
       message: error?.message || "额度不足"
     };
@@ -1013,55 +1055,19 @@ async function markAccountAvailable(accountId, channel = "") {
     status: "ok",
     message: "最近调用成功"
   };
-  if (channelType === "chatplus" || !channelType) patch.cooldownUntil = null;
-  await updateTargetAccountStatus(accountId, channel, patch);
-}
-
-function usageNumber(value) {
-  if (value === null || value === undefined || value === "") return null;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-async function consumeChatUsage(account, channel) {
-  return withAccountAuthLock(account, async () => {
-    const config = await loadRuntimeConfig();
-    const currentAccount = config.accounts.find((item) => item.id === account.id) || account;
-    const current = currentAccount.meta?.abilities?.chatplus || {};
-    const quota = usageNumber(current.quota);
-    const balance = usageNumber(current.balance);
-    if (quota === null || balance === null) {
-      await markAccountAvailable(account.id, channel);
-      return;
-    }
-
-    const nextBalance = Math.max(0, balance - 1);
-    const nextUsed = Math.min(quota, usageNumber(current.used) === null ? quota - nextBalance : Number(current.used) + 1);
-    const quotaResetAt = current.quotaResetAt || "";
-    await updateTargetAccountStatus(account.id, channel, {
-      status: "ok",
-      quota,
-      balance: nextBalance,
-      used: nextUsed,
-      quotaResetAt,
+  if (channelType === "chatplus" || !channelType) {
+    Object.assign(patch, {
+      quota: null,
+      balance: null,
+      used: null,
+      quotaResetAt: "",
       cooldownUntil: null,
       quotaReason: "",
-      period: current.period || current.meta?.chatUsage?.period || "",
-      message: nextBalance <= 0
-        ? "本地记录剩余次数为 0，下次任务会重新校验上游额度。"
-        : "聊天账号可用",
-      meta: {
-        ...(current.meta || {}),
-        chatUsage: {
-          ...(current.meta?.chatUsage || {}),
-          quota,
-          used: nextUsed,
-          balance: nextBalance,
-          period: current.period || current.meta?.chatUsage?.period || ""
-        }
-      }
+      quotaConfirmedByUpstream: false,
+      period: ""
     });
-  });
+  }
+  await updateTargetAccountStatus(accountId, channel, patch);
 }
 
 function drawingFailureTextFromResult(result = {}) {
@@ -1095,7 +1101,9 @@ async function updateTargetStatusAfterError(account, channel, error) {
     ? drawingRetryAfterSeconds(error?.message)
     : 0;
   if (!retryAfterSeconds) {
-    await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
+    await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error, {
+      explicitChatQuotaOnly: channel?.type === "chatplus"
+    }));
     return;
   }
   await withAccountAuthLock(account, () => (
@@ -1105,7 +1113,21 @@ async function updateTargetStatusAfterError(account, channel, error) {
 
 async function updateAccountAfterTask(account, channel, result = {}) {
   if (channel?.type === "chatplus") {
-    await consumeChatUsage(account, channel);
+    const config = await loadRuntimeConfig();
+    const currentAccount = config.accounts.find((item) => item.id === account.id) || account;
+    const ability = channelAbilityKey(channel);
+    const currentStatus = ability
+      ? currentAccount.meta?.abilities?.[ability] || {}
+      : currentAccount;
+    if (
+      result.taskType === "chat"
+      && currentStatus.status === "quota_empty"
+      && currentStatus.quotaConfirmedByUpstream === true
+      && currentStatus.quotaReason === "image_quota"
+    ) {
+      return false;
+    }
+    await markAccountAvailable(account.id, channel);
     return false;
   }
   if (channel?.type !== "drawing" || !isFinishedTask(result.status)) {
@@ -1532,34 +1554,26 @@ function targetAbilityCooling(target) {
   return statusCooling(targetQuotaStatus(target));
 }
 
-function targetUsageRefreshDue(target) {
-  if (target?.channel?.type !== "chatplus") return false;
-  const status = targetQuotaStatus(target);
-  if (status.quotaReason === "image_quota") return false;
-  const resetAt = Date.parse(status.quotaResetAt || "");
-  return Number.isFinite(resetAt) && resetAt <= Date.now();
-}
-
 function targetKnownUnavailable(target) {
   const status = String(targetQuotaStatus(target).status || "unknown").toLowerCase();
   return ["error", "failed", "disconnected", "disabled"].includes(status);
 }
 
 function targetQuotaEmpty(target) {
-  return String(targetQuotaStatus(target).status || "").toLowerCase() === "quota_empty";
+  const status = targetQuotaStatus(target);
+  const quotaEmpty = String(status.status || "").toLowerCase() === "quota_empty";
+  if (target?.channel?.type !== "chatplus") return quotaEmpty;
+  return quotaEmpty && status.quotaConfirmedByUpstream === true;
 }
 
 function statusAccountUsageEmpty(status = {}) {
   return String(status.status || "").toLowerCase() === "quota_empty"
-    && status.quotaReason === "chat_usage_limit";
+    && status.quotaReason === "chat_usage_limit"
+    && status.quotaConfirmedByUpstream === true;
 }
 
 function targetAccountUsageEmpty(target) {
   return statusAccountUsageEmpty(targetQuotaStatus(target));
-}
-
-function targetCachedChatUsageLimit(target) {
-  return target?.channel?.type === "chatplus" && targetAccountUsageEmpty(target);
 }
 
 function targetLastCheckAt(target, status = {}) {
@@ -1567,11 +1581,40 @@ function targetLastCheckAt(target, status = {}) {
   return Number.isFinite(checkedAt) ? checkedAt : 0;
 }
 
+function targetConfirmedQuotaBlocksTask(target, taskType) {
+  if (target?.channel?.type !== "chatplus" || !targetQuotaEmpty(target)) return false;
+  const status = targetQuotaStatus(target);
+  return status.quotaReason !== "image_quota" || taskType !== "chat";
+}
+
+function targetConfirmedQuotaRetryDue(target) {
+  const status = targetQuotaStatus(target);
+  const cooldownAt = Date.parse(status.cooldownUntil || "");
+  if (Number.isFinite(cooldownAt) && cooldownAt > Date.now()) return false;
+  const resetAt = Date.parse(
+    status.quotaReason === "image_quota"
+      ? status.imageQuotaResetAt || status.quotaResetAt || ""
+      : status.quotaResetAt || ""
+  );
+  if (Number.isFinite(resetAt)) return resetAt <= Date.now();
+  if (Number.isFinite(cooldownAt)) return cooldownAt <= Date.now();
+  return Date.now() - targetLastCheckAt(target, status) >= CHAT_USAGE_RECOVERY_CHECK_MS;
+}
+
 function admissionTargets(targets, taskType, options = {}) {
   const skipKnownQuotaEmpty = options.skipKnownQuotaEmpty === true;
   return targets.filter((target) => !(
     targetKnownUnavailable(target)
-      || (skipKnownQuotaEmpty && taskType !== "chat" && targetQuotaEmpty(target) && !targetCachedChatUsageLimit(target))
+      || (
+        targetConfirmedQuotaBlocksTask(target, taskType)
+        && !targetConfirmedQuotaRetryDue(target)
+      )
+      || (
+        skipKnownQuotaEmpty
+        && taskType !== "chat"
+        && target.channel.type !== "chatplus"
+        && targetQuotaEmpty(target)
+      )
   ));
 }
 
@@ -1582,6 +1625,13 @@ function targetRecoveryKey(target) {
 function targetNeedsRecovery(target) {
   const quotaStatus = targetQuotaStatus(target);
   const status = String(quotaStatus.status || "unknown").toLowerCase();
+  if (target?.channel?.type === "chatplus") {
+    if (status === "quota_empty") return false;
+    return (
+      accountCooling(target.account)
+      || ["error", "failed", "disconnected"].includes(status)
+    );
+  }
   if (status === "quota_empty") {
     const resetAt = Date.parse(
       quotaStatus.quotaReason === "image_quota"
@@ -1589,15 +1639,9 @@ function targetNeedsRecovery(target) {
         : quotaStatus.quotaResetAt || quotaStatus.cooldownUntil || ""
     );
     if (Number.isFinite(resetAt) && resetAt <= Date.now()) return true;
-    if (targetCachedChatUsageLimit(target)) {
-      return Date.now() - targetLastCheckAt(target, quotaStatus) >= CHAT_USAGE_RECOVERY_CHECK_MS;
-    }
     return false;
   }
-  if (status === "ok" && targetUsageRefreshDue(target)) return true;
-  return (
-    target?.channel?.type === "chatplus" && accountCooling(target.account)
-  ) || ["error", "failed", "disconnected"].includes(status);
+  return ["error", "failed", "disconnected"].includes(status);
 }
 
 async function recoverTarget(config, target) {
@@ -1625,7 +1669,9 @@ async function recoverTarget(config, target) {
       accountRecoveryRetryAt.set(key, Date.now() + ACCOUNT_RECOVERY_RETRY_MS);
       return null;
     } catch (error) {
-      await updateTargetAccountStatus(target.account.id, target.channel, accountStatusFromError(error));
+      await updateTargetAccountStatus(target.account.id, target.channel, accountStatusFromError(error, {
+        explicitChatQuotaOnly: target.channel.type === "chatplus"
+      }));
       accountRecoveryRetryAt.set(key, Date.now() + ACCOUNT_RECOVERY_RETRY_MS);
       return null;
     } finally {
@@ -1662,8 +1708,15 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
     includeCooling: true
   });
   const ready = admissionTargets(targets, taskType, options).filter((target) => !(
-    (targetAbilityCooling(target) && !targetCachedChatUsageLimit(target))
-      || (target.channel.type === "chatplus" && accountCooling(target.account) && !targetCachedChatUsageLimit(target))
+    (
+      targetAbilityCooling(target)
+      && !(target.channel.type === "chatplus" && !targetQuotaEmpty(target))
+    )
+      || (
+        target.channel.type === "chatplus"
+        && accountCooling(target.account)
+        && targetQuotaStatus(target).status !== "quota_empty"
+      )
   ));
   const recoveryTargets = options.skipRecovery
     ? []
@@ -1700,12 +1753,7 @@ export async function reserveImageTaskAdmission(input = {}) {
     });
   }
   return reserveFirstAvailableTarget(targets, "img2img", {
-    input,
-    confirmBeforeReserve: (target, attempts) => (
-      targetCachedChatUsageLimit(target)
-        ? refreshQuotaBeforeUseFast(config, target, attempts)
-        : true
-    )
+    input
   });
 }
 
@@ -1752,8 +1800,7 @@ function noUsableTargetError(taskType, options = {}) {
 }
 
 function shouldRefreshQuotaBeforeUse(target, taskType) {
-  if (targetCachedChatUsageLimit(target)) return true;
-  if (targetUsageRefreshDue(target)) return true;
+  if (target.channel.type === "chatplus") return false;
   if (taskType === "chat") return false;
   return target.channel.type === "drawing" || targetQuotaStatus(target).status === "quota_empty";
 }
@@ -1796,7 +1843,9 @@ async function refreshQuotaBeforeUse(config, target, attempts) {
     }
     return true;
   } catch (error) {
-    const patch = accountStatusFromError(error);
+    const patch = accountStatusFromError(error, {
+      explicitChatQuotaOnly: target.channel.type === "chatplus"
+    });
     await updateTargetStatusForWork(target, patch);
     pushAttempt(
       attempts,
@@ -2253,6 +2302,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           noQueue: options.noChatplusQueue,
           slot: targetTaskSlot(target, "text2img"),
           modelKey: targetChatModelKey(target, input),
+          quotaProbe: targetConfirmedQuotaBlocksTask(target, "text2img") && targetConfirmedQuotaRetryDue(target),
           blockingSlots: ["chatImage"]
         });
         if (finishedTask) return finishedTask;
@@ -2263,7 +2313,9 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         }
         pushAttempt(attempts, target, error.message || "调用失败", {
           busy: Boolean(error.busy),
-          quotaEmpty: Boolean(error.quotaEmpty || isQuotaEmptyError(error))
+          quotaEmpty: channel.type === "chatplus"
+            ? isExplicitChatQuotaError(error)
+            : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
         });
         if (!error.busy) {
           await updateTargetStatusAfterError(account, channel, error);
@@ -2389,6 +2441,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           noQueue: options.noChatplusQueue,
           slot: targetTaskSlot(target, "img2img"),
           modelKey: targetChatModelKey(target, input),
+          quotaProbe: targetConfirmedQuotaBlocksTask(target, "img2img") && targetConfirmedQuotaRetryDue(target),
           blockingSlots: ["chatImage"]
         });
         if (finishedTask) return finishedTask;
@@ -2399,7 +2452,9 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         }
         pushAttempt(attempts, target, error.message || "调用失败", {
           busy: Boolean(error.busy),
-          quotaEmpty: Boolean(error.quotaEmpty || isQuotaEmptyError(error))
+          quotaEmpty: channel.type === "chatplus"
+            ? isExplicitChatQuotaError(error)
+            : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
         });
         if (!error.busy) {
           await updateTargetStatusAfterError(account, channel, error);
@@ -2475,7 +2530,8 @@ async function runChatCompletionTask(task, input) {
         const finishedTask = await finishChatTask(task, result, channel, account, attempts, responseJson);
           return { result, channel, account, task: finishedTask, responseJson };
       }, {
-        modelKey: targetChatModelKey(target, input)
+        modelKey: targetChatModelKey(target, input),
+        quotaProbe: targetConfirmedQuotaBlocksTask(target, "chat") && targetConfirmedQuotaRetryDue(target)
       });
       if (finished) return finished;
     } catch (error) {
@@ -2487,12 +2543,16 @@ async function runChatCompletionTask(task, input) {
         accountName: account.name,
         message: error.message || "调用失败"
       });
-      if (channel.type === "chatplus" && isQuotaEmptyError(error)) {
-        await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
+      if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
+        await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error, {
+          explicitChatQuotaOnly: true
+        }));
       } else if (channel.type === "chatplus" && isChatBlockedError(error)) {
         await markChatCooldown(account.id, channel, error);
       } else {
-        await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error));
+        await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error, {
+          explicitChatQuotaOnly: channel.type === "chatplus"
+        }));
       }
       if (status === 400 && !isChatBlockedError(error)) {
         error.task = await failQueuedTask(task, error, attempts);
@@ -2629,23 +2689,66 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
   return task;
 }
 
+function preserveConfirmedChatQuota(currentStatus = {}, nextStatus = {}) {
+  if (
+    String(currentStatus.status || "").toLowerCase() !== "quota_empty"
+    || currentStatus.quotaConfirmedByUpstream !== true
+  ) {
+    return nextStatus;
+  }
+  return {
+    ...nextStatus,
+    status: "quota_empty",
+    quota: null,
+    balance: null,
+    used: null,
+    quotaResetAt: currentStatus.quotaResetAt || "",
+    imageQuotaResetAt: currentStatus.imageQuotaResetAt || "",
+    cooldownUntil: currentStatus.cooldownUntil || currentStatus.quotaResetAt || null,
+    quotaReason: currentStatus.quotaReason || "chat_usage_limit",
+    quotaConfirmedByUpstream: true,
+    period: currentStatus.period || "",
+    message: currentStatus.message || "使用次数已用完，等待真实请求确认恢复",
+    meta: {
+      ...(currentStatus.meta || {}),
+      ...(nextStatus.meta || {})
+    }
+  };
+}
+
 async function checkShareAIAbility(config, channel, account, ability) {
   const abilityChannel = shareAIAbilityChannel(channel, ability);
   const client = getClient(config, abilityChannel, account);
+  const currentStatus = ability === "chatplus"
+    ? account.meta?.abilities?.chatplus || {}
+    : account.meta?.abilities?.drawing || {};
   try {
-    const data = await runChatplusAccountWork(abilityChannel, account, () => client.check());
+    const checked = await runChatplusAccountWork(abilityChannel, account, () => client.check());
+    const data = ability === "chatplus"
+      ? preserveConfirmedChatQuota(currentStatus, checked)
+      : checked;
     return { ok: true, data };
   } catch (error) {
+    const errorStatus = ability === "chatplus"
+      ? accountStatusFromError(error, { explicitChatQuotaOnly: true })
+      : accountStatusFromError(error);
+    const data = ability === "chatplus"
+      ? preserveConfirmedChatQuota(currentStatus, {
+          ...errorStatus,
+          message: readableCheckErrorMessage(error),
+          expireAt: ""
+        })
+      : {
+          ...errorStatus,
+          quota: errorStatus.quota ?? null,
+          balance: errorStatus.balance ?? null,
+          quotaResetAt: errorStatus.quotaResetAt || "",
+          expireAt: "",
+          message: readableCheckErrorMessage(error)
+        };
     return {
       ok: false,
-      data: {
-        status: isDisconnectedError(error) ? "disconnected" : isQuotaEmptyError(error) ? "quota_empty" : "error",
-        quota: null,
-        balance: null,
-        quotaResetAt: error?.quotaResetAt || "",
-        expireAt: "",
-        message: readableCheckErrorMessage(error)
-      }
+      data
     };
   }
 }
@@ -2807,20 +2910,35 @@ export async function checkAccount(accountId) {
   }
   const client = getClient(config, channel, account);
   try {
-    const status = await runChatplusAccountWork(channel, account, () => client.check());
-    const nextStatus = withProxyCheckMeta({ ...status, cooldownUntil: null }, proxyResult);
+    const checked = await runChatplusAccountWork(channel, account, () => client.check());
+    const status = channel.type === "chatplus"
+      ? preserveConfirmedChatQuota(account, checked)
+      : checked;
+    const nextStatus = withProxyCheckMeta({
+      ...status,
+      cooldownUntil: status.status === "ok" ? null : status.cooldownUntil
+    }, proxyResult);
     await updateAccountStatus(account.id, nextStatus);
     return nextStatus;
   } catch (error) {
     const message = readableCheckErrorMessage(error);
-    const status = withProxyCheckMeta({
-      status: isDisconnectedError(error) ? "disconnected" : isQuotaEmptyError(error) ? "quota_empty" : "error",
-      quota: null,
-      balance: null,
-      quotaResetAt: error?.quotaResetAt || "",
+    const errorStatus = accountStatusFromError(error, {
+      explicitChatQuotaOnly: channel.type === "chatplus"
+    });
+    const checkedStatus = {
+      ...errorStatus,
+      quota: channel.type === "chatplus" ? null : errorStatus.quota ?? null,
+      balance: channel.type === "chatplus" ? null : errorStatus.balance ?? null,
+      quotaResetAt: errorStatus.quotaResetAt || "",
       expireAt: "",
       message
-    }, proxyResult);
+    };
+    const status = withProxyCheckMeta(
+      channel.type === "chatplus"
+        ? preserveConfirmedChatQuota(account, checkedStatus)
+        : checkedStatus,
+      proxyResult
+    );
     await updateAccountStatus(account.id, status);
     throw new Error(message);
   }
@@ -2962,6 +3080,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         noQueue: wait && channel.type !== "chatplus",
         slot: targetTaskSlot(target, "text2img"),
         modelKey: targetChatModelKey(target, input),
+        quotaProbe: targetConfirmedQuotaBlocksTask(target, "text2img") && targetConfirmedQuotaRetryDue(target),
         blockingSlots: ["chatImage"]
       });
       if (finishedTask) return finishedTask;
@@ -2969,7 +3088,9 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
       if (isTerminalTaskFailureError(error)) throw error;
       pushAttempt(attempts, target, error.message || "调用失败", {
         busy: Boolean(error.busy),
-        quotaEmpty: Boolean(error.quotaEmpty || isQuotaEmptyError(error))
+        quotaEmpty: channel.type === "chatplus"
+          ? isExplicitChatQuotaError(error)
+          : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
       });
       if (!error.busy) await updateTargetStatusAfterError(account, channel, error);
     } finally {

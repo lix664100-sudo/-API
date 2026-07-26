@@ -316,7 +316,7 @@ test("image admission refreshes expired drawing quota before upload", async () =
   }
 });
 
-test("image admission refreshes expired chat image quota before upload", async () => {
+test("expired confirmed chat quota allows a real image request without dashboard refresh", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -351,8 +351,10 @@ test("image admission refreshes expired chat image quota before upload", async (
             used: 220,
             balance: 0,
             quotaReason: "chat_usage_limit",
+            quotaConfirmedByUpstream: true,
             quotaResetAt: new Date(Date.now() - 1000).toISOString(),
             cooldownUntil: new Date(Date.now() - 1000).toISOString(),
+            lastCheckAt: new Date().toISOString(),
             message: "chat usage empty"
           }
         }
@@ -383,16 +385,16 @@ test("image admission refreshes expired chat image quota before upload", async (
 
     const stored = await loadConfig();
     const chatplus = stored.accounts[0].meta.abilities.chatplus;
-    assert.equal(checkCount, 1);
+    assert.equal(checkCount, 0);
     assert.equal(admitted.target.channel.type, "chatplus");
-    assert.equal(chatplus.status, "ok");
-    assert.equal(chatplus.balance, 220);
+    assert.equal(chatplus.status, "quota_empty");
+    assert.equal(chatplus.quotaConfirmedByUpstream, true);
   } finally {
     ChatplusClient.prototype.check = originalCheck;
   }
 });
 
-test("image admission refreshes cached chat usage limit before upload", async () => {
+test("unconfirmed dashboard quota zero does not block image admission", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -460,12 +462,80 @@ test("image admission refreshes cached chat usage limit before upload", async ()
 
     const stored = await loadConfig();
     const chatplus = stored.accounts[0].meta.abilities.chatplus;
-    assert.equal(checkCount, 1);
+    assert.equal(checkCount, 0);
     assert.equal(admitted.target.channel.type, "chatplus");
-    assert.equal(chatplus.status, "ok");
-    assert.equal(chatplus.used, 190);
-    assert.equal(chatplus.balance, 30);
-    assert.equal(chatplus.quotaReason, "");
+    assert.equal(chatplus.status, "quota_empty");
+    assert.equal(chatplus.balance, 0);
+    assert.equal(chatplus.quotaConfirmedByUpstream, undefined);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
+});
+
+test("confirmed chat quota with a future reset blocks image admission", async () => {
+  const config = await loadConfig();
+  const resetAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  await saveConfig({
+    ...config,
+    defaultChannel: "chatplus",
+    concurrency: { chat: 3, drawingImage: 1, chatImage: 1 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        defaultModelId: 1
+      }
+    }],
+    accounts: [{
+      id: "confirmed-chat-empty",
+      channelId: "shareai",
+      name: "Confirmed Chat Empty",
+      username: "confirmed-chat-empty@example.test",
+      password: "test",
+      enabled: true,
+      status: "quota_empty",
+      cooldownUntil: resetAt,
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", message: "drawing quota empty" },
+          chatplus: {
+            status: "quota_empty",
+            quota: null,
+            used: null,
+            balance: null,
+            quotaReason: "chat_usage_limit",
+            quotaConfirmedByUpstream: true,
+            quotaResetAt: resetAt,
+            cooldownUntil: resetAt,
+            lastCheckAt: new Date().toISOString(),
+            message: "chat usage empty"
+          }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    throw new Error("明确用完且未到时间时不应该检测");
+  };
+
+  try {
+    await assert.rejects(
+      reserveImageTaskAdmission({
+        channel: "chatplus",
+        accountId: "confirmed-chat-empty",
+        prompt: "quota test"
+      }),
+      /额度|可用|恢复/
+    );
+    assert.equal(checkCount, 0);
   } finally {
     ChatplusClient.prototype.check = originalCheck;
   }

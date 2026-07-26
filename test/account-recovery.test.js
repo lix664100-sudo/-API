@@ -139,16 +139,16 @@ test("账号检测遇到失效车位后会自动换车", async () => {
   const result = await client.check();
 
   assert.equal(result.status, "ok");
-  assert.equal(result.quota, 220);
-  assert.equal(result.balance, 189);
-  assert.equal(result.used, 31);
-  assert.equal(result.quotaResetAt, "2026-07-22T19:32:29+08:00");
-  assert.equal(result.meta.chatUsage.period, "12h");
+  assert.equal(result.quota, null);
+  assert.equal(result.balance, null);
+  assert.equal(result.used, null);
+  assert.equal(result.quotaResetAt, "");
+  assert.equal(result.quotaConfirmedByUpstream, false);
   assert.equal(result.meta.selectedCarId, "car-3");
   assert.equal(enteredCount, 3);
 });
 
-test("聊天账号信息会换算真实总额度和剩余额度", async () => {
+test("GPT 账号信息会换算真实总额度、剩余额度和重置时间", async () => {
   const client = new ChatplusClient({
     config: {},
     channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
@@ -175,6 +175,84 @@ test("聊天账号信息会换算真实总额度和剩余额度", async () => {
     balance: 183,
     quotaResetAt: "2026-07-22T19:32:29+08:00",
     expireAt: "2026-08-16T05:22:44+08:00",
+    period: "12h"
+  });
+});
+
+test("Gemini 账号信息只读取 Gemini 自己的额度和重置时间", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: {
+      id: "shareai:chatplus",
+      settings: {
+        defaultChatModel: "gpt",
+        chatModels: [
+          { key: "gpt", name: "GPT", enabled: false, default: true },
+          { key: "gemini", name: "Gemini", enabled: true, default: false }
+        ]
+      }
+    },
+    account: { id: "account-gemini-usage", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.json = async () => ({
+    code: 1,
+    data: {
+      limit: 20,
+      userUsed: 1,
+      resetTimeChatgpt: "",
+      per: "12h",
+      geminiLimit: 100,
+      geminiUsed: "7",
+      geminiPer: "24h",
+      resetTimeGemini: "2026-07-27 00:00:00",
+      geminiExpireTime: "2026-08-24 23:49:00"
+    }
+  });
+
+  const usage = await client.loadAccountUsage({ timeoutSec: 8 });
+
+  assert.deepEqual(usage, {
+    quota: 100,
+    used: 7,
+    balance: 93,
+    quotaResetAt: "2026-07-27T00:00:00+08:00",
+    expireAt: "2026-08-24T23:49:00+08:00",
+    period: "24h"
+  });
+});
+
+test("Grok 账号信息只读取 Grok 自己的额度和重置时间", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "grok" } },
+    account: { id: "account-grok-usage", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.json = async () => ({
+    code: 1,
+    data: {
+      limit: 20,
+      userUsed: 1,
+      resetTimeChatgpt: "2026-07-27 01:00:00",
+      grokLimit: 80,
+      grokUsed: "12",
+      grokPer: "12h",
+      resetTimeGrok: "2026-07-27 02:00:00",
+      grokExpireTime: "2026-08-20 12:00:00"
+    }
+  });
+
+  const usage = await client.loadAccountUsage({ timeoutSec: 8 });
+
+  assert.deepEqual(usage, {
+    quota: 80,
+    used: 12,
+    balance: 68,
+    quotaResetAt: "2026-07-27T02:00:00+08:00",
+    expireAt: "2026-08-20T12:00:00+08:00",
     period: "12h"
   });
 });
@@ -231,13 +309,13 @@ test("PLUS 车位有图片额度时账号检测不会误判为无额度", async 
   const result = await client.check();
 
   assert.equal(result.status, "ok");
-  assert.equal(result.balance, 114);
-  assert.equal(result.quotaResetAt, "2026-07-26T07:36:45+08:00");
+  assert.equal(result.balance, null);
+  assert.equal(result.quotaResetAt, "");
   assert.equal(result.meta.selectedCarId, "plus-image-car");
-  assert.equal(result.meta.imageLimit.remaining, 48);
+  assert.equal(result.meta.imageLimit, undefined);
 });
 
-test("聊天账号到期时间优先使用共享套餐有效期", async () => {
+test("Gemini 数据缺失时不会借用 GPT 额度，但仍保留共享套餐有效期", async () => {
   const client = new ChatplusClient({
     config: {},
     channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gemini" } },
@@ -258,10 +336,17 @@ test("聊天账号到期时间优先使用共享套餐有效期", async () => {
 
   const usage = await client.loadAccountUsage({ timeoutSec: 8 });
 
-  assert.equal(usage.expireAt, "2026-07-25T23:42:03+08:00");
+  assert.deepEqual(usage, {
+    quota: null,
+    used: null,
+    balance: null,
+    quotaResetAt: "",
+    expireAt: "2026-07-25T23:42:03+08:00",
+    period: ""
+  });
 });
 
-test("聊天总额度用完后检测会等待刷新且不再选车", async () => {
+test("后台显示额度为零时仍会检测真实车位并保持可用", async () => {
   const client = new ChatplusClient({
     config: {},
     channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
@@ -279,18 +364,23 @@ test("聊天总额度用完后检测会等待刷新且不再选车", async () =>
   });
   client.prepareChatSession = async () => {
     prepareCount += 1;
-    throw new Error("额度用完后不应该继续选车");
+    return {
+      route: { key: "gpt", model: "gpt-test" },
+      init: { default_model_slug: "gpt-test" },
+      selected: { carId: "car-dashboard-zero", carType: "chatgpt", strategy: "balanced" }
+    };
   };
 
   const result = await client.check();
 
-  assert.equal(prepareCount, 0);
-  assert.equal(result.status, "quota_empty");
-  assert.equal(result.quota, 220);
-  assert.equal(result.balance, 0);
-  assert.equal(result.used, 220);
-  assert.equal(result.quotaReason, "chat_usage_limit");
-  assert.equal(result.cooldownUntil, "2026-07-22T19:32:29+08:00");
+  assert.equal(prepareCount, 1);
+  assert.equal(result.status, "ok");
+  assert.equal(result.quota, null);
+  assert.equal(result.balance, null);
+  assert.equal(result.used, null);
+  assert.equal(result.quotaReason, "");
+  assert.equal(result.quotaConfirmedByUpstream, false);
+  assert.equal(result.meta.selectedCarId, "car-dashboard-zero");
 });
 
 test("聊天总额度上限返回会立即停止换车并保留刷新时间", async () => {
@@ -329,13 +419,58 @@ test("聊天总额度上限返回会立即停止换车并保留刷新时间", as
       assert.equal(error.balance, 0);
       assert.equal(error.used, 220);
       assert.equal(error.quotaResetAt, "2026-07-22T19:32:29+08:00");
+      assert.equal(error.quotaConfirmedByUpstream, true);
       return true;
     }
   );
   assert.equal(prepareCount, 1);
 });
 
-test("聊天本地额度减到零后不暂停提交，上游确认后恢复", async () => {
+test("Grok 和 Gemini 即使返回 403，也会优先识别明确用完提示", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "grok" } },
+    account: { id: "account-multi-model-limit", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  client.http = async () => ({
+    status: 403,
+    headers: {},
+    body: "usage count has reached the limit"
+  });
+
+  await assert.rejects(
+    client.sendGrokConversation(
+      "额度测试",
+      { files: [] },
+      { key: "grok", strategy: "balanced", model: "grok-test" },
+      { carId: "grok-car", carType: "grok" }
+    ),
+    (error) => (
+      error.code === "CHAT_USAGE_LIMIT"
+      && error.quotaConfirmedByUpstream === true
+      && error.quotaReason === "chat_usage_limit"
+    )
+  );
+
+  client.geminiSession.bl = "gemini-session";
+  client.uploadGeminiImages = async () => [];
+  await assert.rejects(
+    client.sendGeminiConversation(
+      "额度测试",
+      { files: [] },
+      { key: "gemini", strategy: "thinking", model: "" },
+      { carId: "gemini-car", carType: "gemini" }
+    ),
+    (error) => (
+      error.code === "CHAT_USAGE_LIMIT"
+      && error.quotaConfirmedByUpstream === true
+      && error.quotaReason === "chat_usage_limit"
+    )
+  );
+});
+
+test("后台额度数字不扣减，明确用完后只由真实成功请求恢复", async () => {
   const config = await loadConfig();
   const resetAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
   await saveConfig({
@@ -396,28 +531,57 @@ test("聊天本地额度减到零后不暂停提交，上游确认后恢复", as
   };
 
   try {
-    await createChatCompletion({ channel: "chatplus", messages: [{ role: "user", content: "第一次" }] });
-    await createChatCompletion({ channel: "chatplus", messages: [{ role: "user", content: "第二次" }] });
+    await createChatCompletion({ channel: "chatplus", messages: [{ role: "user", content: "成功请求" }] });
 
     let stored = await loadConfig();
     let account = stored.accounts[0];
     let chatplus = account.meta.abilities.chatplus;
-    assert.equal(submitCount, 2);
-    assert.equal(chatplus.quota, 220);
-    assert.equal(chatplus.used, 220);
-    assert.equal(chatplus.balance, 0);
+    assert.equal(submitCount, 1);
+    assert.equal(chatplus.quota, null);
+    assert.equal(chatplus.used, null);
+    assert.equal(chatplus.balance, null);
     assert.equal(chatplus.status, "ok");
     assert.equal(chatplus.quotaReason, "");
+    assert.equal(chatplus.quotaConfirmedByUpstream, false);
     assert.equal(account.cooldownUntil, null);
-
-    const waiting = await recoverUnavailableChatAccounts();
-    assert.equal(waiting.length, 0);
-    assert.equal(checkCount, 0);
 
     chatplus = {
       ...chatplus,
       status: "quota_empty",
+      quota: null,
+      used: null,
+      balance: null,
       quotaReason: "chat_usage_limit",
+      quotaConfirmedByUpstream: true,
+      quotaResetAt: resetAt,
+      cooldownUntil: resetAt,
+      lastCheckAt: new Date().toISOString()
+    };
+    await saveConfig({
+      ...stored,
+      accounts: [{
+        ...account,
+        cooldownUntil: chatplus.cooldownUntil,
+        meta: {
+          ...account.meta,
+          abilities: { ...account.meta.abilities, chatplus }
+        }
+      }]
+    });
+
+    const waiting = await recoverUnavailableChatAccounts();
+    assert.equal(waiting.length, 0);
+    assert.equal(checkCount, 0);
+    await assert.rejects(
+      createChatCompletion({ channel: "chatplus", messages: [{ role: "user", content: "还没到恢复时间" }] }),
+      /冷却|额度|可用/
+    );
+    assert.equal(submitCount, 1);
+
+    stored = await loadConfig();
+    account = stored.accounts[0];
+    chatplus = {
+      ...account.meta.abilities.chatplus,
       quotaResetAt: new Date(Date.now() - 1000).toISOString(),
       cooldownUntil: new Date(Date.now() - 1000).toISOString()
     };
@@ -433,17 +597,17 @@ test("聊天本地额度减到零后不暂停提交，上游确认后恢复", as
       }]
     });
 
-    const recovered = await recoverUnavailableChatAccounts();
+    await createChatCompletion({ channel: "chatplus", messages: [{ role: "user", content: "到点后真实请求" }] });
     stored = await loadConfig();
     account = stored.accounts[0];
     chatplus = account.meta.abilities.chatplus;
 
-    assert.equal(recovered.length, 1);
-    assert.equal(recovered[0].recovered, true);
-    assert.equal(checkCount, 1);
+    assert.equal(submitCount, 2);
+    assert.equal(checkCount, 0);
     assert.equal(chatplus.status, "ok");
-    assert.equal(chatplus.quota, 220);
-    assert.equal(chatplus.balance, 220);
+    assert.equal(chatplus.quota, null);
+    assert.equal(chatplus.balance, null);
+    assert.equal(chatplus.quotaConfirmedByUpstream, false);
     assert.equal(account.cooldownUntil, null);
   } finally {
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
@@ -1324,10 +1488,11 @@ async function saveChatUsageRecoveryFixture({ lastCheckAt, quotaResetAt }) {
           drawing: { status: "ok", message: "drawing ok" },
           chatplus: {
             status: "quota_empty",
-            quota: 220,
-            used: 220,
-            balance: 0,
+            quota: null,
+            used: null,
+            balance: null,
             quotaReason: "chat_usage_limit",
+            quotaConfirmedByUpstream: true,
             quotaResetAt,
             cooldownUntil: quotaResetAt,
             lastCheckAt,
@@ -1362,79 +1527,141 @@ test("聊天额度不足未满 1 小时不会后台复查", async () => {
   }
 });
 
-test("聊天额度不足超过 1 小时会后台复查并按上游恢复", async () => {
+test("聊天明确用完超过 1 小时后由真实请求探测恢复", async () => {
   await saveChatUsageRecoveryFixture({
     lastCheckAt: new Date(Date.now() - 61 * 60 * 1000).toISOString(),
-    quotaResetAt: new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString()
+    quotaResetAt: ""
   });
 
   const originalCheck = ChatplusClient.prototype.check;
+  const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
   let checkCount = 0;
+  let submitCount = 0;
   ChatplusClient.prototype.check = async () => {
     checkCount += 1;
-    return {
-      status: "ok",
-      quota: 220,
-      used: 180,
-      balance: 40,
-      quotaResetAt: new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString(),
-      cooldownUntil: null,
-      quotaReason: "",
-      message: "chat ok",
-      meta: { chatUsage: { quota: 220, used: 180, balance: 40, period: "12h" } }
-    };
+    throw new Error("明确用完不能靠后台检测恢复");
   };
+  ChatplusClient.prototype.createChatCompletion = async () => ({
+    externalId: `chat-recovery-${++submitCount}`,
+    model: "gpt",
+    content: "恢复成功",
+    imageUrls: [],
+    raw: {}
+  });
 
   try {
     const results = await recoverUnavailableChatAccounts();
+    assert.equal(results.length, 0);
+    assert.equal(checkCount, 0);
+
+    await createChatCompletion({ channel: "chatplus", messages: [{ role: "user", content: "真实恢复探测" }] });
     const stored = await loadConfig();
     const chatplus = stored.accounts[0].meta.abilities.chatplus;
 
-    assert.equal(checkCount, 1);
-    assert.equal(results.length, 1);
-    assert.equal(results[0].channelId, "shareai:chatplus");
-    assert.equal(results[0].recovered, true);
+    assert.equal(submitCount, 1);
     assert.equal(chatplus.status, "ok");
-    assert.equal(chatplus.balance, 40);
+    assert.equal(chatplus.balance, null);
+    assert.equal(chatplus.quotaConfirmedByUpstream, false);
   } finally {
     ChatplusClient.prototype.check = originalCheck;
+    ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
   }
 });
 
-test("聊天额度上游恢复时间到了会立刻后台复查", async () => {
+test("聊天重置时间到了也不会靠后台数字恢复", async () => {
   await saveChatUsageRecoveryFixture({
     lastCheckAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
     quotaResetAt: new Date(Date.now() - 1000).toISOString()
   });
 
   const originalCheck = ChatplusClient.prototype.check;
+  const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
   let checkCount = 0;
+  let submitCount = 0;
   ChatplusClient.prototype.check = async () => {
     checkCount += 1;
+    throw new Error("重置时间到了也不能靠检测恢复");
+  };
+  ChatplusClient.prototype.createChatCompletion = async () => ({
+    externalId: `chat-reset-recovery-${++submitCount}`,
+    model: "gpt",
+    content: "恢复成功",
+    imageUrls: [],
+    raw: {}
+  });
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+    assert.equal(results.length, 0);
+    assert.equal(checkCount, 0);
+
+    await createChatCompletion({ channel: "chatplus", messages: [{ role: "user", content: "重置后真实探测" }] });
+    const stored = await loadConfig();
+    const chatplus = stored.accounts[0].meta.abilities.chatplus;
+
+    assert.equal(submitCount, 1);
+    assert.equal(chatplus.status, "ok");
+    assert.equal(chatplus.balance, null);
+    assert.equal(chatplus.quotaConfirmedByUpstream, false);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+    ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
+  }
+});
+
+test("聊天额度恢复时只放行一个真实探测请求", async () => {
+  await saveChatUsageRecoveryFixture({
+    lastCheckAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+    quotaResetAt: new Date(Date.now() - 1000).toISOString()
+  });
+
+  const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
+  let submitCount = 0;
+  let releaseFirst;
+  let reportEntered;
+  const firstEntered = new Promise((resolve) => {
+    reportEntered = resolve;
+  });
+  const holdFirst = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  ChatplusClient.prototype.createChatCompletion = async () => {
+    submitCount += 1;
+    reportEntered();
+    await holdFirst;
     return {
-      status: "ok",
-      quota: 220,
-      used: 0,
-      balance: 220,
-      quotaResetAt: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString(),
-      cooldownUntil: null,
-      quotaReason: "",
-      message: "chat ok",
-      meta: { chatUsage: { quota: 220, used: 0, balance: 220, period: "12h" } }
+      externalId: "single-recovery-probe",
+      model: "gpt",
+      content: "恢复成功",
+      imageUrls: [],
+      raw: {}
     };
   };
 
   try {
-    const results = await recoverUnavailableChatAccounts();
+    const first = createChatCompletion({
+      channel: "chatplus",
+      messages: [{ role: "user", content: "第一个恢复探测" }]
+    });
+    await firstEntered;
+
+    await assert.rejects(
+      createChatCompletion({
+        channel: "chatplus",
+        messages: [{ role: "user", content: "并发恢复探测" }]
+      }),
+      /正在处理|并发|繁忙|失败/
+    );
+    assert.equal(submitCount, 1);
+
+    releaseFirst();
+    await first;
     const stored = await loadConfig();
     const chatplus = stored.accounts[0].meta.abilities.chatplus;
-
-    assert.equal(checkCount, 1);
-    assert.equal(results.length, 1);
-    assert.equal(results[0].channelId, "shareai:chatplus");
     assert.equal(chatplus.status, "ok");
-    assert.equal(chatplus.balance, 220);
+    assert.equal(chatplus.quotaConfirmedByUpstream, false);
   } finally {
-    ChatplusClient.prototype.check = originalCheck;
+    releaseFirst?.();
+    ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
   }
 });

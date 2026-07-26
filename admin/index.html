@@ -1925,13 +1925,17 @@
           const chatplus = abilityStatus(account, "chatplus");
           const parts = [];
           if (channelAbilityEnabled(channel, "drawing")) parts.push(`绘图 ${quotaPairText(drawing.quota ?? account.quota, drawing.balance ?? account.balance ?? account.quota)}`);
-          if (channelAbilityEnabled(channel, "chatplus")) parts.push(`聊天 ${quotaPairText(chatplus.quota, chatplus.balance)}`);
+          if (channelAbilityEnabled(channel, "chatplus")) parts.push(chatQuotaText(account, channel, chatplus));
           return parts.join("｜") || "-";
         }
         const balance = numberValue(account.balance ?? account.quota);
         const quota = numberValue(account.quota);
-        if (channel?.type === "chatplus") return account.status === "unknown" ? "-" : quotaPairText(account.quota, account.balance);
+        if (channel?.type === "chatplus") return chatQuotaText(account, channel, account);
         return `${quota}/${balance}`;
+      }
+
+      function confirmedChatQuotaEmpty(status = {}) {
+        return status.status === "quota_empty" && status.quotaConfirmedByUpstream === true;
       }
 
       function accountQuotaResetText(account, channel) {
@@ -1940,9 +1944,16 @@
           const chatplus = abilityStatus(account, "chatplus");
           const parts = [
             channelAbilityEnabled(channel, "drawing") && drawing.quotaResetAt ? `绘图 ${formatDateTime(drawing.quotaResetAt)}` : "",
-            channelAbilityEnabled(channel, "chatplus") && chatplus.quotaResetAt ? `聊天 ${formatDateTime(chatplus.quotaResetAt)}` : ""
+            channelAbilityEnabled(channel, "chatplus") && confirmedChatQuotaEmpty(chatplus) && chatplus.quotaResetAt
+              ? `${checkedChatModelName(account, channel)} ${formatDateTime(chatplus.quotaResetAt)}`
+              : ""
           ].filter(Boolean);
           return parts.length ? parts.join("｜") : "-";
+        }
+        if (channel?.type === "chatplus") {
+          return confirmedChatQuotaEmpty(account) && account.quotaResetAt
+            ? `${checkedChatModelName(account, channel)} ${formatDateTime(account.quotaResetAt)}`
+            : "-";
         }
         return formatDateTime(account.quotaResetAt);
       }
@@ -1976,10 +1987,10 @@
         if (channel?.type === "shareai") {
           const parts = [];
           if (channelAbilityEnabled(channel, "drawing")) parts.push(`绘图 ${quotaPairText(stats.drawingQuota, stats.drawingBalance)}`);
-          if (channelAbilityEnabled(channel, "chatplus")) parts.push(`聊天 ${quotaPairText(stats.chatQuota, stats.chatBalance)}`);
+          if (channelAbilityEnabled(channel, "chatplus")) parts.push(chatQuotaText(null, channel, stats.chatStatus));
           return parts.join("｜") || "-";
         }
-        if (channel?.type === "chatplus") return quotaPairText(stats.quota, stats.balance);
+        if (channel?.type === "chatplus") return chatQuotaText(null, channel, stats.chatStatus);
         return `${numberValue(stats.quota)}/${numberValue(stats.balance)}`;
       }
 
@@ -2007,13 +2018,26 @@
         return `${valueText(quota)}/${valueText(balance)}`;
       }
 
+      function chatQuotaText(account, channel, status = {}) {
+        const modelName = checkedChatModelName(account, channel);
+        if (confirmedChatQuotaEmpty(status)) {
+          return status.quotaReason === "image_quota"
+            ? `${modelName} 生图已用完`
+            : `${modelName} 已用完`;
+        }
+        if (status.status === "unknown" || !status.status) return `${modelName} 未检测`;
+        if (["error", "failed", "disconnected", "disabled"].includes(status.status)) return `${modelName} 暂不可用`;
+        return `${modelName} 可用`;
+      }
+
       function accountBalanceForTotal(account, channel) {
         if (channel?.type === "shareai") {
           const drawing = abilityStatus(account, "drawing");
-          const chatplus = abilityStatus(account, "chatplus");
-          return (channelAbilityEnabled(channel, "drawing") ? numberValue(drawing.balance ?? account.balance ?? account.quota) : 0)
-            + (channelAbilityEnabled(channel, "chatplus") ? numberValue(chatplus.balance) : 0);
+          return channelAbilityEnabled(channel, "drawing")
+            ? numberValue(drawing.balance ?? account.balance ?? account.quota)
+            : 0;
         }
+        if (channel?.type === "chatplus") return 0;
         return numberValue(account.balance ?? account.quota);
       }
 
@@ -2039,6 +2063,15 @@
             default: key === defaultKey || item?.default === true
           };
         });
+      }
+
+      function checkedChatModelName(account, channel) {
+        const checkedKey = chatModelKey(abilityStatus(account, "chatplus")?.meta?.chatModel || account?.meta?.chatModel);
+        const enabledModels = chatModelsForChannel(channel).filter((item) => item.enabled);
+        return enabledModels.find((item) => item.key === checkedKey)?.name
+          || enabledModels.find((item) => item.default)?.name
+          || enabledModels[0]?.name
+          || "聊天";
       }
 
       function chatModelSelectOptions(channel) {
@@ -2915,12 +2948,32 @@
         return "unknown";
       }
 
+      function chatDisplayStatus(status = {}) {
+        if (confirmedChatQuotaEmpty(status)) return "quota_empty";
+        if (status.status === "quota_empty") return "ok";
+        return status.status || "unknown";
+      }
+
+      function aggregateChatStatus(accounts, channel) {
+        const statuses = accounts
+          .filter((item) => item.enabled !== false)
+          .map((item) => channel?.type === "shareai" ? abilityStatus(item, "chatplus") : item);
+        if (!statuses.length) return { status: "unknown" };
+        const available = statuses.find((item) => chatDisplayStatus(item) === "ok");
+        if (available) return { ...available, status: "ok", quotaConfirmedByUpstream: false };
+        const explicitEmpty = statuses.find(confirmedChatQuotaEmpty);
+        if (explicitEmpty && statuses.every((item) => confirmedChatQuotaEmpty(item))) return explicitEmpty;
+        const unavailable = statuses.find((item) => ["error", "failed", "disconnected", "disabled"].includes(chatDisplayStatus(item)));
+        return unavailable || statuses[0] || { status: "unknown" };
+      }
+
       function accountEffectiveStatus(account, channel) {
         if (account.enabled === false) return "disabled";
+        if (channel?.type === "chatplus") return chatDisplayStatus(account);
         if (channel?.type !== "shareai") return account.status || "unknown";
         const statuses = [
           channelAbilityEnabled(channel, "drawing") ? abilityStatus(account, "drawing").status : "",
-          channelAbilityEnabled(channel, "chatplus") ? abilityStatus(account, "chatplus").status : ""
+          channelAbilityEnabled(channel, "chatplus") ? chatDisplayStatus(abilityStatus(account, "chatplus")) : ""
         ].filter(Boolean);
         if (!statuses.length) return account.status || "unknown";
         if (statuses.includes("disconnected")) return "disconnected";
@@ -2938,27 +2991,29 @@
           const chatEnabled = channelAbilityEnabled(channel, "chatplus");
           const drawingQuota = drawingEnabled ? related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "drawing").quota ?? item.quota), 0) : 0;
           const drawingBalance = drawingEnabled ? related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "drawing").balance ?? item.balance ?? item.quota), 0) : 0;
-          const chatQuota = chatEnabled ? related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "chatplus").quota), 0) : 0;
-          const chatBalance = chatEnabled ? related.reduce((sum, item) => sum + numberValue(abilityStatus(item, "chatplus").balance), 0) : 0;
+          const chatStatus = chatEnabled ? aggregateChatStatus(related, channel) : { status: "unknown" };
           return {
             accountCount: related.length,
             enabledCount: enabled.length,
             okCount: related.filter((item) => accountEffectiveStatus(item, channel) === "ok").length,
             quota: drawingQuota,
-            balance: drawingBalance + chatBalance,
+            balance: drawingBalance,
             drawingQuota,
             drawingBalance,
-            chatQuota,
-            chatBalance,
+            chatStatus,
             status: getChannelStatus(channel, related)
           };
         }
+        const chatStatus = channel?.type === "chatplus"
+          ? aggregateChatStatus(related, channel)
+          : null;
         return {
           accountCount: related.length,
           enabledCount: enabled.length,
-          okCount: related.filter((item) => item.status === "ok").length,
+          okCount: related.filter((item) => accountEffectiveStatus(item, channel) === "ok").length,
           quota: related.reduce((sum, item) => sum + numberValue(item.quota), 0),
           balance: related.reduce((sum, item) => sum + numberValue(item.balance ?? item.quota), 0),
+          ...(chatStatus ? { chatStatus } : {}),
           status: getChannelStatus(channel, related)
         };
       }
@@ -3353,11 +3408,22 @@
 
         const totals = useMemo(() => {
           const enabledChannels = channels.filter((item) => item.enabled !== false).length;
-          const okAccounts = accounts.filter((item) => item.enabled !== false && item.status === "ok").length;
+          const okAccounts = accounts.filter((item) => {
+            const channel = channels.find((candidate) => candidate.id === item.channelId);
+            return item.enabled !== false && accountEffectiveStatus(item, channel) === "ok";
+          }).length;
           const balance = accounts.reduce((sum, item) => sum + accountBalanceForTotal(item, channels.find((channel) => channel.id === item.channelId)), 0);
+          const drawingAccountCount = accounts.filter((item) => {
+            const channel = channels.find((candidate) => candidate.id === item.channelId);
+            return item.enabled !== false
+              && (
+                channel?.type === "drawing"
+                || (channel?.type === "shareai" && channelAbilityEnabled(channel, "drawing"))
+              );
+          }).length;
           const successCount = tasks.filter((item) => item.status === "success").length;
           const failedCount = tasks.filter((item) => item.status === "failed").length;
-          return { enabledChannels, okAccounts, balance, successCount, failedCount };
+          return { enabledChannels, okAccounts, balance, drawingAccountCount, successCount, failedCount };
         }, [channels, accounts, tasks]);
 
         const taskAccountOptions = useMemo(() => {
@@ -4683,7 +4749,10 @@
               ]),
               h("div", { className: "metric" }, [
                 h("div", { className: "metric-icon" }, Icon.WalletOutlined ? h(Icon.WalletOutlined) : null),
-                h("div", null, [h("div", { className: "metric-label" }, "剩余额度"), h("div", { className: "metric-value" }, totals.balance)])
+                h("div", null, [
+                  h("div", { className: "metric-label" }, "绘图剩余额度"),
+                  h("div", { className: "metric-value" }, totals.drawingAccountCount ? totals.balance : "-")
+                ])
               ]),
               h("div", { className: "metric" }, [
                 h("div", { className: "metric-icon" }, Icon.FileDoneOutlined ? h(Icon.FileDoneOutlined) : null),
@@ -4811,7 +4880,7 @@
                           h("div", { className: "detail-stat-value" }, `${selectedStats.enabledCount || 0}/${selectedStats.accountCount || 0}`)
                         ]),
                         h("div", { className: "detail-stat" }, [
-                          h("div", { className: "detail-stat-label" }, "余额合计"),
+                          h("div", { className: "detail-stat-label" }, "额度与状态"),
                           h("div", { className: "detail-stat-value" }, channelQuotaText(selectedChannel, selectedStats))
                         ])
                       ]),

@@ -567,6 +567,8 @@ function throwIfImageGenerationLimit(content) {
   const error = new Error("当前账户的图片生成额度已用完，正在切换下一个账户。");
   error.imageQuotaExhausted = true;
   error.quotaEmpty = true;
+  error.quotaReason = "image_quota";
+  error.quotaConfirmedByUpstream = true;
   throw error;
 }
 
@@ -574,6 +576,8 @@ function imageQuotaError(message = "图片生成额度已用完。") {
   const error = new Error(message);
   error.imageQuotaExhausted = true;
   error.quotaEmpty = true;
+  error.quotaReason = "image_quota";
+  error.quotaConfirmedByUpstream = true;
   error.status = 429;
   return error;
 }
@@ -633,19 +637,29 @@ function firstPayloadField(data = {}, names = []) {
   return "";
 }
 
-function chatUsageFromPayload(payload = {}) {
-  const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-  const quota = numberOrNull(data?.limit);
-  const used = numberOrNull(data?.userUsed);
-  const balance = quota === null || used === null ? null : Math.max(0, quota - used);
-  return {
-    quota,
-    used,
-    balance,
-    quotaResetAt: shanghaiDateTime(data?.resetTimeChatgpt),
-    expireAt: shanghaiDateTime(firstPayloadField(data, [
-      "expireTimeGemini",
+const chatUsagePayloadFields = {
+  gpt: {
+    quota: ["limit"],
+    used: ["userUsed"],
+    resetAt: ["resetTimeChatgpt"],
+    period: ["per"],
+    expireAt: ["expireTimeChatgpt", "chatgptExpireTime", "chatgptExpireAt", "expireAtChatgpt", "expireTime", "expireAt"]
+  },
+  grok: {
+    quota: ["grokLimit"],
+    used: ["grokUsed"],
+    resetAt: ["resetTimeGrok"],
+    period: ["grokPer"],
+    expireAt: ["grokExpireTime", "expireTimeGrok", "grokExpireAt", "expireAtGrok", "expireTime", "expireAt"]
+  },
+  gemini: {
+    quota: ["geminiLimit"],
+    used: ["geminiUsed"],
+    resetAt: ["resetTimeGemini"],
+    period: ["geminiPer"],
+    expireAt: [
       "geminiExpireTime",
+      "expireTimeGemini",
       "geminiExpireAt",
       "expireAtGemini",
       "expireTimeChatgpt",
@@ -654,8 +668,23 @@ function chatUsageFromPayload(payload = {}) {
       "expireAtChatgpt",
       "expireTime",
       "expireAt"
-    ])),
-    period: String(data?.per || "").trim()
+    ]
+  }
+};
+
+function chatUsageFromPayload(payload = {}, modelKey = "gpt") {
+  const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  const fields = chatUsagePayloadFields[chatModelKey(modelKey)] || chatUsagePayloadFields.gpt;
+  const quota = numberOrNull(firstPayloadField(data, fields.quota));
+  const used = numberOrNull(firstPayloadField(data, fields.used));
+  const balance = quota === null || used === null ? null : Math.max(0, quota - used);
+  return {
+    quota,
+    used,
+    balance,
+    quotaResetAt: shanghaiDateTime(firstPayloadField(data, fields.resetAt)),
+    expireAt: shanghaiDateTime(firstPayloadField(data, fields.expireAt)),
+    period: String(firstPayloadField(data, fields.period) || "").trim()
   };
 }
 
@@ -678,6 +707,27 @@ function chatUsageLimitFromText(value) {
   };
 }
 
+function isChatUsageLimitMessage(value) {
+  return /使用次数已达上限|聊天(?:使用次数|额度).{0,24}(?:已用完|用完|耗尽|达到上限)|usage count has reached the limit|chat usage.{0,24}(?:exhausted|limit reached|used up)/i.test(String(value || ""));
+}
+
+function chatUsageLimitError(message, usage = {}) {
+  const error = new Error(message || "当前账号的使用次数已用完。");
+  error.status = 429;
+  error.code = "CHAT_USAGE_LIMIT";
+  error.noRetry = true;
+  error.quotaEmpty = true;
+  error.quotaReason = "chat_usage_limit";
+  error.quotaConfirmedByUpstream = true;
+  if (usage.quota !== null && usage.quota !== undefined) error.quota = usage.quota;
+  if (usage.used !== null && usage.used !== undefined) error.used = usage.used;
+  if (usage.balance !== null && usage.balance !== undefined) error.balance = usage.balance;
+  error.quotaResetAt = usage.quotaResetAt || "";
+  error.cooldownUntil = usage.quotaResetAt || null;
+  error.period = usage.period || "";
+  return error;
+}
+
 function conversationSubmitError(response) {
   let payload = null;
   try {
@@ -686,24 +736,15 @@ function conversationSubmitError(response) {
     payload = null;
   }
   const detail = String(payload?.detail?.message || payload?.message || "").trim();
-  const usage = chatUsageLimitFromText(detail);
-  const error = new Error(usage
-    ? `聊天使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`
-    : detail || `聊天站提交失败：${response.status}`);
+  const usage = chatUsageLimitFromText(detail || response.body);
+  const error = usage
+    ? chatUsageLimitError(
+      `聊天使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`,
+      usage
+    )
+    : new Error(detail || `聊天站提交失败：${response.status}`);
   error.status = response.status;
   error.body = response.body;
-  if (usage) {
-    error.code = "CHAT_USAGE_LIMIT";
-    error.noRetry = true;
-    error.quotaEmpty = true;
-    error.quotaReason = "chat_usage_limit";
-    error.quota = usage.quota;
-    error.used = usage.used;
-    error.balance = usage.balance;
-    error.quotaResetAt = usage.quotaResetAt;
-    error.cooldownUntil = usage.quotaResetAt;
-    error.period = usage.period;
-  }
   return error;
 }
 
@@ -1399,7 +1440,7 @@ export class ChatplusClient {
     });
   }
 
-  async loadAccountUsage(options = {}) {
+  async loadAccountUsage(options = {}, modelKey = "") {
     await this.loginPortal(options);
     const payload = await this.json("/frontend-api/getme", {
       timeoutSec: options.timeoutSec
@@ -1407,7 +1448,8 @@ export class ChatplusClient {
     if (payload?.code !== undefined && payload.code !== 1) {
       throw new Error(payload?.msg || "读取聊天额度失败。");
     }
-    return chatUsageFromPayload(payload);
+    const route = resolveChatModelRoute(this.channel?.settings || {}, modelKey);
+    return chatUsageFromPayload(payload, route.key);
   }
 
   async enterCar(carId, carType, options = {}) {
@@ -1485,10 +1527,7 @@ export class ChatplusClient {
     if (!candidates.length) throw new Error(`${route.name} 暂时没有可用车辆。`);
     const tierCandidates = candidates.filter((item) => carMatchesTier(item.car, tier));
     if (!tierCandidates.length) throw new Error(`${route.name} 暂时没有可用的${carTierDisplayName(tier)}车位。`);
-    const usableCars = route.strategy === "image"
-      ? tierCandidates.filter((item) => item.car.imageRemaining > 0 && !item.car.isPro)
-      : tierCandidates;
-    if (!usableCars.length) throw imageQuotaError("暂时没有图片额度可用的 GPT 账号。");
+    const usableCars = tierCandidates;
     const selected = usableCars[0];
     return {
       carId: selected.carId,
@@ -1537,61 +1576,27 @@ export class ChatplusClient {
   async check() {
     return this.runAccountWork(async () => {
       const requestOptions = { timeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC };
-      const usage = await this.loadAccountUsage(requestOptions);
-      const usageQuotaEmpty = usage.balance !== null && usage.balance <= 0;
-      if (usageQuotaEmpty) {
-        return {
-          status: "quota_empty",
-          quota: usage.quota,
-          balance: 0,
-          used: usage.used,
-          quotaResetAt: usage.quotaResetAt,
-          expireAt: usage.expireAt,
-          cooldownUntil: usage.quotaResetAt || null,
-          quotaReason: "chat_usage_limit",
-          message: usage.quotaResetAt
-            ? `聊天使用次数已用完，等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新`
-            : "聊天使用次数已用完，等待刷新",
-          meta: {
-            chatUsage: {
-              quota: usage.quota,
-              used: usage.used,
-              balance: 0,
-              period: usage.period
-            }
-          }
-        };
-      }
+      const usageRoute = resolveChatModelRoute(this.channel?.settings || {}, "");
+      const usage = await this.loadAccountUsage(requestOptions, usageRoute.key);
       const { init, route, selected } = await this.prepareChatSession({
-        model: this.channel?.settings?.defaultChatModel || "",
+        model: usageRoute.key,
         preferImageCar: true,
         checkTimeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC
       }, new Set(), 5);
-      const imageLimit = limitFromInit(init);
-      const remaining = imageLimit.remaining ?? null;
-      const remainingNumber = numberOrNull(remaining);
-      const quotaEmpty = remainingNumber !== null && remainingNumber <= 0;
-      const imageResetAt = imageQuotaResetAt(imageLimit);
       return {
-        status: quotaEmpty ? "quota_empty" : "ok",
-        quota: usage.quota ?? remaining,
-        balance: usage.balance ?? remaining,
-        used: usage.used,
-        quotaResetAt: usage.quotaResetAt || imageResetAt,
-        imageQuotaResetAt: imageResetAt,
+        status: "ok",
+        quota: null,
+        balance: null,
+        used: null,
+        quotaResetAt: "",
+        imageQuotaResetAt: "",
         expireAt: usage.expireAt,
         cooldownUntil: null,
-        quotaReason: quotaEmpty ? "image_quota" : "",
-        message: quotaEmpty ? "聊天图片额度不足" : "聊天账号可用",
+        quotaReason: "",
+        quotaConfirmedByUpstream: false,
+        message: "聊天账号可用",
         meta: {
           defaultModel: init.default_model_slug || this.defaultModel,
-          imageLimit,
-          chatUsage: {
-            quota: usage.quota,
-            used: usage.used,
-            balance: usage.balance,
-            period: usage.period
-          },
           chatModel: route.key,
           selectedCarId: selected.carId,
           strategy: selected.strategy
@@ -1893,6 +1898,12 @@ export class ChatplusClient {
         referer: `${this.baseUrl}/app`
       }
     });
+    throwIfImageGenerationLimit(response.body);
+    if (isChatUsageLimitMessage(response.body)) {
+      const error = chatUsageLimitError("当前 Gemini 账号的使用次数已用完。");
+      error.imageQuotaExhausted = true;
+      throw error;
+    }
     if ([401, 403].includes(response.status)) {
       const error = new Error("Gemini 上游拒绝了当前登录会话，请重新检测账号。");
       error.status = response.status;
@@ -1911,10 +1922,12 @@ export class ChatplusClient {
     const imageUrls = extractGeminiImageUrls(events, this.baseUrl);
     throwIfImageGenerationLimit(directContent);
     const upstreamError = extractGeminiErrorText(events);
-    if (isImageGenerationLimitMessage(upstreamError) || /usage count has reached the limit|使用次数已达上限/i.test(upstreamError)) {
-      const error = imageQuotaError("当前 Gemini 账号的使用次数已用完。");
-      error.quotaReason = "chat_usage_limit";
-      error.noRetry = true;
+    if (isImageGenerationLimitMessage(upstreamError)) {
+      throw imageQuotaError("当前 Gemini 账号的图片生成额度已用完。");
+    }
+    if (isChatUsageLimitMessage(upstreamError)) {
+      const error = chatUsageLimitError("当前 Gemini 账号的使用次数已用完。");
+      error.imageQuotaExhausted = true;
       throw error;
     }
     if (!directContent && !imageUrls.length && upstreamError) {
@@ -1978,6 +1991,9 @@ export class ChatplusClient {
       }
     });
 
+    if (isChatUsageLimitMessage(response.body)) {
+      throw chatUsageLimitError("当前 Grok 账号的使用次数已用完。");
+    }
     if ([301, 302, 303, 307, 308, 401, 403].includes(response.status)) {
       const error = new Error("Grok 上游拦截了后台直连请求，需要真实浏览器会话才能提交；当前 API 请先使用 GPT 通道。");
       error.status = 502;
@@ -1991,6 +2007,10 @@ export class ChatplusClient {
     }
 
     const events = parseJsonLines(response.body);
+    const directContent = extractGrokAssistantText(events);
+    if (isChatUsageLimitMessage(directContent)) {
+      throw chatUsageLimitError("当前 Grok 账号的使用次数已用完。");
+    }
     return {
       events,
       conversationId: extractGrokConversationId(events),
@@ -1999,7 +2019,7 @@ export class ChatplusClient {
       upstreamModel,
       route,
       selected,
-      directContent: extractGrokAssistantText(events)
+      directContent
     };
   }
 
