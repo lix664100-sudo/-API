@@ -14,3 +14,7 @@ work/
 npm-debug.log*
 Thumbs.db
 .DS_Store
+
+# 仅保留在本地的说明文件
+/README.md
+/PRODUCT.md
