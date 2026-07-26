@@ -127,13 +127,15 @@ test("账号检测遇到失效车位后会自动换车", async () => {
     default_model_slug: "auto",
     limits_progress: [{ feature_name: "image_gen", remaining: 19 }]
   });
-  client.loadAccountUsage = async () => ({
-    quota: 220,
-    used: 31,
-    balance: 189,
-    quotaResetAt: "2026-07-22T19:32:29+08:00",
-    expireAt: "2026-08-16T05:22:44+08:00",
-    period: "12h"
+  client.loadAccountUsages = async () => ({
+    gpt: {
+      quota: 220,
+      used: 31,
+      balance: 189,
+      quotaResetAt: "2026-07-22T19:32:29+08:00",
+      expireAt: "2026-08-16T05:22:44+08:00",
+      period: "12h"
+    }
   });
 
   const result = await client.check();
@@ -144,6 +146,14 @@ test("账号检测遇到失效车位后会自动换车", async () => {
   assert.equal(result.used, null);
   assert.equal(result.quotaResetAt, "");
   assert.equal(result.quotaConfirmedByUpstream, false);
+  assert.deepEqual(result.meta.referenceUsage.gpt, {
+    quota: 220,
+    used: 31,
+    balance: 189,
+    quotaResetAt: "2026-07-22T19:32:29+08:00",
+    expireAt: "2026-08-16T05:22:44+08:00",
+    period: "12h"
+  });
   assert.equal(result.meta.selectedCarId, "car-3");
   assert.equal(enteredCount, 3);
 });
@@ -223,6 +233,34 @@ test("Gemini 账号信息只读取 Gemini 自己的额度和重置时间", async
   });
 });
 
+test("Gemini 没有返回重置时间时按北京时间次日零点显示", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gemini" } },
+    account: { id: "account-gemini-midnight", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.json = async () => ({
+    code: 1,
+    data: {
+      geminiLimit: 70,
+      geminiUsed: "5",
+      geminiPer: "24h",
+      resetTimeGemini: ""
+    }
+  });
+
+  const usage = await client.loadAccountUsage({ timeoutSec: 8 });
+
+  assert.equal(usage.quota, 70);
+  assert.equal(usage.used, 5);
+  assert.equal(usage.balance, 65);
+  assert.match(usage.quotaResetAt, /^\d{4}-\d{2}-\d{2}T00:00:00\+08:00$/);
+  const remainingMs = Date.parse(usage.quotaResetAt) - Date.now();
+  assert.ok(remainingMs > 0 && remainingMs <= 24 * 60 * 60 * 1000);
+});
+
 test("Grok 账号信息只读取 Grok 自己的额度和重置时间", async () => {
   const client = new ChatplusClient({
     config: {},
@@ -264,13 +302,15 @@ test("PLUS 车位有图片额度时账号检测不会误判为无额度", async 
     account: { id: "account-plus-image", username: "test@example.com", password: "test" },
     sessionLock: async (work) => work()
   });
-  client.loadAccountUsage = async () => ({
-    quota: 220,
-    used: 106,
-    balance: 114,
-    quotaResetAt: "2026-07-26T07:36:45+08:00",
-    expireAt: "2026-08-16T05:22:44+08:00",
-    period: "12h"
+  client.loadAccountUsages = async () => ({
+    gpt: {
+      quota: 220,
+      used: 106,
+      balance: 114,
+      quotaResetAt: "2026-07-26T07:36:45+08:00",
+      expireAt: "2026-08-16T05:22:44+08:00",
+      period: "12h"
+    }
   });
   client.loginPortal = async () => {};
   client.json = async (pathName) => {
@@ -354,13 +394,15 @@ test("后台显示额度为零时仍会检测真实车位并保持可用", async
     sessionLock: async (work) => work()
   });
   let prepareCount = 0;
-  client.loadAccountUsage = async () => ({
-    quota: 220,
-    used: 220,
-    balance: 0,
-    quotaResetAt: "2026-07-22T19:32:29+08:00",
-    expireAt: "2026-08-16T05:22:44+08:00",
-    period: "12h"
+  client.loadAccountUsages = async () => ({
+    gpt: {
+      quota: 220,
+      used: 220,
+      balance: 0,
+      quotaResetAt: "2026-07-22T19:32:29+08:00",
+      expireAt: "2026-08-16T05:22:44+08:00",
+      period: "12h"
+    }
   });
   client.prepareChatSession = async () => {
     prepareCount += 1;

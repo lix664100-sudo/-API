@@ -410,9 +410,17 @@ export class DrawingClient {
   }
 
   defaultModelId(input = {}) {
-    return this.drawingModelId(input.model_id)
-      || this.drawingModelId(input.modelId)
-      || this.drawingModelId(input.model)
+    const explicitModelId = this.drawingModelId(input.model_id)
+      || this.drawingModelId(input.modelId);
+    if (explicitModelId) return explicitModelId;
+    const modelKey = String(input.model || "").trim().toLowerCase();
+    if (modelKey === "gpt") return 1;
+    if (modelKey === "gemini") {
+      return [2, 3].includes(Number(this.channel?.settings?.geminiDrawingModelId))
+        ? Number(this.channel.settings.geminiDrawingModelId)
+        : 2;
+    }
+    return this.drawingModelId(input.model)
       || this.drawingModelId(this.channel?.settings?.defaultModelId)
       || this.drawingModelId(this.config.defaultModelId)
       || 1;

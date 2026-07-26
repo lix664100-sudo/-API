@@ -10,6 +10,7 @@ const defaultTaskConcurrency = { chat: 3, drawingImage: 2, chatImage: 2 };
 const scheduledChatTasks = new Set();
 const scheduledImageTasks = new Set();
 const activeTaskCounts = new Map();
+const activeDrawingModelCounts = new Map();
 const activeSubmittedTaskIds = new Set();
 const activeAccountAuthTasks = new Map();
 const activeChatplusAccountWork = new Map();
@@ -153,6 +154,10 @@ function activeCountForModelSlot(slot, modelKey) {
   return total;
 }
 
+function activeCountForDrawingModel(modelKey) {
+  return activeDrawingModelCounts.get(modelRequestKey(modelKey)) || 0;
+}
+
 function activeCountForAccountSlot(slot, accountId) {
   const prefix = `${slot}:`;
   const suffix = `:${accountId}`;
@@ -206,10 +211,16 @@ function targetSupportsChatModel(target, modelKey) {
   return requestedKey === (modelRequestKey(settings.defaultChatModel) || "gpt");
 }
 
+function targetSupportsRuntimeModel(target, taskType, modelKey) {
+  if (taskType === "chat") return targetSupportsChatModel(target, modelKey);
+  if (target?.channel?.type === "drawing") return ["gpt", "gemini"].includes(modelRequestKey(modelKey));
+  return targetSupportsChatModel(target, modelKey);
+}
+
 function runtimeTargets(config, taskType, channelType, availableOnly = false, modelKey = "") {
   const targets = selectTargets(config, "auto", taskType, { includeCooling: true })
     .filter((target) => target.channel.type === channelType)
-    .filter((target) => !modelKey || targetSupportsChatModel(target, modelKey))
+    .filter((target) => !modelKey || targetSupportsRuntimeModel(target, taskType, modelKey))
     .filter((target) => !availableOnly || targetRuntimeAvailable(target, taskType));
   return [...new Map(targets.map((target) => [target.account.id, target])).values()];
 }
@@ -235,6 +246,13 @@ function runtimeChatModelKeys(config) {
   const keys = new Set();
   for (const channel of config.channels || []) {
     if (channel.enabled === false) continue;
+    if (
+      channel.type === "drawing"
+      || (channel.type === "shareai" && channelAbilityEnabled(channel, "drawing"))
+    ) {
+      keys.add("gpt");
+      keys.add("gemini");
+    }
     const chatChannel = channel.type === "shareai"
       ? (channelAbilityEnabled(channel, "chatplus") ? shareAIAbilityChannel(channel, "chatplus") : null)
       : channel.type === "chatplus" ? channel : null;
@@ -254,21 +272,30 @@ function runtimeChatModelKeys(config) {
 }
 
 function runtimeModelConcurrency(config, availableOnly = false) {
+  const sharedDrawingRunning = activeCountForSlot("drawingImage");
   return Object.fromEntries(runtimeChatModelKeys(config).map((modelKey) => {
     const configured = {
       chat: runtimeSlotCapacity(config, "chat", "chatplus", "chat", availableOnly, modelKey),
+      drawingImage: runtimeSlotCapacity(config, "text2img", "drawing", "drawingImage", availableOnly, modelKey),
       chatImage: runtimeSlotCapacity(config, "text2img", "chatplus", "chatImage", availableOnly, modelKey)
     };
     const available = availableOnly
       ? configured
-      : {
+        : {
           chat: runtimeSlotCapacity(config, "chat", "chatplus", "chat", true, modelKey),
+          drawingImage: runtimeSlotCapacity(config, "text2img", "drawing", "drawingImage", true, modelKey),
           chatImage: runtimeSlotCapacity(config, "text2img", "chatplus", "chatImage", true, modelKey)
         };
     const running = {
       chat: activeCountForModelSlot("chat", modelKey),
+      drawingImage: activeCountForDrawingModel(modelKey),
       chatImage: activeCountForModelSlot("chatImage", modelKey)
     };
+    const configuredImage = configured.drawingImage + configured.chatImage;
+    const availableImage = available.drawingImage + available.chatImage;
+    const runningImage = running.drawingImage + running.chatImage;
+    const sharedDrawingBlocking = ["gpt", "gemini"].includes(modelKey) ? sharedDrawingRunning : 0;
+    const blockingImage = sharedDrawingBlocking + running.chatImage;
     return [modelKey, {
       concurrency: {
         ...configured,
@@ -284,7 +311,12 @@ function runtimeModelConcurrency(config, availableOnly = false) {
       },
       categories: {
         chat: runtimeCategory(configured, available, running, ["chat"]),
-        image: runtimeCategory(configured, available, running, ["chatImage"])
+        image: {
+          configured: configuredImage,
+          available: availableImage,
+          running: runningImage,
+          idle: Math.max(0, availableImage - blockingImage)
+        }
       }
     }];
   }));
@@ -326,14 +358,13 @@ export async function getRuntimeStatus() {
       image: tasks.filter((task) =>
         task.status === "waiting_upstream"
         && task.taskType !== "chat"
-        && task.channelType === "chatplus"
-        && storedTaskChatModelKey(task) === modelKey
+        && storedTaskModelKey(task) === modelKey
       ).length,
       chat: tasks.filter((task) =>
         task.status === "waiting_upstream"
         && task.taskType === "chat"
         && task.channelType === "chatplus"
-        && storedTaskChatModelKey(task) === modelKey
+        && storedTaskModelKey(task) === modelKey
       ).length
     };
   }
@@ -364,7 +395,7 @@ function taskSlotLabel(slot) {
 function targetChatModelKey(target = {}, input = {}) {
   if (target?.channel?.type !== "chatplus") return "";
   const lock = requestedModelLock(input);
-  if (lock.type === "gpt-image") return "gpt";
+  if (["gpt-image", "gemini-image"].includes(lock.type)) return lock.key;
   if (lock.type === "chat" && lock.key) return modelRequestKey(lock.key);
   const settings = target.channel.settings || {};
   const defaultKey = modelRequestKey(settings.defaultChatModel);
@@ -374,18 +405,40 @@ function targetChatModelKey(target = {}, input = {}) {
   return modelRequestKey(route?.key || route?.name || route?.model) || "gpt";
 }
 
-function storedTaskChatModelKey(task = {}) {
-  const rawKey = modelRequestKey(task.raw?.chatModel || task.chatModel);
+function targetImageModelKey(target = {}, input = {}) {
+  const requestedKey = requestedImageModelKey(input, target?.channel?.settings || {});
+  if (["gpt", "gemini"].includes(requestedKey)) return requestedKey;
+  return target?.channel?.type === "chatplus"
+    ? targetChatModelKey(target, input)
+    : drawingModelFamily(target?.channel?.settings?.defaultModelId) || "gpt";
+}
+
+function imageInputForTarget(target = {}, input = {}) {
+  if (target?.channel?.type !== "chatplus") return input;
+  return {
+    ...input,
+    model: targetImageModelKey(target, input)
+  };
+}
+
+function storedTaskModelKey(task = {}) {
+  const rawKey = modelRequestKey(task.raw?.modelFamily || task.raw?.chatModel || task.chatModel);
   if (rawKey === "gpt" || rawKey === "grok" || rawKey === "gemini") return rawKey;
   if (rawKey.includes("gemini")) return "gemini";
   if (rawKey.includes("grok")) return "grok";
   if (rawKey.includes("gpt")) return "gpt";
   const modelKey = modelRequestKey(task.modelId);
+  const drawingFamily = drawingModelFamily(modelKey);
+  if (drawingFamily) return drawingFamily;
   if (modelKey === "gpt" || modelKey === "grok" || modelKey === "gemini") return modelKey;
   if (modelKey.includes("gemini")) return "gemini";
   if (modelKey.includes("grok")) return "grok";
   if (modelKey.includes("gpt")) return "gpt";
   return "gpt";
+}
+
+function storedTaskChatModelKey(task = {}) {
+  return storedTaskModelKey(task);
 }
 
 function taskSlotKey(slot, target = {}, input = {}) {
@@ -455,6 +508,13 @@ async function tryReserveTaskSlot(slot, target = {}, input = {}) {
   const occupied = count + durableState.total - Math.min(durableState.active, count);
   if (occupied >= taskSlotLimit(slot, target)) return null;
   activeTaskCounts.set(key, count + 1);
+  const drawingModelKey = slot === "drawingImage" ? targetImageModelKey(target, input) : "";
+  if (drawingModelKey) {
+    activeDrawingModelCounts.set(
+      drawingModelKey,
+      activeCountForDrawingModel(drawingModelKey) + 1
+    );
+  }
   let released = false;
   return () => {
     if (released) return;
@@ -462,6 +522,11 @@ async function tryReserveTaskSlot(slot, target = {}, input = {}) {
     const next = Math.max(0, (activeTaskCounts.get(key) || 0) - 1);
     if (next) activeTaskCounts.set(key, next);
     else activeTaskCounts.delete(key);
+    if (drawingModelKey) {
+      const nextModelCount = Math.max(0, activeCountForDrawingModel(drawingModelKey) - 1);
+      if (nextModelCount) activeDrawingModelCounts.set(drawingModelKey, nextModelCount);
+      else activeDrawingModelCounts.delete(drawingModelKey);
+    }
   };
 }
 
@@ -573,6 +638,8 @@ function shareAIAbilityChannel(channel, ability) {
         baseUrl: settings.chatBaseUrl || "https://www.chatplus.cc",
         defaultChatModel: settings.defaultChatModel || "gpt",
         chatModels: settings.chatModels || [],
+        geminiDrawingModelId: Number(settings.geminiDrawingModelId || 2),
+        imageSourcePriority: settings.imageSourcePriority || { gpt: "drawing", gemini: "drawing" },
         autoCarSelection: true,
         autoCarSelectionMigrated: true
       }
@@ -587,7 +654,9 @@ function shareAIAbilityChannel(channel, ability) {
     type: "drawing",
     settings: {
       baseUrl: settings.drawingBaseUrl || "https://drawing.aishare.icu",
-      defaultModelId: Number(settings.defaultModelId || 1)
+      defaultModelId: Number(settings.defaultModelId || 1),
+      geminiDrawingModelId: Number(settings.geminiDrawingModelId || 2),
+      imageSourcePriority: settings.imageSourcePriority || { gpt: "drawing", gemini: "drawing" }
     }
   };
 }
@@ -606,10 +675,18 @@ function requestedAbility(channel, requestedChannel) {
   return "";
 }
 
-function shareAIAbilitiesForTask(channel, requestedChannel, taskType) {
+function shareAIAbilitiesForTask(channel, requestedChannel, taskType, input = {}) {
   const requested = requestedAbility(channel, requestedChannel);
   const abilities = requested ? [requested] : taskType === "chat" ? ["chatplus"] : ["drawing", "chatplus"];
-  return abilities.filter((ability) => channelAbilityEnabled(channel, ability));
+  const enabled = abilities.filter((ability) => channelAbilityEnabled(channel, ability));
+  if (requested || taskType === "chat" || enabled.length < 2) return enabled;
+  const modelKey = requestedImageModelKey(input, channel.settings || {});
+  const preferred = channel.settings?.imageSourcePriority?.[modelKey] === "chatplus"
+    ? "chatplus"
+    : "drawing";
+  return enabled.sort((left, right) => (
+    left === preferred ? -1 : right === preferred ? 1 : 0
+  ));
 }
 
 function isPendingTask(status) {
@@ -1358,15 +1435,23 @@ function modelRequestKey(value) {
 
 const chatModelRequestKeys = new Set(["gpt", "grok", "gemini"]);
 const gptImageModelRequestKeys = new Set(["1", "gpt-image-2", "chatgpt-image-2"]);
-const drawingModelRequestKeys = new Set([
-  "1",
+const geminiImageModelRequestKeys = new Set([
   "2",
   "3",
-  "gpt-image-2",
-  "chatgpt-image-2",
   "nano-banana-pro",
   "nano-banana"
 ]);
+const drawingModelRequestKeys = new Set([
+  ...gptImageModelRequestKeys,
+  ...geminiImageModelRequestKeys
+]);
+
+function drawingModelFamily(value) {
+  const key = modelRequestKey(value);
+  if (gptImageModelRequestKeys.has(key) || key === "gpt") return "gpt";
+  if (geminiImageModelRequestKeys.has(key) || key === "gemini") return "gemini";
+  return "";
+}
 
 function requestedModelLock(input = {}) {
   const explicitModel = input.model || input.chat_model || input.chatModel || "";
@@ -1374,15 +1459,29 @@ function requestedModelLock(input = {}) {
   if (explicitKey && explicitKey !== "auto") {
     if (chatModelRequestKeys.has(explicitKey)) return { type: "chat", key: explicitKey };
     if (gptImageModelRequestKeys.has(explicitKey)) return { type: "gpt-image", key: "gpt" };
+    if (geminiImageModelRequestKeys.has(explicitKey)) return { type: "gemini-image", key: "gemini" };
     if (drawingModelRequestKeys.has(explicitKey)) return { type: "drawing" };
     return { type: "chat", key: explicitKey };
   }
 
   const imageModelKey = modelRequestKey(input.model_id ?? input.modelId ?? "");
   if (!imageModelKey || imageModelKey === "auto") return { type: "auto" };
-  return gptImageModelRequestKeys.has(imageModelKey)
-    ? { type: "gpt-image", key: "gpt" }
-    : { type: "drawing" };
+  if (gptImageModelRequestKeys.has(imageModelKey)) return { type: "gpt-image", key: "gpt" };
+  if (geminiImageModelRequestKeys.has(imageModelKey)) return { type: "gemini-image", key: "gemini" };
+  return { type: "drawing" };
+}
+
+function requestedImageModelKey(input = {}, settings = {}) {
+  const lock = requestedModelLock(input);
+  if (["gpt-image", "gemini-image"].includes(lock.type)) return lock.key;
+  if (lock.type === "chat" && ["gpt", "gemini"].includes(lock.key)) return lock.key;
+  return drawingModelFamily(
+    input.model_id
+      ?? input.modelId
+      ?? input.model
+      ?? settings.defaultModelId
+      ?? 1
+  ) || "gpt";
 }
 
 function requestedChannelForInput(config, input = {}) {
@@ -1394,15 +1493,22 @@ function requestedChannelForInput(config, input = {}) {
 function targetMatchesRequestedModel(target, taskType, input = {}) {
   const lock = requestedModelLock(input);
   if (taskType === "chat") {
+    if (["gpt-image", "gemini-image"].includes(lock.type)) {
+      return targetSupportsChatModel(target, lock.key);
+    }
     return lock.type !== "chat" || targetSupportsChatModel(target, lock.key);
   }
   if (lock.type === "auto") return true;
   if (lock.type === "chat") {
-    return target.channel.type === "chatplus" && targetSupportsChatModel(target, lock.key);
-  }
-  if (lock.type === "gpt-image") {
+    if (!["gpt", "gemini"].includes(lock.key)) {
+      return target.channel.type === "chatplus" && targetSupportsChatModel(target, lock.key);
+    }
     return target.channel.type === "drawing"
-      || (target.channel.type === "chatplus" && targetSupportsChatModel(target, "gpt"));
+      || (target.channel.type === "chatplus" && targetSupportsChatModel(target, lock.key));
+  }
+  if (["gpt-image", "gemini-image"].includes(lock.type)) {
+    return target.channel.type === "drawing"
+      || (target.channel.type === "chatplus" && targetSupportsChatModel(target, lock.key));
   }
   if (lock.type === "drawing") return target.channel.type === "drawing";
   return true;
@@ -1458,7 +1564,7 @@ function selectTargets(config, requestedChannel = "auto", taskType = "text2img",
       .filter((account) => !requestedAccountId || account.id === requestedAccountId)
       .sort((a, b) => Number(a.priority || 99) - Number(b.priority || 99));
     if (channel.type === "shareai") {
-      for (const ability of shareAIAbilitiesForTask(channel, requestedChannel, taskType)) {
+      for (const ability of shareAIAbilitiesForTask(channel, requestedChannel, taskType, options.input || {})) {
         const abilityAccounts = accounts.filter((account) =>
           !(ability === "chatplus" && !options.includeCooling && accountCooling(account))
         );
@@ -1752,9 +1858,13 @@ export async function reserveImageTaskAdmission(input = {}) {
       input
     });
   }
-  return reserveFirstAvailableTarget(targets, "img2img", {
+  const reserved = await reserveFirstAvailableTarget(targets, "img2img", {
     input
   });
+  return {
+    ...reserved,
+    modelKey: targetImageModelKey(reserved.target, input)
+  };
 }
 
 export async function assertImageTaskAdmission(input = {}) {
@@ -1976,10 +2086,16 @@ async function reserveFirstAvailableTarget(targets, taskType, options = {}) {
   throw error;
 }
 
-function consumeAdmissionReservation(admission, targets) {
+function consumeAdmissionReservation(admission, targets, input = {}) {
   if (!admission?.release) return null;
   const target = targets.find((item) => sameTarget(item, admission.target));
-  if (!target) {
+  const preferredType = targets[0]?.channel?.type || "";
+  const requestedModelKey = target ? targetImageModelKey(target, input) : "";
+  if (
+    !target
+    || (preferredType && target.channel.type !== preferredType)
+    || (admission.modelKey && admission.modelKey !== requestedModelKey)
+  ) {
     admission.release();
     return null;
   }
@@ -2172,6 +2288,9 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
     responseJson: null,
     raw: {
       queued: true,
+      ...(taskType !== "chat"
+        ? { modelFamily: targetImageModelKey(target, input) }
+        : {}),
       ...(raw || {}),
       ...(target.channel.type === "chatplus"
         ? { chatModel: targetChatModelKey(target, input) }
@@ -2285,7 +2404,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           };
           const chatplusConcurrentSubmit = channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false;
           let result = await client.createTextTask({
-            ...input,
+            ...imageInputForTarget(target, input),
             onSubmitted,
             ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
             waitForImages: options.waitForChatplusImages === true
@@ -2307,9 +2426,16 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
+        if (savedTaskExternalId(taskState)) {
+          if (isTerminalTaskFailureError(error)) {
+            pushAttempt(attempts, target, error.message || "调用失败");
+            return failQueuedTask(taskState, error, attempts);
+          }
+          return taskState;
+        }
         if (isTerminalTaskFailureError(error)) {
           pushAttempt(attempts, target, error.message || "调用失败");
-          return failQueuedTask(taskState, error, attempts);
+          continue;
         }
         pushAttempt(attempts, target, error.message || "调用失败", {
           busy: Boolean(error.busy),
@@ -2424,7 +2550,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           };
           const chatplusConcurrentSubmit = channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false;
           let result = await submitImageTask(client, {
-            ...input,
+            ...imageInputForTarget(target, input),
             onSubmitted,
             ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
             waitForImages: options.waitForChatplusImages === true
@@ -2446,9 +2572,16 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
+        if (savedTaskExternalId(taskState)) {
+          if (isTerminalTaskFailureError(error)) {
+            pushAttempt(attempts, target, error.message || "调用失败");
+            return failQueuedTask(taskState, error, attempts);
+          }
+          return taskState;
+        }
         if (isTerminalTaskFailureError(error)) {
           pushAttempt(attempts, target, error.message || "调用失败");
-          return failQueuedTask(taskState, error, attempts);
+          continue;
         }
         pushAttempt(attempts, target, error.message || "调用失败", {
           busy: Boolean(error.busy),
@@ -2624,7 +2757,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
     });
   }
 
-  const reserved = consumeAdmissionReservation(admission, targets)
+  const reserved = consumeAdmissionReservation(admission, targets, input)
     || await reserveFirstAvailableTarget(targets, "img2img", { input });
   const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img", requestMeta });
   try {
@@ -3052,6 +3185,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
   const attempts = [];
   for (const target of targets) {
     const { channel, account } = target;
+    let submitted = false;
     const release = await tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target, input);
     if (!release) {
       attempts.push(targetBusyAttempt(target, "text2img"));
@@ -3063,7 +3197,10 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         const client = getWorkClient(config, channel, account);
         const chatplusConcurrentSubmit = wait && channel.type === "chatplus";
         let result = await client.createTextTask({
-          ...input,
+          ...imageInputForTarget(target, input),
+          onSubmitted: () => {
+            submitted = true;
+          },
           ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
           waitForImages: wait
         });
@@ -3085,7 +3222,11 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
       });
       if (finishedTask) return finishedTask;
     } catch (error) {
-      if (isTerminalTaskFailureError(error)) throw error;
+      if (submitted) throw error;
+      if (isTerminalTaskFailureError(error)) {
+        pushAttempt(attempts, target, error.message || "调用失败");
+        continue;
+      }
       pushAttempt(attempts, target, error.message || "调用失败", {
         busy: Boolean(error.busy),
         quotaEmpty: channel.type === "chatplus"
@@ -3124,7 +3265,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
       input
     });
   }
-  const reserved = consumeAdmissionReservation(admission, targets);
+  const reserved = consumeAdmissionReservation(admission, targets, input);
 
   if (wait) {
     const task = queuedTask({ input: { ...input, files }, target: reserved?.target || targets[0], taskType: "img2img", requestMeta });

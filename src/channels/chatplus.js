@@ -629,6 +629,16 @@ function shanghaiDateTime(value) {
   return text;
 }
 
+function nextShanghaiMidnight(now = Date.now()) {
+  const shanghaiNow = new Date(now + 8 * 60 * 60 * 1000);
+  const nextDay = new Date(Date.UTC(
+    shanghaiNow.getUTCFullYear(),
+    shanghaiNow.getUTCMonth(),
+    shanghaiNow.getUTCDate() + 1
+  ));
+  return `${nextDay.toISOString().slice(0, 10)}T00:00:00+08:00`;
+}
+
 function firstPayloadField(data = {}, names = []) {
   for (const name of names) {
     const value = data?.[name];
@@ -674,15 +684,17 @@ const chatUsagePayloadFields = {
 
 function chatUsageFromPayload(payload = {}, modelKey = "gpt") {
   const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-  const fields = chatUsagePayloadFields[chatModelKey(modelKey)] || chatUsagePayloadFields.gpt;
+  const key = chatModelKey(modelKey);
+  const fields = chatUsagePayloadFields[key] || chatUsagePayloadFields.gpt;
   const quota = numberOrNull(firstPayloadField(data, fields.quota));
   const used = numberOrNull(firstPayloadField(data, fields.used));
   const balance = quota === null || used === null ? null : Math.max(0, quota - used);
+  const upstreamResetAt = shanghaiDateTime(firstPayloadField(data, fields.resetAt));
   return {
     quota,
     used,
     balance,
-    quotaResetAt: shanghaiDateTime(firstPayloadField(data, fields.resetAt)),
+    quotaResetAt: upstreamResetAt || (key === "gemini" && quota !== null ? nextShanghaiMidnight() : ""),
     expireAt: shanghaiDateTime(firstPayloadField(data, fields.expireAt)),
     period: String(firstPayloadField(data, fields.period) || "").trim()
   };
@@ -1440,7 +1452,7 @@ export class ChatplusClient {
     });
   }
 
-  async loadAccountUsage(options = {}, modelKey = "") {
+  async loadAccountUsages(options = {}) {
     await this.loginPortal(options);
     const payload = await this.json("/frontend-api/getme", {
       timeoutSec: options.timeoutSec
@@ -1448,8 +1460,15 @@ export class ChatplusClient {
     if (payload?.code !== undefined && payload.code !== 1) {
       throw new Error(payload?.msg || "读取聊天额度失败。");
     }
+    return Object.fromEntries(
+      ["gpt", "grok", "gemini"].map((key) => [key, chatUsageFromPayload(payload, key)])
+    );
+  }
+
+  async loadAccountUsage(options = {}, modelKey = "") {
+    const usages = await this.loadAccountUsages(options);
     const route = resolveChatModelRoute(this.channel?.settings || {}, modelKey);
-    return chatUsageFromPayload(payload, route.key);
+    return usages[route.key] || usages.gpt;
   }
 
   async enterCar(carId, carType, options = {}) {
@@ -1577,7 +1596,8 @@ export class ChatplusClient {
     return this.runAccountWork(async () => {
       const requestOptions = { timeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC };
       const usageRoute = resolveChatModelRoute(this.channel?.settings || {}, "");
-      const usage = await this.loadAccountUsage(requestOptions, usageRoute.key);
+      const referenceUsage = await this.loadAccountUsages(requestOptions);
+      const usage = referenceUsage[usageRoute.key] || referenceUsage.gpt;
       const { init, route, selected } = await this.prepareChatSession({
         model: usageRoute.key,
         preferImageCar: true,
@@ -1599,7 +1619,8 @@ export class ChatplusClient {
           defaultModel: init.default_model_slug || this.defaultModel,
           chatModel: route.key,
           selectedCarId: selected.carId,
-          strategy: selected.strategy
+          strategy: selected.strategy,
+          referenceUsage
         }
       };
     });

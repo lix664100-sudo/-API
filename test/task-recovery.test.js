@@ -8,7 +8,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-recovery-"));
 process.env.DATA_DIR = dataDir;
 
 const { getTask, listTasks, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
-const { createImageTask, inspectUpstreamTask, queueImageTask, refreshProcessingTasks, refreshTask } = await import("../src/channel-manager.js");
+const { createImageTask, getRuntimeStatus, inspectUpstreamTask, queueImageTask, refreshProcessingTasks, refreshTask, reserveImageTaskAdmission } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
@@ -19,10 +19,15 @@ after(async () => {
 test("drawing client accepts OpenAI image model aliases", () => {
   const client = new DrawingClient({
     config: { defaultModelId: 3 },
-    channel: { id: "shareai:drawing", settings: { defaultModelId: 2 } },
+    channel: {
+      id: "shareai:drawing",
+      settings: { defaultModelId: 2, geminiDrawingModelId: 3 }
+    },
     account: { id: "account-drawing-model" }
   });
 
+  assert.equal(client.defaultModelId({ model: "gpt" }), 1);
+  assert.equal(client.defaultModelId({ model: "gemini" }), 3);
   assert.equal(client.defaultModelId({ model: "gpt-image-2" }), 1);
   assert.equal(client.defaultModelId({ model: "nano-banana-pro" }), 2);
   assert.equal(client.defaultModelId({ model: "nano-banana" }), 3);
@@ -341,6 +346,186 @@ test("image fallback stores the real chat image channel before the final image i
     DrawingClient.prototype.getTask = originalDrawingGetTask;
     ChatplusClient.prototype.createImageTask = originalChatCreateImageTask;
     ChatplusClient.prototype.getTask = originalChatGetTask;
+  }
+});
+
+test("preferred chat image failure falls back to drawing before an upstream task is accepted", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    imageStorage: { mode: "never", autoCleanup: false, retentionDays: 7 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        enabledAbilities: { drawing: true, chatplus: true },
+        imageSourcePriority: { gpt: "chatplus", gemini: "drawing" },
+        defaultModelId: 1
+      }
+    }],
+    accounts: [{
+      id: "chat-to-drawing-fallback",
+      channelId: "shareai",
+      name: "Chat to Drawing Fallback",
+      username: "chat-to-drawing@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", balance: 50 },
+          chatplus: { status: "ok", balance: 10 }
+        }
+      }
+    }]
+  });
+
+  const originalChatCreateImageTask = ChatplusClient.prototype.createImageTask;
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  const originalDrawingUploadImage = DrawingClient.prototype.uploadImage;
+  const originalDrawingCreateImageTask = DrawingClient.prototype.createImageTask;
+  let chatAttempts = 0;
+  let drawingAttempts = 0;
+
+  ChatplusClient.prototype.createImageTask = async () => {
+    chatAttempts += 1;
+    const error = new Error("chat image rejected before submission");
+    error.upstreamExplicitFailure = true;
+    throw error;
+  };
+  DrawingClient.prototype.check = async () => ({
+    status: "ok",
+    quota: 50,
+    balance: 49,
+    message: "drawing ok"
+  });
+  DrawingClient.prototype.uploadImage = async () => ({
+    uploadId: 1,
+    upload: { id: 1 }
+  });
+  DrawingClient.prototype.createImageTask = async (input) => {
+    drawingAttempts += 1;
+    return {
+      externalId: "drawing-fallback-task",
+      status: "success",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: 1,
+      imageCount: 1,
+      imageUrls: ["https://images.example.test/drawing-fallback.png"],
+      raw: {}
+    };
+  };
+
+  try {
+    const result = await createImageTask({
+      input: { model: "gpt", prompt: "fallback to drawing" },
+      files: [{
+        filename: "source.png",
+        mimetype: "image/png",
+        toBuffer: async () => Buffer.from("image")
+      }],
+      wait: true
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(chatAttempts, 1);
+    assert.equal(drawingAttempts, 1);
+    assert.equal(result.status, "success");
+    assert.equal(result.channelType, "drawing");
+    assert.equal(result.channelId, "shareai:drawing");
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalChatCreateImageTask;
+    DrawingClient.prototype.check = originalDrawingCheck;
+    DrawingClient.prototype.uploadImage = originalDrawingUploadImage;
+    DrawingClient.prototype.createImageTask = originalDrawingCreateImageTask;
+  }
+});
+
+test("multipart admission releases the provisional model slot after the real model is parsed", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    imageStorage: { mode: "never", autoCleanup: false, retentionDays: 7 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        enabledAbilities: { drawing: true, chatplus: false },
+        defaultModelId: 1,
+        geminiDrawingModelId: 2
+      }
+    }],
+    accounts: [{
+      id: "multipart-model-account",
+      channelId: "shareai",
+      name: "Multipart Model Account",
+      username: "multipart-model@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      concurrency: { chat: 1, drawingImage: 1, chatImage: 1 },
+      meta: { abilities: { drawing: { status: "ok", quota: 50, balance: 50 } } }
+    }]
+  });
+
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  const originalDrawingUploadImage = DrawingClient.prototype.uploadImage;
+  const originalDrawingCreateImageTask = DrawingClient.prototype.createImageTask;
+  let runningAtSubmit = null;
+  DrawingClient.prototype.check = async () => ({
+    status: "ok",
+    quota: 50,
+    balance: 49,
+    message: "drawing ok"
+  });
+  DrawingClient.prototype.uploadImage = async () => ({ uploadId: 1, upload: { id: 1 } });
+  DrawingClient.prototype.createImageTask = async (input) => {
+    runningAtSubmit = await getRuntimeStatus();
+    return {
+      externalId: "multipart-gemini-task",
+      status: "success",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: 2,
+      imageCount: 1,
+      imageUrls: ["https://images.example.test/multipart-gemini.png"],
+      raw: {}
+    };
+  };
+
+  const admission = await reserveImageTaskAdmission({ prompt: "before multipart parsing" });
+  try {
+    const result = await createImageTask({
+      input: { model: "gemini", prompt: "after multipart parsing" },
+      files: [{
+        filename: "source.png",
+        mimetype: "image/png",
+        toBuffer: async () => Buffer.from("image")
+      }],
+      wait: true,
+      admission
+    });
+
+    assert.equal(result.status, "success");
+    assert.equal(runningAtSubmit.models.gpt.categories.image.running, 0);
+    assert.equal(runningAtSubmit.models.gemini.categories.image.running, 1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } finally {
+    admission.release();
+    await saveConfig(config);
+    DrawingClient.prototype.check = originalDrawingCheck;
+    DrawingClient.prototype.uploadImage = originalDrawingUploadImage;
+    DrawingClient.prototype.createImageTask = originalDrawingCreateImageTask;
   }
 });
 

@@ -541,7 +541,7 @@ test("confirmed chat quota with a future reset blocks image admission", async ()
   }
 });
 
-test("Gemini image admission uses chat image even when default channel is drawing", async () => {
+test("GPT and Gemini image admission follow their separate source priorities", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -556,6 +556,7 @@ test("Gemini image admission uses chat image even when default channel is drawin
         drawingBaseUrl: "https://drawing.example.test",
         chatBaseUrl: "https://chat.example.test",
         defaultModelId: 1,
+        imageSourcePriority: { gpt: "drawing", gemini: "chatplus" },
         defaultChatModel: "gpt",
         chatModels: [
           { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-test", strategy: "image", enabled: true, default: true },
@@ -580,15 +581,22 @@ test("Gemini image admission uses chat image even when default channel is drawin
     }]
   });
 
-  const admitted = await reserveImageTaskAdmission({
+  const gpt = await reserveImageTaskAdmission({
+    prompt: "gpt should use drawing",
+    model: "gpt"
+  });
+  const gemini = await reserveImageTaskAdmission({
     prompt: "gemini should stay in chat image",
     model: "gemini"
   });
   try {
-    assert.equal(admitted.target.channel.type, "chatplus");
-    assert.equal(admitted.target.channel.id, "shareai:chatplus");
+    assert.equal(gpt.target.channel.type, "drawing");
+    assert.equal(gpt.target.channel.id, "shareai:drawing");
+    assert.equal(gemini.target.channel.type, "chatplus");
+    assert.equal(gemini.target.channel.id, "shareai:chatplus");
   } finally {
-    admitted.release();
+    gpt.release();
+    gemini.release();
   }
 });
 
@@ -638,7 +646,7 @@ test("Nano-Banana image admission uses drawing even when default channel is chat
   }
 });
 
-test("Gemini image admission fails instead of using drawing when chat image is disabled", async () => {
+test("Gemini image admission uses drawing when chat image is disabled", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -673,15 +681,14 @@ test("Gemini image admission fails instead of using drawing when chat image is d
     }]
   });
 
-  await assert.rejects(
-    reserveImageTaskAdmission({
-      prompt: "gemini should not use drawing",
-      model: "gemini"
-    }),
-    (error) => {
-      assert.equal(error.status, 503);
-      assert.match(error.message, /生图账号/);
-      return true;
-    }
-  );
+  const admitted = await reserveImageTaskAdmission({
+    prompt: "gemini should use drawing",
+    model: "gemini"
+  });
+  try {
+    assert.equal(admitted.target.channel.type, "drawing");
+    assert.equal(admitted.target.channel.id, "shareai:drawing");
+  } finally {
+    admitted.release();
+  }
 });

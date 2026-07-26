@@ -31,7 +31,9 @@ test("keeps multiple ShareAI channels and separates accounts by channel", async 
         settings: {
           drawingBaseUrl: "https://drawing.aishare.icu",
           chatBaseUrl: "https://one.aishare.icu",
-          enabledAbilities: { drawing: true, chatplus: true }
+          enabledAbilities: { drawing: true, chatplus: true },
+          geminiDrawingModelId: 3,
+          imageSourcePriority: { gpt: "chatplus", gemini: "drawing" }
         }
       },
       {
@@ -76,6 +78,11 @@ test("keeps multiple ShareAI channels and separates accounts by channel", async 
   assert.deepEqual(stored.channels.map((item) => item.id), ["shareai", "midjourneye"]);
   assert.equal(stored.channels.find((item) => item.id === "midjourneye")?.settings.enabledAbilities.drawing, false);
   assert.equal(stored.channels.find((item) => item.id === "midjourneye")?.settings.enabledAbilities.chatplus, true);
+  assert.deepEqual(
+    stored.channels.find((item) => item.id === "shareai")?.settings.imageSourcePriority,
+    { gpt: "chatplus", gemini: "drawing" }
+  );
+  assert.equal(stored.channels.find((item) => item.id === "shareai")?.settings.geminiDrawingModelId, 3);
   assert.deepEqual(stored.accounts.map((item) => item.channelId).sort(), ["midjourneye", "shareai"]);
 });
 

@@ -54,6 +54,8 @@ const defaultShareAISettings = {
   chatBaseUrl: "https://www.chatplus.cc",
   enabledAbilities: { drawing: true, chatplus: true },
   defaultModelId: 1,
+  geminiDrawingModelId: 2,
+  imageSourcePriority: { gpt: "drawing", gemini: "drawing" },
   defaultChatModel: "gpt",
   chatModels: defaultChatModels,
   autoCarSelection: true,
@@ -148,6 +150,19 @@ function normalizeConcurrency(value = {}) {
   };
 }
 
+function normalizeImageSourcePriority(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    gpt: source.gpt === "chatplus" ? "chatplus" : "drawing",
+    gemini: source.gemini === "chatplus" ? "chatplus" : "drawing"
+  };
+}
+
+function normalizeGeminiDrawingModelId(value) {
+  const modelId = Number(value);
+  return [2, 3].includes(modelId) ? modelId : 2;
+}
+
 function normalizeAccountConcurrency(value = {}, fallback = defaultConcurrency) {
   return normalizeConcurrency({
     chat: value.chat ?? fallback.chat,
@@ -222,6 +237,8 @@ function normalizeShareAIChannel(channels = []) {
   settings.chatModels = normalizeChatModels(settings, migrateAutoSelection);
   settings.defaultChatModel = settings.chatModels.find((item) => item.default && item.enabled)?.key || settings.chatModels[0]?.key || "gpt";
   settings.defaultModelId = Number(settings.defaultModelId || 1);
+  settings.geminiDrawingModelId = normalizeGeminiDrawingModelId(settings.geminiDrawingModelId);
+  settings.imageSourcePriority = normalizeImageSourcePriority(settings.imageSourcePriority);
   settings.autoCarSelection = true;
   settings.autoCarSelectionMigrated = true;
   settings.legacyChannelIds = {
@@ -262,6 +279,8 @@ function normalizeShareAISettings(channel = {}, legacy = {}) {
   settings.chatModels = normalizeChatModels(settings, migrateAutoSelection);
   settings.defaultChatModel = settings.chatModels.find((item) => item.default && item.enabled)?.key || settings.chatModels[0]?.key || "gpt";
   settings.defaultModelId = Number(settings.defaultModelId || 1);
+  settings.geminiDrawingModelId = normalizeGeminiDrawingModelId(settings.geminiDrawingModelId);
+  settings.imageSourcePriority = normalizeImageSourcePriority(settings.imageSourcePriority);
   settings.autoCarSelection = true;
   settings.autoCarSelectionMigrated = true;
   settings.enabledAbilities = {

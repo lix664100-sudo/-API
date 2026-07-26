@@ -112,12 +112,16 @@ test("runtime capacity only counts accounts whose channel enables the model", as
 
   const runtime = await getRuntimeStatus();
   assert.equal(runtime.concurrency.drawingImage, 6);
-  assert.equal(runtime.models.gpt.categories.image.configured, 9);
+  assert.equal(runtime.models.gpt.categories.image.configured, 15);
   assert.equal(runtime.models.gpt.categories.chat.configured, 9);
-  assert.equal(runtime.models.gemini.categories.image.configured, 3);
+  assert.equal(runtime.models.gemini.categories.image.configured, 9);
   assert.equal(runtime.models.gemini.categories.chat.configured, 3);
 
-  const gemini = await reserveImageTaskAdmission({ model: "gemini", prompt: "gemini" });
+  const gemini = await reserveImageTaskAdmission({
+    channel: "gemini-channel",
+    model: "gemini",
+    prompt: "gemini"
+  });
   try {
     assert.equal(gemini.target.account.id, "gemini-account");
   } finally {
@@ -144,6 +148,38 @@ test("GPT and Gemini use separate image concurrency slots", async () => {
   } finally {
     gpt.release();
     gemini.release();
+  }
+});
+
+test("drawing image usage reduces the available image concurrency for both GPT and Gemini", async () => {
+  const config = await loadConfig();
+  const next = modelConfig(config);
+  next.channels[0].settings.enabledAbilities = { drawing: true, chatplus: true };
+  next.channels[0].settings.imageSourcePriority = { gpt: "drawing", gemini: "drawing" };
+  next.channels[0].settings.chatModels.push({
+    key: "grok",
+    name: "Grok",
+    carType: "grok",
+    model: "",
+    enabled: true,
+    default: false
+  });
+  next.accounts[0].concurrency = { chat: 1, drawingImage: 2, chatImage: 1 };
+  next.accounts[0].meta.abilities.drawing = { status: "ok" };
+  await saveConfig(next);
+
+  const gpt = await reserveImageTaskAdmission({ model: "gpt", prompt: "drawing gpt" });
+  try {
+    const runtime = await getRuntimeStatus();
+    assert.equal(gpt.target.channel.type, "drawing");
+    assert.equal(runtime.models.gpt.categories.image.running, 1);
+    assert.equal(runtime.models.gemini.categories.image.running, 0);
+    assert.equal(runtime.models.gpt.categories.image.idle, 2);
+    assert.equal(runtime.models.gemini.categories.image.idle, 2);
+    assert.equal(runtime.models.grok.categories.image.configured, 1);
+    assert.equal(runtime.models.grok.categories.image.idle, 1);
+  } finally {
+    gpt.release();
   }
 });
 
