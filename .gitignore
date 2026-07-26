@@ -7,7 +7,7 @@ node_modules/
 # 含有账号、密钥和运行数据的本地文件
 data/
 work/
-outputs/
+/outputs
 
 # 日志与系统文件
 *.log
