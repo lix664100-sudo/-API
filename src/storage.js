@@ -55,7 +55,6 @@ const defaultShareAISettings = {
   enabledAbilities: { drawing: true, chatplus: true },
   defaultModelId: 1,
   geminiDrawingModelId: 2,
-  imageSourcePriority: { gpt: "drawing", gemini: "drawing" },
   defaultChatModel: "gpt",
   chatModels: defaultChatModels,
   autoCarSelection: true,
@@ -81,6 +80,7 @@ const defaultConfig = {
   defaultModelId: 1,
   defaultRatio: "1:1",
   defaultImageCount: 1,
+  imageSourcePriority: "chatplus",
   waitTimeoutSec: 300,
   waitTimeoutVersion: 2,
   imageStorage: defaultImageStorage,
@@ -150,12 +150,8 @@ function normalizeConcurrency(value = {}) {
   };
 }
 
-function normalizeImageSourcePriority(value = {}) {
-  const source = value && typeof value === "object" ? value : {};
-  return {
-    gpt: source.gpt === "chatplus" ? "chatplus" : "drawing",
-    gemini: source.gemini === "chatplus" ? "chatplus" : "drawing"
-  };
+function normalizeImageSourcePriority(value) {
+  return value === "drawing" ? "drawing" : "chatplus";
 }
 
 function normalizeGeminiDrawingModelId(value) {
@@ -238,7 +234,6 @@ function normalizeShareAIChannel(channels = []) {
   settings.defaultChatModel = settings.chatModels.find((item) => item.default && item.enabled)?.key || settings.chatModels[0]?.key || "gpt";
   settings.defaultModelId = Number(settings.defaultModelId || 1);
   settings.geminiDrawingModelId = normalizeGeminiDrawingModelId(settings.geminiDrawingModelId);
-  settings.imageSourcePriority = normalizeImageSourcePriority(settings.imageSourcePriority);
   settings.autoCarSelection = true;
   settings.autoCarSelectionMigrated = true;
   settings.legacyChannelIds = {
@@ -248,6 +243,7 @@ function normalizeShareAIChannel(channels = []) {
   delete settings.baseUrl;
   delete settings.carId;
   delete settings.carType;
+  delete settings.imageSourcePriority;
 
   return [{
     id: String(shareai?.id || "shareai"),
@@ -280,7 +276,6 @@ function normalizeShareAISettings(channel = {}, legacy = {}) {
   settings.defaultChatModel = settings.chatModels.find((item) => item.default && item.enabled)?.key || settings.chatModels[0]?.key || "gpt";
   settings.defaultModelId = Number(settings.defaultModelId || 1);
   settings.geminiDrawingModelId = normalizeGeminiDrawingModelId(settings.geminiDrawingModelId);
-  settings.imageSourcePriority = normalizeImageSourcePriority(settings.imageSourcePriority);
   settings.autoCarSelection = true;
   settings.autoCarSelectionMigrated = true;
   settings.enabledAbilities = {
@@ -298,6 +293,7 @@ function normalizeShareAISettings(channel = {}, legacy = {}) {
   delete settings.baseUrl;
   delete settings.carId;
   delete settings.carType;
+  delete settings.imageSourcePriority;
   return settings;
 }
 
@@ -563,6 +559,7 @@ function normalizeConfig(stored = {}) {
     ...defaultConfig,
     ...stored,
     defaultChannel,
+    imageSourcePriority: normalizeImageSourcePriority(stored.imageSourcePriority),
     imageStorage: normalizeImageStorage(stored.imageStorage),
     concurrency: normalizeConcurrency(stored.concurrency),
     waitTimeoutSec: normalizeWaitTimeout(stored),
@@ -590,6 +587,8 @@ export async function loadConfig({ waitForWrites = true } = {}) {
     !stored.apiKey
     || !Array.isArray(stored.channels)
     || !Array.isArray(stored.accounts)
+    || stored.imageSourcePriority !== config.imageSourcePriority
+    || stored.channels.some((channel) => Object.prototype.hasOwnProperty.call(channel?.settings || {}, "imageSourcePriority"))
     || stored.waitTimeoutVersion !== 2
     || Number(stored.waitTimeoutSec) !== config.waitTimeoutSec
   ) {
@@ -622,6 +621,7 @@ export function publicConfig(config) {
     defaultModelId: config.defaultModelId,
     defaultRatio: config.defaultRatio,
     defaultImageCount: config.defaultImageCount,
+    imageSourcePriority: config.imageSourcePriority,
     waitTimeoutSec: config.waitTimeoutSec,
     imageStorage: config.imageStorage,
     concurrency: config.concurrency,

@@ -354,6 +354,7 @@ test("preferred chat image failure falls back to drawing before an upstream task
   await saveConfig({
     ...config,
     defaultChannel: "shareai",
+    imageSourcePriority: "chatplus",
     imageStorage: { mode: "never", autoCleanup: false, retentionDays: 7 },
     channels: [{
       id: "shareai",
@@ -364,7 +365,6 @@ test("preferred chat image failure falls back to drawing before an upstream task
         drawingBaseUrl: "https://drawing.example.test",
         chatBaseUrl: "https://chat.example.test",
         enabledAbilities: { drawing: true, chatplus: true },
-        imageSourcePriority: { gpt: "chatplus", gemini: "drawing" },
         defaultModelId: 1
       }
     }],

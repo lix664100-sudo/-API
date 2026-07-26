@@ -842,6 +842,7 @@ app.post("/api/config", async (request) => {
     defaultModelId: Number(body.defaultModelId || current.defaultModelId || 1),
     defaultRatio: body.defaultRatio || current.defaultRatio || "1:1",
     defaultImageCount: Number(body.defaultImageCount || current.defaultImageCount || 1),
+    imageSourcePriority: body.imageSourcePriority || current.imageSourcePriority || "chatplus",
     waitTimeoutSec: Number(body.waitTimeoutSec ?? current.waitTimeoutSec ?? 300),
     imageStorage: body.imageStorage || current.imageStorage,
     concurrency: body.concurrency || current.concurrency

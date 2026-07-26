@@ -21,6 +21,7 @@ test("keeps multiple ShareAI channels and separates accounts by channel", async 
   await saveConfig({
     ...config,
     defaultChannel: "midjourneye",
+    imageSourcePriority: "drawing",
     channels: [
       {
         id: "shareai",
@@ -78,9 +79,10 @@ test("keeps multiple ShareAI channels and separates accounts by channel", async 
   assert.deepEqual(stored.channels.map((item) => item.id), ["shareai", "midjourneye"]);
   assert.equal(stored.channels.find((item) => item.id === "midjourneye")?.settings.enabledAbilities.drawing, false);
   assert.equal(stored.channels.find((item) => item.id === "midjourneye")?.settings.enabledAbilities.chatplus, true);
-  assert.deepEqual(
-    stored.channels.find((item) => item.id === "shareai")?.settings.imageSourcePriority,
-    { gpt: "chatplus", gemini: "drawing" }
+  assert.equal(stored.imageSourcePriority, "drawing");
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(stored.channels.find((item) => item.id === "shareai")?.settings || {}, "imageSourcePriority"),
+    false
   );
   assert.equal(stored.channels.find((item) => item.id === "shareai")?.settings.geminiDrawingModelId, 3);
   assert.deepEqual(stored.accounts.map((item) => item.channelId).sort(), ["midjourneye", "shareai"]);

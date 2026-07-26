@@ -541,62 +541,110 @@ test("confirmed chat quota with a future reset blocks image admission", async ()
   }
 });
 
-test("GPT and Gemini image admission follow their separate source priorities", async () => {
+test("global source priority is shared by GPT and Gemini across channel priorities", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
-    defaultChannel: "drawing",
+    defaultChannel: "auto",
+    imageSourcePriority: "chatplus",
     concurrency: { chat: 3, drawingImage: 5, chatImage: 5 },
-    channels: [{
-      id: "shareai",
-      type: "shareai",
-      name: "ShareAI",
-      enabled: true,
-      settings: {
-        drawingBaseUrl: "https://drawing.example.test",
-        chatBaseUrl: "https://chat.example.test",
-        defaultModelId: 1,
-        imageSourcePriority: { gpt: "drawing", gemini: "chatplus" },
-        defaultChatModel: "gpt",
-        chatModels: [
-          { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-test", strategy: "image", enabled: true, default: true },
-          { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", enabled: true, default: false }
-        ]
-      }
-    }],
-    accounts: [{
-      id: "gemini-admission-account",
-      channelId: "shareai",
-      name: "Gemini Admission",
-      username: "gemini-admission@example.test",
-      password: "test",
-      enabled: true,
-      status: "ok",
-      meta: {
-        abilities: {
-          drawing: { status: "ok" },
-          chatplus: { status: "ok" }
+    channels: [
+      {
+        id: "priority-one",
+        type: "shareai",
+        name: "Priority one",
+        enabled: true,
+        priority: 1,
+        settings: {
+          drawingBaseUrl: "https://drawing.example.test",
+          chatBaseUrl: "https://gpt-chat.example.test",
+          enabledAbilities: { drawing: true, chatplus: true },
+          defaultModelId: 1,
+          defaultChatModel: "gpt",
+          chatModels: [
+            { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-test", strategy: "image", enabled: true, default: true },
+            { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", enabled: false, default: false }
+          ]
+        }
+      },
+      {
+        id: "priority-two",
+        type: "shareai",
+        name: "Priority two",
+        enabled: true,
+        priority: 2,
+        settings: {
+          chatBaseUrl: "https://gemini-chat.example.test",
+          enabledAbilities: { drawing: false, chatplus: true },
+          defaultChatModel: "gemini",
+          chatModels: [
+            { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-test", strategy: "image", enabled: false, default: false },
+            { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", enabled: true, default: true }
+          ]
         }
       }
-    }]
+    ],
+    accounts: [
+      {
+        id: "priority-one-account",
+        channelId: "priority-one",
+        name: "Priority one account",
+        username: "priority-one@example.test",
+        password: "test",
+        enabled: true,
+        status: "ok",
+        meta: {
+          abilities: {
+            drawing: { status: "ok" },
+            chatplus: { status: "ok" }
+          }
+        }
+      },
+      {
+        id: "priority-two-account",
+        channelId: "priority-two",
+        name: "Priority two account",
+        username: "priority-two@example.test",
+        password: "test",
+        enabled: true,
+        status: "ok",
+        meta: {
+          abilities: {
+            chatplus: { status: "ok" }
+          }
+        }
+      }
+    ]
   });
 
   const gpt = await reserveImageTaskAdmission({
-    prompt: "gpt should use drawing",
+    prompt: "gpt should use chat image",
     model: "gpt"
   });
   const gemini = await reserveImageTaskAdmission({
-    prompt: "gemini should stay in chat image",
+    prompt: "gemini should use lower-priority chat image",
     model: "gemini"
   });
   try {
-    assert.equal(gpt.target.channel.type, "drawing");
-    assert.equal(gpt.target.channel.id, "shareai:drawing");
+    assert.equal(gpt.target.channel.type, "chatplus");
+    assert.equal(gpt.target.channel.id, "priority-one:chatplus");
     assert.equal(gemini.target.channel.type, "chatplus");
-    assert.equal(gemini.target.channel.id, "shareai:chatplus");
+    assert.equal(gemini.target.channel.id, "priority-two:chatplus");
   } finally {
     gpt.release();
     gemini.release();
+  }
+
+  await saveConfig({ imageSourcePriority: "drawing" });
+  const drawingFirst = await reserveImageTaskAdmission({
+    prompt: "gemini should now use drawing",
+    model: "gemini"
+  });
+  try {
+    assert.equal(drawingFirst.target.channel.type, "drawing");
+    assert.equal(drawingFirst.target.channel.id, "priority-one:drawing");
+  } finally {
+    drawingFirst.release();
   }
 });
 

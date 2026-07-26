@@ -154,8 +154,8 @@ test("GPT and Gemini use separate image concurrency slots", async () => {
 test("drawing image usage reduces the available image concurrency for both GPT and Gemini", async () => {
   const config = await loadConfig();
   const next = modelConfig(config);
+  next.imageSourcePriority = "drawing";
   next.channels[0].settings.enabledAbilities = { drawing: true, chatplus: true };
-  next.channels[0].settings.imageSourcePriority = { gpt: "drawing", gemini: "drawing" };
   next.channels[0].settings.chatModels.push({
     key: "grok",
     name: "Grok",
@@ -176,8 +176,8 @@ test("drawing image usage reduces the available image concurrency for both GPT a
     assert.equal(runtime.models.gemini.categories.image.running, 0);
     assert.equal(runtime.models.gpt.categories.image.idle, 2);
     assert.equal(runtime.models.gemini.categories.image.idle, 2);
-    assert.equal(runtime.models.grok.categories.image.configured, 1);
-    assert.equal(runtime.models.grok.categories.image.idle, 1);
+    assert.equal(runtime.models.grok.categories.image.configured, 0);
+    assert.equal(runtime.models.grok.categories.image.idle, 0);
   } finally {
     gpt.release();
   }

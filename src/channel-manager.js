@@ -213,6 +213,7 @@ function targetSupportsChatModel(target, modelKey) {
 
 function targetSupportsRuntimeModel(target, taskType, modelKey) {
   if (taskType === "chat") return targetSupportsChatModel(target, modelKey);
+  if (modelRequestKey(modelKey) === "grok") return false;
   if (target?.channel?.type === "drawing") return ["gpt", "gemini"].includes(modelRequestKey(modelKey));
   return targetSupportsChatModel(target, modelKey);
 }
@@ -639,7 +640,6 @@ function shareAIAbilityChannel(channel, ability) {
         defaultChatModel: settings.defaultChatModel || "gpt",
         chatModels: settings.chatModels || [],
         geminiDrawingModelId: Number(settings.geminiDrawingModelId || 2),
-        imageSourcePriority: settings.imageSourcePriority || { gpt: "drawing", gemini: "drawing" },
         autoCarSelection: true,
         autoCarSelectionMigrated: true
       }
@@ -655,8 +655,7 @@ function shareAIAbilityChannel(channel, ability) {
     settings: {
       baseUrl: settings.drawingBaseUrl || "https://drawing.aishare.icu",
       defaultModelId: Number(settings.defaultModelId || 1),
-      geminiDrawingModelId: Number(settings.geminiDrawingModelId || 2),
-      imageSourcePriority: settings.imageSourcePriority || { gpt: "drawing", gemini: "drawing" }
+      geminiDrawingModelId: Number(settings.geminiDrawingModelId || 2)
     }
   };
 }
@@ -675,18 +674,10 @@ function requestedAbility(channel, requestedChannel) {
   return "";
 }
 
-function shareAIAbilitiesForTask(channel, requestedChannel, taskType, input = {}) {
+function shareAIAbilitiesForTask(channel, requestedChannel, taskType) {
   const requested = requestedAbility(channel, requestedChannel);
   const abilities = requested ? [requested] : taskType === "chat" ? ["chatplus"] : ["drawing", "chatplus"];
-  const enabled = abilities.filter((ability) => channelAbilityEnabled(channel, ability));
-  if (requested || taskType === "chat" || enabled.length < 2) return enabled;
-  const modelKey = requestedImageModelKey(input, channel.settings || {});
-  const preferred = channel.settings?.imageSourcePriority?.[modelKey] === "chatplus"
-    ? "chatplus"
-    : "drawing";
-  return enabled.sort((left, right) => (
-    left === preferred ? -1 : right === preferred ? 1 : 0
-  ));
+  return abilities.filter((ability) => channelAbilityEnabled(channel, ability));
 }
 
 function isPendingTask(status) {
@@ -1474,7 +1465,7 @@ function requestedModelLock(input = {}) {
 function requestedImageModelKey(input = {}, settings = {}) {
   const lock = requestedModelLock(input);
   if (["gpt-image", "gemini-image"].includes(lock.type)) return lock.key;
-  if (lock.type === "chat" && ["gpt", "gemini"].includes(lock.key)) return lock.key;
+  if (lock.type === "chat" && ["gpt", "grok", "gemini"].includes(lock.key)) return lock.key;
   return drawingModelFamily(
     input.model_id
       ?? input.modelId
@@ -1482,6 +1473,15 @@ function requestedImageModelKey(input = {}, settings = {}) {
       ?? settings.defaultModelId
       ?? 1
   ) || "gpt";
+}
+
+function assertImageGenerationModelSupported(input = {}) {
+  const lock = requestedModelLock(input);
+  if (lock.type !== "chat" || lock.key !== "grok") return;
+  const error = new Error("Grok 暂不支持图片生成，请改用 GPT 或 Gemini。");
+  error.status = 400;
+  error.code = "GROK_IMAGE_GENERATION_UNSUPPORTED";
+  throw error;
 }
 
 function requestedChannelForInput(config, input = {}) {
@@ -1549,6 +1549,15 @@ function balancedAccountOrder(accounts, routingKey) {
   ];
 }
 
+function orderTargetsByImageSource(config, taskType, targets) {
+  if (taskType === "chat") return targets;
+  const preferred = config.imageSourcePriority === "drawing" ? "drawing" : "chatplus";
+  return [
+    ...targets.filter((target) => target.channel.type === preferred),
+    ...targets.filter((target) => target.channel.type !== preferred)
+  ];
+}
+
 function selectTargets(config, requestedChannel = "auto", taskType = "text2img", options = {}) {
   const requestedAccountId = String(options.accountId || "").trim();
   const channels = config.channels
@@ -1564,7 +1573,7 @@ function selectTargets(config, requestedChannel = "auto", taskType = "text2img",
       .filter((account) => !requestedAccountId || account.id === requestedAccountId)
       .sort((a, b) => Number(a.priority || 99) - Number(b.priority || 99));
     if (channel.type === "shareai") {
-      for (const ability of shareAIAbilitiesForTask(channel, requestedChannel, taskType, options.input || {})) {
+      for (const ability of shareAIAbilitiesForTask(channel, requestedChannel, taskType)) {
         const abilityAccounts = accounts.filter((account) =>
           !(ability === "chatplus" && !options.includeCooling && accountCooling(account))
         );
@@ -1587,7 +1596,8 @@ function selectTargets(config, requestedChannel = "auto", taskType = "text2img",
       targets.push({ channel, account });
     }
   }
-  return targets.filter((target) => targetMatchesRequestedModel(target, taskType, options.input));
+  const matchedTargets = targets.filter((target) => targetMatchesRequestedModel(target, taskType, options.input));
+  return orderTargetsByImageSource(config, taskType, matchedTargets);
 }
 
 function noChatTargetsError(config, requestedChannel) {
@@ -1842,6 +1852,7 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
 }
 
 export async function reserveImageTaskAdmission(input = {}) {
+  assertImageGenerationModelSupported(input);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
@@ -2713,6 +2724,7 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
     error.status = 400;
     throw error;
   }
+  assertImageGenerationModelSupported(input);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true, input });
@@ -2744,6 +2756,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   }
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files, 3);
+  assertImageGenerationModelSupported(input);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
@@ -3177,6 +3190,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
     error.status = 400;
     throw error;
   }
+  assertImageGenerationModelSupported(input);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true, input });
@@ -3248,6 +3262,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   }
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files, 3);
+  assertImageGenerationModelSupported(input);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();

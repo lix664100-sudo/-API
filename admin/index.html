@@ -1290,8 +1290,8 @@
       ];
 
       const imageSourcePriorityOptions = [
-        { label: "绘图站优先", value: "drawing" },
-        { label: "聊天生图优先", value: "chatplus" }
+        { label: "聊天生图优先", value: "chatplus" },
+        { label: "绘图站优先", value: "drawing" }
       ];
 
       const chatModelDefaults = [
@@ -1982,14 +1982,6 @@
         return {
           drawing: enabled.drawing !== false,
           chatplus: enabled.chatplus !== false
-        };
-      }
-
-      function imageSourcePriorityDefaults(settings = {}) {
-        const priority = settings.imageSourcePriority || {};
-        return {
-          gpt: priority.gpt === "chatplus" ? "chatplus" : "drawing",
-          gemini: priority.gemini === "chatplus" ? "chatplus" : "drawing"
         };
       }
 
@@ -3950,13 +3942,11 @@
           const chatModels = chatModelsForChannel(channel);
           const defaultChatModel = chatModels.find((item) => item.default)?.key || "gpt";
           const enabledAbilities = shareAIAbilityDefaults(channel?.settings || {});
-          const imageSourcePriority = imageSourcePriorityDefaults(channel?.settings || {});
           channelForm.setFieldsValue(channel ? {
             ...channel,
             settings: {
               ...(channel.settings || {}),
               enabledAbilities,
-              imageSourcePriority,
               geminiDrawingModelId: [2, 3].includes(Number(channel.settings?.geminiDrawingModelId))
                 ? Number(channel.settings.geminiDrawingModelId)
                 : 2,
@@ -3972,7 +3962,6 @@
               drawingBaseUrl: config?.drawingBaseUrl || "https://drawing.aishare.icu",
               chatBaseUrl: "https://www.chatplus.cc",
               enabledAbilities: { drawing: true, chatplus: true },
-              imageSourcePriority: { gpt: "drawing", gemini: "drawing" },
               defaultModelId: config?.defaultModelId || 1,
               geminiDrawingModelId: 2,
               defaultChatModel: "gpt",
@@ -3993,7 +3982,7 @@
 
           const enabledAbilities = shareAIAbilityDefaults(payload.settings);
           payload.settings.enabledAbilities = enabledAbilities;
-          payload.settings.imageSourcePriority = imageSourcePriorityDefaults(payload.settings);
+          delete payload.settings.imageSourcePriority;
           payload.settings.geminiDrawingModelId = [2, 3].includes(Number(payload.settings.geminiDrawingModelId))
             ? Number(payload.settings.geminiDrawingModelId)
             : 2;
@@ -5372,6 +5361,11 @@
                         style: { marginBottom: 14 }
                       }),
                       h("div", { className: "form-grid" }, [
+                        h(Form.Item, {
+                          label: "生图来源优先",
+                          name: "imageSourcePriority",
+                          extra: "首选来源没有可用账号或额度时，自动切换到另一来源。"
+                        }, h(Select, { options: imageSourcePriorityOptions })),
                         h(Form.Item, { label: "兜底渠道", name: "defaultChannel" }, h(Select, { options: channelOptions })),
                         h(Form.Item, { label: "兜底绘图模型", name: "defaultModelId" }, h(Select, { options: drawingModelOptions })),
                         h(Form.Item, { label: "兜底比例", name: "defaultRatio" }, h(Select, { options: ["1:1", "16:9", "9:16", "4:3", "3:4"].map((value) => ({ label: value, value })) })),
@@ -5435,26 +5429,6 @@
                   }, h(Input, { disabled: !editingChannelChatEnabled, placeholder: "https://www.chatplus.cc" }))
                 ])
               : h(Form.Item, { label: "网站地址", name: ["settings", "baseUrl"], rules: [{ required: true, message: "请输入网站地址" }] }, h(Input, { placeholder: "https://example.com" })),
-            editingChannelType === "shareai" && editingChannelDrawingEnabled && editingChannelChatEnabled
-              ? h("div", { className: "api-doc-section" }, [
-                  h("div", { className: "section-title" }, [
-                    h("h3", null, "生图来源"),
-                    h("span", null, "首选来源不可用时自动切换")
-                  ]),
-                  h("div", { className: "form-grid" }, [
-                    h(Form.Item, {
-                      label: "GPT 生图首选",
-                      name: ["settings", "imageSourcePriority", "gpt"],
-                      extra: "模型 1 使用此顺序。"
-                    }, h(Select, { options: imageSourcePriorityOptions })),
-                    h(Form.Item, {
-                      label: "Gemini 生图首选",
-                      name: ["settings", "imageSourcePriority", "gemini"],
-                      extra: "模型 2、3 使用此顺序。"
-                    }, h(Select, { options: imageSourcePriorityOptions }))
-                  ])
-                ])
-              : null,
             (editingChannelType === "chatplus" || (editingChannelType === "shareai" && editingChannelChatEnabled))
               ? h("div", { className: "api-doc-section" }, [
                   h(Form.Item, { label: "默认对话模型", name: ["settings", "defaultChatModel"] }, h(Select, { options: chatModelDefaults.map((item) => ({ label: item.name, value: item.key })) })),
