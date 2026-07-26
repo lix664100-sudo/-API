@@ -7,7 +7,7 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-grok-image-routing-"));
 process.env.DATA_DIR = dataDir;
 
-const { loadConfig, saveConfig } = await import("../src/storage.js");
+const { closeStorage, loadConfig, saveConfig } = await import("../src/storage.js");
 const {
   createImageTask,
   createTextTask,
@@ -61,6 +61,7 @@ await saveConfig({
 });
 
 after(async () => {
+  await closeStorage();
   await rm(dataDir, { recursive: true, force: true });
 });
 

@@ -34,6 +34,7 @@ import {
   setRuntimePublicBaseUrl
 } from "./image-store.js";
 import {
+  closeStorage,
   getTask,
   getTaskBySourceTaskId,
   listIntradayTaskStats,
@@ -1198,6 +1199,31 @@ function scheduleRuntimeStats() {
   const timer = setInterval(record, 30_000);
   timer.unref?.();
 }
+
+app.addHook("onClose", async () => {
+  await closeStorage();
+});
+
+let shutdownStarted = false;
+async function shutdown(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  app.log.info({ signal }, "service shutdown started");
+  try {
+    await app.close();
+    process.exit(0);
+  } catch (error) {
+    app.log.error(error, "service shutdown failed");
+    process.exit(1);
+  }
+}
+
+process.once("SIGINT", () => {
+  void shutdown("SIGINT");
+});
+process.once("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
 
 const port = Number(process.env.PORT || 3210);
 const host = process.env.HOST || "127.0.0.1";

@@ -7,12 +7,13 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-recovery-"));
 process.env.DATA_DIR = dataDir;
 
-const { getTask, listTasks, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
+const { closeStorage, getTask, listTasks, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
 const { createImageTask, getRuntimeStatus, inspectUpstreamTask, queueImageTask, refreshProcessingTasks, refreshTask, reserveImageTaskAdmission } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
+  await closeStorage();
   await rm(dataDir, { recursive: true, force: true });
 });
 

@@ -8,7 +8,7 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-image-admission-"));
 process.env.DATA_DIR = dataDir;
 
-const { loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
+const { closeStorage, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
 const {
   assertImageTaskAdmission,
   attachImageAdmissionToRequest,
@@ -19,6 +19,7 @@ const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
+  await closeStorage();
   await rm(dataDir, { recursive: true, force: true });
 });
 

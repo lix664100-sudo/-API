@@ -7,9 +7,10 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-list-page-"));
 process.env.DATA_DIR = dataDir;
 
-const { listTaskPage, upsertTask } = await import("../src/storage.js");
+const { closeStorage, listTaskPage, upsertTask } = await import("../src/storage.js");
 
 after(async () => {
+  await closeStorage();
   await rm(dataDir, { recursive: true, force: true });
 });
 

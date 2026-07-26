@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import Database from "better-sqlite3";
 
 const rootDir = process.cwd();
 const dataDir = path.resolve(rootDir, process.env.DATA_DIR || "data");
@@ -8,6 +9,7 @@ const configFile = path.join(dataDir, "config.json");
 const tasksFile = path.join(dataDir, "tasks.json");
 const statsFile = path.join(dataDir, "stats.json");
 const runtimeStatsFile = path.join(dataDir, "runtime-stats.json");
+const databaseFile = path.join(dataDir, "storage.sqlite");
 const taskHistoryDays = 2;
 const taskHistoryLimit = 50000;
 const statRecordDays = 31;
@@ -20,11 +22,13 @@ let runtimeStatsWriteQueue = Promise.resolve();
 let tasksWriteQueue = Promise.resolve();
 let configWriteQueue = Promise.resolve();
 let statsRevision = 0;
+let statsSnapshot = null;
 const intradayStatsCache = new Map();
 let tasksLoadPromise = null;
+let storageDatabase = null;
+let storageDatabasePromise = null;
 let tasksSnapshot = {
   ready: false,
-  stamp: "",
   tasks: [],
   queryCache: new Map(),
   searchTextCache: new WeakMap()
@@ -114,14 +118,191 @@ async function writeJson(file, value) {
   await rename(tempFile, file);
 }
 
-async function fileStamp(file) {
+function storageTaskId(task = {}) {
+  return String(task.id || taskSourceTaskId(task) || randomUUID()).trim();
+}
+
+function writeTaskRow(database, task) {
+  const stored = {
+    ...task,
+    id: storageTaskId(task)
+  };
+  database.prepare(`
+    INSERT INTO tasks (
+      id, source_task_id, created_at, created_time, status, payload
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      source_task_id = excluded.source_task_id,
+      created_at = excluded.created_at,
+      created_time = excluded.created_time,
+      status = excluded.status,
+      payload = excluded.payload
+  `).run(
+    stored.id,
+    taskSourceTaskId(stored),
+    String(stored.createdAt || stored.updatedAt || new Date().toISOString()),
+    taskHistoryTime(stored) ?? Date.now(),
+    taskStatus(stored),
+    JSON.stringify(stored)
+  );
+  return stored;
+}
+
+function writeTaskStatRow(database, record) {
+  database.prepare(`
+    INSERT INTO task_stats (task_id, time, payload)
+    VALUES (?, ?, ?)
+    ON CONFLICT(task_id) DO UPDATE SET
+      time = excluded.time,
+      payload = excluded.payload
+  `).run(record.taskId, Number(record.time || Date.now()), JSON.stringify(record));
+}
+
+function setStorageMeta(database, key, value) {
+  database.prepare(`
+    INSERT INTO storage_meta (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, String(value ?? ""));
+}
+
+function getStorageMeta(database, key) {
+  return database.prepare("SELECT value FROM storage_meta WHERE key = ?").pluck().get(key) || "";
+}
+
+function removeTaskRows(database, tasks = []) {
+  if (!tasks.length) return;
+  const remove = database.prepare("DELETE FROM tasks WHERE id = ?");
+  database.transaction((items) => {
+    for (const task of items) remove.run(String(task.id || ""));
+  })(tasks);
+}
+
+function pruneTaskStatRows(database, now = Date.now()) {
+  const cutoff = now - statRecordDays * 24 * 60 * 60 * 1000;
+  database.prepare("DELETE FROM task_stats WHERE time < ?").run(cutoff);
+  database.prepare(`
+    DELETE FROM task_stats
+    WHERE task_id NOT IN (
+      SELECT task_id
+      FROM task_stats
+      ORDER BY time DESC
+      LIMIT ?
+    )
+  `).run(statRecordLimit);
+}
+
+async function migrateLegacyStorage(database) {
+  const taskCount = database.prepare("SELECT COUNT(*) FROM tasks").pluck().get();
+  if (taskCount === 0) {
+    const legacyTasks = limitTasks(await readJson(tasksFile, []));
+    const insertTasks = database.transaction((tasks) => {
+      for (const task of tasks) writeTaskRow(database, task);
+    });
+    insertTasks(legacyTasks);
+    setStorageMeta(database, "tasks_migrated_at", new Date().toISOString());
+  }
+
+  const statCount = database.prepare("SELECT COUNT(*) FROM task_stats").pluck().get();
+  if (statCount === 0) {
+    const legacyStats = normalizeStats(await readJson(statsFile, { version: 1, records: {} }));
+    const insertStats = database.transaction((records) => {
+      for (const record of records) writeTaskStatRow(database, record);
+    });
+    insertStats(Object.values(legacyStats.records || {}));
+    pruneTaskStatRows(database);
+    setStorageMeta(
+      database,
+      "stats_updated_at",
+      legacyStats.updatedAt || new Date().toISOString()
+    );
+    setStorageMeta(database, "stats_migrated_at", new Date().toISOString());
+  }
+}
+
+async function openStorageDatabase() {
+  await ensureDir();
+  const database = new Database(databaseFile);
   try {
-    const info = await stat(file);
-    return `${info.size}:${info.mtimeMs}`;
+    database.pragma("journal_mode = WAL");
+    database.pragma("synchronous = NORMAL");
+    database.pragma("busy_timeout = 5000");
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        source_task_id TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        created_time INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT '',
+        payload TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS tasks_source_task_id_idx
+        ON tasks(source_task_id);
+      CREATE INDEX IF NOT EXISTS tasks_created_time_idx
+        ON tasks(created_time DESC);
+      CREATE INDEX IF NOT EXISTS tasks_status_idx
+        ON tasks(status);
+
+      CREATE TABLE IF NOT EXISTS task_stats (
+        task_id TEXT PRIMARY KEY,
+        time INTEGER NOT NULL,
+        payload TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS task_stats_time_idx
+        ON task_stats(time DESC);
+
+      CREATE TABLE IF NOT EXISTS storage_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+    await migrateLegacyStorage(database);
+    return database;
   } catch (error) {
-    if (error.code === "ENOENT") return "missing";
+    database.close();
     throw error;
   }
+}
+
+async function getStorageDatabase() {
+  if (storageDatabase) return storageDatabase;
+  if (!storageDatabasePromise) {
+    storageDatabasePromise = openStorageDatabase()
+      .then((database) => {
+        storageDatabase = database;
+        return database;
+      })
+      .finally(() => {
+        storageDatabasePromise = null;
+      });
+  }
+  return storageDatabasePromise;
+}
+
+export async function closeStorage() {
+  await Promise.all([
+    configWriteQueue.catch(() => {}),
+    tasksWriteQueue.catch(() => {}),
+    statsWriteQueue.catch(() => {}),
+    runtimeStatsWriteQueue.catch(() => {})
+  ]);
+
+  const database = storageDatabase || await storageDatabasePromise?.catch(() => null);
+  if (database?.open) {
+    database.pragma("wal_checkpoint(TRUNCATE)");
+    database.close();
+  }
+  storageDatabase = null;
+  storageDatabasePromise = null;
+  tasksLoadPromise = null;
+  statsSnapshot = null;
+  intradayStatsCache.clear();
+  tasksSnapshot = {
+    ready: false,
+    tasks: [],
+    queryCache: new Map(),
+    searchTextCache: new WeakMap()
+  };
 }
 
 function normalizeChatModelKey(value) {
@@ -720,10 +901,9 @@ function limitTasks(tasks) {
     .slice(0, taskHistoryLimit);
 }
 
-function setTasksSnapshot(tasks, stamp = "") {
+function setTasksSnapshot(tasks) {
   tasksSnapshot = {
     ready: true,
-    stamp,
     tasks,
     queryCache: new Map(),
     searchTextCache: new WeakMap()
@@ -731,19 +911,29 @@ function setTasksSnapshot(tasks, stamp = "") {
   return tasks;
 }
 
-async function loadTasksFromDisk() {
-  const tasks = await readJson(tasksFile, []);
+async function loadTasksFromDatabase() {
+  const database = await getStorageDatabase();
+  const tasks = database.prepare(`
+    SELECT payload
+    FROM tasks
+    ORDER BY created_time DESC
+  `).all().map((row) => JSON.parse(row.payload));
   const limited = limitTasks(tasks);
-  if (limited.length !== tasks.length) await writeJson(tasksFile, limited);
-  return setTasksSnapshot(limited, await fileStamp(tasksFile));
+  if (limited.length !== tasks.length) {
+    const retainedIds = new Set(limited.map((task) => String(task.id || "")));
+    removeTaskRows(
+      database,
+      tasks.filter((task) => !retainedIds.has(String(task.id || "")))
+    );
+  }
+  return setTasksSnapshot(limited);
 }
 
 async function loadTasks({ waitForWrites = true } = {}) {
   if (waitForWrites) await tasksWriteQueue.catch(() => {});
-  const currentStamp = tasksSnapshot.ready ? await fileStamp(tasksFile) : "";
-  if (tasksSnapshot.ready && currentStamp === tasksSnapshot.stamp) return tasksSnapshot.tasks;
+  if (tasksSnapshot.ready) return tasksSnapshot.tasks;
   if (!tasksLoadPromise) {
-    tasksLoadPromise = loadTasksFromDisk().finally(() => {
+    tasksLoadPromise = loadTasksFromDatabase().finally(() => {
       tasksLoadPromise = null;
     });
   }
@@ -882,14 +1072,26 @@ export async function upsertTask(task) {
       updatedAt: new Date().toISOString()
     };
     if (index >= 0 && shouldKeepStoredTask(tasks[index], next)) return tasks[index];
-    const stored = index >= 0
+    const storedCandidate = index >= 0
       ? { ...tasks[index], ...next, id: tasks[index].id || next.id }
       : { ...next, createdAt: task.createdAt || new Date().toISOString() };
+    const stored = {
+      ...storedCandidate,
+      id: storageTaskId(storedCandidate)
+    };
     if (index >= 0) tasks[index] = stored;
     else tasks.push(stored);
     const limited = limitTasks(tasks);
-    await writeJson(tasksFile, limited);
-    setTasksSnapshot(limited, await fileStamp(tasksFile));
+    const database = await getStorageDatabase();
+    writeTaskRow(database, stored);
+    if (limited.length !== tasks.length) {
+      const retainedIds = new Set(limited.map((item) => String(item.id || "")));
+      removeTaskRows(
+        database,
+        tasks.filter((item) => !retainedIds.has(String(item.id || "")))
+      );
+    }
+    setTasksSnapshot(limited);
     return stored;
   });
   tasksWriteQueue = write.catch(() => {});
@@ -1297,19 +1499,36 @@ async function withStatsLock(work) {
 }
 
 async function loadStats() {
-  return normalizeStats(await readJson(statsFile, { version: 1, records: {} }));
+  if (statsSnapshot) return statsSnapshot;
+  const database = await getStorageDatabase();
+  const records = database.prepare(`
+    SELECT payload
+    FROM task_stats
+    ORDER BY time DESC
+  `).all().map((row) => JSON.parse(row.payload));
+  statsSnapshot = normalizeStats({
+    updatedAt: getStorageMeta(database, "stats_updated_at") || null,
+    records: Object.fromEntries(records.map((record) => [record.taskId, record]))
+  });
+  return statsSnapshot;
 }
 
 async function seedStatsFromTasks(stats) {
   if (Object.keys(stats.records || {}).length) return stats;
   const tasks = await loadTasks();
+  const records = [];
   for (const task of tasks) {
     const record = taskStatRecord(task);
-    if (record) stats.records[record.taskId] = record;
+    if (record) records.push(record);
   }
-  const next = pruneStats(stats);
-  await writeJson(statsFile, next);
-  return next;
+  const database = await getStorageDatabase();
+  database.transaction((items) => {
+    for (const record of items) writeTaskStatRow(database, record);
+    pruneTaskStatRows(database);
+    setStorageMeta(database, "stats_updated_at", new Date().toISOString());
+  })(records);
+  statsSnapshot = null;
+  return loadStats();
 }
 
 async function loadTaskStatsSnapshot() {
@@ -1322,10 +1541,13 @@ export async function recordTaskStat(task) {
   const record = taskStatRecord(task);
   if (!record) return null;
   return withStatsLock(async () => {
-    const stats = await loadStats();
-    stats.records[record.taskId] = record;
-    const next = pruneStats(stats);
-    await writeJson(statsFile, next);
+    const database = await getStorageDatabase();
+    database.transaction(() => {
+      writeTaskStatRow(database, record);
+      pruneTaskStatRows(database);
+      setStorageMeta(database, "stats_updated_at", new Date().toISOString());
+    })();
+    statsSnapshot = null;
     statsRevision += 1;
     intradayStatsCache.clear();
     return record;

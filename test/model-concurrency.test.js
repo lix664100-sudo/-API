@@ -7,11 +7,12 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-model-concurrency-"));
 process.env.DATA_DIR = dataDir;
 
-const { loadConfig, saveConfig } = await import("../src/storage.js");
+const { closeStorage, loadConfig, saveConfig } = await import("../src/storage.js");
 const { getRuntimeStatus, reserveImageTaskAdmission } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 
 after(async () => {
+  await closeStorage();
   await rm(dataDir, { recursive: true, force: true });
 });
 

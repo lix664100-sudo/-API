@@ -7,12 +7,13 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-account-recovery-"));
 process.env.DATA_DIR = dataDir;
 
-const { loadConfig, saveConfig } = await import("../src/storage.js");
+const { closeStorage, loadConfig, saveConfig } = await import("../src/storage.js");
 const { checkAccount, clearAccountCooldown, createChatCompletion, createImageTask, createTextTask, getRuntimeStatus, recoverUnavailableChatAccounts } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient, drawingSevereFailureReason, normalizeDrawingTask } = await import("../src/channels/drawing.js");
 
 after(async () => {
+  await closeStorage();
   await rm(dataDir, { recursive: true, force: true });
 });
 
