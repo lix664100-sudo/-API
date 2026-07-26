@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { after, test } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
@@ -8,7 +9,12 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-image-admission-")
 process.env.DATA_DIR = dataDir;
 
 const { loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
-const { assertImageTaskAdmission, reserveImageTaskAdmission } = await import("../src/channel-manager.js");
+const {
+  assertImageTaskAdmission,
+  attachImageAdmissionToRequest,
+  getRuntimeStatus,
+  reserveImageTaskAdmission
+} = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
@@ -165,6 +171,77 @@ test("image admission reservation blocks another request before task creation", 
       result.value.release();
     }
   }
+});
+
+test("aborted image upload releases its reserved slot before task creation", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "drawing",
+    concurrency: { chat: 3, drawingImage: 1, chatImage: 1 },
+    channels: [{
+      id: "aborted-upload",
+      type: "shareai",
+      name: "Aborted upload",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        defaultModelId: 1
+      }
+    }],
+    accounts: [{
+      id: "aborted-upload-account",
+      channelId: "aborted-upload",
+      name: "Aborted upload account",
+      username: "aborted-upload@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok" },
+          chatplus: { status: "ok" }
+        }
+      }
+    }]
+  });
+
+  const request = new EventEmitter();
+  request.complete = false;
+  request.aborted = false;
+  request.destroyed = false;
+  const reserved = attachImageAdmissionToRequest(
+    await reserveImageTaskAdmission({ channel: "drawing", prompt: "aborted upload" }),
+    { raw: request }
+  );
+
+  assert.equal((await getRuntimeStatus()).categories.image.running, 1);
+  request.aborted = true;
+  request.emit("aborted");
+  assert.equal((await getRuntimeStatus()).categories.image.running, 0);
+
+  reserved.release();
+  assert.equal((await getRuntimeStatus()).categories.image.running, 0);
+});
+
+test("completed upload hands its reserved slot to the task until task completion", async () => {
+  const request = new EventEmitter();
+  request.complete = true;
+  request.aborted = false;
+  request.destroyed = false;
+  const reserved = attachImageAdmissionToRequest(
+    await reserveImageTaskAdmission({ channel: "drawing", prompt: "completed upload" }),
+    { raw: request }
+  );
+
+  reserved.handoff();
+  request.aborted = true;
+  request.emit("aborted");
+  assert.equal((await getRuntimeStatus()).categories.image.running, 1);
+
+  reserved.release();
+  assert.equal((await getRuntimeStatus()).categories.image.running, 0);
 });
 
 test("image admission skips known empty drawing quota before upload", async () => {

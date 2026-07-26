@@ -30,6 +30,7 @@ function modelConfig(baseConfig) {
         defaultChatModel: "gpt",
         chatModels: [
           { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-test", enabled: true, default: true },
+          { key: "grok", name: "Grok", carType: "grok", model: "", enabled: true, default: false },
           { key: "gemini", name: "Gemini", carType: "gemini", model: "", enabled: true, default: false }
         ]
       }
@@ -151,6 +152,28 @@ test("GPT and Gemini use separate image concurrency slots", async () => {
   }
 });
 
+test("Grok uses its own image concurrency slot", async () => {
+  const config = await loadConfig();
+  await saveConfig(modelConfig(config));
+
+  const gpt = await reserveImageTaskAdmission({ model: "gpt", prompt: "gpt" });
+  const grok = await reserveImageTaskAdmission({ model: "grok", prompt: "grok" });
+  try {
+    const runtime = await getRuntimeStatus();
+    assert.equal(runtime.models.gpt.categories.image.running, 1);
+    assert.equal(runtime.models.grok.categories.image.running, 1);
+    assert.equal(runtime.models.grok.categories.image.configured, 1);
+
+    await assert.rejects(
+      reserveImageTaskAdmission({ model: "grok", prompt: "second grok" }),
+      (error) => error.status === 429 && error.code === "CONCURRENCY_LIMIT"
+    );
+  } finally {
+    gpt.release();
+    grok.release();
+  }
+});
+
 test("drawing image usage reduces the available image concurrency for both GPT and Gemini", async () => {
   const config = await loadConfig();
   const next = modelConfig(config);
@@ -176,8 +199,8 @@ test("drawing image usage reduces the available image concurrency for both GPT a
     assert.equal(runtime.models.gemini.categories.image.running, 0);
     assert.equal(runtime.models.gpt.categories.image.idle, 2);
     assert.equal(runtime.models.gemini.categories.image.idle, 2);
-    assert.equal(runtime.models.grok.categories.image.configured, 0);
-    assert.equal(runtime.models.grok.categories.image.idle, 0);
+    assert.equal(runtime.models.grok.categories.image.configured, 1);
+    assert.equal(runtime.models.grok.categories.image.idle, 1);
   } finally {
     gpt.release();
   }

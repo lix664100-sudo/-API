@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { normalizeProxyUrl } from "../proxy.js";
 
@@ -14,6 +14,22 @@ const GEMINI_UPLOAD_PREFLIGHT_RPC_ID = "ESY5D";
 const GEMINI_UPLOAD_START_PATH = "/gemini/push/upload/";
 const GEMINI_DEFAULT_BUILD_LABEL = "boq_assistant-bard-web-server_20260525.09_p0";
 const GEMINI_DEFAULT_PUSH_ID = "feeds/mcudyrk2a4khkz";
+const GROK_DIRECT_UPLOAD_PATHS = [
+  "/grok/http/upload-file-v2/direct",
+  "/http/upload-file-v2/direct"
+];
+const GROK_LEGACY_UPLOAD_PATH = "/rest/app-chat/upload-file";
+const GROK_IMAGE_EDIT_MODEL = "imagine-image-edit";
+const GROK_IMAGE_UPLOAD_SOURCE = "IMAGINE_SELF_UPLOAD_FILE_SOURCE";
+const GROK_MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const GROK_STATSIG_EPOCH = 1682924400;
+const GROK_STATSIG_SALT = "obfiowerehiring";
+const GROK_STATSIG_MARK = 0x03;
+const GROK_STATSIG_SEED = Buffer.from(
+  "t2ODAFY4ozXd0K2Y8MdI2XfxTDiJoakZPuoaKfcQn8VuasZMcKliyhA1pJ+o1oMf",
+  "base64"
+);
+const GROK_STATSIG_FINGERPRINT = "3bab9506b851eb851eb840e8f5c28f5c28f80e8f5c28f5c28f806b851eb851eb8400";
 const badCarUntil = new Map();
 
 function trimSlash(value) {
@@ -282,6 +298,199 @@ function parseJsonLines(text) {
     }
   }
   return events;
+}
+
+function requestedGrokImageCount(input = {}) {
+  const value = Number(input.image_count ?? input.imageCount ?? input.n ?? 1);
+  if (!Number.isFinite(value)) return 1;
+  return Math.min(3, Math.max(1, Math.round(value)));
+}
+
+function grokAspectRatio(input = {}) {
+  const value = String(input.ratio_label || input.ratio || input.aspect_ratio || input.aspectRatio || input.size || "")
+    .trim()
+    .toLowerCase();
+  const mapped = {
+    "1024x1024": "1:1",
+    "1024x1536": "2:3",
+    "1536x1024": "3:2",
+    "720x1280": "9:16",
+    "1280x720": "16:9",
+    "1024x1792": "2:3",
+    "1792x1024": "3:2"
+  }[value] || value;
+  return /^(?:1:1|2:3|3:2|3:4|4:3|9:16|16:9|1:2|2:1)$/.test(mapped) ? mapped : "";
+}
+
+function safeMultipartFilename(value, fallback = "image.png") {
+  const filename = String(value || fallback).replace(/[\r\n"]/g, "_").trim();
+  return filename || fallback;
+}
+
+function grokMultipartBody(file, buffer) {
+  const boundary = `----ShareAIGrok${randomUUID().replaceAll("-", "")}`;
+  const filename = safeMultipartFilename(file.filename);
+  const mimetype = String(file.mimetype || "image/png").toLowerCase();
+  const body = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\n`
+      + `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n`
+      + `Content-Type: ${mimetype}\r\n\r\n`
+    ),
+    buffer,
+    Buffer.from(
+      `\r\n--${boundary}\r\n`
+      + `Content-Disposition: form-data; name="file_source"\r\n\r\n`
+      + `${GROK_IMAGE_UPLOAD_SOURCE}\r\n`
+      + `--${boundary}--\r\n`
+    )
+  ]);
+  return {
+    body,
+    contentType: `multipart/form-data; boundary=${boundary}`
+  };
+}
+
+function grokUploadedFile(body) {
+  let payload = null;
+  try {
+    payload = JSON.parse(String(body || ""));
+  } catch {
+    payload = null;
+  }
+  const metadata = payload?.fileMetadata || payload?.data?.fileMetadata || payload || {};
+  const id = String(metadata.fileMetadataId || metadata.fileId || metadata.id || "").trim();
+  const uri = String(metadata.fileUri || metadata.uri || metadata.url || "").trim();
+  if (!id) {
+    const error = new Error("Grok 图片上传成功，但没有返回图片编号。");
+    error.status = 502;
+    error.code = "INVALID_UPSTREAM_RESPONSE";
+    throw error;
+  }
+  return { id, uri };
+}
+
+export function generateGrokStatsigId(method, path, options = {}) {
+  const nowUnix = Math.floor(Number(options.nowUnix ?? Date.now() / 1000));
+  const number = (nowUnix - GROK_STATSIG_EPOCH) >>> 0;
+  const requestMethod = String(method || "GET").toUpperCase();
+  const requestPath = String(path || "/");
+  const digest = createHash("sha256")
+    .update(`${requestMethod}!${requestPath}!${number}${GROK_STATSIG_SALT}${GROK_STATSIG_FINGERPRINT}`)
+    .digest();
+  const key = Number.isInteger(options.randomKey)
+    ? options.randomKey & 0xff
+    : randomBytes(1)[0];
+  const output = Buffer.alloc(70);
+
+  output[0] = key;
+  for (let index = 0; index < GROK_STATSIG_SEED.length; index += 1) {
+    output[index + 1] = GROK_STATSIG_SEED[index] ^ key;
+  }
+  output.writeUInt32LE(number, 49);
+  for (let index = 49; index < 53; index += 1) output[index] ^= key;
+  for (let index = 0; index < 16; index += 1) output[index + 53] = digest[index] ^ key;
+  output[69] = GROK_STATSIG_MARK ^ key;
+
+  return output.toString("base64").replace(/=+$/, "");
+}
+
+function absoluteGrokImageUrl(value, baseUrl) {
+  const source = String(value || "").trim();
+  if (!source) return "";
+  if (/^https:\/\//i.test(source)) return source;
+  if (/^\/?users\//i.test(source)) return `https://assets.grok.com/${source.replace(/^\/+/, "")}`;
+  if (source.startsWith("/")) return `${trimSlash(baseUrl)}${source}`;
+  return "";
+}
+
+function isFinalGrokImageUrl(value) {
+  const source = String(value || "").trim();
+  if (!source || /-part-/i.test(source)) return false;
+  try {
+    const url = new URL(source);
+    return ["assets.grok.com", "imagine-public.x.ai", "imgen.x.ai"].includes(url.hostname.toLowerCase())
+      || /\/generated\//i.test(url.pathname)
+      || /\/image_generation_content\//i.test(url.pathname);
+  } catch {
+    return /^\/?users\/.+\/generated\//i.test(source);
+  }
+}
+
+function collectGrokImageUrls(value, baseUrl, output = [], seen = new Set()) {
+  if (!value) return output;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if ((text.startsWith("{") || text.startsWith("[")) && !seen.has(text)) {
+      try {
+        seen.add(text);
+        collectGrokImageUrls(JSON.parse(text), baseUrl, output, seen);
+      } catch {
+        // Some Grok response fields contain ordinary text rather than encoded JSON.
+      }
+    }
+    for (const match of text.matchAll(/!\[[^\]]*]\((https:\/\/[^)\s]+)\)/gi)) {
+      const url = absoluteGrokImageUrl(match[1], baseUrl);
+      if (isFinalGrokImageUrl(url) && !output.includes(url)) output.push(url);
+    }
+    return output;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectGrokImageUrls(item, baseUrl, output, seen));
+    return output;
+  }
+  if (typeof value !== "object" || seen.has(value)) return output;
+  seen.add(value);
+
+  const progress = Number(value.progress ?? value.percentage_complete ?? value.percentageComplete);
+  const moderated = value.moderated === true;
+  const final = value.isFinal === true
+    || value.completed === true
+    || String(value.current_status || value.status || "").toLowerCase() === "completed"
+    || (Number.isFinite(progress) && progress >= 100);
+  const directUrl = value.imageUrl || value.image_url || value.generatedImageUrl || "";
+  if (!moderated && final && directUrl) {
+    const url = absoluteGrokImageUrl(directUrl, baseUrl);
+    if (isFinalGrokImageUrl(url) && !output.includes(url)) output.push(url);
+  }
+
+  const generatedUrls = value.generatedImageUrls || value.generated_image_urls;
+  if (!moderated && Array.isArray(generatedUrls)) {
+    for (const item of generatedUrls) {
+      const url = absoluteGrokImageUrl(item, baseUrl);
+      if (isFinalGrokImageUrl(url) && !output.includes(url)) output.push(url);
+    }
+  }
+
+  Object.values(value).forEach((item) => collectGrokImageUrls(item, baseUrl, output, seen));
+  return output;
+}
+
+function extractGrokImageUrls(events, baseUrl) {
+  return collectGrokImageUrls(events, baseUrl);
+}
+
+function grokUpstreamError(events) {
+  const values = [];
+  const collect = (value, key = "") => {
+    if (!value) return;
+    if (typeof value === "string") {
+      if (/(?:error|failed|failure|moderated|quota|limit|unavailable|not allowed|无法|失败|额度|上限|限制)/i.test(value)
+        || /error|failure|rejection|streamError/i.test(key)) {
+        values.push(value.trim());
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => collect(item, key));
+      return;
+    }
+    if (typeof value === "object") {
+      Object.entries(value).forEach(([nestedKey, item]) => collect(item, nestedKey));
+    }
+  };
+  collect(events);
+  return values.filter(Boolean).sort((left, right) => right.length - left.length)[0] || "";
 }
 
 function parseGeminiJsonLines(text) {
@@ -1977,41 +2186,184 @@ export class ChatplusClient {
     };
   }
 
+  async grokStatsigId(method, path) {
+    return generateGrokStatsigId(method, path);
+  }
+
+  async uploadGrokImage(file) {
+    const buffer = await file.toBuffer();
+    const mimetype = String(file.mimetype || "image/png").toLowerCase();
+    if (!["image/png", "image/jpeg", "image/jpg", "image/webp"].includes(mimetype)) {
+      const error = new Error("Grok 参考图只支持 PNG、JPG 或 WebP。");
+      error.status = 400;
+      error.noRetry = true;
+      throw error;
+    }
+    if (!buffer.length || buffer.length > GROK_MAX_IMAGE_BYTES) {
+      const error = new Error("Grok 参考图不能为空，且单张不能超过 25 MB。");
+      error.status = 400;
+      error.noRetry = true;
+      throw error;
+    }
+
+    const filename = fileNameFromMime(mimetype, file.filename || `grok-image-${randomUUID()}`);
+    const uploadFile = { filename, mimetype };
+    const multipart = grokMultipartBody(uploadFile, buffer);
+    for (const path of GROK_DIRECT_UPLOAD_PATHS) {
+      const response = await this.http(path, {
+        method: "POST",
+        body: multipart.body,
+        rawBody: true,
+        timeoutSec: 60,
+        headers: {
+          "content-type": multipart.contentType,
+          accept: "application/json, text/plain, */*",
+          referer: `${this.baseUrl}/imagine`
+        }
+      });
+      if (response.status >= 200 && response.status < 300) return grokUploadedFile(response.body);
+      if (![404, 405, 410, 501].includes(response.status)) {
+        const error = new Error(`Grok 参考图上传失败：${response.status}`);
+        error.status = response.status || 502;
+        error.noRetry = response.status >= 400 && response.status < 500;
+        throw error;
+      }
+    }
+
+    const legacy = await this.http(GROK_LEGACY_UPLOAD_PATH, {
+      method: "POST",
+      timeoutSec: 60,
+      body: {
+        fileName: filename,
+        fileMimeType: mimetype,
+        content: buffer.toString("base64"),
+        fileSource: GROK_IMAGE_UPLOAD_SOURCE
+      },
+      headers: {
+        accept: "application/json, text/plain, */*",
+        referer: `${this.baseUrl}/imagine`
+      }
+    });
+    if (legacy.status < 200 || legacy.status >= 300) {
+      const error = new Error(`Grok 参考图上传失败：${legacy.status}`);
+      error.status = legacy.status || 502;
+      error.noRetry = legacy.status >= 400 && legacy.status < 500;
+      throw error;
+    }
+    return grokUploadedFile(legacy.body);
+  }
+
+  async uploadGrokImages(files = []) {
+    const uploads = [];
+    for (const file of files) uploads.push(await this.uploadGrokImage(file));
+    return uploads;
+  }
+
+  grokImageEditBody(prompt, input, uploads) {
+    const imageToImage = {
+      prompt,
+      inputAssets: uploads.map((upload) => upload.id),
+      numOfImages: requestedGrokImageCount(input)
+    };
+    const aspectRatio = grokAspectRatio(input);
+    if (aspectRatio) imageToImage.aspectRatio = aspectRatio;
+    return {
+      temporary: true,
+      modelName: GROK_IMAGE_EDIT_MODEL,
+      message: prompt,
+      mediaGenInput: { imageToImage },
+      responseMetadata: {
+        modelConfigOverride: {
+          modelMap: {
+            imageEditModel: "imagine"
+          }
+        }
+      },
+      enableImageGeneration: true,
+      returnImageBytes: false,
+      returnRawGrokInXaiRequest: false,
+      enableImageStreaming: true,
+      imageGenerationCount: requestedGrokImageCount(input),
+      forceConcise: false,
+      enableSideBySide: false,
+      sendFinalMetadata: true,
+      isReasoning: false,
+      disableTextFollowUps: true,
+      disableMemory: true,
+      forceSideBySide: false
+    };
+  }
+
   async sendGrokConversation(prompt, input, route, selected) {
-    if ((input.files || []).length) {
-      const error = new Error("Grok 后台直连接口暂时不能稳定接收图片；带图对话请先使用 GPT 通道。");
+    const files = input.files || [];
+    const imageGeneration = input.imageGeneration === true;
+    if (files.length && !imageGeneration) {
+      const error = new Error("Grok 普通对话暂不支持上传图片。");
       error.status = 400;
       error.noRetry = true;
       throw error;
     }
 
     const messageId = randomUUID();
-    const upstreamModel = route.model || "grok-4";
-    const response = await this.http("/rest/app-chat/conversations/new", {
-      method: "POST",
-      body: {
-        message: prompt,
-        modelName: upstreamModel,
-        parentResponseId: null,
-        disableSearch: false,
-        enableImageGeneration: false,
-        imageAttachments: [],
-        fileAttachments: [],
-        enableImageStreaming: true,
-        imageGenerationCount: 1,
-        forceConcise: false,
-        enableSideBySide: true,
-        sendFinalMetadata: true,
-        isReasoning: route.strategy === "thinking",
-        disableMemory: true
-      },
-      headers: {
-        origin: this.baseUrl,
-        referer: `${this.baseUrl}/`,
-        accept: "application/json, text/plain, */*"
+    const uploads = imageGeneration && files.length ? await this.uploadGrokImages(files) : [];
+    const upstreamModel = uploads.length ? GROK_IMAGE_EDIT_MODEL : route.model || "grok-4";
+    const imageCount = requestedGrokImageCount(input);
+    const body = uploads.length
+      ? this.grokImageEditBody(prompt, input, uploads)
+      : {
+          message: imageGeneration ? `Drawing: ${prompt}` : prompt,
+          modelName: upstreamModel,
+          parentResponseId: null,
+          temporary: imageGeneration,
+          disableSearch: false,
+          enableImageGeneration: imageGeneration,
+          imageAttachments: [],
+          fileAttachments: [],
+          returnImageBytes: false,
+          returnRawGrokInXaiRequest: false,
+          enableImageStreaming: imageGeneration,
+          imageGenerationCount: imageGeneration ? imageCount : 1,
+          forceConcise: false,
+          enableSideBySide: imageGeneration,
+          sendFinalMetadata: true,
+          isReasoning: imageGeneration ? false : route.strategy === "thinking",
+          disableTextFollowUps: imageGeneration,
+          disableMemory: true
+    };
+    const conversationPath = "/rest/app-chat/conversations/new";
+    let statsigId = imageGeneration ? await this.grokStatsigId("POST", conversationPath) : "";
+    let response = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      response = await this.http(conversationPath, {
+        method: "POST",
+        body,
+        headers: {
+          origin: this.baseUrl,
+          referer: imageGeneration ? `${this.baseUrl}/imagine` : `${this.baseUrl}/`,
+          accept: "application/json, text/plain, */*",
+          "cache-control": "no-cache",
+          pragma: "no-cache",
+          priority: "u=1, i",
+          "sec-fetch-dest": "empty",
+          "sec-fetch-mode": "cors",
+          "sec-fetch-site": "same-origin",
+          "x-xai-request-id": randomUUID(),
+          ...(statsigId ? { "x-statsig-id": statsigId } : {})
+        }
+      });
+      if (response.status !== 403
+        || !imageGeneration
+        || isChatUsageLimitMessage(response.body)
+        || isImageGenerationLimitMessage(response.body)
+        || attempt > 0) {
+        break;
       }
-    });
+      statsigId = await this.grokStatsigId("POST", conversationPath, true);
+    }
 
+    if (imageGeneration && isImageGenerationLimitMessage(response.body)) {
+      throw imageQuotaError("当前 Grok 账号的图片生成额度已用完。");
+    }
     if (isChatUsageLimitMessage(response.body)) {
       throw chatUsageLimitError("当前 Grok 账号的使用次数已用完。");
     }
@@ -2029,8 +2381,22 @@ export class ChatplusClient {
 
     const events = parseJsonLines(response.body);
     const directContent = extractGrokAssistantText(events);
+    const imageUrls = imageGeneration
+      ? extractGrokImageUrls(events, this.baseUrl).slice(0, imageCount)
+      : [];
+    const upstreamError = grokUpstreamError(events);
+    if (imageGeneration && isImageGenerationLimitMessage(upstreamError)) {
+      throw imageQuotaError("当前 Grok 账号的图片生成额度已用完。");
+    }
     if (isChatUsageLimitMessage(directContent)) {
       throw chatUsageLimitError("当前 Grok 账号的使用次数已用完。");
+    }
+    if (imageGeneration && !imageUrls.length) {
+      const error = new Error(upstreamError || directContent || "Grok 没有返回可用的图片。");
+      error.status = isTerminalImageFailureMessage(error.message) ? 400 : 502;
+      error.code = "INVALID_UPSTREAM_RESPONSE";
+      error.noRetry = error.status === 400;
+      throw error;
     }
     return {
       events,
@@ -2040,7 +2406,8 @@ export class ChatplusClient {
       upstreamModel,
       route,
       selected,
-      directContent
+      directContent,
+      imageUrls
     };
   }
 
@@ -2280,10 +2647,15 @@ export class ChatplusClient {
     return this.runTaskWork(input, async () => {
       const prompt = String(input.prompt || "").trim();
       if (!prompt) throw new Error("请输入生图描述。");
-      const result = await this.withImageQuotaFallback(prompt, { ...input, preferImageCar: true, requireConversationId: true }, async (conversation) => {
+      const result = await this.withImageQuotaFallback(prompt, {
+        ...input,
+        imageGeneration: true,
+        preferImageCar: true,
+        requireConversationId: true
+      }, async (conversation) => {
         throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
-        if (conversation.route?.key === "gemini") {
+        if (["gemini", "grok"].includes(conversation.route?.key)) {
           return { ...conversation, imageUrls: conversation.imageUrls || [] };
         }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
@@ -2314,10 +2686,16 @@ export class ChatplusClient {
       if (!prompt) throw new Error("Please enter an image edit prompt.");
       if (!files.length) throw new Error("Please upload a source image.");
 
-      const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: true, requireConversationId: true }, async (conversation) => {
+      const result = await this.withImageQuotaFallback(prompt, {
+        ...input,
+        files,
+        imageGeneration: true,
+        preferImageCar: true,
+        requireConversationId: true
+      }, async (conversation) => {
         throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
-        if (conversation.route?.key === "gemini") {
+        if (["gemini", "grok"].includes(conversation.route?.key)) {
           return { ...conversation, imageUrls: conversation.imageUrls || [] };
         }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };

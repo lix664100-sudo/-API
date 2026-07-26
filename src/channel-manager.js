@@ -213,7 +213,6 @@ function targetSupportsChatModel(target, modelKey) {
 
 function targetSupportsRuntimeModel(target, taskType, modelKey) {
   if (taskType === "chat") return targetSupportsChatModel(target, modelKey);
-  if (modelRequestKey(modelKey) === "grok") return false;
   if (target?.channel?.type === "drawing") return ["gpt", "gemini"].includes(modelRequestKey(modelKey));
   return targetSupportsChatModel(target, modelKey);
 }
@@ -408,7 +407,7 @@ function targetChatModelKey(target = {}, input = {}) {
 
 function targetImageModelKey(target = {}, input = {}) {
   const requestedKey = requestedImageModelKey(input, target?.channel?.settings || {});
-  if (["gpt", "gemini"].includes(requestedKey)) return requestedKey;
+  if (["gpt", "grok", "gemini"].includes(requestedKey)) return requestedKey;
   return target?.channel?.type === "chatplus"
     ? targetChatModelKey(target, input)
     : drawingModelFamily(target?.channel?.settings?.defaultModelId) || "gpt";
@@ -1475,15 +1474,6 @@ function requestedImageModelKey(input = {}, settings = {}) {
   ) || "gpt";
 }
 
-function assertImageGenerationModelSupported(input = {}) {
-  const lock = requestedModelLock(input);
-  if (lock.type !== "chat" || lock.key !== "grok") return;
-  const error = new Error("Grok 暂不支持图片生成，请改用 GPT 或 Gemini。");
-  error.status = 400;
-  error.code = "GROK_IMAGE_GENERATION_UNSUPPORTED";
-  throw error;
-}
-
 function requestedChannelForInput(config, input = {}) {
   const requestedChannel = String(input.channel || "").trim();
   if (requestedChannel) return requestedChannel;
@@ -1852,7 +1842,6 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
 }
 
 export async function reserveImageTaskAdmission(input = {}) {
-  assertImageGenerationModelSupported(input);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
@@ -1875,6 +1864,49 @@ export async function reserveImageTaskAdmission(input = {}) {
   return {
     ...reserved,
     modelKey: targetImageModelKey(reserved.target, input)
+  };
+}
+
+export function attachImageAdmissionToRequest(admission, request) {
+  const raw = request?.raw || request;
+  if (!admission?.release || typeof raw?.once !== "function") return admission;
+
+  let handedOff = false;
+  let listening = true;
+  const releaseReservedSlot = admission.release;
+  const detach = () => {
+    if (!listening) return;
+    listening = false;
+    raw.removeListener?.("aborted", releaseBeforeHandoff);
+    raw.removeListener?.("error", releaseBeforeHandoff);
+    raw.removeListener?.("close", releaseIfUploadIncomplete);
+  };
+  const release = () => {
+    detach();
+    releaseReservedSlot();
+  };
+  const releaseBeforeHandoff = () => {
+    if (!handedOff) release();
+  };
+  const releaseIfUploadIncomplete = () => {
+    if (raw.complete !== true) releaseBeforeHandoff();
+  };
+
+  raw.once("aborted", releaseBeforeHandoff);
+  raw.once("error", releaseBeforeHandoff);
+  raw.once("close", releaseIfUploadIncomplete);
+
+  if (raw.aborted === true || (raw.destroyed === true && raw.complete !== true)) {
+    releaseBeforeHandoff();
+  }
+
+  return {
+    ...admission,
+    release,
+    handoff() {
+      handedOff = true;
+      detach();
+    }
   };
 }
 
@@ -2113,6 +2145,7 @@ function consumeAdmissionReservation(admission, targets, input = {}) {
   return {
     target,
     release: admission.release,
+    handoff: admission.handoff,
     attempts: Array.isArray(admission.attempts) ? admission.attempts : []
   };
 }
@@ -2724,7 +2757,6 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
     error.status = 400;
     throw error;
   }
-  assertImageGenerationModelSupported(input);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true, input });
@@ -2756,7 +2788,6 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   }
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files, 3);
-  assertImageGenerationModelSupported(input);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
@@ -2774,6 +2805,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
     || await reserveFirstAvailableTarget(targets, "img2img", { input });
   const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img", requestMeta });
   try {
+    reserved.handoff?.();
     await upsertTask(task);
   } catch (error) {
     reserved.release();
@@ -3190,7 +3222,6 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
     error.status = 400;
     throw error;
   }
-  assertImageGenerationModelSupported(input);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true, input });
@@ -3262,7 +3293,6 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   }
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files, 3);
-  assertImageGenerationModelSupported(input);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
@@ -3285,6 +3315,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   if (wait) {
     const task = queuedTask({ input: { ...input, files }, target: reserved?.target || targets[0], taskType: "img2img", requestMeta });
     try {
+      reserved?.handoff?.();
       await upsertTask(task);
     } catch (error) {
       reserved?.release();

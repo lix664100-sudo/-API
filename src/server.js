@@ -9,6 +9,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
+  attachImageAdmissionToRequest,
   checkAccount,
   checkAllAccounts,
   clearAccountCooldown,
@@ -65,6 +66,7 @@ const adminPassword = String(process.env.ADMIN_PASSWORD || "999999");
 const adminSessionSecret = String(process.env.ADMIN_SESSION_SECRET || process.env.SESSION_SECRET || "shareai-local-admin-secret");
 const adminSessionMs = Math.max(1, Number(process.env.ADMIN_SESSION_HOURS || 12)) * 60 * 60 * 1000;
 const updateTimeoutMs = Math.max(10, Number(process.env.ADMIN_UPDATE_TIMEOUT_SEC || 120)) * 1000;
+const imageUploadTimeoutMs = 5 * 60 * 1000;
 const updateOutputLimit = 8000;
 const resultImageCleanupIntervalMs = Math.max(5, Number(process.env.RESULT_IMAGE_CLEANUP_INTERVAL_MIN || 60)) * 60 * 1000;
 const publicAdminApiPaths = new Set([
@@ -77,7 +79,11 @@ const activeAdminSessions = new Map();
 let updateRunning = false;
 let refreshProcessingPromise = null;
 
-const app = Fastify({ logger: true, bodyLimit: 60 * 1024 * 1024 });
+const app = Fastify({
+  logger: true,
+  bodyLimit: 60 * 1024 * 1024,
+  requestTimeout: imageUploadTimeoutMs
+});
 
 await app.register(cors, { origin: true });
 await app.register(multipart, { limits: { fileSize: 25 * 1024 * 1024 } });
@@ -289,7 +295,8 @@ function imageAdmissionInput(request, requestMeta = {}) {
 }
 
 async function reserveImageRequestAdmission(request, requestMeta = {}) {
-  return reserveImageTaskAdmission(imageAdmissionInput(request, requestMeta));
+  const admission = await reserveImageTaskAdmission(imageAdmissionInput(request, requestMeta));
+  return attachImageAdmissionToRequest(admission, request);
 }
 
 async function requireApiKey(request, reply) {
