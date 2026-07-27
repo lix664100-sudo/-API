@@ -147,6 +147,49 @@ test("显式选择 Gemini 时不会被 model_id 改成 GPT", async () => {
   assert.equal(route.carType, "gemini");
 });
 
+test("Gemini 生图优先选择还有生图额度的车位", async () => {
+  const testClient = client();
+  testClient.fetchCars = async () => [
+    {
+      id: "idle-without-images",
+      status: 1,
+      count: 0,
+      cooldown: 0,
+      desc: "ok",
+      label: "ok",
+      imageRemaining: 0,
+      isPro: true,
+      isUltra: false,
+      isVirtual: false,
+      realCarIDs: []
+    },
+    {
+      id: "busy-with-images",
+      status: 1,
+      count: 2,
+      cooldown: 0,
+      desc: "ok",
+      label: "ok",
+      imageRemaining: 10,
+      isPro: true,
+      isUltra: false,
+      isVirtual: false,
+      realCarIDs: []
+    }
+  ];
+  testClient.enterCar = async () => {};
+
+  const result = await testClient.prepareChatSession({
+    model: "gemini",
+    preferImageCar: true
+  });
+
+  assert.equal(result.route.strategy, "thinking");
+  assert.equal(result.route.selectionStrategy, "image");
+  assert.equal(result.selected.carId, "busy-with-images");
+  assert.equal(result.selected.strategy, "image");
+});
+
 test("GPT 图片模型明确走 GPT 图片车位", async () => {
   const testClient = client();
 
@@ -263,28 +306,77 @@ test("Gemini 返回图片时直接算成功，不再走 GPT 详情接口", async
   assert.equal(waitCalled, false);
 });
 
-test("Gemini 生图只返回文字时直接失败并保留原文", async () => {
+test("Gemini 生图只返回文字时会自动换车并继续出图", async () => {
   const testClient = client();
-  testClient.geminiSession = {
-    at: "token-at",
-    sid: "123456",
-    bl: "boq_assistant-bard-web-server_test",
-    pushId: "feeds/test",
-    uploadClientPctx: "CgcSBWjK7pYx",
-    sourcePath: "/app"
+  const cars = ["text-only-car", "image-car"];
+  const selectedCars = [];
+  const submitted = [];
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    const carId = cars.find((item) => !ignoredCarIds.has(item));
+    assert.ok(carId);
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
   };
-  testClient.uploadGeminiImages = async () => [["uploaded-image", "source.png"]];
-  testClient.prepareChatSession = async () => ({
-    route: { key: "gemini", strategy: "thinking", model: "" },
-    selected: { carId: "car-test", carType: "gemini" },
-    init: {}
+  testClient.sendGeminiConversation = async (_prompt, _input, route, selected) => {
+    selectedCars.push(selected.carId);
+    const hasImage = selected.carId === "image-car";
+    return {
+      events: [],
+      conversationId: `conversation-${selected.carId}`,
+      model: "gemini",
+      upstreamModel: "gemini",
+      route,
+      selected,
+      directContent: hasImage ? "已完成" : "我只能提供修改建议，无法生成这张图片。",
+      imageUrls: hasImage ? ["https://example.test/generated-image.png"] : []
+    };
+  };
+
+  const result = await testClient.createImageTask({
+    prompt: "只返回图片",
+    model: "gemini",
+    files: [fakeImageFile()],
+    onSubmitted: async (value) => {
+      submitted.push(value);
+    }
   });
-  testClient.http = async () => ({
-    status: 200,
-    headers: {},
-    body: geminiResponse({ text: "我只能提供修改建议，无法生成这张图片。" })
-  });
-  let submitted = null;
+
+  assert.deepEqual(selectedCars, ["text-only-car", "image-car"]);
+  assert.equal(submitted.length, 2);
+  assert.equal(result.status, "success");
+  assert.deepEqual(result.imageUrls, ["https://example.test/generated-image.png"]);
+});
+
+test("Gemini 连续五个车位只返回文字时失败并保留最后回复", async () => {
+  const testClient = client();
+  const selectedCars = [];
+  const submitted = [];
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    const carId = `text-only-car-${ignoredCarIds.size + 1}`;
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.sendGeminiConversation = async (_prompt, _input, route, selected) => {
+    selectedCars.push(selected.carId);
+    return {
+      events: [],
+      conversationId: `conversation-${selected.carId}`,
+      model: "gemini",
+      upstreamModel: "gemini",
+      route,
+      selected,
+      directContent: "我只能提供修改建议，无法生成这张图片。",
+      imageUrls: []
+    };
+  };
 
   await assert.rejects(
     () => testClient.createImageTask({
@@ -292,19 +384,58 @@ test("Gemini 生图只返回文字时直接失败并保留原文", async () => {
       model: "gemini",
       files: [fakeImageFile()],
       onSubmitted: async (value) => {
-        submitted = value;
+        submitted.push(value);
       }
     }),
     (error) => {
       assert.equal(error.code, "upstream_text_response");
       assert.equal(error.upstreamExplicitFailure, true);
       assert.equal(error.upstreamText, "我只能提供修改建议，无法生成这张图片。");
+      assert.match(error.message, /已自动尝试 5 个 Gemini 生图车位/);
       return true;
     }
   );
 
-  assert.equal(submitted.status, "processing");
-  assert.equal(submitted.externalId, "conversation-test");
+  assert.equal(selectedCars.length, 5);
+  assert.equal(new Set(selectedCars).size, 5);
+  assert.equal(submitted.length, 5);
+});
+
+test("Gemini 明确触发内容安全限制时不会重复换车", async () => {
+  const testClient = client();
+  let attempts = 0;
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    attempts += 1;
+    const carId = `policy-car-${attempts}`;
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.sendGeminiConversation = async (_prompt, _input, route, selected) => ({
+    events: [],
+    conversationId: `conversation-${selected.carId}`,
+    model: "gemini",
+    upstreamModel: "gemini",
+    route,
+    selected,
+    directContent: "This request may violate our content policy for image generation.",
+    imageUrls: []
+  });
+
+  await assert.rejects(
+    () => testClient.createImageTask({
+      prompt: "只返回图片",
+      model: "gemini",
+      files: [fakeImageFile()],
+      onSubmitted: async () => {}
+    }),
+    (error) => error.code === "content_policy" && error.upstreamExplicitFailure === true
+  );
+
+  assert.equal(attempts, 1);
 });
 
 test("Gemini 图片下载会保留登录状态和原始二进制内容", async () => {

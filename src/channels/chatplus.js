@@ -846,19 +846,29 @@ function imageQuotaError(message = "图片生成额度已用完。") {
   return error;
 }
 
-function isTerminalImageFailureMessage(content) {
+function isImagePolicyFailureMessage(content) {
   const text = String(content || "").replace(/\s+/g, " ").trim();
   if (!text) return false;
   return /(?:violate|violates|violating).{0,160}(?:guardrails|policy|policies|content)/i.test(text)
     || /(?:guardrails|content policy|safety policy|safety system).{0,160}(?:image|content|request|third-party)/i.test(text)
     || /similarity to third-party content/i.test(text)
-    || /(?:can't|cannot|unable to|won't)\s+(?:create|generate|help with).{0,120}(?:image|content|request)/i.test(text)
-    || /(?:内容安全|安全拦截|上游渠道内容安全拦截|违规|无法生成|不能生成)/.test(text);
+    || /(?:内容安全|安全拦截|上游渠道内容安全拦截|违规)/.test(text);
 }
 
-function throwIfTerminalImageFailure(content) {
+function isTerminalImageFailureMessage(content) {
+  const text = String(content || "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  return isImagePolicyFailureMessage(text)
+    || /(?:can't|cannot|unable to|won't)\s+(?:create|generate|help with).{0,120}(?:image|content|request)/i.test(text)
+    || /(?:无法生成|不能生成)/.test(text);
+}
+
+function throwIfTerminalImageFailure(content, options = {}) {
   const message = String(content || "").trim();
-  if (!isTerminalImageFailureMessage(message)) return;
+  const failed = options.policyOnly
+    ? isImagePolicyFailureMessage(message)
+    : isTerminalImageFailureMessage(message);
+  if (!failed) return;
   const error = new Error(message);
   error.upstreamExplicitFailure = true;
   error.upstreamStatus = "failed";
@@ -867,7 +877,7 @@ function throwIfTerminalImageFailure(content) {
   throw error;
 }
 
-function throwIfTextImageResponse(content) {
+function throwIfTextImageResponse(content, options = {}) {
   const message = String(content || "").trim();
   if (!message) return;
   const error = new Error(message);
@@ -876,6 +886,7 @@ function throwIfTextImageResponse(content) {
   error.upstreamStatus = "failed";
   error.status = 400;
   error.code = "upstream_text_response";
+  if (options.retryableCar === true) error.retryableImageCar = true;
   throw error;
 }
 
@@ -1727,9 +1738,10 @@ export class ChatplusClient {
 
   chatRouteForInput(input = {}) {
     const resolvedRoute = resolveChatModelRoute(this.channel?.settings || {}, requestedChatModel(input));
-    return input.preferImageCar && resolvedRoute.key === "gpt"
-      ? { ...resolvedRoute, strategy: "image" }
-      : resolvedRoute;
+    if (!input.preferImageCar) return resolvedRoute;
+    if (resolvedRoute.key === "gpt") return { ...resolvedRoute, strategy: "image" };
+    if (resolvedRoute.key === "gemini") return { ...resolvedRoute, selectionStrategy: "image" };
+    return resolvedRoute;
   }
 
   chatSessionKey(route = {}) {
@@ -1738,6 +1750,7 @@ export class ChatplusClient {
       route.carType || "",
       route.model || "",
       route.strategy || "",
+      route.selectionStrategy || "",
       route.carTier || ""
     ].join("::");
   }
@@ -1886,7 +1899,8 @@ export class ChatplusClient {
   async selectCar(route, ignoredCarIds = new Set(), options = {}) {
     const cars = await this.fetchCars(route.carType, options);
     const tier = effectiveCarTier(route);
-    const candidates = rankedCars(cars, route.strategy)
+    const selectionStrategy = route.selectionStrategy || route.strategy;
+    const candidates = rankedCars(cars, selectionStrategy)
       .map((car) => ({ car, carId: concreteCarId(car) }))
       .filter((item) => !ignoredCarIds.has(item.carId))
       .filter((item) => !isBadCar(this.account?.id, route.carType, item.carId));
@@ -1900,7 +1914,7 @@ export class ChatplusClient {
       carType: route.carType,
       car: selected.car,
       candidateCount: usableCars.length,
-      strategy: route.strategy || "balanced",
+      strategy: selectionStrategy || "balanced",
       carTier: tier
     };
   }
@@ -2650,16 +2664,37 @@ export class ChatplusClient {
   async withImageQuotaFallback(prompt, input, work) {
     const ignoredCarIds = new Set();
     const quotaErrors = [];
+    const textResponseErrors = [];
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
         const conversation = await this.sendConversation(prompt, input, ignoredCarIds);
         return await work(conversation);
       } catch (error) {
-        if (!error.imageQuotaExhausted) throw error;
-        quotaErrors.push(error.message || "图片生成额度已用完。");
+        if (error.retryableImageCar === true) {
+          textResponseErrors.push(error);
+          continue;
+        }
+        if (error.imageQuotaExhausted) {
+          quotaErrors.push(error.message || "图片生成额度已用完。");
+          continue;
+        }
+        throw error;
       }
     }
-    throw imageQuotaError(`已自动尝试 ${quotaErrors.length} 个账户，但图片生成额度都已用完。`);
+    if (textResponseErrors.length) {
+      const lastError = textResponseErrors[textResponseErrors.length - 1];
+      const attempted = quotaErrors.length + textResponseErrors.length;
+      const error = new Error(
+        `已自动尝试 ${attempted} 个 Gemini 生图车位，但都没有返回图片。最后一次上游回复：${lastError.message}`
+      );
+      error.upstreamText = lastError.upstreamText || lastError.message || "";
+      error.upstreamExplicitFailure = true;
+      error.upstreamStatus = "failed";
+      error.status = 400;
+      error.code = "upstream_text_response";
+      throw error;
+    }
+    throw imageQuotaError(`已自动尝试 ${quotaErrors.length} 个生图车位，但图片生成额度都已用完。`);
   }
 
   async waitForConversationImages(events, conversationId, timeoutSec, options = {}) {
@@ -2795,7 +2830,13 @@ export class ChatplusClient {
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
         if (["gemini", "grok"].includes(conversation.route?.key)) {
           const imageUrls = conversation.imageUrls || [];
-          if (!imageUrls.length) throwIfTextImageResponse(conversation.directContent);
+          if (!imageUrls.length) {
+            const retryableCar = conversation.route?.key === "gemini";
+            if (retryableCar) {
+              throwIfTerminalImageFailure(conversation.directContent, { policyOnly: true });
+            }
+            throwIfTextImageResponse(conversation.directContent, { retryableCar });
+          }
           return { ...conversation, imageUrls };
         }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
@@ -2843,7 +2884,13 @@ export class ChatplusClient {
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
         if (["gemini", "grok"].includes(conversation.route?.key)) {
           const imageUrls = conversation.imageUrls || [];
-          if (!imageUrls.length) throwIfTextImageResponse(conversation.directContent);
+          if (!imageUrls.length) {
+            const retryableCar = conversation.route?.key === "gemini";
+            if (retryableCar) {
+              throwIfTerminalImageFailure(conversation.directContent, { policyOnly: true });
+            }
+            throwIfTextImageResponse(conversation.directContent, { retryableCar });
+          }
           return { ...conversation, imageUrls };
         }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
