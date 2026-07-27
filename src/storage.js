@@ -1001,11 +1001,20 @@ function taskMatchesSearch(task, value, searchTextCache = null) {
   return parts.length > 0 && parts.every((part) => haystack.includes(part));
 }
 
-export async function listTaskPage({ page = 1, pageSize = 100, keyword = "", accountId = "", channel = "", status = "" } = {}) {
+export async function listTaskPage({
+  page = 1,
+  pageSize = 100,
+  keyword = "",
+  accountId = "",
+  sourceChannelId = "",
+  channel = "",
+  status = ""
+} = {}) {
   const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
   const normalizedPageSize = Math.min(500, Math.max(1, Math.floor(Number(pageSize) || 100)));
   const normalizedKeyword = normalizeTaskSearchKeyword(keyword);
   const normalizedAccountId = String(accountId || "").trim();
+  const normalizedSourceChannelId = String(sourceChannelId || "").trim();
   const normalizedChannel = String(channel || "").trim().toLowerCase();
   const normalizedStatus = String(status || "").trim().toLowerCase();
 
@@ -1013,6 +1022,7 @@ export async function listTaskPage({ page = 1, pageSize = 100, keyword = "", acc
   const cacheKey = [
     normalizedKeyword,
     normalizedAccountId,
+    normalizedSourceChannelId,
     normalizedChannel,
     normalizedStatus
   ].join("\u0000");
@@ -1020,6 +1030,10 @@ export async function listTaskPage({ page = 1, pageSize = 100, keyword = "", acc
   if (!filtered) {
     filtered = tasks.filter((task) => {
       if (normalizedAccountId && normalizedAccountId !== "all" && String(task.accountId || "") !== normalizedAccountId) return false;
+      if (normalizedSourceChannelId && normalizedSourceChannelId !== "all") {
+        const taskChannelId = String(task.channelId || "").trim();
+        if (taskChannelId !== normalizedSourceChannelId && !taskChannelId.startsWith(`${normalizedSourceChannelId}:`)) return false;
+      }
       if (normalizedChannel && normalizedChannel !== "all" && taskStatChannelGroup(task) !== normalizedChannel) return false;
       if (normalizedStatus && normalizedStatus !== "all" && taskStatus(task) !== normalizedStatus) return false;
       return taskMatchesSearch(task, normalizedKeyword, tasksSnapshot.searchTextCache);

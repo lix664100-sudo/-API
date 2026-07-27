@@ -979,6 +979,7 @@ app.get("/api/tasks/page", async (request) => ({
     pageSize: request.query?.pageSize,
     keyword: request.query?.keyword,
     accountId: request.query?.accountId,
+    sourceChannelId: request.query?.sourceChannelId,
     channel: request.query?.channel,
     status: request.query?.status
   })

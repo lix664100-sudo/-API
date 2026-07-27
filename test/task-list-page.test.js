@@ -22,6 +22,7 @@ test("task pages return the newest matching records without returning the full h
       sourceTaskId: "batch_draw_old_001",
       status: "failed",
       channelType: "drawing",
+      channelId: "channel-shareai:drawing",
       accountId: "account-a",
       errorMessage: "upstream concurrency limit",
       createdAt: new Date(now - 3 * 60 * 60 * 1000).toISOString()
@@ -31,6 +32,7 @@ test("task pages return the newest matching records without returning the full h
       sourceTaskId: "batch_draw_middle_002",
       status: "success",
       channelType: "chatplus",
+      channelId: "channel-google:chatplus",
       accountId: "account-b",
       createdAt: new Date(now - 2 * 60 * 60 * 1000).toISOString()
     },
@@ -39,6 +41,7 @@ test("task pages return the newest matching records without returning the full h
       sourceTaskId: "batch_draw_new_003",
       status: "processing",
       channelType: "drawing",
+      channelId: "channel-shareai:drawing",
       accountId: "account-a",
       createdAt: new Date(now - 60 * 60 * 1000).toISOString()
     }
@@ -58,6 +61,7 @@ test("task pages return the newest matching records without returning the full h
   const filtered = await listTaskPage({
     keyword: "batch_draw_old",
     accountId: "account-a",
+    sourceChannelId: "channel-shareai",
     channel: "drawing",
     status: "failed"
   });
@@ -67,4 +71,8 @@ test("task pages return the newest matching records without returning the full h
   const errorSearch = await listTaskPage({ keyword: "concurrency limit" });
   assert.equal(errorSearch.total, 1);
   assert.equal(errorSearch.items[0].id, "task-old-drawing");
+
+  const sourceChannel = await listTaskPage({ sourceChannelId: "channel-google" });
+  assert.equal(sourceChannel.total, 1);
+  assert.equal(sourceChannel.items[0].id, "task-middle-chat");
 });
