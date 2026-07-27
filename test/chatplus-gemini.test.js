@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 
@@ -260,6 +261,81 @@ test("Gemini 返回图片时直接算成功，不再走 GPT 详情接口", async
   assert.equal(result.status, "success");
   assert.deepEqual(result.imageUrls, ["https://claude.midjourneye.com/gemini/images/gg-dl/generated-image"]);
   assert.equal(waitCalled, false);
+});
+
+test("Gemini 生图只返回文字时直接失败并保留原文", async () => {
+  const testClient = client();
+  testClient.geminiSession = {
+    at: "token-at",
+    sid: "123456",
+    bl: "boq_assistant-bard-web-server_test",
+    pushId: "feeds/test",
+    uploadClientPctx: "CgcSBWjK7pYx",
+    sourcePath: "/app"
+  };
+  testClient.uploadGeminiImages = async () => [["uploaded-image", "source.png"]];
+  testClient.prepareChatSession = async () => ({
+    route: { key: "gemini", strategy: "thinking", model: "" },
+    selected: { carId: "car-test", carType: "gemini" },
+    init: {}
+  });
+  testClient.http = async () => ({
+    status: 200,
+    headers: {},
+    body: geminiResponse({ text: "我只能提供修改建议，无法生成这张图片。" })
+  });
+  let submitted = null;
+
+  await assert.rejects(
+    () => testClient.createImageTask({
+      prompt: "只返回图片",
+      model: "gemini",
+      files: [fakeImageFile()],
+      onSubmitted: async (value) => {
+        submitted = value;
+      }
+    }),
+    (error) => {
+      assert.equal(error.code, "upstream_text_response");
+      assert.equal(error.upstreamExplicitFailure, true);
+      assert.equal(error.upstreamText, "我只能提供修改建议，无法生成这张图片。");
+      return true;
+    }
+  );
+
+  assert.equal(submitted.status, "processing");
+  assert.equal(submitted.externalId, "conversation-test");
+});
+
+test("Gemini 图片下载会保留登录状态和原始二进制内容", async () => {
+  const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0xff, 0x00, 0xfe, 0x80]);
+  let receivedCookie = "";
+  const server = createServer((request, response) => {
+    receivedCookie = String(request.headers.cookie || "");
+    response.writeHead(200, { "content-type": "image/png" });
+    response.end(imageBytes);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const testClient = client();
+  testClient.baseUrl = `http://127.0.0.1:${address.port}`;
+  testClient.portalLoggedIn = true;
+  testClient.carId = "car-test";
+  testClient.carType = "gemini";
+  testClient.cookies = ["session=test-session"];
+
+  try {
+    const result = await testClient.downloadResultImage("/gemini/images/test", {
+      carId: "car-test",
+      carType: "gemini",
+      timeoutMs: 5000
+    });
+    assert.deepEqual(result.buffer, imageBytes);
+    assert.equal(result.contentType, "image/png");
+    assert.equal(receivedCookie, "session=test-session");
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });
 
 test("Gemini 没有返回文字或图片时不能误判成功", async () => {

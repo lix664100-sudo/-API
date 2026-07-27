@@ -6,6 +6,8 @@ const rootDir = process.cwd();
 export const resultImageDir = path.resolve(rootDir, process.env.RESULT_IMAGE_DIR || "outputs/results");
 
 const cleanupIntervalMs = Math.max(5, Number(process.env.RESULT_IMAGE_CLEANUP_INTERVAL_MIN || 60)) * 60 * 1000;
+const defaultDownloadTimeoutMs = Math.max(1000, Number(process.env.RESULT_IMAGE_DOWNLOAD_TIMEOUT_MS || 30000));
+const defaultDownloadAttempts = Math.max(1, Number(process.env.RESULT_IMAGE_DOWNLOAD_ATTEMPTS || 2));
 const imageFilePattern = /\.(png|jpe?g|webp|gif)$/i;
 let runtimePublicBaseUrl = "";
 let lastAutoCleanupAt = 0;
@@ -91,12 +93,28 @@ export function shouldMirrorImageUrl(url, config = {}) {
   return looksTemporaryImageUrl(source);
 }
 
-async function downloadImage(url) {
-  const response = await fetch(url, {
-    headers: {
-      "user-agent": "ShareAI-API/1.0"
+async function downloadImage(url, options = {}) {
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || defaultDownloadTimeoutMs));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(url, {
+      headers: {
+        "user-agent": "ShareAI-API/1.0"
+      },
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error("图片保存超时，稍后会自动重试。");
+      timeoutError.code = "IMAGE_DOWNLOAD_TIMEOUT";
+      throw timeoutError;
     }
-  });
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
   if (!response.ok) throw new Error(`图片保存失败：上游图片地址返回 ${response.status}。`);
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.toLowerCase().startsWith("image/")) {
@@ -105,6 +123,27 @@ async function downloadImage(url) {
   const buffer = Buffer.from(await response.arrayBuffer());
   if (!buffer.length) throw new Error("图片保存失败：上游返回了空文件。");
   return { buffer, contentType };
+}
+
+async function downloadImageWithRetry(url, options = {}) {
+  const attempts = Math.max(1, Number(options.attempts || defaultDownloadAttempts));
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const downloader = typeof options.downloadImage === "function"
+        ? options.downloadImage
+        : downloadImage;
+      return await downloader(url, { timeoutMs: options.timeoutMs || defaultDownloadTimeoutMs });
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+  }
+  const error = lastError || new Error("图片保存失败。");
+  error.code ||= "IMAGE_MIRROR_FAILED";
+  throw error;
 }
 
 async function resultImageFiles() {
@@ -202,10 +241,10 @@ export async function runAutoCleanupResultImages(config = {}, options = {}) {
   return cleanupResultImages(config, { mode: "expired", retentionDays: settings.retentionDays });
 }
 
-export async function mirrorImageUrl(url, config = {}) {
+export async function mirrorImageUrl(url, config = {}, options = {}) {
   const source = String(url || "").trim();
   if (!source || isLocalResultUrl(source, config)) return source;
-  const { buffer, contentType } = await downloadImage(source);
+  const { buffer, contentType } = await downloadImageWithRetry(source, options);
   await mkdir(resultImageDir, { recursive: true });
   const filename = `${Date.now()}-${randomUUID()}${extFromContentType(contentType)}`;
   await writeFile(path.join(resultImageDir, filename), buffer);
@@ -213,14 +252,14 @@ export async function mirrorImageUrl(url, config = {}) {
   return localResultUrl(filename, config);
 }
 
-export async function mirrorImageUrls(urls = [], config = {}) {
+export async function mirrorImageUrls(urls = [], config = {}, options = {}) {
   const results = [];
   for (const url of Array.isArray(urls) ? urls : []) {
     if (!shouldMirrorImageUrl(url, config)) {
       results.push(url);
       continue;
     }
-    results.push(await mirrorImageUrl(url, config));
+    results.push(await mirrorImageUrl(url, config, options));
   }
   return results;
 }

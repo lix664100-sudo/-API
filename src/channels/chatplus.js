@@ -77,6 +77,33 @@ function runCurl(args, input = "") {
   });
 }
 
+function runCurlBuffer(args, input = "") {
+  return new Promise((resolve, reject) => {
+    const child = spawn(CURL_COMMAND, args, { windowsHide: true });
+    const stdout = [];
+    let stderr = "";
+    child.stdout.on("data", (data) => {
+      stdout.push(Buffer.from(data));
+    });
+    child.stderr.on("data", (data) => {
+      stderr += data;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(stdout));
+        return;
+      }
+      const message = stderr || `curl 退出码：${code}`;
+      const error = new Error(code === 28 ? "聊天站响应慢，代理可能可用但请求超时。" : message);
+      if (code === 28) error.status = 504;
+      reject(error);
+    });
+    if (input) child.stdin.end(input);
+    else child.stdin.end();
+  });
+}
+
 function splitHttp(raw) {
   const sections = raw.split(/\r?\n\r?\n/);
   let headerIndex = -1;
@@ -104,6 +131,25 @@ function splitHttp(raw) {
     }
   }
   return { status, headers, body };
+}
+
+const CURL_DOWNLOAD_MARKER = "\n__SHAREAI_DOWNLOAD_META__";
+
+function splitCurlDownload(raw) {
+  const marker = Buffer.from(CURL_DOWNLOAD_MARKER);
+  const index = raw.lastIndexOf(marker);
+  if (index < 0) {
+    const error = new Error("图片下载结果不完整，请稍后重试。");
+    error.code = "INVALID_IMAGE_DOWNLOAD";
+    throw error;
+  }
+  const meta = raw.subarray(index + marker.length).toString("utf8");
+  const [statusText = "0", contentType = ""] = meta.split(/\r?\n/, 2);
+  return {
+    status: Number(statusText) || 0,
+    contentType: contentType.trim(),
+    buffer: raw.subarray(0, index)
+  };
 }
 
 function cookieName(cookie) {
@@ -710,6 +756,8 @@ function normalizeChatFiles(input, messages) {
 
 function submittedImageTask(conversation, input, prompt, taskType, sourceImageCount = 0) {
   const { events = [], conversationId, model, upstreamModel, route, selected } = conversation;
+  const imageUrls = Array.isArray(conversation.imageUrls) ? conversation.imageUrls.filter(Boolean) : [];
+  const upstreamText = String(conversation.directContent || "").trim();
   return {
     externalId: conversationId,
     status: "processing",
@@ -717,8 +765,9 @@ function submittedImageTask(conversation, input, prompt, taskType, sourceImageCo
     taskType,
     modelId: model,
     ratio: input.ratio_label || input.ratio || "",
-    imageCount: 0,
-    imageUrls: [],
+    imageCount: imageUrls.length,
+    imageUrls,
+    upstreamText,
     raw: {
       conversationId,
       eventCount: events.length,
@@ -727,7 +776,13 @@ function submittedImageTask(conversation, input, prompt, taskType, sourceImageCo
       chatModel: route?.key,
       selectedCarId: selected?.carId,
       selectedCarType: selected?.carType,
-      strategy: selected?.strategy
+      strategy: selected?.strategy,
+      ...(imageUrls.length ? {
+        upstreamCompleted: true,
+        upstreamStatus: "success",
+        originalImageUrls: imageUrls
+      } : {}),
+      ...(upstreamText ? { upstreamText } : {})
     }
   };
 }
@@ -816,6 +871,7 @@ function throwIfTextImageResponse(content) {
   const message = String(content || "").trim();
   if (!message) return;
   const error = new Error(message);
+  error.upstreamText = message;
   error.upstreamExplicitFailure = true;
   error.upstreamStatus = "failed";
   error.status = 400;
@@ -1477,6 +1533,88 @@ export class ChatplusClient {
     const result = splitHttp(await runCurl(args, input));
     setCookiesFromHeaders(this.cookies, result.headers);
     return result;
+  }
+
+  async downloadResultImage(url, context = {}) {
+    const source = new URL(String(url || ""), this.baseUrl).toString();
+    const sameSite = source.startsWith(`${this.baseUrl}/`);
+    const timeoutSec = Math.max(
+      5,
+      Math.ceil(Number(context.timeoutMs || 0) / 1000)
+        || Number(context.timeoutSec || 30)
+    );
+
+    const prepareSession = async (force = false) => {
+      if (!sameSite) return;
+      if (force) {
+        await this.sessionLock(async () => this.resetSession());
+      }
+      await this.loginPortal({ timeoutSec });
+      const carId = String(context.carId || "");
+      const carType = String(context.carType || "gemini");
+      if (carId && (force || this.carId !== carId || this.carType !== carType)) {
+        this.carId = carId;
+        this.carType = carType;
+        await this.enterCar(carId, carType, { timeoutSec });
+      }
+    };
+
+    const download = async () => {
+      const headers = {
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+        accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        ...(sameSite ? { referer: `${this.baseUrl}/app` } : {})
+      };
+      if (sameSite && this.cookies.length) headers.cookie = this.cookieHeader();
+      const args = [
+        "-sS",
+        "-L",
+        "--connect-timeout",
+        String(Math.min(DEFAULT_CONNECT_TIMEOUT_SEC, timeoutSec)),
+        "--max-time",
+        String(timeoutSec)
+      ];
+      const proxyUrl = proxyUrlFor(this.account);
+      if (proxyUrl) args.push("--proxy", proxyUrl);
+      for (const [key, value] of Object.entries(headers)) {
+        args.push("-H", `${key}: ${value}`);
+      }
+      args.push(
+        "--output",
+        "-",
+        "--write-out",
+        `${CURL_DOWNLOAD_MARKER}%{http_code}\n%{content_type}`,
+        source
+      );
+      return splitCurlDownload(await runCurlBuffer(args));
+    };
+
+    await prepareSession();
+    let result = await download();
+    if (sameSite && [401, 403].includes(result.status)) {
+      await prepareSession(true);
+      result = await download();
+    }
+    if (result.status < 200 || result.status >= 300) {
+      const error = new Error(`图片保存失败：上游图片地址返回 ${result.status}。`);
+      error.status = result.status;
+      error.code = "IMAGE_DOWNLOAD_FAILED";
+      throw error;
+    }
+    if (!result.contentType.toLowerCase().startsWith("image/")) {
+      const error = new Error("图片保存失败：上游返回的不是图片。");
+      error.code = "INVALID_IMAGE_DOWNLOAD";
+      throw error;
+    }
+    if (!result.buffer.length) {
+      const error = new Error("图片保存失败：上游返回了空文件。");
+      error.code = "INVALID_IMAGE_DOWNLOAD";
+      throw error;
+    }
+    return {
+      buffer: result.buffer,
+      contentType: result.contentType
+    };
   }
 
   async json(path, options = {}) {
@@ -2656,7 +2794,9 @@ export class ChatplusClient {
         throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
         if (["gemini", "grok"].includes(conversation.route?.key)) {
-          return { ...conversation, imageUrls: conversation.imageUrls || [] };
+          const imageUrls = conversation.imageUrls || [];
+          if (!imageUrls.length) throwIfTextImageResponse(conversation.directContent);
+          return { ...conversation, imageUrls };
         }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
         const waitClient = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
@@ -2664,6 +2804,7 @@ export class ChatplusClient {
         return { ...conversation, imageUrls };
       });
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
+      const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
 
       return {
         externalId: conversationId || messageId,
@@ -2674,6 +2815,11 @@ export class ChatplusClient {
         ratio: input.ratio_label || input.ratio || "",
         imageCount: imageUrls.length,
         imageUrls,
+        downloadImage: (url, options = {}) => downloadClient.downloadResultImage(url, {
+          ...options,
+          carId: selected?.carId,
+          carType: selected?.carType
+        }),
         raw: { conversationId, eventCount: events.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy }
       };
     });
@@ -2696,7 +2842,9 @@ export class ChatplusClient {
         throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
         if (["gemini", "grok"].includes(conversation.route?.key)) {
-          return { ...conversation, imageUrls: conversation.imageUrls || [] };
+          const imageUrls = conversation.imageUrls || [];
+          if (!imageUrls.length) throwIfTextImageResponse(conversation.directContent);
+          return { ...conversation, imageUrls };
         }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
         const waitClient = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
@@ -2704,6 +2852,7 @@ export class ChatplusClient {
         return { ...conversation, imageUrls };
       });
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
+      const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
 
       return {
         externalId: conversationId || messageId,
@@ -2714,6 +2863,11 @@ export class ChatplusClient {
         ratio: input.ratio_label || input.ratio || "",
         imageCount: imageUrls.length,
         imageUrls,
+        downloadImage: (url, options = {}) => downloadClient.downloadResultImage(url, {
+          ...options,
+          carId: selected?.carId,
+          carType: selected?.carType
+        }),
         raw: { conversationId, eventCount: events.length, sourceImageCount: files.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy }
       };
     });

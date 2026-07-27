@@ -1102,10 +1102,19 @@ function failedRefreshResult(task, externalId, error) {
   };
 }
 
-async function mirrorTaskImages(result, config) {
+async function mirrorTaskImages(result, config, client = null) {
   const imageUrls = Array.isArray(result?.imageUrls) ? result.imageUrls.filter(Boolean) : [];
   if (!imageUrls.length) return result;
-  const mirroredUrls = await mirrorImageUrls(imageUrls, config);
+  const downloadImage = typeof result?.downloadImage === "function"
+    ? result.downloadImage
+    : typeof client?.downloadResultImage === "function"
+      ? (url, options = {}) => client.downloadResultImage(url, {
+          ...options,
+          carId: result?.raw?.selectedCarId,
+          carType: result?.raw?.selectedCarType
+        })
+      : undefined;
+  const mirroredUrls = await mirrorImageUrls(imageUrls, config, { downloadImage });
   return {
     ...result,
     imageUrls: mirroredUrls,
@@ -1310,6 +1319,27 @@ async function interruptDisabledRefreshTask(task, channel, account) {
   return interruptedTask;
 }
 
+async function interruptUnrecoverableGeminiTask(task) {
+  const interruptedAt = new Date().toISOString();
+  const message = "这个旧 Gemini 任务没有保存返回内容，无法自动恢复；任务已停止，不计入失败。";
+  const interruptedTask = {
+    ...task,
+    status: "interrupted",
+    errorMessage: "",
+    responseJson: { ok: null, message },
+    completedAt: interruptedAt,
+    raw: {
+      ...(task.raw || {}),
+      interrupted: true,
+      interruptedAt,
+      interruptedReason: message,
+      geminiResultMissing: true
+    }
+  };
+  await upsertTask(interruptedTask);
+  return interruptedTask;
+}
+
 export async function refreshTask(taskId) {
   const task = await getTask(taskId);
   if (!task) throw new Error("任务不存在。");
@@ -1326,6 +1356,41 @@ export async function refreshTask(taskId) {
   const externalId = taskExternalId(task);
   if (!externalId || (task.raw?.queued && String(externalId).startsWith("task-"))) return task;
 
+  const taskStillActive = scheduledImageTasks.has(task.id) || activeSubmittedTaskIds.has(task.id);
+  const originalImageUrls = storedOriginalImageUrls(task);
+  if (originalImageUrls.length) {
+    if (taskStillActive) return task;
+    try {
+      const result = await mirrorTaskImages({
+        externalId,
+        status: "success",
+        prompt: task.prompt,
+        taskType: task.taskType,
+        modelId: task.modelId,
+        ratio: task.ratio,
+        imageCount: originalImageUrls.length,
+        imageUrls: originalImageUrls,
+        raw: {
+          ...(task.raw || {}),
+          originalImageUrls,
+          imageMirrorPending: false
+        }
+      }, config, client);
+      const nextTask = mergeRefreshedTask(task, result, channel, account);
+      await upsertTask(nextTask);
+      await recordTaskStat(nextTask);
+      await updateAccountAfterTask(account, channel, nextTask);
+      return nextTask;
+    } catch (error) {
+      return keepSubmittedTaskRecoverable(task, error, task.attempts || []);
+    }
+  }
+
+  if (storedTaskModelKey(task) === "gemini" && task.raw?.submitted === true) {
+    if (taskStillActive) return task;
+    return interruptUnrecoverableGeminiTask(task);
+  }
+
   let refreshedResult;
   try {
     refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
@@ -1336,7 +1401,7 @@ export async function refreshTask(taskId) {
     if (!isTerminalRefreshError(error)) throw error;
     refreshedResult = failedRefreshResult(task, externalId, error);
   }
-  const result = await mirrorTaskImages(refreshedTaskWaitState(task, refreshedResult, config.waitTimeoutSec), config);
+  const result = await mirrorTaskImages(refreshedTaskWaitState(task, refreshedResult, config.waitTimeoutSec), config, client);
   const nextTask = mergeRefreshedTask(task, result, channel, account);
   await upsertTask(nextTask);
   if (isFinishedTask(nextTask.status)) {
@@ -2353,10 +2418,12 @@ async function failQueuedTask(task, error, attempts = []) {
   const responseMessage = error.message || readableAttemptError(attempts) || "任务失败";
   const statusCode = Number(error.status || error.statusCode || 0) || null;
   const code = error.code || (statusCode === 429 ? "CONCURRENCY_LIMIT" : "");
+  const upstreamText = String(error.upstreamText || "").trim();
   const sourceTaskId = task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson);
   const failedTask = {
     ...task,
     status: "failed",
+    upstreamText: upstreamText || task.upstreamText || "",
     errorMessage: error.message || readableAttemptError(attempts) || "任务失败",
     statusCode,
     attempts,
@@ -2366,6 +2433,7 @@ async function failQueuedTask(task, error, attempts = []) {
       ...(sourceTaskId ? { sourceTaskId } : {}),
       ...(statusCode ? { status: statusCode } : {}),
       ...(code ? { code } : {}),
+      ...(upstreamText ? { upstreamText } : {}),
       attempts: taskResponseJson(attempts)
     },
     completedAt: new Date().toISOString()
@@ -2400,21 +2468,74 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
 }
 
 async function persistSubmittedTask(task, result, channel, account, attempts) {
-  if (!savedTaskExternalId(result) || isFinishedTask(result?.status)) return task;
+  if (!savedTaskExternalId(result)) return task;
+  const upstreamCompleted = result?.status === "success";
+  if (isFinishedTask(result?.status) && !upstreamCompleted) return task;
   const submittedTask = mergeRefreshedTask(task, {
     ...result,
-    status: result.status || "processing"
+    status: upstreamCompleted ? "processing" : result.status || "processing"
   }, channel, account);
   submittedTask.attempts = attempts;
+  submittedTask.completedAt = null;
   submittedTask.raw = {
     ...(submittedTask.raw || {}),
     queued: false,
     submitted: true,
-    submittedAt: task.raw?.submittedAt || new Date().toISOString()
+    submittedAt: task.raw?.submittedAt || new Date().toISOString(),
+    ...(upstreamCompleted
+      ? {
+          upstreamCompleted: true,
+          upstreamStatus: result.status,
+          originalImageUrls: Array.isArray(result.imageUrls) ? result.imageUrls.filter(Boolean) : []
+        }
+      : {})
   };
   await upsertTask(submittedTask);
   activeSubmittedTaskIds.add(submittedTask.id);
   return submittedTask;
+}
+
+function storedOriginalImageUrls(task = {}) {
+  const urls = [
+    ...(Array.isArray(task.raw?.originalImageUrls) ? task.raw.originalImageUrls : []),
+    ...(task.raw?.upstreamCompleted && Array.isArray(task.imageUrls) ? task.imageUrls : [])
+  ];
+  return [...new Set(urls.filter(Boolean))];
+}
+
+async function keepSubmittedTaskRecoverable(task, error, attempts = []) {
+  const originalImageUrls = storedOriginalImageUrls(task);
+  const now = new Date().toISOString();
+  const message = originalImageUrls.length
+    ? "图片已经生成，正在重新保存到服务器。"
+    : "任务已经提交，但结果保存中断，系统会继续尝试。";
+  const nextTask = {
+    ...task,
+    status: "waiting_upstream",
+    imageCount: Math.max(Number(task.imageCount || 0), originalImageUrls.length),
+    imageUrls: originalImageUrls.length ? originalImageUrls : task.imageUrls || [],
+    errorMessage: "",
+    attempts,
+    responseJson: attachResponseSourceTaskId(
+      { ok: null, message },
+      task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson)
+    ),
+    completedAt: null,
+    raw: {
+      ...(task.raw || {}),
+      queued: false,
+      submitted: true,
+      waitingUpstream: true,
+      waitingSince: task.raw?.waitingSince || now,
+      imageMirrorPending: originalImageUrls.length > 0,
+      ...(originalImageUrls.length ? { originalImageUrls } : {}),
+      resultSaveError: error?.message || "结果保存中断。",
+      resultSaveErrorCode: error?.code || "",
+      resultSaveErrorAt: now
+    }
+  };
+  await upsertTask(nextTask);
+  return nextTask;
 }
 
 async function runQueuedTextTask(task, input, reserved = null, options = {}) {
@@ -2458,7 +2579,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
             result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
           }
-          result = await mirrorTaskImages(result, config);
+          result = await mirrorTaskImages(result, config, client);
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
           parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
@@ -2475,7 +2596,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
             pushAttempt(attempts, target, error.message || "调用失败");
             return failQueuedTask(taskState, error, attempts);
           }
-          return taskState;
+          return keepSubmittedTaskRecoverable(taskState, error, attempts);
         }
         if (isTerminalTaskFailureError(error)) {
           pushAttempt(attempts, target, error.message || "调用失败");
@@ -2604,7 +2725,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
             result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
           }
-          result = await mirrorTaskImages(result, config);
+          result = await mirrorTaskImages(result, config, client);
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
           parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
@@ -2621,7 +2742,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
             pushAttempt(attempts, target, error.message || "调用失败");
             return failQueuedTask(taskState, error, attempts);
           }
-          return taskState;
+          return keepSubmittedTaskRecoverable(taskState, error, attempts);
         }
         if (isTerminalTaskFailureError(error)) {
           pushAttempt(attempts, target, error.message || "调用失败");
@@ -2702,7 +2823,7 @@ async function runChatCompletionTask(task, input) {
         if (typeof client.createChatCompletion !== "function") {
           throw new Error("这个渠道暂不支持对话。");
         }
-        const result = await mirrorTaskImages(await client.createChatCompletion(input), config);
+        const result = await mirrorTaskImages(await client.createChatCompletion(input), config, client);
         const responseJson = chatCompletionResponseJson({ result, channel });
         const finishedTask = await finishChatTask(task, result, channel, account, attempts, responseJson);
           return { result, channel, account, task: finishedTask, responseJson };
@@ -3250,7 +3371,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
           waitForImages: wait
         });
         if (wait && channel.type === "drawing") result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
-        result = await mirrorTaskImages(result, config);
+        result = await mirrorTaskImages(result, config, client);
         const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
         await upsertTask(task);
         if (isFinishedTask(task.status)) await recordTaskStat(task);

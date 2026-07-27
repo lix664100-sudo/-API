@@ -51,10 +51,14 @@ test("required image mirroring saves the result locally", async () => {
 });
 
 test("required image mirroring fails instead of returning a broken upstream link", async () => {
-  globalThis.fetch = async () => new Response("Internal Server Error", {
-    status: 500,
-    headers: { "content-type": "text/plain" }
-  });
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    return new Response("Internal Server Error", {
+      status: 500,
+      headers: { "content-type": "text/plain" }
+    });
+  };
 
   await assert.rejects(
     () => mirrorImageUrls([
@@ -64,4 +68,28 @@ test("required image mirroring fails instead of returning a broken upstream link
     }),
     /500/
   );
+  assert.equal(attempts, 2);
+});
+
+test("Gemini image mirroring can use an authenticated channel downloader", async () => {
+  const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 5, 6, 7, 8]);
+  const calls = [];
+  const [url] = await mirrorImageUrls([
+    "https://claude.midjourneye.com/gemini/images/gg-dl/authenticated-image"
+  ], {
+    publicBaseUrl: "https://api.example.test",
+    imageStorage: { mode: "smart", autoCleanup: false, retentionDays: 7 }
+  }, {
+    attempts: 1,
+    downloadImage: async (source, options) => {
+      calls.push({ source, options });
+      return { buffer: imageBytes, contentType: "image/png" };
+    }
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].source, "https://claude.midjourneye.com/gemini/images/gg-dl/authenticated-image");
+  assert.equal(calls[0].options.timeoutMs, 30000);
+  const filename = path.basename(new URL(url).pathname);
+  assert.deepEqual(await readFile(path.join(resultImageDir, filename)), imageBytes);
 });
