@@ -886,8 +886,10 @@ test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", asyn
 
   const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
   const originalDownloadResultImage = ChatplusClient.prototype.downloadResultImage;
+  const placeholderUrl = "http://googleusercontent.com/image_generation_content/421";
   const upstreamUrl = "https://one.aishare.icu/gemini/images/gg-dl/recoverable-image";
   let mirrorAvailable = false;
+  const downloadedUrls = [];
   ChatplusClient.prototype.createImageTask = async (input) => {
     await input.onSubmitted?.({
       externalId: "c_gemini_mirror_recovery",
@@ -910,8 +912,8 @@ test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", asyn
       taskType: "img2img",
       prompt: input.prompt,
       modelId: "gemini",
-      imageCount: 1,
-      imageUrls: [upstreamUrl],
+      imageCount: 2,
+      imageUrls: [placeholderUrl, upstreamUrl],
       raw: {
         conversationId: "c_gemini_mirror_recovery",
         chatModel: "gemini",
@@ -920,7 +922,8 @@ test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", asyn
       }
     };
   };
-  ChatplusClient.prototype.downloadResultImage = async () => {
+  ChatplusClient.prototype.downloadResultImage = async (url) => {
+    downloadedUrls.push(url);
     if (!mirrorAvailable) throw new Error("模拟图片转存失败");
     return {
       buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]),
@@ -942,6 +945,7 @@ test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", asyn
     });
 
     assert.equal(pending.status, "waiting_upstream");
+    assert.equal(pending.imageCount, 1);
     assert.equal(pending.raw.imageMirrorPending, true);
     assert.deepEqual(pending.raw.originalImageUrls, [upstreamUrl]);
     assert.match(pending.raw.resultSaveError, /模拟图片转存失败/);
@@ -952,6 +956,7 @@ test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", asyn
     assert.equal(recovered.imageCount, 1);
     assert.match(recovered.imageUrls[0], /^https:\/\/api\.example\.test\/uploads\/results\/.+\.png$/);
     assert.equal(recovered.raw.imageMirrorPending, false);
+    assert.deepEqual(downloadedUrls, [upstreamUrl, upstreamUrl, upstreamUrl]);
     localFilename = path.basename(new URL(recovered.imageUrls[0]).pathname);
   } finally {
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;

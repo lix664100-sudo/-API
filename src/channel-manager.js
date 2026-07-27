@@ -1102,8 +1102,20 @@ function failedRefreshResult(task, externalId, error) {
   };
 }
 
+function usableImageResultUrls(urls = []) {
+  return [...new Set((Array.isArray(urls) ? urls : []).filter((value) => {
+    const source = String(value || "").trim();
+    if (!source) return false;
+    try {
+      return !/^\/image_generation_content\/\d+$/i.test(new URL(source).pathname.replace(/\/+$/, ""));
+    } catch {
+      return !/(?:^|\/)image_generation_content\/\d+(?:$|[?#])/i.test(source);
+    }
+  }))];
+}
+
 async function mirrorTaskImages(result, config, client = null) {
-  const imageUrls = Array.isArray(result?.imageUrls) ? result.imageUrls.filter(Boolean) : [];
+  const imageUrls = usableImageResultUrls(result?.imageUrls);
   if (!imageUrls.length) return result;
   const downloadImage = typeof result?.downloadImage === "function"
     ? result.downloadImage
@@ -1117,6 +1129,7 @@ async function mirrorTaskImages(result, config, client = null) {
   const mirroredUrls = await mirrorImageUrls(imageUrls, config, { downloadImage });
   return {
     ...result,
+    imageCount: mirroredUrls.length,
     imageUrls: mirroredUrls,
     raw: {
       ...(result.raw || {}),
@@ -2486,7 +2499,7 @@ async function persistSubmittedTask(task, result, channel, account, attempts) {
       ? {
           upstreamCompleted: true,
           upstreamStatus: result.status,
-          originalImageUrls: Array.isArray(result.imageUrls) ? result.imageUrls.filter(Boolean) : []
+          originalImageUrls: usableImageResultUrls(result.imageUrls)
         }
       : {})
   };
@@ -2500,7 +2513,7 @@ function storedOriginalImageUrls(task = {}) {
     ...(Array.isArray(task.raw?.originalImageUrls) ? task.raw.originalImageUrls : []),
     ...(task.raw?.upstreamCompleted && Array.isArray(task.imageUrls) ? task.imageUrls : [])
   ];
-  return [...new Set(urls.filter(Boolean))];
+  return usableImageResultUrls(urls);
 }
 
 async function keepSubmittedTaskRecoverable(task, error, attempts = []) {
@@ -2512,7 +2525,7 @@ async function keepSubmittedTaskRecoverable(task, error, attempts = []) {
   const nextTask = {
     ...task,
     status: "waiting_upstream",
-    imageCount: Math.max(Number(task.imageCount || 0), originalImageUrls.length),
+    imageCount: originalImageUrls.length || Number(task.imageCount || 0),
     imageUrls: originalImageUrls.length ? originalImageUrls : task.imageUrls || [],
     errorMessage: "",
     attempts,
