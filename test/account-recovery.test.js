@@ -159,6 +159,165 @@ test("账号检测遇到失效车位后会自动换车", async () => {
   assert.equal(enteredCount, 3);
 });
 
+test("账号检测步骤超时后会自动重试并使用二十秒等待时间", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gemini" } },
+    account: { id: "account-check-retry", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let usageAttempts = 0;
+  client.loadAccountUsages = async (options) => {
+    usageAttempts += 1;
+    assert.equal(options.timeoutSec, 20);
+    if (usageAttempts === 1) {
+      const error = new Error("聊天站响应慢，代理可能可用但请求超时。");
+      error.status = 504;
+      throw error;
+    }
+    return {
+      gemini: {
+        quota: 70,
+        used: 1,
+        balance: 69,
+        quotaResetAt: "",
+        expireAt: "2026-08-16T05:22:44+08:00",
+        period: "24h"
+      }
+    };
+  };
+  client.prepareChatSession = async (input) => {
+    assert.equal(input.checkTimeoutSec, 20);
+    return {
+      route: { key: "gemini", model: "gemini" },
+      init: {},
+      selected: { carId: "gemini-car", carType: "gemini", strategy: "balanced" }
+    };
+  };
+
+  const result = await client.check();
+
+  assert.equal(usageAttempts, 2);
+  assert.equal(result.status, "ok");
+  assert.equal(result.meta.selectedCarId, "gemini-car");
+});
+
+test("账号检测连续两次请求超时会记录具体失败步骤", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gemini" } },
+    account: { id: "account-check-step", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let usageAttempts = 0;
+  client.loadAccountUsages = async () => {
+    usageAttempts += 1;
+    const error = new Error("聊天站响应慢，代理可能可用但请求超时。");
+    error.status = 504;
+    throw error;
+  };
+
+  await assert.rejects(
+    client.check(),
+    (error) => {
+      assert.equal(error.code, "ACCOUNT_CHECK_TIMEOUT");
+      assert.equal(error.accountCheckTimeout, true);
+      assert.equal(error.accountCheckStep, "读取账号额度");
+      assert.match(error.message, /读取账号额度超时/);
+      return true;
+    }
+  );
+  assert.equal(usageAttempts, 2);
+});
+
+test("第一次账号检测超时保留可用状态，连续两次才异常，成功后清零", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    channels: [{
+      id: "shareai",
+      name: "ShareAI账号",
+      type: "shareai",
+      enabled: true,
+      priority: 1,
+      settings: {
+        ...config.channels.find((item) => item.id === "shareai")?.settings,
+        enabledAbilities: { drawing: false, chatplus: true },
+        defaultChatModel: "gemini"
+      }
+    }],
+    accounts: [{
+      id: "account-timeout-preserve",
+      channelId: "shareai",
+      name: "检测超时保护账号",
+      username: "timeout-preserve@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: {
+            status: "ok",
+            message: "聊天账号可用",
+            quota: null,
+            balance: null
+          }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  const timeoutError = () => {
+    const error = new Error("读取账号额度超时，聊天站连续两次没有及时响应。");
+    error.status = 504;
+    error.code = "ACCOUNT_CHECK_TIMEOUT";
+    error.accountCheckTimeout = true;
+    error.accountCheckStep = "读取账号额度";
+    return error;
+  };
+  ChatplusClient.prototype.check = async () => {
+    throw timeoutError();
+  };
+
+  try {
+    const first = await checkAccount("account-timeout-preserve");
+    assert.equal(first.status, "ok");
+    assert.equal(first.meta.abilities.chatplus.status, "ok");
+    assert.equal(first.meta.abilities.chatplus.meta.accountCheck.status, "timeout");
+    assert.equal(first.meta.abilities.chatplus.meta.accountCheck.consecutiveTimeouts, 1);
+
+    await assert.rejects(
+      checkAccount("account-timeout-preserve"),
+      /连续两次检测超时/
+    );
+    const afterSecond = await loadConfig();
+    const failedAccount = afterSecond.accounts.find((item) => item.id === "account-timeout-preserve");
+    assert.equal(failedAccount.status, "error");
+    assert.equal(failedAccount.meta.abilities.chatplus.status, "error");
+    assert.equal(failedAccount.meta.abilities.chatplus.meta.accountCheck.status, "failed");
+    assert.equal(failedAccount.meta.abilities.chatplus.meta.accountCheck.consecutiveTimeouts, 2);
+
+    ChatplusClient.prototype.check = async () => ({
+      status: "ok",
+      quota: null,
+      balance: null,
+      quotaResetAt: "",
+      expireAt: "",
+      message: "聊天账号可用",
+      meta: {}
+    });
+    const recovered = await checkAccount("account-timeout-preserve");
+    assert.equal(recovered.status, "ok");
+    assert.equal(recovered.meta.abilities.chatplus.meta.accountCheck.status, "ok");
+    assert.equal(recovered.meta.abilities.chatplus.meta.accountCheck.consecutiveTimeouts, 0);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+    await saveConfig(config);
+  }
+});
+
 test("GPT 账号信息会换算真实总额度、剩余额度和重置时间", async () => {
   const client = new ChatplusClient({
     config: {},

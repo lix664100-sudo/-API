@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { normalizeProxyUrl } from "../proxy.js";
 
 const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
-const ACCOUNT_CHECK_TIMEOUT_SEC = 8;
+const ACCOUNT_CHECK_TIMEOUT_SEC = 20;
 const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 300;
 const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
 const MAX_CHAT_CAR_ATTEMPTS = 8;
@@ -48,6 +48,33 @@ function requestTimeoutSec(options = {}, config = {}) {
       || DEFAULT_CHAT_HTTP_TIMEOUT_SEC
   );
   return Math.max(1, configured);
+}
+
+function isAccountCheckRequestTimeout(error) {
+  const message = String(error?.message || "");
+  return Number(error?.status || error?.statusCode || 0) === 504
+    || error?.code === "ACCOUNT_CHECK_TIMEOUT"
+    || /聊天站响应慢|请求超时|timeout|timed out|ETIMEDOUT|AbortError/i.test(message);
+}
+
+async function runAccountCheckStep(step, work) {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await work();
+    } catch (error) {
+      if (!isAccountCheckRequestTimeout(error)) throw error;
+      lastError = error;
+    }
+  }
+
+  const error = new Error(`${step}超时，聊天站连续两次没有及时响应。`);
+  error.status = 504;
+  error.code = "ACCOUNT_CHECK_TIMEOUT";
+  error.accountCheckTimeout = true;
+  error.accountCheckStep = step;
+  error.cause = lastError;
+  throw error;
 }
 
 function runCurl(args, input = "") {
@@ -1957,13 +1984,19 @@ export class ChatplusClient {
     return this.runAccountWork(async () => {
       const requestOptions = { timeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC };
       const usageRoute = resolveChatModelRoute(this.channel?.settings || {}, "");
-      const referenceUsage = await this.loadAccountUsages(requestOptions);
+      const referenceUsage = await runAccountCheckStep(
+        "读取账号额度",
+        () => this.loadAccountUsages(requestOptions)
+      );
       const usage = referenceUsage[usageRoute.key] || referenceUsage.gpt;
-      const { init, route, selected } = await this.prepareChatSession({
-        model: usageRoute.key,
-        preferImageCar: true,
-        checkTimeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC
-      }, new Set(), 5);
+      const { init, route, selected } = await runAccountCheckStep(
+        `进入 ${usageRoute.name} 页面`,
+        () => this.prepareChatSession({
+          model: usageRoute.key,
+          preferImageCar: true,
+          checkTimeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC
+        }, new Set(), 5)
+      );
       return {
         status: "ok",
         quota: null,

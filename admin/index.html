@@ -2109,6 +2109,7 @@
           ok: ["success", "可用"],
           disconnected: ["warning", "自动换线中"],
           quota_empty: ["warning", "额度不足"],
+          check_timeout: ["warning", "检测超时"],
           error: ["error", "异常"],
           success: ["success", "成功"],
           failed: ["error", "失败"],
@@ -3032,6 +3033,15 @@
         if (statuses.includes("ok")) return "ok";
         if (statuses.includes("quota_empty")) return "quota_empty";
         return account.status || "unknown";
+      }
+
+      function accountCheckDisplayStatus(account, channel) {
+        const status = channel?.type === "shareai"
+          ? abilityStatus(account, "chatplus")
+          : channel?.type === "chatplus"
+            ? account
+            : {};
+        return status?.meta?.accountCheck?.status === "timeout" ? "check_timeout" : "";
       }
 
       function getChannelStats(channel, accounts) {
@@ -4501,15 +4511,16 @@
             render: (_, row) => {
               const rowChannel = channels.find((item) => item.id === row.channelId);
               const effectiveStatus = accountEffectiveStatus(row, rowChannel);
+              const displayStatus = accountCheckDisplayStatus(row, rowChannel) || effectiveStatus;
               if (row.enabled === false) return statusTag("disabled");
-              if (!channelAbilityEnabled(rowChannel, "drawing") || !drawingAccountIsCooling(row)) return statusTag(effectiveStatus);
+              if (!channelAbilityEnabled(rowChannel, "drawing") || !drawingAccountIsCooling(row)) return statusTag(displayStatus);
               const drawing = drawingCooldownStatus(row);
               const reason = drawing.cooldownReason === "drawing_rate_limited"
                 ? "绘图站提示上传过于频繁，已按上游要求暂停该账号绘图"
                 : "绘图站上游连续失败 3 次，已暂停该账号绘图";
               const tooltip = `${reason}；${formatDateTime(drawing.cooldownUntil)} 自动恢复。`;
               return h(Space, { direction: "vertical", size: 2, align: "start" }, [
-                h("span", { key: "status" }, statusTag(effectiveStatus)),
+                h("span", { key: "status" }, statusTag(displayStatus)),
                 h(Tooltip, { key: "cooldown", title: tooltip },
                   h(Tag, { color: "orange" }, `绘图冷却中 · ${drawingCooldownText(row)}`)
                 )

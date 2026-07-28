@@ -3028,6 +3028,54 @@ function preserveConfirmedChatQuota(currentStatus = {}, nextStatus = {}) {
   };
 }
 
+function isAccountCheckTimeoutError(error) {
+  const message = String(error?.message || "");
+  return error?.accountCheckTimeout === true
+    || error?.code === "ACCOUNT_CHECK_TIMEOUT"
+    || /聊天站响应慢|请求超时|检测超时|timeout|timed out|ETIMEDOUT|AbortError/i.test(message);
+}
+
+function successfulAccountCheckStatus(status = {}) {
+  return {
+    ...status,
+    meta: {
+      ...(status.meta || {}),
+      accountCheck: {
+        status: "ok",
+        consecutiveTimeouts: 0,
+        step: "",
+        checkedAt: new Date().toISOString()
+      }
+    }
+  };
+}
+
+function accountCheckTimeoutStatus(currentStatus = {}, error) {
+  const previousCheck = currentStatus.meta?.accountCheck || {};
+  const consecutiveTimeouts = Number(previousCheck.consecutiveTimeouts || 0) + 1;
+  const step = String(error?.accountCheckStep || "账号检测");
+  const preservePreviousStatus = consecutiveTimeouts < 2
+    && ["ok", "quota_empty", "cooldown"].includes(String(currentStatus.status || "").toLowerCase());
+  const message = preservePreviousStatus
+    ? `${step}超时，已自动复查一次；暂时沿用上次状态。`
+    : `${step}连续两次检测超时，请稍后再次检测。`;
+
+  return {
+    ...currentStatus,
+    status: preservePreviousStatus ? currentStatus.status : "error",
+    message,
+    meta: {
+      ...(currentStatus.meta || {}),
+      accountCheck: {
+        status: preservePreviousStatus ? "timeout" : "failed",
+        consecutiveTimeouts,
+        step,
+        checkedAt: new Date().toISOString()
+      }
+    }
+  };
+}
+
 async function checkShareAIAbility(config, channel, account, ability) {
   const abilityChannel = shareAIAbilityChannel(channel, ability);
   const client = getClient(config, abilityChannel, account);
@@ -3037,10 +3085,16 @@ async function checkShareAIAbility(config, channel, account, ability) {
   try {
     const checked = await runChatplusAccountWork(abilityChannel, account, () => client.check());
     const data = ability === "chatplus"
-      ? preserveConfirmedChatQuota(currentStatus, checked)
+      ? preserveConfirmedChatQuota(currentStatus, successfulAccountCheckStatus(checked))
       : checked;
     return { ok: true, data };
   } catch (error) {
+    if (ability === "chatplus" && isAccountCheckTimeoutError(error)) {
+      return {
+        ok: false,
+        data: accountCheckTimeoutStatus(currentStatus, error)
+      };
+    }
     const errorStatus = ability === "chatplus"
       ? accountStatusFromError(error, { explicitChatQuotaOnly: true })
       : accountStatusFromError(error);
@@ -3222,7 +3276,9 @@ export async function checkAccount(accountId) {
   }
   const client = getClient(config, channel, account);
   try {
-    const checked = await runChatplusAccountWork(channel, account, () => client.check());
+    const checked = successfulAccountCheckStatus(
+      await runChatplusAccountWork(channel, account, () => client.check())
+    );
     const status = channel.type === "chatplus"
       ? preserveConfirmedChatQuota(account, checked)
       : checked;
@@ -3233,6 +3289,12 @@ export async function checkAccount(accountId) {
     await updateAccountStatus(account.id, nextStatus);
     return nextStatus;
   } catch (error) {
+    if (channel.type === "chatplus" && isAccountCheckTimeoutError(error)) {
+      const status = withProxyCheckMeta(accountCheckTimeoutStatus(account, error), proxyResult);
+      await updateAccountStatus(account.id, status);
+      if (status.status === "error") throw new Error(status.message);
+      return status;
+    }
     const message = readableCheckErrorMessage(error);
     const errorStatus = accountStatusFromError(error, {
       explicitChatQuotaOnly: channel.type === "chatplus"
