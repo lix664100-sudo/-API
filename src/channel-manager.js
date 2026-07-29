@@ -781,6 +781,7 @@ function accountStatusFromError(error, options = {}) {
       quotaResetAt: error?.quotaResetAt || "",
       cooldownUntil,
       quotaReason: error?.quotaReason || "",
+      quotaModel: error?.quotaModel || "",
       quotaConfirmedByUpstream: explicitChatQuotaOnly || error?.quotaConfirmedByUpstream === true,
       period: error?.period || "",
       message: error?.message || "额度不足"
@@ -1765,6 +1766,25 @@ function targetLastCheckAt(target, status = {}) {
   return Number.isFinite(checkedAt) ? checkedAt : 0;
 }
 
+function chatRecoveryUsage(status = {}) {
+  const referenceUsage = status.meta?.referenceUsage;
+  if (referenceUsage && typeof referenceUsage === "object") {
+    const keys = [
+      status.quotaModel,
+      status.meta?.chatModel,
+      status.quotaReason === "image_quota" ? "gemini" : "",
+      "gpt"
+    ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+    for (const key of new Set(keys)) {
+      if (referenceUsage[key] && typeof referenceUsage[key] === "object") {
+        return referenceUsage[key];
+      }
+    }
+  }
+  const directUsage = status.meta?.recoveryUsage;
+  return directUsage && typeof directUsage === "object" ? directUsage : null;
+}
+
 function targetConfirmedQuotaBlocksTask(target, taskType) {
   if (target?.channel?.type !== "chatplus" || !targetQuotaEmpty(target)) return false;
   const status = targetQuotaStatus(target);
@@ -1775,10 +1795,11 @@ function targetConfirmedQuotaRetryDue(target) {
   const status = targetQuotaStatus(target);
   const cooldownAt = Date.parse(status.cooldownUntil || "");
   if (Number.isFinite(cooldownAt) && cooldownAt > Date.now()) return false;
+  const recoveryUsage = chatRecoveryUsage(status);
   const resetAt = Date.parse(
     status.quotaReason === "image_quota"
-      ? status.imageQuotaResetAt || status.quotaResetAt || ""
-      : status.quotaResetAt || ""
+      ? status.imageQuotaResetAt || status.quotaResetAt || recoveryUsage?.quotaResetAt || ""
+      : status.quotaResetAt || recoveryUsage?.quotaResetAt || ""
   );
   if (Number.isFinite(resetAt)) return resetAt <= Date.now();
   if (Number.isFinite(cooldownAt)) return cooldownAt <= Date.now();
@@ -1810,7 +1831,9 @@ function targetNeedsRecovery(target) {
   const quotaStatus = targetQuotaStatus(target);
   const status = String(quotaStatus.status || "unknown").toLowerCase();
   if (target?.channel?.type === "chatplus") {
-    if (status === "quota_empty") return false;
+    if (status === "quota_empty") {
+      return targetQuotaEmpty(target) && targetConfirmedQuotaRetryDue(target);
+    }
     return (
       accountCooling(target.account)
       || ["error", "failed", "disconnected"].includes(status)
@@ -1836,26 +1859,42 @@ async function recoverTarget(config, target) {
   if ((accountRecoveryRetryAt.get(key) || 0) > Date.now()) return null;
 
   const recovery = (async () => {
+    const currentStatus = targetQuotaStatus(target);
     try {
-      const status = await runChatplusAccountWork(
-        target.channel,
-        target.account,
-        () => getClient(config, target.channel, target.account).check()
+      const checked = successfulAccountCheckStatus(
+        await runChatplusAccountWork(
+          target.channel,
+          target.account,
+          () => getClient(config, target.channel, target.account).check({
+            model: target.channel.type === "chatplus" ? currentStatus.quotaModel || "" : ""
+          })
+        )
       );
+      const status = target.channel.type === "chatplus"
+        ? preserveConfirmedChatQuota(currentStatus, checked)
+        : checked;
       await updateTargetAccountStatus(target.account.id, target.channel, {
         ...status,
-        cooldownUntil: null
+        cooldownUntil: status.status === "ok" ? null : status.cooldownUntil
       });
-      if (["ok", "quota_empty"].includes(status.status)) {
+      if (status.status === "ok") {
+        accountRecoveryRetryAt.delete(key);
+        return status;
+      }
+      if (status.status === "quota_empty") {
         accountRecoveryRetryAt.delete(key);
         return status;
       }
       accountRecoveryRetryAt.set(key, Date.now() + ACCOUNT_RECOVERY_RETRY_MS);
       return null;
     } catch (error) {
-      await updateTargetAccountStatus(target.account.id, target.channel, accountStatusFromError(error, {
+      const errorStatus = accountStatusFromError(error, {
         explicitChatQuotaOnly: target.channel.type === "chatplus"
-      }));
+      });
+      const status = target.channel.type === "chatplus"
+        ? preserveConfirmedChatQuota(currentStatus, errorStatus)
+        : errorStatus;
+      await updateTargetAccountStatus(target.account.id, target.channel, status);
       accountRecoveryRetryAt.set(key, Date.now() + ACCOUNT_RECOVERY_RETRY_MS);
       return null;
     } finally {
@@ -1880,7 +1919,7 @@ export async function recoverUnavailableChatAccounts() {
     return {
       accountId: target.account.id,
       channelId: target.channel.id,
-      recovered: ["ok", "quota_empty"].includes(status?.status),
+      recovered: status?.status === "ok",
       status: status?.status || targetQuotaStatus(target).status || "unknown"
     };
   }));
@@ -3008,16 +3047,50 @@ function preserveConfirmedChatQuota(currentStatus = {}, nextStatus = {}) {
   ) {
     return nextStatus;
   }
+  const recoveryUsage = chatRecoveryUsage(nextStatus);
+  const recoveryBalance = Number(recoveryUsage?.balance);
+  if (
+    String(nextStatus.status || "").toLowerCase() === "ok"
+    && Number.isFinite(recoveryBalance)
+    && recoveryBalance > 0
+  ) {
+    return {
+      ...nextStatus,
+      quota: null,
+      balance: null,
+      used: null,
+      quotaResetAt: "",
+      imageQuotaResetAt: "",
+      cooldownUntil: null,
+      quotaReason: "",
+      quotaModel: "",
+      quotaConfirmedByUpstream: false,
+      period: ""
+    };
+  }
+
+  const recoveryResetAt = recoveryUsage?.quotaResetAt || "";
+  const resetAt = recoveryResetAt || currentStatus.quotaResetAt || "";
+  const resetTime = Date.parse(resetAt);
+  const successfulCheck = String(nextStatus.status || "").toLowerCase() === "ok";
+  const cooldownUntil = successfulCheck
+    ? Number.isFinite(resetTime) && resetTime > Date.now()
+      ? resetAt
+      : new Date(Date.now() + CHAT_USAGE_RECOVERY_CHECK_MS).toISOString()
+    : currentStatus.cooldownUntil || nextStatus.cooldownUntil || null;
   return {
     ...nextStatus,
     status: "quota_empty",
     quota: null,
     balance: null,
     used: null,
-    quotaResetAt: currentStatus.quotaResetAt || "",
-    imageQuotaResetAt: currentStatus.imageQuotaResetAt || "",
-    cooldownUntil: currentStatus.cooldownUntil || currentStatus.quotaResetAt || null,
+    quotaResetAt: resetAt,
+    imageQuotaResetAt: currentStatus.quotaReason === "image_quota"
+      ? recoveryResetAt || currentStatus.imageQuotaResetAt || resetAt
+      : currentStatus.imageQuotaResetAt || "",
+    cooldownUntil,
     quotaReason: currentStatus.quotaReason || "chat_usage_limit",
+    quotaModel: currentStatus.quotaModel || nextStatus.meta?.chatModel || "",
     quotaConfirmedByUpstream: true,
     period: currentStatus.period || "",
     message: currentStatus.message || "使用次数已用完，等待真实请求确认恢复",

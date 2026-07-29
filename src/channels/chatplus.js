@@ -1980,10 +1980,10 @@ export class ChatplusClient {
     throw new Error(`${route.name} 自动找车失败：${errors.join("；")}`);
   }
 
-  async check() {
+  async check(options = {}) {
     return this.runAccountWork(async () => {
       const requestOptions = { timeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC };
-      const usageRoute = resolveChatModelRoute(this.channel?.settings || {}, "");
+      const usageRoute = resolveChatModelRoute(this.channel?.settings || {}, options.model || "");
       const referenceUsage = await runAccountCheckStep(
         "读取账号额度",
         () => this.loadAccountUsages(requestOptions)
@@ -2014,6 +2014,7 @@ export class ChatplusClient {
           chatModel: route.key,
           selectedCarId: selected.carId,
           strategy: selected.strategy,
+          recoveryUsage: usage,
           referenceUsage
         }
       };
@@ -2621,11 +2622,13 @@ export class ChatplusClient {
       : async (work) => this.sessionLock(work);
     for (let attempt = 0; attempt < MAX_CHAT_CAR_ATTEMPTS; attempt += 1) {
       let selected = null;
+      let activeRoute = null;
       try {
         const session = input.concurrentSubmit === true
           ? await this.prepareReusableChatSession(input, ignoredCarIds, 1)
           : await this.prepareChatSession(input, ignoredCarIds, 1);
         const { route, init } = session;
+        activeRoute = route;
         const submitClient = input.concurrentSubmit === true ? this.createSubmitClient(session) : this;
         selected = session.selected;
         if (route.key === "grok") {
@@ -2675,7 +2678,12 @@ export class ChatplusClient {
           submitSessionSnapshot: submitClient.sessionSnapshot()
         };
       } catch (error) {
-        if (error.noRetry || error.imageQuotaExhausted) throw error;
+        if (error.noRetry || error.imageQuotaExhausted) {
+          if (error.quotaConfirmedByUpstream === true) {
+            error.quotaModel = activeRoute?.key || "";
+          }
+          throw error;
+        }
         const retryableCarError = selected && (isAuthSessionError(error) || isCarPlanMismatchError(error));
         if (retryableCarError) {
           this.rememberAuthFailedCar(selected);
