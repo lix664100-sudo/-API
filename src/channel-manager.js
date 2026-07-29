@@ -1796,6 +1796,8 @@ function targetConfirmedQuotaRetryDue(target) {
   const cooldownAt = Date.parse(status.cooldownUntil || "");
   if (Number.isFinite(cooldownAt) && cooldownAt > Date.now()) return false;
   const recoveryUsage = chatRecoveryUsage(status);
+  const recoveryBalance = Number(recoveryUsage?.balance);
+  if (Number.isFinite(recoveryBalance) && recoveryBalance > 0) return true;
   const resetAt = Date.parse(
     status.quotaReason === "image_quota"
       ? status.imageQuotaResetAt || status.quotaResetAt || recoveryUsage?.quotaResetAt || ""

@@ -1715,7 +1715,13 @@ test("background recovery refreshes expired drawing quota", async () => {
   }
 });
 
-async function saveChatUsageRecoveryFixture({ lastCheckAt, quotaResetAt, quotaModel = "gemini" }) {
+async function saveChatUsageRecoveryFixture({
+  lastCheckAt,
+  quotaResetAt,
+  cooldownUntil = quotaResetAt,
+  quotaModel = "gemini",
+  referenceUsage = null
+}) {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -1741,9 +1747,10 @@ async function saveChatUsageRecoveryFixture({ lastCheckAt, quotaResetAt, quotaMo
             quotaModel,
             quotaConfirmedByUpstream: true,
             quotaResetAt,
-            cooldownUntil: quotaResetAt,
+            cooldownUntil,
             lastCheckAt,
-            message: "chat usage empty"
+            message: "chat usage empty",
+            ...(referenceUsage ? { meta: { chatModel: quotaModel, referenceUsage } } : {})
           }
         }
       }
@@ -1855,6 +1862,48 @@ test("聊天重置时间到了会由后台核验恢复", async () => {
     assert.equal(checkCount, 1);
     assert.equal(chatplus.status, "ok");
     assert.equal(chatplus.balance, null);
+    assert.equal(chatplus.quotaConfirmedByUpstream, false);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
+});
+
+test("聊天旧状态已有明确剩余额度时不会被下次重置时间挡住", async () => {
+  await saveChatUsageRecoveryFixture({
+    lastCheckAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+    cooldownUntil: new Date(Date.now() - 1000).toISOString(),
+    quotaResetAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    referenceUsage: {
+      gemini: {
+        quota: 70,
+        used: 0,
+        balance: 70,
+        quotaResetAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+      }
+    }
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      meta: {
+        chatModel: "gemini",
+        recoveryUsage: { quota: 70, used: 0, balance: 70 }
+      }
+    };
+  };
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const chatplus = stored.accounts[0].meta.abilities.chatplus;
+
+    assert.equal(checkCount, 1);
+    assert.equal(results[0].recovered, true);
+    assert.equal(chatplus.status, "ok");
     assert.equal(chatplus.quotaConfirmedByUpstream, false);
   } finally {
     ChatplusClient.prototype.check = originalCheck;
