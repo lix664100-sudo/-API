@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { safeProxyEndpoint } from "./proxy.js";
 
 const rootDir = process.cwd();
 const dataDir = path.resolve(rootDir, process.env.DATA_DIR || "data");
@@ -17,6 +18,7 @@ const dailyStatDays = 30;
 const imageTaskTypes = new Set(["text2img", "img2img"]);
 const statRecordLimit = 50000;
 const intradayIntervalMinutes = 30;
+const accountImportLimit = 500;
 let statsWriteQueue = Promise.resolve();
 let runtimeStatsWriteQueue = Promise.resolve();
 let tasksWriteQueue = Promise.resolve();
@@ -778,12 +780,13 @@ export async function loadConfig({ waitForWrites = true } = {}) {
   return config;
 }
 
-export async function saveConfig(nextConfig) {
+function updateConfig(buildPatch) {
   const write = configWriteQueue.catch(() => {}).then(async () => {
     const current = await loadConfig({ waitForWrites: false });
+    const patch = await buildPatch(current);
     const merged = normalizeConfig({
       ...current,
-      ...nextConfig,
+      ...patch,
       updatedAt: new Date().toISOString()
     });
     await writeJson(configFile, merged);
@@ -791,6 +794,10 @@ export async function saveConfig(nextConfig) {
   });
   configWriteQueue = write.catch(() => {});
   return write;
+}
+
+export async function saveConfig(nextConfig) {
+  return updateConfig(() => nextConfig);
 }
 
 export function publicConfig(config) {
@@ -813,69 +820,178 @@ export function publicConfig(config) {
 }
 
 export async function saveChannel(channelId, patch) {
-  const config = await loadConfig();
-  const id = String(channelId || patch.id || `channel-${randomUUID()}`);
-  const index = config.channels.findIndex((channel) => channel.id === id);
-  const current = index >= 0 ? config.channels[index] : {};
-  const next = {
-    ...current,
-    ...patch,
-    id,
-    enabled: patch.enabled !== false,
-    priority: Number(patch.priority || current.priority || config.channels.length + 1),
-    settings: { ...(current.settings || {}), ...(patch.settings || {}) }
-  };
-  const channels = [...config.channels];
-  if (index >= 0) channels[index] = next;
-  else channels.push(next);
-  return saveConfig({ channels });
-}
-
-export async function removeChannel(channelId) {
-  const config = await loadConfig();
-  return saveConfig({
-    channels: config.channels.filter((channel) => channel.id !== channelId),
-    accounts: config.accounts.filter((account) => account.channelId !== channelId),
-    defaultChannel: config.defaultChannel === channelId ? "auto" : config.defaultChannel
+  return updateConfig((config) => {
+    const id = String(channelId || patch.id || `channel-${randomUUID()}`);
+    const index = config.channels.findIndex((channel) => channel.id === id);
+    const current = index >= 0 ? config.channels[index] : {};
+    const next = {
+      ...current,
+      ...patch,
+      id,
+      enabled: patch.enabled !== false,
+      priority: Number(patch.priority || current.priority || config.channels.length + 1),
+      settings: { ...(current.settings || {}), ...(patch.settings || {}) }
+    };
+    const channels = [...config.channels];
+    if (index >= 0) channels[index] = next;
+    else channels.push(next);
+    return { channels };
   });
 }
 
+export async function removeChannel(channelId) {
+  return updateConfig((config) => ({
+    channels: config.channels.filter((channel) => channel.id !== channelId),
+    accounts: config.accounts.filter((account) => account.channelId !== channelId),
+    defaultChannel: config.defaultChannel === channelId ? "auto" : config.defaultChannel
+  }));
+}
+
 export async function saveAccount(accountInput) {
-  const config = await loadConfig();
-  const accounts = [...config.accounts];
-  const index = accounts.findIndex((account) => account.id === accountInput.id);
-  const current = index >= 0 ? accounts[index] : {};
-  const next = {
-    ...current,
-    ...accountInput,
-    id: accountInput.id || `account-${randomUUID()}`,
-    enabled: accountInput.enabled !== false,
-    priority: Number(accountInput.priority || current.priority || 1),
-    routingWeight: normalizeRoutingWeight(accountInput.routingWeight ?? current.routingWeight),
-    concurrency: normalizeAccountConcurrency(
-      accountInput.concurrency,
-      current.concurrency || config.concurrency
-    )
-  };
-  if (!accountInput.password && current.password) next.password = current.password;
-  if (index >= 0) accounts[index] = next;
-  else accounts.push(next);
-  return saveConfig({ accounts });
+  return updateConfig((config) => {
+    const accounts = [...config.accounts];
+    const index = accounts.findIndex((account) => account.id === accountInput.id);
+    const current = index >= 0 ? accounts[index] : {};
+    const next = {
+      ...current,
+      ...accountInput,
+      id: accountInput.id || `account-${randomUUID()}`,
+      enabled: accountInput.enabled !== false,
+      priority: Number(accountInput.priority || current.priority || 1),
+      routingWeight: normalizeRoutingWeight(accountInput.routingWeight ?? current.routingWeight),
+      concurrency: normalizeAccountConcurrency(
+        accountInput.concurrency,
+        current.concurrency || config.concurrency
+      )
+    };
+    if (!accountInput.password && current.password) next.password = current.password;
+    if (index >= 0) accounts[index] = next;
+    else accounts.push(next);
+    return { accounts };
+  });
 }
 
 export async function removeAccount(accountId) {
-  const config = await loadConfig();
-  return saveConfig({ accounts: config.accounts.filter((account) => account.id !== accountId) });
+  return updateConfig((config) => ({
+    accounts: config.accounts.filter((account) => account.id !== accountId)
+  }));
+}
+
+function importedAccountText(value, field, rowNumber, maxLength) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    const error = new Error(`第 ${rowNumber} 行缺少${field}。`);
+    error.status = 400;
+    throw error;
+  }
+  if (text.length > maxLength) {
+    const error = new Error(`第 ${rowNumber} 行的${field}过长。`);
+    error.status = 400;
+    throw error;
+  }
+  return text;
+}
+
+function normalizeImportedAccount(row, index, channelId, config) {
+  const rowNumber = index + 2;
+  const name = importedAccountText(row?.name, "账号名称", rowNumber, 100);
+  const username = importedAccountText(row?.username, "登录账号", rowNumber, 320);
+  const password = String(row?.password ?? "");
+  const proxyUrl = String(row?.proxyUrl ?? row?.proxy ?? "").trim();
+  if (!password) {
+    const error = new Error(`第 ${rowNumber} 行缺少登录密码。`);
+    error.status = 400;
+    throw error;
+  }
+  if (password.length > 1024) {
+    const error = new Error(`第 ${rowNumber} 行的登录密码过长。`);
+    error.status = 400;
+    throw error;
+  }
+  if (proxyUrl.length > 2048 || (proxyUrl && !safeProxyEndpoint(proxyUrl).proxyHost)) {
+    const error = new Error(`第 ${rowNumber} 行的代理 IP 格式不正确。`);
+    error.status = 400;
+    throw error;
+  }
+  return {
+    id: `account-${randomUUID()}`,
+    channelId,
+    name,
+    username,
+    password,
+    proxyUrl,
+    enabled: true,
+    priority: 1,
+    routingWeight: 1,
+    concurrency: normalizeAccountConcurrency({}, config.concurrency),
+    status: "unknown"
+  };
+}
+
+export async function importAccounts(input = {}) {
+  const channelId = String(input.channelId || "").trim();
+  const source = Array.isArray(input.accounts) ? input.accounts : [];
+  if (!channelId) {
+    const error = new Error("请选择导入账号所属的渠道。");
+    error.status = 400;
+    throw error;
+  }
+  if (!source.length) {
+    const error = new Error("没有可导入的账号。");
+    error.status = 400;
+    throw error;
+  }
+  if (source.length > accountImportLimit) {
+    const error = new Error(`每次最多导入 ${accountImportLimit} 个账号，请拆分后重试。`);
+    error.status = 400;
+    throw error;
+  }
+
+  let result = null;
+  const config = await updateConfig((current) => {
+    if (!current.channels.some((channel) => channel.id === channelId)) {
+      const error = new Error("导入账号所属的渠道不存在。");
+      error.status = 400;
+      throw error;
+    }
+
+    const existingUsernames = new Set(
+      current.accounts
+        .filter((account) => account.channelId === channelId)
+        .map((account) => String(account.username || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+    const imported = [];
+    let skipped = 0;
+    source.forEach((row, index) => {
+      const account = normalizeImportedAccount(row, index, channelId, current);
+      const duplicateKey = account.username.toLowerCase();
+      if (existingUsernames.has(duplicateKey)) {
+        skipped += 1;
+        return;
+      }
+      existingUsernames.add(duplicateKey);
+      imported.push(account);
+    });
+    result = {
+      total: source.length,
+      imported: imported.length,
+      skipped
+    };
+    return { accounts: [...current.accounts, ...imported] };
+  });
+
+  return { config, result };
 }
 
 export async function updateAccountStatus(accountId, statusPatch) {
-  const config = await loadConfig();
-  const accounts = config.accounts.map((account) =>
-    account.id === accountId
-      ? { ...account, ...statusPatch, lastCheckAt: new Date().toISOString() }
-      : account
-  );
-  await saveConfig({ accounts });
+  await updateConfig((config) => ({
+    accounts: config.accounts.map((account) =>
+      account.id === accountId
+        ? { ...account, ...statusPatch, lastCheckAt: new Date().toISOString() }
+        : account
+    )
+  }));
 }
 
 function sortTasks(tasks) {

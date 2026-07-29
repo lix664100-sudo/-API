@@ -11,6 +11,7 @@
     <script src="/admin/vendor/antd.min.js"></script>
     <script src="/admin/vendor/ant-design-icons.min.js"></script>
     <script src="/admin/vendor/echarts.min.js"></script>
+    <script src="/admin/vendor/papaparse.min.js"></script>
     <style>
       :root {
         --page-bg: #f4f6f8;
@@ -2190,6 +2191,124 @@
         return check.message && status === "failed" ? h(Tooltip, { title: check.message }, content) : content;
       }
 
+      const accountImportHeaderAliases = {
+        name: "name",
+        "账号名称": "name",
+        username: "username",
+        "登录账号": "username",
+        "账号": "username",
+        password: "password",
+        "登录密码": "password",
+        "密码": "password",
+        proxyurl: "proxyUrl",
+        "代理ip": "proxyUrl",
+        "代理 ip": "proxyUrl",
+        "代理": "proxyUrl"
+      };
+
+      function normalizeAccountImportHeader(value) {
+        const text = String(value || "").replace(/^\uFEFF/, "").trim();
+        return accountImportHeaderAliases[text.toLowerCase()] || text;
+      }
+
+      function validAccountImportProxy(value) {
+        const text = String(value || "").trim();
+        if (!text) return true;
+        if (text.includes("|")) {
+          const parts = text.split("|").map((item) => item.trim());
+          const port = Number(parts[1]);
+          return parts.length >= 4
+            && Boolean(parts[0] && parts[2] && parts[3])
+            && Number.isInteger(port)
+            && port >= 1
+            && port <= 65535;
+        }
+        try {
+          const parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`);
+          return Boolean(parsed.hostname);
+        } catch {
+          return false;
+        }
+      }
+
+      function accountImportProxyLabel(value) {
+        const text = String(value || "").trim();
+        if (!text) return "服务器 IP";
+        if (text.includes("|")) {
+          const [host, port] = text.split("|").map((item) => item.trim());
+          return [host, port].filter(Boolean).join(":") || "已配置代理";
+        }
+        try {
+          const parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`);
+          return [parsed.hostname, parsed.port].filter(Boolean).join(":") || "已配置代理";
+        } catch {
+          return "格式不正确";
+        }
+      }
+
+      function parseAccountImportText(text, currentAccounts, channelId) {
+        if (!window.Papa) return { rows: [], error: "导入组件加载失败，请刷新页面重试。" };
+        const parsed = window.Papa.parse(String(text || ""), {
+          header: true,
+          skipEmptyLines: "greedy",
+          transformHeader: normalizeAccountImportHeader
+        });
+        const fields = new Set(parsed.meta?.fields || []);
+        const missingFields = [
+          ["name", "账号名称"],
+          ["username", "登录账号"],
+          ["password", "登录密码"]
+        ].filter(([key]) => !fields.has(key)).map(([, label]) => label);
+        if (missingFields.length) {
+          return { rows: [], error: `缺少表头：${missingFields.join("、")}。` };
+        }
+        if (parsed.data.length > 500) {
+          return { rows: [], error: "每次最多导入 500 个账号，请拆分后重试。" };
+        }
+
+        const parseErrors = new Map();
+        (parsed.errors || []).forEach((error) => {
+          const rowIndex = Number(error.row);
+          if (Number.isInteger(rowIndex) && rowIndex >= 0) {
+            parseErrors.set(rowIndex, error.message || "CSV 格式不正确");
+          }
+        });
+        const existing = new Set(
+          currentAccounts
+            .filter((account) => account.channelId === channelId)
+            .map((account) => String(account.username || "").trim().toLowerCase())
+            .filter(Boolean)
+        );
+        const seen = new Set(existing);
+        const rows = parsed.data.map((item, index) => {
+          const name = String(item.name || "").trim();
+          const username = String(item.username || "").trim();
+          const password = String(item.password ?? "");
+          const proxyUrl = String(item.proxyUrl || "").trim();
+          const errors = [];
+          if (parseErrors.has(index)) errors.push(parseErrors.get(index));
+          if (!name) errors.push("缺少账号名称");
+          if (!username) errors.push("缺少登录账号");
+          if (!password) errors.push("缺少登录密码");
+          if (proxyUrl && !validAccountImportProxy(proxyUrl)) errors.push("代理 IP 格式不正确");
+
+          const duplicateKey = username.toLowerCase();
+          const duplicate = !errors.length && seen.has(duplicateKey);
+          if (!errors.length && !duplicate) seen.add(duplicateKey);
+          return {
+            key: `account-import-${index}`,
+            rowNumber: index + 2,
+            name,
+            username,
+            password,
+            proxyUrl,
+            status: errors.length ? "error" : duplicate ? "duplicate" : "valid",
+            message: errors.join("；") || (duplicate ? "同一渠道已有相同登录账号" : "可导入")
+          };
+        });
+        return { rows, error: "" };
+      }
+
       function taskTypeLabel(type) {
         const map = {
           chat: "对话",
@@ -3204,6 +3323,11 @@
         const [productivityTrendDays, setProductivityTrendDays] = useState(7);
         const [channelModalOpen, setChannelModalOpen] = useState(false);
         const [accountModalOpen, setAccountModalOpen] = useState(false);
+        const [accountImportOpen, setAccountImportOpen] = useState(false);
+        const [accountImportText, setAccountImportText] = useState("");
+        const [accountImportRows, setAccountImportRows] = useState([]);
+        const [accountImportError, setAccountImportError] = useState("");
+        const [accountImporting, setAccountImporting] = useState(false);
         const [editingChannel, setEditingChannel] = useState(null);
         const [editingAccount, setEditingAccount] = useState(null);
 
@@ -4111,6 +4235,84 @@
           }
         }
 
+        function openAccountImport() {
+          setAccountImportText("");
+          setAccountImportRows([]);
+          setAccountImportError("");
+          setAccountImportOpen(true);
+        }
+
+        function previewAccountImport(value = accountImportText) {
+          const parsed = parseAccountImportText(value, accounts, selectedChannel?.id);
+          setAccountImportRows(parsed.rows);
+          setAccountImportError(parsed.error);
+          if (parsed.error) message.error(parsed.error);
+          else if (!parsed.rows.length) message.warning("没有读取到账号数据");
+        }
+
+        function readAccountImportFile(file) {
+          if (file.size > 2 * 1024 * 1024) {
+            message.error("CSV 文件不能超过 2 MB");
+            return false;
+          }
+          const reader = new FileReader();
+          reader.onload = () => {
+            const value = String(reader.result || "");
+            setAccountImportText(value);
+            previewAccountImport(value);
+          };
+          reader.onerror = () => message.error("CSV 文件读取失败，请重新选择");
+          reader.readAsText(file, "utf-8");
+          return false;
+        }
+
+        function downloadAccountImportTemplate() {
+          const csv = window.Papa.unparse([{
+            "账号名称": "账号 1",
+            "登录账号": "name@example.com",
+            "登录密码": "password",
+            "代理 IP": "s123762.ips5.vip|9125|3856070|a47b734a5|2026-08-10"
+          }], { columns: ["账号名称", "登录账号", "登录密码", "代理 IP"] });
+          const url = URL.createObjectURL(new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }));
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = "账号批量导入模板.csv";
+          link.click();
+          URL.revokeObjectURL(url);
+        }
+
+        async function submitAccountImport() {
+          const validRows = accountImportRows.filter((row) => row.status === "valid");
+          if (!selectedChannel?.id || !validRows.length) return;
+          setAccountImporting(true);
+          try {
+            const response = await api("/api/accounts/import", {
+              method: "POST",
+              body: {
+                channelId: selectedChannel.id,
+                accounts: validRows.map(({ name, username, password, proxyUrl }) => ({
+                  name,
+                  username,
+                  password,
+                  proxyUrl
+                }))
+              }
+            });
+            setConfig(response.config);
+            setSelectedChannelId(selectedChannel.id);
+            setAccountImportOpen(false);
+            await refreshRuntimeStatus();
+            const result = response.result || {};
+            message.success(result.skipped
+              ? `导入完成：新增 ${result.imported || 0} 个，跳过重复 ${result.skipped} 个`
+              : `导入完成：新增 ${result.imported || 0} 个账号`);
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setAccountImporting(false);
+          }
+        }
+
         async function deleteAccount(id) {
           try {
             setConfig(await api(`/api/accounts/${id}`, { method: "DELETE" }));
@@ -4980,7 +5182,10 @@
                         : null,
                       h("div", { className: "section-title" }, [
                         h("h3", null, "渠道账号"),
-                        h(Button, { type: "primary", icon: Icon.PlusOutlined ? h(Icon.PlusOutlined) : null, onClick: () => openAccountModal(null), disabled: !channels.length }, "新增账号")
+                        h(Space, { size: 8 }, [
+                          h(Button, { icon: Icon.UploadOutlined ? h(Icon.UploadOutlined) : null, onClick: openAccountImport, disabled: !channels.length }, "批量导入"),
+                          h(Button, { type: "primary", icon: Icon.PlusOutlined ? h(Icon.PlusOutlined) : null, onClick: () => openAccountModal(null), disabled: !channels.length }, "新增账号")
+                        ])
                       ]),
                       h(Table, {
                         rowKey: "id",
@@ -5561,7 +5766,90 @@
               message: "每个账号单独限制；首页只把该账号所属渠道已启用的模型计入对应并发。",
               style: { marginBottom: 0 }
             })
-          ]))
+          ])),
+          h(Modal, {
+            title: "批量导入账号",
+            open: accountImportOpen,
+            onCancel: () => {
+              if (!accountImporting) setAccountImportOpen(false);
+            },
+            onOk: submitAccountImport,
+            okText: `导入 ${accountImportRows.filter((row) => row.status === "valid").length} 个账号`,
+            okButtonProps: {
+              disabled: Boolean(accountImportError) || !accountImportRows.some((row) => row.status === "valid")
+            },
+            cancelText: "取消",
+            confirmLoading: accountImporting,
+            maskClosable: !accountImporting,
+            width: 920,
+            destroyOnClose: true
+          }, [
+            h(Alert, {
+              key: "notice",
+              type: "info",
+              showIcon: true,
+              message: `导入到“${selectedChannel?.name || ""}”`,
+              description: "CSV 表头需要包含：账号名称、登录账号、登录密码、代理 IP。代理 IP 可以留空。",
+              style: { marginBottom: 14 }
+            }),
+            h(Space, { key: "actions", size: 8, wrap: true, style: { marginBottom: 12 } }, [
+              h(Upload, {
+                accept: ".csv,.txt,text/csv,text/plain",
+                beforeUpload: readAccountImportFile,
+                showUploadList: false,
+                maxCount: 1
+              }, h(Button, { icon: Icon.UploadOutlined ? h(Icon.UploadOutlined) : null }, "选择 CSV 文件")),
+              h(Button, { onClick: downloadAccountImportTemplate, icon: Icon.DownloadOutlined ? h(Icon.DownloadOutlined) : null }, "下载模板"),
+              h(Button, { type: "primary", ghost: true, onClick: () => previewAccountImport() }, "预览内容")
+            ]),
+            h(Input.TextArea, {
+              key: "text",
+              value: accountImportText,
+              onChange: (event) => {
+                setAccountImportText(event.target.value);
+                setAccountImportRows([]);
+                setAccountImportError("");
+              },
+              rows: 6,
+              placeholder: "也可以直接粘贴 CSV 内容，然后点击“预览内容”",
+              style: { marginBottom: 12 }
+            }),
+            accountImportError
+              ? h(Alert, { key: "error", type: "error", showIcon: true, message: accountImportError, style: { marginBottom: 12 } })
+              : null,
+            accountImportRows.length
+              ? h("div", { key: "preview" }, [
+                  h(Space, { size: 6, wrap: true, style: { marginBottom: 10 } }, [
+                    h(Tag, { color: "green" }, `可导入 ${accountImportRows.filter((row) => row.status === "valid").length}`),
+                    h(Tag, null, `重复 ${accountImportRows.filter((row) => row.status === "duplicate").length}`),
+                    h(Tag, { color: "red" }, `错误 ${accountImportRows.filter((row) => row.status === "error").length}`)
+                  ]),
+                  h(Table, {
+                    rowKey: "key",
+                    size: "small",
+                    pagination: accountImportRows.length > 6 ? { pageSize: 6, showSizeChanger: false } : false,
+                    scroll: { x: 720 },
+                    dataSource: accountImportRows,
+                    columns: [
+                      { title: "行", dataIndex: "rowNumber", width: 64 },
+                      { title: "账号名称", dataIndex: "name", width: 150, ellipsis: true },
+                      { title: "登录账号", dataIndex: "username", width: 210, ellipsis: true },
+                      { title: "代理 IP", dataIndex: "proxyUrl", width: 180, render: accountImportProxyLabel },
+                      {
+                        title: "结果",
+                        dataIndex: "status",
+                        width: 210,
+                        render: (_value, row) => row.status === "valid"
+                          ? h(Tag, { color: "green" }, "可导入")
+                          : row.status === "duplicate"
+                            ? h(Tag, null, "重复，已跳过")
+                            : h(Tag, { color: "red" }, row.message || "格式错误")
+                      }
+                    ]
+                  })
+                ])
+              : null
+          ])
         ]);
       }
 

@@ -42,6 +42,7 @@ import {
   closeStorage,
   getTask,
   getTaskBySourceTaskId,
+  importAccounts,
   listIntradayTaskStats,
   listTaskPage,
   listTaskStats,
@@ -851,6 +852,17 @@ app.delete("/api/channels/:id", async (request) => {
 app.post("/api/accounts", async (request) => {
   const config = await saveAccount(request.body || {});
   return { ok: true, data: publicConfig(config) };
+});
+
+app.post("/api/accounts/import", async (request) => {
+  const imported = await importAccounts(request.body || {});
+  return {
+    ok: true,
+    data: {
+      config: publicConfig(imported.config),
+      result: imported.result
+    }
+  };
 });
 
 app.delete("/api/accounts/:id", async (request) => {
