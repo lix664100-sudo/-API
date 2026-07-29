@@ -894,8 +894,14 @@ function importedAccountText(value, field, rowNumber, maxLength) {
 
 function normalizeImportedAccount(row, index, channelId, config) {
   const rowNumber = index + 2;
-  const name = importedAccountText(row?.name, "账号名称", rowNumber, 100);
   const username = importedAccountText(row?.username, "登录账号", rowNumber, 320);
+  const nameInput = String(row?.name ?? "").trim();
+  if (nameInput.length > 320) {
+    const error = new Error(`第 ${rowNumber} 行的账号名称过长。`);
+    error.status = 400;
+    throw error;
+  }
+  const name = nameInput || username;
   const password = String(row?.password ?? "");
   const proxyUrl = String(row?.proxyUrl ?? row?.proxy ?? "").trim();
   if (!password) {

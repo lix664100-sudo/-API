@@ -48,6 +48,21 @@ test("批量导入会使用当前渠道默认设置并一次保存", async () =>
   assert.deepEqual(accounts[0].concurrency, stored.concurrency);
 });
 
+test("账号名称为空时自动使用登录账号", async () => {
+  const imported = await importAccounts({
+    channelId: "shareai",
+    accounts: [{
+      username: "without-name@example.com",
+      password: "password-without-name"
+    }]
+  });
+
+  assert.deepEqual(imported.result, { total: 1, imported: 1, skipped: 0 });
+  const stored = await loadConfig();
+  const account = stored.accounts.find((item) => item.username === "without-name@example.com");
+  assert.equal(account.name, "without-name@example.com");
+});
+
 test("同一渠道已有账号和同批重复账号会被跳过", async () => {
   const imported = await importAccounts({
     channelId: "shareai",
@@ -60,7 +75,7 @@ test("同一渠道已有账号和同批重复账号会被跳过", async () => {
 
   assert.deepEqual(imported.result, { total: 3, imported: 1, skipped: 2 });
   const stored = await loadConfig();
-  assert.equal(stored.accounts.filter((account) => account.channelId === "shareai").length, 3);
+  assert.equal(stored.accounts.filter((account) => account.channelId === "shareai").length, 4);
   assert.equal(stored.accounts.find((account) => account.username === "a@example.com").password, "password-a");
 });
 

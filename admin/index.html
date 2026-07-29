@@ -2249,20 +2249,33 @@
       function parseAccountImportText(text, currentAccounts, channelId) {
         if (!window.Papa) return { rows: [], error: "导入组件加载失败，请刷新页面重试。" };
         const parsed = window.Papa.parse(String(text || ""), {
-          header: true,
-          skipEmptyLines: "greedy",
-          transformHeader: normalizeAccountImportHeader
+          delimiter: ",",
+          skipEmptyLines: "greedy"
         });
-        const fields = new Set(parsed.meta?.fields || []);
-        const missingFields = [
-          ["name", "账号名称"],
-          ["username", "登录账号"],
-          ["password", "登录密码"]
-        ].filter(([key]) => !fields.has(key)).map(([, label]) => label);
-        if (missingFields.length) {
+        const sourceRows = (parsed.data || []).map((source, sourceIndex) => {
+          const cells = (Array.isArray(source) ? source : [source])
+            .map((value) => String(value ?? "").trim());
+          return {
+            sourceIndex,
+            cells: cells.length === 1 && cells[0] ? cells[0].split(/\s+/) : cells
+          };
+        }).filter((row) => row.cells.some(Boolean));
+        if (!sourceRows.length) return { rows: [], error: "" };
+
+        const headerFields = sourceRows[0].cells.map(normalizeAccountImportHeader);
+        const knownFields = new Set(["name", "username", "password", "proxyUrl"]);
+        const recognizedHeaderCount = headerFields.filter((field) => knownFields.has(field)).length;
+        const hasHeader = headerFields.includes("username") && headerFields.includes("password");
+        if (recognizedHeaderCount && !hasHeader) {
+          const missingFields = [
+            ["username", "登录账号"],
+            ["password", "登录密码"]
+          ].filter(([key]) => !headerFields.includes(key)).map(([, label]) => label);
           return { rows: [], error: `缺少表头：${missingFields.join("、")}。` };
         }
-        if (parsed.data.length > 500) {
+
+        const dataRows = hasHeader ? sourceRows.slice(1) : sourceRows;
+        if (dataRows.length > 500) {
           return { rows: [], error: "每次最多导入 500 个账号，请拆分后重试。" };
         }
 
@@ -2280,14 +2293,30 @@
             .filter(Boolean)
         );
         const seen = new Set(existing);
-        const rows = parsed.data.map((item, index) => {
-          const name = String(item.name || "").trim();
+        const rows = dataRows.map(({ cells, sourceIndex }, index) => {
+          let item = {};
+          let structureError = "";
+          if (hasHeader) {
+            headerFields.forEach((field, fieldIndex) => {
+              if (knownFields.has(field)) item[field] = cells[fieldIndex] || "";
+            });
+          } else if (cells.length === 2) {
+            [item.username, item.password] = cells;
+          } else if (cells.length === 3) {
+            [item.username, item.password, item.proxyUrl] = cells;
+          } else if (cells.length === 4) {
+            [item.name, item.username, item.password, item.proxyUrl] = cells;
+          } else {
+            structureError = "每行需要填写 2、3 或 4 项";
+          }
+
           const username = String(item.username || "").trim();
+          const name = String(item.name || username).trim();
           const password = String(item.password ?? "");
           const proxyUrl = String(item.proxyUrl || "").trim();
           const errors = [];
-          if (parseErrors.has(index)) errors.push(parseErrors.get(index));
-          if (!name) errors.push("缺少账号名称");
+          if (parseErrors.has(sourceIndex)) errors.push(parseErrors.get(sourceIndex));
+          if (structureError) errors.push(structureError);
           if (!username) errors.push("缺少登录账号");
           if (!password) errors.push("缺少登录密码");
           if (proxyUrl && !validAccountImportProxy(proxyUrl)) errors.push("代理 IP 格式不正确");
@@ -2297,7 +2326,7 @@
           if (!errors.length && !duplicate) seen.add(duplicateKey);
           return {
             key: `account-import-${index}`,
-            rowNumber: index + 2,
+            rowNumber: sourceIndex + 1,
             name,
             username,
             password,
@@ -4268,11 +4297,10 @@
 
         function downloadAccountImportTemplate() {
           const csv = window.Papa.unparse([{
-            "账号名称": "账号 1",
             "登录账号": "name@example.com",
             "登录密码": "password",
-            "代理 IP": "s123762.ips5.vip|9125|3856070|a47b734a5|2026-08-10"
-          }], { columns: ["账号名称", "登录账号", "登录密码", "代理 IP"] });
+            "代理 IP": "proxy.example.com|1080|user|password|2026-12-31"
+          }], { columns: ["登录账号", "登录密码", "代理 IP"] });
           const url = URL.createObjectURL(new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }));
           const link = document.createElement("a");
           link.href = url;
@@ -5789,7 +5817,7 @@
               type: "info",
               showIcon: true,
               message: `导入到“${selectedChannel?.name || ""}”`,
-              description: "CSV 表头需要包含：账号名称、登录账号、登录密码、代理 IP。代理 IP 可以留空。",
+              description: "支持 CSV；也可每行按空格填写“登录账号 密码 代理 IP”。账号名称和代理 IP 都可以不填。",
               style: { marginBottom: 14 }
             }),
             h(Space, { key: "actions", size: 8, wrap: true, style: { marginBottom: 12 } }, [
@@ -5811,7 +5839,7 @@
                 setAccountImportError("");
               },
               rows: 6,
-              placeholder: "也可以直接粘贴 CSV 内容，然后点击“预览内容”",
+              placeholder: "每行一个账号，例如：name@example.com password proxy.example.com|1080|user|password",
               style: { marginBottom: 12 }
             }),
             accountImportError
