@@ -103,6 +103,44 @@ test("停用账号不会被后台自动恢复登录", async () => {
   }
 });
 
+test("绘图账号检测不再请求已下线的统计地址", async () => {
+  const client = new DrawingClient({
+    config: {
+      mainBaseUrl: "https://main.example.test",
+      drawingBaseUrl: "https://drawing.example.test"
+    },
+    channel: {
+      id: "shareai:drawing",
+      settings: { baseUrl: "https://drawing.example.test" }
+    },
+    account: {
+      id: "drawing-profile-only",
+      username: "drawing-profile-only@example.test",
+      password: "test"
+    }
+  });
+  const requestedPaths = [];
+  client.ensureLogin = async () => {};
+  client.request = async (pathName) => {
+    requestedPaths.push(pathName);
+    if (pathName === "/api/v1/profile") {
+      return {
+        quota_points: 100,
+        balance: 44,
+        external_sub_expire_at: "2026-08-16T05:22:00+08:00"
+      };
+    }
+    throw new Error(`不应再请求旧地址：${pathName}`);
+  };
+
+  const result = await client.check();
+
+  assert.deepEqual(requestedPaths, ["/api/v1/profile"]);
+  assert.equal(result.status, "ok");
+  assert.equal(result.quota, 100);
+  assert.equal(result.balance, 44);
+});
+
 test("账号检测遇到失效车位后会自动换车", async () => {
   const client = new ChatplusClient({
     config: {},

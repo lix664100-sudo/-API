@@ -1291,25 +1291,43 @@ function taskStatDuration(task, status) {
   return end - start;
 }
 
+function taskWasSystemRejected(task, status) {
+  if (status !== "failed" || task?.raw?.returnedError !== true || task?.raw?.submitted === true) return false;
+  const code = String(task?.responseJson?.code || task?.code || "").trim().toUpperCase();
+  return code === "CONCURRENCY_LIMIT";
+}
+
+function taskStatCount(record) {
+  const value = record?.tasks;
+  return Math.max(0, Number(value === undefined || value === null ? 1 : value) || 0);
+}
+
+function taskStatValue(record, field, fallback = 0) {
+  const value = record?.[field];
+  return Math.max(0, Number(value === undefined || value === null ? fallback : value) || 0);
+}
+
 function taskStatRecord(task) {
   const status = finalStatStatus(task?.status);
   if (!status || !task?.id) return null;
   const time = taskStatTime(task);
+  const systemRejected = taskWasSystemRejected(task, status);
   return {
     taskId: String(task.id),
     day: dateKeyInShanghai(time),
     time,
     status,
     taskType: task.taskType || "",
-    accountId: task.accountId || "",
-    accountName: task.accountName || "",
+    accountId: systemRejected ? "" : task.accountId || "",
+    accountName: systemRejected ? "" : task.accountName || "",
     channelId: task.channelId || "",
     channelName: task.channelName || "",
     channelType: task.channelType || "",
     channelGroup: taskStatChannelGroup(task),
-    tasks: 1,
+    tasks: systemRejected ? 0 : 1,
     successImages: status === "success" ? taskGeneratedImageCount(task) : 0,
-    failedTasks: status === "failed" ? 1 : 0,
+    failedTasks: status === "failed" && !systemRejected ? 1 : 0,
+    systemRejectedTasks: systemRejected ? 1 : 0,
     durationMs: taskStatDuration(task, status)
   };
 }
@@ -1358,12 +1376,14 @@ export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now 
       tasks: 0,
       successTasks: 0,
       failedTasks: 0,
+      systemRejectedTasks: 0,
       successImages: 0,
       durationMsTotal: 0,
       durationSamples: 0
     };
-    const taskCount = Math.max(0, Number(record?.tasks || 1) || 0);
+    const taskCount = taskStatCount(record);
     current.tasks += taskCount;
+    current.systemRejectedTasks += taskStatValue(record, "systemRejectedTasks");
     if (record?.status === "success") {
       current.successTasks += taskCount;
       current.successImages += Math.max(0, Number(record?.successImages || 0) || 0);
@@ -1373,7 +1393,7 @@ export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now 
         current.durationSamples += 1;
       }
     } else if (record?.status === "failed") {
-      current.failedTasks += Math.max(0, Number(record?.failedTasks || taskCount) || 0);
+      current.failedTasks += taskStatValue(record, "failedTasks", taskCount);
     }
     grouped.set(key, current);
   }
@@ -1422,12 +1442,14 @@ export function summarizeRecentTaskStats(records = [], days = 7, now = Date.now(
       channelGroup,
       tasks: 0,
       successImages: 0,
-      failedTasks: 0
+      failedTasks: 0,
+      systemRejectedTasks: 0
     };
-    const taskCount = Math.max(0, Number(record?.tasks || 1) || 0);
+    const taskCount = taskStatCount(record);
     current.tasks += taskCount;
     current.successImages += Math.max(0, Number(record?.successImages || 0) || 0);
-    current.failedTasks += Math.max(0, Number(record?.failedTasks || (status === "failed" ? taskCount : 0)) || 0);
+    current.failedTasks += taskStatValue(record, "failedTasks", status === "failed" ? taskCount : 0);
+    current.systemRejectedTasks += taskStatValue(record, "systemRejectedTasks");
     grouped.set(key, current);
   }
 
@@ -1479,6 +1501,7 @@ export function summarizeIntradayTaskStats(records = [], day, now = Date.now()) 
       tasks: 0,
       successTasks: 0,
       failedTasks: 0,
+      systemRejectedTasks: 0,
       successImages: 0,
       accountIds: new Set()
     };
@@ -1491,13 +1514,14 @@ export function summarizeIntradayTaskStats(records = [], day, now = Date.now()) 
     const minute = minutesInShanghai(record?.time);
     if (minute === null) continue;
     const bucket = buckets[Math.min(bucketCount - 1, Math.floor(minute / intradayIntervalMinutes))];
-    const taskCount = Math.max(0, Number(record?.tasks || 1) || 0);
+    const taskCount = taskStatCount(record);
     bucket.tasks += taskCount;
+    bucket.systemRejectedTasks += taskStatValue(record, "systemRejectedTasks");
     if (record?.status === "success") {
       bucket.successTasks += taskCount;
       bucket.successImages += Math.max(0, Number(record?.successImages || 0) || 0);
     } else if (record?.status === "failed") {
-      bucket.failedTasks += Math.max(0, Number(record?.failedTasks || taskCount) || 0);
+      bucket.failedTasks += taskStatValue(record, "failedTasks", taskCount);
     }
     const accountId = String(record?.accountId || record?.accountName || "").trim();
     if (taskCount > 0 && accountId) bucket.accountIds.add(accountId);
@@ -1511,6 +1535,7 @@ export function summarizeIntradayTaskStats(records = [], day, now = Date.now()) 
     tasks: bucket.tasks,
     successTasks: bucket.successTasks,
     failedTasks: bucket.failedTasks,
+    systemRejectedTasks: bucket.systemRejectedTasks,
     successImages: bucket.successImages,
     accountCount: bucket.accountIds.size,
     successRate: bucket.tasks ? Number((bucket.successTasks / bucket.tasks * 100).toFixed(1)) : null
@@ -1525,6 +1550,7 @@ export function summarizeIntradayTaskStats(records = [], day, now = Date.now()) 
     totalImages: normalizedBuckets.reduce((sum, bucket) => sum + bucket.successImages, 0),
     totalTasks: normalizedBuckets.reduce((sum, bucket) => sum + bucket.tasks, 0),
     failedTasks: normalizedBuckets.reduce((sum, bucket) => sum + bucket.failedTasks, 0),
+    systemRejectedTasks: normalizedBuckets.reduce((sum, bucket) => sum + bucket.systemRejectedTasks, 0),
     peak: peak?.successImages > 0 ? {
       start: peak.start,
       end: peak.end,

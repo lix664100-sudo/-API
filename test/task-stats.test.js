@@ -1,13 +1,26 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { after, test } from "node:test";
 
-import {
+const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-stats-"));
+process.env.DATA_DIR = dataDir;
+
+const {
+  closeStorage,
   mergeRuntimeStatSample,
+  recordTaskStat,
   summarizeDailyRuntimeStats,
   summarizeDailyTaskStats,
   summarizeIntradayTaskStats,
   summarizeRecentTaskStats
-} from "../src/storage.js";
+} = await import("../src/storage.js");
+
+after(async () => {
+  await closeStorage();
+  await rm(dataDir, { recursive: true, force: true });
+});
 
 test("compact task stats preserve totals while combining repeated records", () => {
   const now = Date.parse("2026-07-22T12:00:00+08:00");
@@ -58,7 +71,8 @@ test("compact task stats preserve totals while combining repeated records", () =
     channelGroup: "drawing",
     tasks: 2,
     successImages: 3,
-    failedTasks: 0
+    failedTasks: 0,
+    systemRejectedTasks: 0
   });
   assert.equal(summary.find((record) => record.status === "failed").failedTasks, 1);
 });
@@ -146,6 +160,7 @@ test("最近生图趋势按北京时间汇总成功和失败，并补齐没有�
     tasks: 2,
     successTasks: 1,
     failedTasks: 1,
+    systemRejectedTasks: 0,
     successImages: 2,
     durationMsTotal: 90000,
     durationSamples: 1,
@@ -249,6 +264,7 @@ test("分时出图按北京时间每30分钟统计成功图片", () => {
     tasks: 2,
     successTasks: 1,
     failedTasks: 1,
+    systemRejectedTasks: 0,
     successImages: 2,
     accountCount: 1,
     successRate: 50
@@ -257,4 +273,83 @@ test("分时出图按北京时间每30分钟统计成功图片", () => {
   assert.equal(summary.totalImages, 3);
   assert.equal(summary.failedTasks, 1);
   assert.deepEqual(summary.peak, { start: "09:00", end: "09:30", successImages: 2 });
+});
+
+test("system rejections are reported separately and do not lower account success rates", () => {
+  const day = "2026-07-18";
+  const now = Date.parse("2026-07-18T12:00:00+08:00");
+  const records = [
+    {
+      day,
+      time: Date.parse("2026-07-18T09:00:00+08:00"),
+      status: "success",
+      taskType: "img2img",
+      accountId: "account-a",
+      accountName: "Account A",
+      channelGroup: "drawing",
+      tasks: 1,
+      successImages: 1,
+      failedTasks: 0,
+      systemRejectedTasks: 0
+    },
+    {
+      day,
+      time: Date.parse("2026-07-18T09:10:00+08:00"),
+      status: "failed",
+      taskType: "img2img",
+      accountId: "",
+      accountName: "",
+      channelGroup: "drawing",
+      tasks: 0,
+      successImages: 0,
+      failedTasks: 0,
+      systemRejectedTasks: 1
+    }
+  ];
+
+  const recent = summarizeRecentTaskStats(records, 7, now);
+  const recentRejection = recent.find((record) => record.systemRejectedTasks === 1);
+  assert.equal(recentRejection.tasks, 0);
+  assert.equal(recentRejection.failedTasks, 0);
+  assert.equal(recentRejection.accountId, "");
+
+  const daily = summarizeDailyTaskStats(records, 7, now);
+  const account = daily.records.find((record) => record.accountId === "account-a");
+  const dailyRejection = daily.records.find((record) => record.systemRejectedTasks === 1);
+  assert.equal(account.tasks, 1);
+  assert.equal(account.successTasks, 1);
+  assert.equal(account.failedTasks, 0);
+  assert.equal(dailyRejection.tasks, 0);
+  assert.equal(dailyRejection.failedTasks, 0);
+
+  const intraday = summarizeIntradayTaskStats(records, day, now);
+  assert.equal(intraday.totalTasks, 1);
+  assert.equal(intraday.failedTasks, 0);
+  assert.equal(intraday.systemRejectedTasks, 1);
+  assert.equal(intraday.buckets[18].tasks, 1);
+  assert.equal(intraday.buckets[18].systemRejectedTasks, 1);
+});
+
+test("a concurrency rejection before submission is not assigned to the attempted account", async () => {
+  const completedAt = new Date().toISOString();
+  const record = await recordTaskStat({
+    id: "system-rejection-before-submission",
+    status: "failed",
+    taskType: "img2img",
+    accountId: "attempted-account",
+    accountName: "Attempted Account",
+    channelId: "shareai:drawing",
+    channelName: "Drawing",
+    channelType: "drawing",
+    responseJson: { code: "CONCURRENCY_LIMIT" },
+    raw: { returnedError: true },
+    createdAt: completedAt,
+    completedAt
+  });
+
+  assert.equal(record.accountId, "");
+  assert.equal(record.accountName, "");
+  assert.equal(record.tasks, 0);
+  assert.equal(record.failedTasks, 0);
+  assert.equal(record.systemRejectedTasks, 1);
 });

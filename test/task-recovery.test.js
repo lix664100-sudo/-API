@@ -968,6 +968,201 @@ test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", asyn
   }
 });
 
+test("Gemini 旧图片地址失效后会读取新地址并恢复", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    publicBaseUrl: "https://api.example.test",
+    imageStorage: { mode: "smart", autoCleanup: false, retentionDays: 7 },
+    accounts: [{
+      id: "account-gemini-fresh-url",
+      channelId: "shareai",
+      name: "Gemini 新地址恢复测试账号",
+      username: "gemini-fresh-url@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const id = "task-gemini-fresh-url";
+  const oldUrl = "https://one.aishare.icu/gemini/images/gg-dl/expired-image";
+  const newUrl = "https://one.aishare.icu/gemini/images/gg-dl/refreshed-image";
+  const now = new Date().toISOString();
+  await upsertTask({
+    id,
+    externalId: "c_gemini_fresh_url",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    modelId: "gemini",
+    prompt: "Gemini 新地址恢复测试",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-gemini-fresh-url",
+    accountName: "Gemini 新地址恢复测试账号",
+    imageCount: 1,
+    imageUrls: [oldUrl],
+    raw: {
+      submitted: true,
+      upstreamCompleted: true,
+      imageMirrorPending: true,
+      originalImageUrls: [oldUrl],
+      waitingSince: now,
+      selectedCarId: "gemini-car",
+      selectedCarType: "gemini"
+    },
+    createdAt: now,
+    completedAt: null
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  const originalDownloadResultImage = ChatplusClient.prototype.downloadResultImage;
+  const downloadedUrls = [];
+  let localFilename = "";
+  ChatplusClient.prototype.getTask = async (externalId) => ({
+    externalId,
+    status: "success",
+    imageCount: 1,
+    imageUrls: [newUrl],
+    raw: {
+      conversationId: externalId,
+      selectedCarId: "gemini-car",
+      selectedCarType: "gemini"
+    }
+  });
+  ChatplusClient.prototype.downloadResultImage = async (url) => {
+    downloadedUrls.push(url);
+    if (url === oldUrl) {
+      const error = new Error("图片保存失败：上游图片地址返回 500。");
+      error.status = 500;
+      throw error;
+    }
+    return {
+      buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]),
+      contentType: "image/png"
+    };
+  };
+
+  try {
+    const recovered = await refreshTask(id);
+    assert.equal(recovered.status, "success", JSON.stringify(recovered.responseJson || recovered.raw || {}));
+    assert.equal(recovered.imageCount, 1);
+    assert.match(recovered.imageUrls[0], /^https:\/\/api\.example\.test\/uploads\/results\/.+\.png$/);
+    assert.equal(downloadedUrls.includes(oldUrl), true);
+    assert.equal(downloadedUrls.includes(newUrl), true);
+    assert.equal(recovered.raw.imageMirrorPending, false);
+    assert.deepEqual(recovered.raw.originalImageUrls, [newUrl]);
+    localFilename = path.basename(new URL(recovered.imageUrls[0]).pathname);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    ChatplusClient.prototype.downloadResultImage = originalDownloadResultImage;
+    await saveConfig(config);
+    if (localFilename) {
+      await rm(path.join(process.cwd(), "outputs", "results", localFilename), { force: true });
+    }
+  }
+});
+
+test("Gemini 图片地址长期失效后会停止等待且不计失败", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    publicBaseUrl: "https://api.example.test",
+    imageStorage: { mode: "smart", autoCleanup: false, retentionDays: 7 },
+    accounts: [{
+      id: "account-gemini-expired-mirror",
+      channelId: "shareai",
+      name: "Gemini 失效地址测试账号",
+      username: "gemini-expired-mirror@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const id = "task-gemini-expired-mirror";
+  const expiredUrl = "https://one.aishare.icu/gemini/images/gg-dl/permanently-expired";
+  const waitingSince = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+  await upsertTask({
+    id,
+    externalId: "c_gemini_expired_mirror",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    modelId: "gemini",
+    prompt: "Gemini 失效地址停止等待测试",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-gemini-expired-mirror",
+    accountName: "Gemini 失效地址测试账号",
+    imageCount: 1,
+    imageUrls: [expiredUrl],
+    raw: {
+      submitted: true,
+      upstreamCompleted: true,
+      imageMirrorPending: true,
+      originalImageUrls: [expiredUrl],
+      waitingSince,
+      selectedCarId: "gemini-car",
+      selectedCarType: "gemini"
+    },
+    createdAt: waitingSince,
+    completedAt: null
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  const originalDownloadResultImage = ChatplusClient.prototype.downloadResultImage;
+  let upstreamReadCount = 0;
+  let downloadCount = 0;
+  ChatplusClient.prototype.getTask = async (externalId) => {
+    upstreamReadCount += 1;
+    return {
+      externalId,
+      status: "success",
+      imageCount: 1,
+      imageUrls: [expiredUrl],
+      raw: { conversationId: externalId }
+    };
+  };
+  ChatplusClient.prototype.downloadResultImage = async () => {
+    downloadCount += 1;
+    const error = new Error("图片保存失败：上游图片地址返回 500。");
+    error.status = 500;
+    throw error;
+  };
+
+  try {
+    const interrupted = await refreshTask(id);
+    assert.equal(interrupted.status, "interrupted");
+    assert.equal(interrupted.imageCount, 0, JSON.stringify(interrupted.responseJson || interrupted.raw || {}));
+    assert.deepEqual(interrupted.imageUrls, []);
+    assert.equal(interrupted.errorMessage, "");
+    assert.equal(interrupted.raw.imageMirrorPending, false);
+    assert.equal(interrupted.raw.imageMirrorGaveUp, true);
+    assert.equal(upstreamReadCount, 0);
+    assert.equal(downloadCount, 0);
+    assert.match(interrupted.responseJson.message, /任务已停止，不计入失败/);
+    assert.ok(interrupted.completedAt);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    ChatplusClient.prototype.downloadResultImage = originalDownloadResultImage;
+    await saveConfig(config);
+  }
+});
+
 test("没有保存结果的旧 Gemini 任务会停止而不是永久处理中", async () => {
   const config = await loadConfig();
   await saveConfig({

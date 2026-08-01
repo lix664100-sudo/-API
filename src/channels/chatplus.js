@@ -215,9 +215,15 @@ function isAuthSessionError(error) {
   return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|unauthorized|forbidden/i.test(text);
 }
 
+function isProCarPlanMismatchError(error) {
+  const text = `${error?.message || ""} ${error?.body || ""}`.replace(/\s+/g, " ");
+  return /不是\s*Pro\s*用户|not.{0,12}(?:a\s+)?pro\s+user/i.test(text);
+}
+
 function isCarPlanMismatchError(error) {
   const text = `${error?.message || ""} ${error?.body || ""}`.replace(/\s+/g, " ");
-  return /\u4e0d\u662f\s*Ultra\s*\u7528\u6237|\u5347\u7ea7\u540e\u4f7f\u7528\u8be5\u8f66|not.{0,24}ultra|ultra.{0,24}user|(?:upgrade|\u5347\u7ea7).{0,24}(?:car|\u8be5\u8f66|\u8f66\u4f4d|Ultra)/i.test(text);
+  return isProCarPlanMismatchError(error)
+    || /\u4e0d\u662f\s*Ultra\s*\u7528\u6237|\u5347\u7ea7\u540e\u4f7f\u7528\u8be5\u8f66|not.{0,24}ultra|ultra.{0,24}user|(?:upgrade|\u5347\u7ea7).{0,24}(?:car|\u8be5\u8f66|\u8f66\u4f4d|Ultra)/i.test(text);
 }
 
 function fileNameFromMime(mimeType, fallback = "image.png") {
@@ -906,7 +912,7 @@ function throwIfTerminalImageFailure(content, options = {}) {
 
 function throwIfTextImageResponse(content, options = {}) {
   const message = String(content || "").trim();
-  if (!message) return;
+  if (!message || isSkippedMainlineContent(message)) return;
   const error = new Error(message);
   error.upstreamText = message;
   error.upstreamExplicitFailure = true;
@@ -1502,6 +1508,7 @@ export class ChatplusClient {
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWorks = new Map();
     this.concurrentChatSessions = new Map();
+    this.proCarsUnavailableUntil = 0;
   }
 
   makeContextSignature({ channel, account }) {
@@ -1523,6 +1530,7 @@ export class ChatplusClient {
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     if (changed) {
       this.contextSignature = nextSignature;
+      this.proCarsUnavailableUntil = 0;
       this.resetSession();
     }
   }
@@ -1934,7 +1942,14 @@ export class ChatplusClient {
     if (!candidates.length) throw new Error(`${route.name} 暂时没有可用车辆。`);
     const tierCandidates = candidates.filter((item) => carMatchesTier(item.car, tier));
     if (!tierCandidates.length) throw new Error(`${route.name} 暂时没有可用的${carTierDisplayName(tier)}车位。`);
-    const usableCars = tierCandidates;
+    const proCarsUnavailable = this.proCarsUnavailableUntil > Date.now();
+    if (!proCarsUnavailable && this.proCarsUnavailableUntil) this.proCarsUnavailableUntil = 0;
+    const usableCars = proCarsUnavailable
+      ? tierCandidates.filter((item) => !item.car.isPro && !item.car.isUltra)
+      : tierCandidates;
+    if (!usableCars.length) {
+      throw new Error(`${route.name} 当前账号不能使用 PRO 车位，普通车位也暂时不可用。`);
+    }
     const selected = usableCars[0];
     return {
       carId: selected.carId,
@@ -1948,6 +1963,12 @@ export class ChatplusClient {
 
   rememberAuthFailedCar(selected) {
     rememberBadCar(this.account?.id, selected?.carType, selected?.carId);
+  }
+
+  rememberProCarsUnavailable(error) {
+    if (isProCarPlanMismatchError(error)) {
+      this.proCarsUnavailableUntil = Date.now() + BAD_CAR_TTL_MS;
+    }
   }
 
   async prepareChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
@@ -1967,6 +1988,7 @@ export class ChatplusClient {
       } catch (error) {
         const retryableCarError = isAuthSessionError(error) || isCarPlanMismatchError(error);
         if (retryableCarError) {
+          this.rememberProCarsUnavailable(error);
           this.rememberAuthFailedCar(selected);
           await this.sessionLock(async () => this.resetSession());
         }
@@ -2686,6 +2708,7 @@ export class ChatplusClient {
         }
         const retryableCarError = selected && (isAuthSessionError(error) || isCarPlanMismatchError(error));
         if (retryableCarError) {
+          this.rememberProCarsUnavailable(error);
           this.rememberAuthFailedCar(selected);
           await this.sessionLock(async () => this.resetSession());
           errors.push(error.message || "调用失败");

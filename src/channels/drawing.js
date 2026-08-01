@@ -373,10 +373,8 @@ export class DrawingClient {
   async check() {
     const checkOptions = { timeoutMs: ACCOUNT_CHECK_TIMEOUT_MS };
     await this.ensureLogin(checkOptions);
-    const [profile, stats] = await Promise.all([
-      this.request("/api/v1/profile", checkOptions),
-      this.request("/api/v1/profile/stats", checkOptions)
-    ]);
+    const profile = await this.request("/api/v1/profile", checkOptions);
+    const stats = {};
     const balance = profile?.balance ?? profile?.quota_points ?? stats?.balance ?? null;
     const quota = profile?.quota_points ?? profile?.quota ?? stats?.quota ?? null;
     const quotaEmpty = isZeroOrLess(balance);

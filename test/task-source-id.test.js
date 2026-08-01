@@ -329,3 +329,31 @@ test("chatplus text-only image wait returns upstream text immediately", async ()
     }
   );
 });
+
+test("chatplus image wait ignores skipped mainline marker and keeps waiting", async () => {
+  const marker = "{\"skipped_mainline\":true}";
+  const resultUrl = "https://one.example.test/generated-result.png";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-marker-account", username: "marker@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  let imageReadCount = 0;
+  client.imageUrlsFrom = async () => {
+    imageReadCount += 1;
+    return imageReadCount === 1 ? [] : [resultUrl];
+  };
+  client.json = async () => ({ mapping: {} });
+
+  const imageUrls = await client.waitForConversationImages([{
+    message: {
+      author: { role: "assistant" },
+      content: { parts: [marker] }
+    }
+  }], "conversation-with-skipped-mainline", 30, { generatedOnly: true });
+
+  assert.deepEqual(imageUrls, [resultUrl]);
+  assert.equal(imageReadCount, 2);
+});

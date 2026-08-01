@@ -306,6 +306,65 @@ test("Gemini 返回图片时直接算成功，不再走 GPT 详情接口", async
   assert.equal(waitCalled, false);
 });
 
+test("Gemini 结果不能把上传原图识别成生成图", async () => {
+  const testClient = client();
+  const events = [JSON.parse(geminiResponse({
+    imageUrl: "https://cloudlian.cn/gemini/images/gg/uploaded-source"
+  }))];
+
+  assert.deepEqual(await testClient.imageUrlsFrom(events, { gemini: true }), []);
+});
+
+test("Gemini 同时返回原图和生成图时只保留生成图", async () => {
+  const testClient = client();
+  const events = [JSON.parse(geminiResponse({
+    imageUrl: "https://cloudlian.cn/gemini/images/gg/uploaded-source https://cloudlian.cn/gemini/images/gg-dl/generated-image"
+  }))];
+
+  assert.deepEqual(await testClient.imageUrlsFrom(events, { gemini: true }), [
+    "https://cloudlian.cn/gemini/images/gg-dl/generated-image"
+  ]);
+});
+
+test("Gemini 没有生成图也没有文字时会自动换车", async () => {
+  const testClient = client();
+  const cars = ["source-only-car", "image-car"];
+  const selectedCars = [];
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    const carId = cars.find((item) => !ignoredCarIds.has(item));
+    assert.ok(carId);
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.sendGeminiConversation = async (_prompt, _input, route, selected) => {
+    selectedCars.push(selected.carId);
+    return {
+      events: [],
+      conversationId: `conversation-${selected.carId}`,
+      model: "gemini",
+      upstreamModel: "gemini",
+      route,
+      selected,
+      directContent: "",
+      imageUrls: selected.carId === "image-car" ? ["https://example.test/generated-image.png"] : []
+    };
+  };
+
+  const result = await testClient.createImageTask({
+    prompt: "只返回图片",
+    model: "gemini",
+    files: [fakeImageFile()],
+    onSubmitted: async () => {}
+  });
+
+  assert.deepEqual(selectedCars, ["source-only-car", "image-car"]);
+  assert.deepEqual(result.imageUrls, ["https://example.test/generated-image.png"]);
+});
+
 test("Gemini 生图只返回文字时会自动换车并继续出图", async () => {
   const testClient = client();
   const cars = ["text-only-car", "image-car"];

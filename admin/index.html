@@ -2021,6 +2021,46 @@
         return `${valueText(quota)}/${valueText(balance)}`;
       }
 
+      function aggregateChatReferenceUsage(accounts, channelType, modelKeys) {
+        const statuses = accounts
+          .filter((item) => item.enabled !== false)
+          .map((item) => channelType === "shareai" ? item?.meta?.abilities?.chatplus || {} : item);
+        const referenceUsage = {};
+
+        modelKeys.forEach((modelKey) => {
+          const usages = statuses
+            .map((status) => status?.meta?.referenceUsage?.[modelKey])
+            .filter((usage) => (
+              usage
+              && usage.quota !== null
+              && usage.quota !== undefined
+              && String(usage.quota).trim() !== ""
+              && Number.isFinite(Number(usage.quota))
+              && usage.balance !== null
+              && usage.balance !== undefined
+              && String(usage.balance).trim() !== ""
+              && Number.isFinite(Number(usage.balance))
+            ));
+          if (!usages.length) return;
+
+          const quota = usages.reduce((sum, usage) => sum + Number(usage.quota), 0);
+          const balance = usages.reduce((sum, usage) => sum + Number(usage.balance), 0);
+          const commonValue = (key) => {
+            const values = usages.map((usage) => String(usage[key] || "").trim());
+            return values.every(Boolean) && new Set(values).size === 1 ? values[0] : "";
+          };
+          referenceUsage[modelKey] = {
+            quota,
+            balance,
+            used: Math.max(0, quota - balance),
+            quotaResetAt: commonValue("quotaResetAt"),
+            period: commonValue("period")
+          };
+        });
+
+        return referenceUsage;
+      }
+
       function chatQuotaText(account, channel, status = {}) {
         const modelName = checkedChatModelName(account, channel);
         if (confirmedChatQuotaEmpty(status)) {
@@ -2399,16 +2439,26 @@
         return 0;
       }
 
+      function taskRecordCount(row) {
+        const value = row?.tasks;
+        return Math.max(0, numberValue(value === undefined || value === null ? 1 : value));
+      }
+
+      function failedTaskRecordCount(row) {
+        const value = row?.failedTasks;
+        return Math.max(0, numberValue(value === undefined || value === null ? taskRecordCount(row) : value));
+      }
+
       function summarizeTaskRange(source, predicate) {
         const items = source.filter(predicate);
         return {
-          tasks: items.reduce((sum, item) => sum + Math.max(0, numberValue(item.tasks || 1)), 0),
+          tasks: items.reduce((sum, item) => sum + taskRecordCount(item), 0),
           successTasks: items.reduce((sum, item) => (
-            sum + (item.status === "success" ? Math.max(0, numberValue(item.tasks || 1)) : 0)
+            sum + (item.status === "success" ? taskRecordCount(item) : 0)
           ), 0),
           successImages: items.reduce((sum, item) => sum + (item.status === "success" ? taskGeneratedImageCount(item) : 0), 0),
           failedTasks: items.reduce((sum, item) => (
-            sum + (item.status === "failed" ? Math.max(0, numberValue(item.failedTasks || item.tasks || 1)) : 0)
+            sum + (item.status === "failed" ? failedTaskRecordCount(item) : 0)
           ), 0)
         };
       }
@@ -2592,6 +2642,7 @@
 
       function productivityDayData(daily, accounts, day) {
         const rows = new Map();
+        let systemRejectedTasks = 0;
         (Array.isArray(accounts) ? accounts : []).forEach((account) => {
           rows.set(String(account.id), {
             id: String(account.id),
@@ -2606,7 +2657,10 @@
         });
         (Array.isArray(daily?.records) ? daily.records : []).forEach((record) => {
           if (record.day !== day) return;
-          const id = String(record.accountId || record.accountName || "unknown");
+          systemRejectedTasks += numberValue(record.systemRejectedTasks);
+          const accountKey = String(record.accountId || record.accountName || "").trim();
+          if (!accountKey && numberValue(record.tasks) <= 0) return;
+          const id = accountKey || "unknown";
           const current = rows.get(id) || {
             id,
             name: record.accountName || record.accountId || "未知账号",
@@ -2637,6 +2691,7 @@
           totalImages,
           totalTasks,
           totalFailed,
+          systemRejectedTasks,
           activeAccounts,
           averagePerAccount: activeAccounts ? totalImages / activeAccounts : 0,
           averageDurationMs: durationSamples ? durationMsTotal / durationSamples : null,
@@ -3159,12 +3214,24 @@
           .filter((item) => item.enabled !== false)
           .map((item) => channel?.type === "shareai" ? abilityStatus(item, "chatplus") : item);
         if (!statuses.length) return { status: "unknown" };
+        const referenceUsage = aggregateChatReferenceUsage(
+          accounts,
+          channel?.type,
+          chatModelsForChannel(channel).filter((item) => item.enabled).map((item) => item.key)
+        );
+        const withReferenceUsage = (status) => ({
+          ...status,
+          meta: {
+            ...(status.meta || {}),
+            referenceUsage
+          }
+        });
         const available = statuses.find((item) => chatDisplayStatus(item) === "ok");
-        if (available) return { ...available, status: "ok", quotaConfirmedByUpstream: false };
+        if (available) return withReferenceUsage({ ...available, status: "ok", quotaConfirmedByUpstream: false });
         const explicitEmpty = statuses.find(confirmedChatQuotaEmpty);
-        if (explicitEmpty && statuses.every((item) => confirmedChatQuotaEmpty(item))) return explicitEmpty;
+        if (explicitEmpty && statuses.every((item) => confirmedChatQuotaEmpty(item))) return withReferenceUsage(explicitEmpty);
         const unavailable = statuses.find((item) => ["error", "failed", "disconnected", "disabled"].includes(chatDisplayStatus(item)));
-        return unavailable || statuses[0] || { status: "unknown" };
+        return withReferenceUsage(unavailable || statuses[0] || { status: "unknown" });
       }
 
       function accountEffectiveStatus(account, channel) {
@@ -5360,7 +5427,7 @@
                         h("div", { className: "productivity-summary-item", key: "images" }, [
                           h("div", { className: "task-summary-label" }, "总出图"),
                           h("div", { className: "productivity-summary-value" }, selectedProductivity.totalImages.toLocaleString("zh-CN")),
-                          h("div", { className: "productivity-summary-note" }, `完成任务 ${selectedProductivity.totalTasks.toLocaleString("zh-CN")} 个`)
+                          h("div", { className: "productivity-summary-note" }, `完成任务 ${selectedProductivity.totalTasks.toLocaleString("zh-CN")} 个 · 系统拒绝 ${selectedProductivity.systemRejectedTasks.toLocaleString("zh-CN")} 个`)
                         ]),
                         h("div", { className: "productivity-summary-item", key: "accounts" }, [
                           h("div", { className: "task-summary-label" }, "参与账号"),
@@ -5426,7 +5493,7 @@
                       ]),
                       h("div", { className: "productivity-table-title" }, [
                         h("h3", null, `${chartDayLabel(productivityDay)}账号明细`),
-                        h("span", { className: "toolbar-note" }, `总出图 ${selectedProductivity.totalImages.toLocaleString("zh-CN")} 张，失败任务 ${selectedProductivity.totalFailed.toLocaleString("zh-CN")} 个`)
+                        h("span", { className: "toolbar-note" }, `总出图 ${selectedProductivity.totalImages.toLocaleString("zh-CN")} 张，账号失败 ${selectedProductivity.totalFailed.toLocaleString("zh-CN")} 个，系统拒绝 ${selectedProductivity.systemRejectedTasks.toLocaleString("zh-CN")} 个`)
                       ]),
                       h(Table, {
                         rowKey: "id",

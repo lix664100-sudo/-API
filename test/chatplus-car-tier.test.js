@@ -87,3 +87,29 @@ test("chatplus retries another car when upstream rejects an Ultra-only car", asy
   assert.deepEqual(entered, ["ultra-car", "pro-car"]);
   assert.equal(session.selected.carId, "pro-car");
 });
+
+test("chatplus switches ordinary accounts from PRO cars to a regular car", async () => {
+  const client = clientForGemini({ strategy: "speed", carTier: "auto" });
+  const entered = [];
+  client.fetchCars = async () => [
+    car({ id: "pro-car-a", label: "PRO-3", isPro: true, count: 0 }),
+    car({ id: "pro-car-b", label: "PRO-5", isPro: true, count: 1 }),
+    car({ id: "regular-car", label: "PLUS", isPro: false, count: 50 })
+  ];
+  client.enterCar = async (carId) => {
+    entered.push(carId);
+    if (carId.startsWith("pro-car")) {
+      throw new Error("您不是Pro用户，请升级后使用该车。");
+    }
+    client.portalLoggedIn = true;
+  };
+
+  const firstSession = await client.prepareChatSession({}, new Set(), 2);
+  assert.deepEqual(entered, ["pro-car-a", "regular-car"]);
+  assert.equal(firstSession.selected.carId, "regular-car");
+
+  entered.length = 0;
+  const nextSession = await client.prepareChatSession({}, new Set(), 1);
+  assert.deepEqual(entered, ["regular-car"]);
+  assert.equal(nextSession.selected.carId, "regular-car");
+});

@@ -818,3 +818,69 @@ test("Gemini image admission uses drawing when chat image is disabled", async ()
     admitted.release();
   }
 });
+
+test("image admission rotates equal accounts before upload and preserves explicit account selection", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "drawing",
+    concurrency: { chat: 3, drawingImage: 2, chatImage: 3 },
+    channels: [{
+      id: "balanced-admission",
+      type: "shareai",
+      name: "Balanced Admission",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        enabledAbilities: { drawing: true, chatplus: true },
+        defaultModelId: 1
+      }
+    }],
+    accounts: ["a", "b"].map((suffix) => ({
+      id: `balanced-account-${suffix}`,
+      channelId: "balanced-admission",
+      name: `Balanced Account ${suffix.toUpperCase()}`,
+      username: `balanced-${suffix}@example.test`,
+      password: "test",
+      enabled: true,
+      priority: 1,
+      routingWeight: 1,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok" },
+          chatplus: { status: "ok" }
+        }
+      }
+    }))
+  });
+
+  const selectedAccountIds = [];
+  for (let index = 0; index < 4; index += 1) {
+    const admitted = await reserveImageTaskAdmission({
+      channel: "drawing",
+      prompt: `balanced admission ${index}`
+    });
+    selectedAccountIds.push(admitted.target.account.id);
+    admitted.release();
+  }
+
+  assert.deepEqual(selectedAccountIds, [
+    "balanced-account-a",
+    "balanced-account-b",
+    "balanced-account-a",
+    "balanced-account-b"
+  ]);
+
+  const explicit = await reserveImageTaskAdmission({
+    channel: "drawing",
+    accountId: "balanced-account-b",
+    prompt: "explicit account"
+  });
+  try {
+    assert.equal(explicit.target.account.id, "balanced-account-b");
+  } finally {
+    explicit.release();
+  }
+});

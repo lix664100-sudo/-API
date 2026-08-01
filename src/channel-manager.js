@@ -25,6 +25,8 @@ const DRAWING_FAILURE_LIMIT = 3;
 const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
 const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
 const FAST_QUOTA_REFRESH_TIMEOUT_MS = 5000;
+const IMAGE_MIRROR_RECOVERY_TIMEOUT_MS = 30 * 60 * 1000;
+const IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS = 20;
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 
 function normalizeSourceTaskId(value) {
@@ -1134,7 +1136,11 @@ async function mirrorTaskImages(result, config, client = null) {
     imageUrls: mirroredUrls,
     raw: {
       ...(result.raw || {}),
-      originalImageUrls: imageUrls
+      originalImageUrls: imageUrls,
+      imageMirrorPending: false,
+      imageMirrorRecoveredAt: new Date().toISOString(),
+      resultSaveError: "",
+      resultSaveErrorCode: ""
     }
   };
 }
@@ -1372,8 +1378,19 @@ export async function refreshTask(taskId) {
 
   const taskStillActive = scheduledImageTasks.has(task.id) || activeSubmittedTaskIds.has(task.id);
   const originalImageUrls = storedOriginalImageUrls(task);
+  let storedMirrorError = null;
   if (originalImageUrls.length) {
     if (taskStillActive) return task;
+    if (imageMirrorRecoveryExpired(task)) {
+      const now = new Date().toISOString();
+      return interruptExpiredImageMirror(
+        task,
+        new Error(task.raw?.resultSaveError || "上游图片地址已失效。"),
+        Number(task.raw?.imageMirrorRetryCount || 0),
+        imageMirrorRecoveryStartedAt(task, now),
+        now
+      );
+    }
     try {
       const result = await mirrorTaskImages({
         externalId,
@@ -1396,11 +1413,15 @@ export async function refreshTask(taskId) {
       await updateAccountAfterTask(account, channel, nextTask);
       return nextTask;
     } catch (error) {
-      return keepSubmittedTaskRecoverable(task, error, task.attempts || []);
+      storedMirrorError = error;
     }
   }
 
-  if (storedTaskModelKey(task) === "gemini" && task.raw?.submitted === true) {
+  if (
+    !storedMirrorError
+    && storedTaskModelKey(task) === "gemini"
+    && task.raw?.submitted === true
+  ) {
     if (taskStillActive) return task;
     return interruptUnrecoverableGeminiTask(task);
   }
@@ -1412,10 +1433,46 @@ export async function refreshTask(taskId) {
       carType: task.raw?.selectedCarType
     }));
   } catch (error) {
+    if (storedMirrorError) {
+      return keepSubmittedTaskRecoverable(task, storedMirrorError, task.attempts || []);
+    }
     if (!isTerminalRefreshError(error)) throw error;
     refreshedResult = failedRefreshResult(task, externalId, error);
   }
-  const result = await mirrorTaskImages(refreshedTaskWaitState(task, refreshedResult, config.waitTimeoutSec), config, client);
+  let refreshInput = refreshedTaskWaitState(task, refreshedResult, config.waitTimeoutSec);
+  if (storedMirrorError) {
+    const storedUrls = new Set(originalImageUrls);
+    const replacementUrls = usableImageResultUrls(refreshedResult?.imageUrls)
+      .filter((url) => !storedUrls.has(url));
+    if (!replacementUrls.length) {
+      return keepSubmittedTaskRecoverable(task, storedMirrorError, task.attempts || []);
+    }
+    refreshInput = {
+      ...refreshInput,
+      status: "success",
+      imageCount: replacementUrls.length,
+      imageUrls: replacementUrls
+    };
+  }
+
+  let result;
+  try {
+    result = await mirrorTaskImages(refreshInput, config, client);
+  } catch (error) {
+    if (!storedMirrorError) throw error;
+    const replacementUrls = usableImageResultUrls(refreshInput.imageUrls);
+    return keepSubmittedTaskRecoverable({
+      ...task,
+      imageCount: replacementUrls.length,
+      imageUrls: replacementUrls,
+      raw: {
+        ...(task.raw || {}),
+        ...(refreshedResult?.raw || {}),
+        upstreamCompleted: true,
+        originalImageUrls: replacementUrls
+      }
+    }, error, task.attempts || []);
+  }
   const nextTask = mergeRefreshedTask(task, result, channel, account);
   await upsertTask(nextTask);
   if (isFinishedTask(nextTask.status)) {
@@ -1966,6 +2023,7 @@ export async function reserveImageTaskAdmission(input = {}) {
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
     accountId: requestedAccountId,
+    balanced: true,
     skipKnownQuotaEmpty: true,
     input
   });
@@ -2269,6 +2327,29 @@ function consumeAdmissionReservation(admission, targets, input = {}) {
   };
 }
 
+async function selectImageExecutionTargets(
+  config,
+  requestedChannel,
+  requestedAccountId,
+  input,
+  admission,
+  options = {}
+) {
+  const hasAdmission = Boolean(admission?.release);
+  const select = (balanced) => selectReadyTargets(config, requestedChannel, "img2img", {
+    ...options,
+    accountId: requestedAccountId,
+    balanced,
+    input
+  });
+  let targets = await select(!hasAdmission);
+  const reserved = consumeAdmissionReservation(admission, targets, input);
+  if (reserved || !hasAdmission) return { targets, reserved };
+
+  targets = await select(true);
+  return { targets, reserved: null };
+}
+
 function orderedTargets(targets, reserved) {
   if (!reserved?.target) return targets;
   return [
@@ -2557,9 +2638,68 @@ function storedOriginalImageUrls(task = {}) {
   return usableImageResultUrls(urls);
 }
 
+function imageMirrorRecoveryStartedAt(task, now) {
+  const saved = task.raw?.imageMirrorFirstFailedAt
+    || (task.raw?.imageMirrorPending ? task.raw?.waitingSince : "")
+    || task.raw?.resultSaveErrorAt;
+  const parsed = Date.parse(saved || "");
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : now;
+}
+
+function imageMirrorRecoveryExpired(task, now = Date.now()) {
+  const firstFailedAt = imageMirrorRecoveryStartedAt(task, new Date(now).toISOString());
+  const recoveryAgeMs = now - Date.parse(firstFailedAt);
+  return Number(task.raw?.imageMirrorRetryCount || 0) >= IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS
+    || recoveryAgeMs >= IMAGE_MIRROR_RECOVERY_TIMEOUT_MS;
+}
+
+async function interruptExpiredImageMirror(task, error, retryCount, firstFailedAt, now) {
+  const message = "图片已经生成，但上游图片地址失效，系统多次尝试后仍无法保存；任务已停止，不计入失败。";
+  const nextTask = {
+    ...task,
+    status: "interrupted",
+    imageCount: 0,
+    imageUrls: [],
+    errorMessage: "",
+    responseJson: attachResponseSourceTaskId(
+      { ok: null, message },
+      task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson)
+    ),
+    completedAt: now,
+    raw: {
+      ...(task.raw || {}),
+      waitingUpstream: false,
+      imageMirrorPending: false,
+      imageMirrorGaveUp: true,
+      imageMirrorRetryCount: retryCount,
+      imageMirrorFirstFailedAt: firstFailedAt,
+      resultSaveError: error?.message || "结果保存中断。",
+      resultSaveErrorCode: error?.code || "",
+      resultSaveErrorAt: now,
+      interrupted: true,
+      interruptedAt: now,
+      interruptedReason: message
+    }
+  };
+  await upsertTask(nextTask);
+  return nextTask;
+}
+
 async function keepSubmittedTaskRecoverable(task, error, attempts = []) {
   const originalImageUrls = storedOriginalImageUrls(task);
   const now = new Date().toISOString();
+  const retryCount = Number(task.raw?.imageMirrorRetryCount || 0) + 1;
+  const firstFailedAt = imageMirrorRecoveryStartedAt(task, now);
+  const recoveryAgeMs = Date.now() - Date.parse(firstFailedAt);
+  if (
+    originalImageUrls.length
+    && (
+      retryCount >= IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS
+      || recoveryAgeMs >= IMAGE_MIRROR_RECOVERY_TIMEOUT_MS
+    )
+  ) {
+    return interruptExpiredImageMirror(task, error, retryCount, firstFailedAt, now);
+  }
   const message = originalImageUrls.length
     ? "图片已经生成，正在重新保存到服务器。"
     : "任务已经提交，但结果保存中断，系统会继续尝试。";
@@ -2582,6 +2722,8 @@ async function keepSubmittedTaskRecoverable(task, error, attempts = []) {
       waitingUpstream: true,
       waitingSince: task.raw?.waitingSince || now,
       imageMirrorPending: originalImageUrls.length > 0,
+      imageMirrorRetryCount: retryCount,
+      imageMirrorFirstFailedAt: firstFailedAt,
       ...(originalImageUrls.length ? { originalImageUrls } : {}),
       resultSaveError: error?.message || "结果保存中断。",
       resultSaveErrorCode: error?.code || "",
@@ -2966,7 +3108,14 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, balanced: true, input });
+  const selection = await selectImageExecutionTargets(
+    config,
+    requestedChannel,
+    requestedAccountId,
+    input,
+    admission
+  );
+  const targets = selection.targets;
   if (!targets.length) {
     throw noUsableTargetError("img2img", {
       config,
@@ -2976,8 +3125,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
     });
   }
 
-  const reserved = consumeAdmissionReservation(admission, targets, input)
-    || await reserveFirstAvailableTarget(targets, "img2img", { input });
+  const reserved = selection.reserved || await reserveFirstAvailableTarget(targets, "img2img", { input });
   const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img", requestMeta });
   try {
     reserved.handoff?.();
@@ -3564,15 +3712,20 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   }
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files, 3);
+  if (!wait) return queueImageTask({ input, files, requestMeta, admission });
+
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
-    accountId: requestedAccountId,
-    balanced: wait,
-    skipRecovery: wait,
-    input
-  });
+  const selection = await selectImageExecutionTargets(
+    config,
+    requestedChannel,
+    requestedAccountId,
+    input,
+    admission,
+    { skipRecovery: true }
+  );
+  const targets = selection.targets;
   if (!targets.length) {
     throw noUsableTargetError("img2img", {
       config,
@@ -3581,42 +3734,38 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
       input
     });
   }
-  const reserved = consumeAdmissionReservation(admission, targets, input);
+  const reserved = selection.reserved;
 
-  if (wait) {
-    const task = queuedTask({ input: { ...input, files }, target: reserved?.target || targets[0], taskType: "img2img", requestMeta });
-    try {
-      reserved?.handoff?.();
-      await upsertTask(task);
-    } catch (error) {
-      reserved?.release();
-      throw error;
-    }
-    scheduledImageTasks.add(task.id);
-    let finalTask;
-    try {
-      finalTask = await runQueuedImageTask(task, input, files, reserved, {
-        fastQuotaRefresh: true,
-        waitForChatplusImages: true
-      });
-    } finally {
-      scheduledImageTasks.delete(task.id);
-    }
-    if (finalTask.status === "failed") {
-      const responseJson = finalTask.responseJson || {};
-      const message = responseJson.message || finalTask.errorMessage || "图生图任务失败。";
-      const error = new Error(message);
-      const statusCode = Number(finalTask.statusCode || responseJson.status || responseJson.statusCode || 0);
-      error.status = statusCode || (String(message).includes("并发上限") ? 429 : 502);
-      error.code = responseJson.code || (error.status === 429 ? "CONCURRENCY_LIMIT" : undefined);
-      error.attempts = finalTask.attempts || responseJson.attempts || [];
-      error.upstreamText = responseJson.upstreamText || finalTask.upstreamText || "";
-      error.responseJson = responseJson;
-      error.task = finalTask;
-      throw error;
-    }
-    return finalTask;
+  const task = queuedTask({ input: { ...input, files }, target: reserved?.target || targets[0], taskType: "img2img", requestMeta });
+  try {
+    reserved?.handoff?.();
+    await upsertTask(task);
+  } catch (error) {
+    reserved?.release();
+    throw error;
   }
-
-  return queueImageTask({ input, files, requestMeta, admission: reserved });
+  scheduledImageTasks.add(task.id);
+  let finalTask;
+  try {
+    finalTask = await runQueuedImageTask(task, input, files, reserved, {
+      fastQuotaRefresh: true,
+      waitForChatplusImages: true
+    });
+  } finally {
+    scheduledImageTasks.delete(task.id);
+  }
+  if (finalTask.status === "failed") {
+    const responseJson = finalTask.responseJson || {};
+    const message = responseJson.message || finalTask.errorMessage || "图生图任务失败。";
+    const error = new Error(message);
+    const statusCode = Number(finalTask.statusCode || responseJson.status || responseJson.statusCode || 0);
+    error.status = statusCode || (String(message).includes("并发上限") ? 429 : 502);
+    error.code = responseJson.code || (error.status === 429 ? "CONCURRENCY_LIMIT" : undefined);
+    error.attempts = finalTask.attempts || responseJson.attempts || [];
+    error.upstreamText = responseJson.upstreamText || finalTask.upstreamText || "";
+    error.responseJson = responseJson;
+    error.task = finalTask;
+    throw error;
+  }
+  return finalTask;
 }
