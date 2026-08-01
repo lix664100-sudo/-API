@@ -8,13 +8,39 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-recovery-"));
 process.env.DATA_DIR = dataDir;
 
 const { closeStorage, getTask, listTasks, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
-const { createImageTask, getRuntimeStatus, inspectUpstreamTask, queueImageTask, refreshProcessingTasks, refreshTask, reserveImageTaskAdmission } = await import("../src/channel-manager.js");
+const { createImageTask, getRuntimeStatus, imageTaskClientView, inspectUpstreamTask, queueImageTask, refreshProcessingTasks, refreshTask, reserveImageTaskAdmission } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
   await closeStorage();
   await rm(dataDir, { recursive: true, force: true });
+});
+
+test("waiting image task response hides temporary image URLs", () => {
+  const temporaryUrl = "https://cloudlian.cn/gemini/images/gg-dl/temporary-result";
+  const view = imageTaskClientView({
+    id: "task-waiting-client-view",
+    sourceTaskId: "source-waiting-client-view",
+    externalId: "conversation-waiting-client-view",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    modelId: "gemini",
+    imageCount: 1,
+    imageUrls: [temporaryUrl],
+    requestJson: { sourceImage: "https://images.example.test/source.png" },
+    raw: { originalImageUrls: [temporaryUrl] },
+    createdAt: "2026-07-27T22:20:17.698Z",
+    completedAt: null
+  });
+
+  assert.equal(view.status, "waiting_upstream");
+  assert.equal(view.imageCount, 0);
+  assert.deepEqual(view.imageUrls, []);
+  assert.equal(view.raw, undefined);
+  assert.equal(view.requestJson, undefined);
+  assert.equal(JSON.stringify(view).includes("cloudlian.cn"), false);
+  assert.equal(JSON.stringify(view).includes("images.example.test"), false);
 });
 
 test("drawing client accepts OpenAI image model aliases", () => {
@@ -861,7 +887,7 @@ test("有上游编号的旧任务超过等待时间后保持等待上游", async
   }
 });
 
-test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", async () => {
+test("synchronous Gemini image waits for temporary mirror recovery", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -888,7 +914,7 @@ test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", asyn
   const originalDownloadResultImage = ChatplusClient.prototype.downloadResultImage;
   const placeholderUrl = "http://googleusercontent.com/image_generation_content/421";
   const upstreamUrl = "https://one.aishare.icu/gemini/images/gg-dl/recoverable-image";
-  let mirrorAvailable = false;
+  let downloadAttempt = 0;
   const downloadedUrls = [];
   ChatplusClient.prototype.createImageTask = async (input) => {
     await input.onSubmitted?.({
@@ -924,7 +950,12 @@ test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", asyn
   };
   ChatplusClient.prototype.downloadResultImage = async (url) => {
     downloadedUrls.push(url);
-    if (!mirrorAvailable) throw new Error("模拟图片转存失败");
+    downloadAttempt += 1;
+    if (downloadAttempt <= 2) {
+      const error = new Error("temporary image is not ready");
+      error.status = 500;
+      throw error;
+    }
     return {
       buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]),
       contentType: "image/png"
@@ -933,7 +964,7 @@ test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", asyn
 
   let localFilename = "";
   try {
-    const pending = await createImageTask({
+    const recovered = await createImageTask({
       input: {
         channel: "chatplus",
         model: "gemini",
@@ -944,18 +975,10 @@ test("Gemini 图片转存失败时保留原结果并可在刷新时恢复", asyn
       wait: true
     });
 
-    assert.equal(pending.status, "waiting_upstream");
-    assert.equal(pending.imageCount, 1);
-    assert.equal(pending.raw.imageMirrorPending, true);
-    assert.deepEqual(pending.raw.originalImageUrls, [upstreamUrl]);
-    assert.match(pending.raw.resultSaveError, /模拟图片转存失败/);
-
-    mirrorAvailable = true;
-    const recovered = await refreshTask(pending.id);
     assert.equal(recovered.status, "success");
     assert.equal(recovered.imageCount, 1);
     assert.match(recovered.imageUrls[0], /^https:\/\/api\.example\.test\/uploads\/results\/.+\.png$/);
-    assert.equal(recovered.raw.imageMirrorPending, false);
+    assert.equal(recovered.imageUrls.includes(upstreamUrl), false);
     assert.deepEqual(downloadedUrls, [upstreamUrl, upstreamUrl, upstreamUrl]);
     localFilename = path.basename(new URL(recovered.imageUrls[0]).pathname);
   } finally {

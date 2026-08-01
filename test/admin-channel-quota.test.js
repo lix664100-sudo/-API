@@ -5,12 +5,12 @@ import vm from "node:vm";
 
 const adminHtml = await readFile(new URL("../admin/index.html", import.meta.url), "utf8");
 const functionMatch = adminHtml.match(
-  /function aggregateChatReferenceUsage\(accounts, channelType, modelKeys\) \{[\s\S]*?\n      \}\n\n      function chatQuotaText/
+  /function aggregateChatReferenceUsage\(accounts, channelType, modelKeys\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function chatQuotaText/
 );
 
 assert.ok(functionMatch, "管理后台中应存在聊天额度汇总方法");
 
-const functionSource = functionMatch[0].replace(/\n\n      function chatQuotaText$/, "");
+const functionSource = functionMatch[0].replace(/\r?\n\r?\n      function chatQuotaText$/, "");
 const aggregateChatReferenceUsage = vm.runInNewContext(
   `(${functionSource.replace(/^function /, "function ")})`
 );

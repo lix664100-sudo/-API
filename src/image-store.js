@@ -65,6 +65,7 @@ function looksTemporaryImageUrl(source) {
     const pathname = url.pathname.toLowerCase();
     const keys = [...url.searchParams.keys()].map((key) => key.toLowerCase());
     if (host.includes("chatplus.cc") && pathname.startsWith("/backend-api/")) return true;
+    if (/^\/backend-api\/files\/[^/]+\/download\/?$/.test(pathname)) return true;
     if (pathname.startsWith("/gemini/images/")) return true;
     if (pathname.includes("/image_generation_content/")) return true;
     if (pathname.includes("/backend-api/estuary/content")) return true;

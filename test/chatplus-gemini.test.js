@@ -309,7 +309,7 @@ test("Gemini 返回图片时直接算成功，不再走 GPT 详情接口", async
 test("Gemini 结果不能把上传原图识别成生成图", async () => {
   const testClient = client();
   const events = [JSON.parse(geminiResponse({
-    imageUrl: "https://cloudlian.cn/gemini/images/gg/uploaded-source"
+    imageUrl: "https://claude.midjourneye.com/gemini/images/gg/uploaded-source"
   }))];
 
   assert.deepEqual(await testClient.imageUrlsFrom(events, { gemini: true }), []);
@@ -318,11 +318,11 @@ test("Gemini 结果不能把上传原图识别成生成图", async () => {
 test("Gemini 同时返回原图和生成图时只保留生成图", async () => {
   const testClient = client();
   const events = [JSON.parse(geminiResponse({
-    imageUrl: "https://cloudlian.cn/gemini/images/gg/uploaded-source https://cloudlian.cn/gemini/images/gg-dl/generated-image"
+    imageUrl: "https://claude.midjourneye.com/gemini/images/gg/uploaded-source https://claude.midjourneye.com/gemini/images/gg-dl/generated-image"
   }))];
 
   assert.deepEqual(await testClient.imageUrlsFrom(events, { gemini: true }), [
-    "https://cloudlian.cn/gemini/images/gg-dl/generated-image"
+    "https://claude.midjourneye.com/gemini/images/gg-dl/generated-image"
   ]);
 });
 
@@ -497,6 +497,28 @@ test("Gemini 明确触发内容安全限制时不会重复换车", async () => {
   assert.equal(attempts, 1);
 });
 
+test("图片生成频率限制不会被误判成内容违规", async () => {
+  const testClient = client();
+  const rateLimitMessage = "当前图片生成频率达到限制，请等待约2分钟后重试，目前无法生成图片。";
+  const events = [{
+    author: { role: "assistant" },
+    content: {
+      content_type: "text",
+      parts: [rateLimitMessage]
+    }
+  }];
+
+  await assert.rejects(
+    () => testClient.waitForConversationImages(events, "conversation-rate-limit", 5),
+    (error) => {
+      assert.equal(error.status, 429);
+      assert.equal(error.code, "rate_limit");
+      assert.notEqual(error.code, "content_policy");
+      return true;
+    }
+  );
+});
+
 test("Gemini 图片下载会保留登录状态和原始二进制内容", async () => {
   const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0xff, 0x00, 0xfe, 0x80]);
   let receivedCookie = "";
@@ -527,6 +549,51 @@ test("Gemini 图片下载会保留登录状态和原始二进制内容", async (
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 });
+test("private file metadata follows the authenticated image URL", async () => {
+  const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x01, 0x02, 0x03, 0x04]);
+  const requests = [];
+  const server = createServer((request, response) => {
+    requests.push({ url: request.url, cookie: String(request.headers.cookie || "") });
+    if (request.url === "/backend-api/files/file_test/download") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ download_url: "/backend-api/estuary/content" }));
+      return;
+    }
+    if (request.url === "/backend-api/estuary/content") {
+      response.writeHead(200, { "content-type": "image/png" });
+      response.end(imageBytes);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const testClient = client();
+  testClient.baseUrl = `http://127.0.0.1:${address.port}`;
+  testClient.portalLoggedIn = true;
+  testClient.carId = "car-test";
+  testClient.carType = "chatgpt";
+  testClient.cookies = ["session=test-session"];
+
+  try {
+    const result = await testClient.downloadResultImage("/backend-api/files/file_test/download", {
+      carId: "car-test",
+      carType: "chatgpt",
+      timeoutMs: 5000
+    });
+    assert.deepEqual(result.buffer, imageBytes);
+    assert.equal(result.contentType, "image/png");
+    assert.deepEqual(requests.map((item) => item.url), [
+      "/backend-api/files/file_test/download",
+      "/backend-api/estuary/content"
+    ]);
+    assert.ok(requests.every((item) => item.cookie === "session=test-session"));
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 
 test("Gemini 没有返回文字或图片时不能误判成功", async () => {
   const testClient = client();

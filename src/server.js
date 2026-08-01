@@ -16,6 +16,7 @@ import {
   createChatCompletion,
   createImageTask,
   getRuntimeStatus,
+  imageTaskClientView,
   inspectUpstreamTask,
   queueChatCompletion,
   queueImageTask,
@@ -1063,11 +1064,12 @@ app.get("/v1/models", { preHandler: requireApiKey }, async () => {
 });
 
 function imageEditResponse(task) {
-  const imageUrls = Array.isArray(task?.imageUrls) ? task.imageUrls : [];
+  const responseTask = imageTaskClientView(task);
+  const imageUrls = responseTask.imageUrls;
   return {
     created: Math.floor(Date.now() / 1000),
     data: imageUrls.map((url) => ({ url })),
-    task
+    task: responseTask
   };
 }
 
@@ -1110,6 +1112,7 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
     if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
     const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta, admission });
     admissionTransferred = true;
+    if (task.status !== "success") reply.code(202);
     return imageEditResponse(task);
   } catch (error) {
     return sendError(reply, error, { requestMeta, input, files, taskType: "img2img" });

@@ -678,7 +678,7 @@ function isPlaceholderGeminiImageUrl(value) {
 
 function addGeminiImageUrl(output, value, baseUrl) {
   const normalized = normalizeGeminiImageUrl(value, baseUrl);
-  if (normalized) output.add(normalized);
+  if (normalized && !/\/gemini\/images\/gg\//i.test(normalized)) output.add(normalized);
 }
 
 function scanGeminiImageRefs(value, baseUrl, output = new Set()) {
@@ -888,33 +888,48 @@ function isImagePolicyFailureMessage(content) {
     || /(?:内容安全|安全拦截|上游渠道内容安全拦截|违规)/.test(text);
 }
 
+function isImageRateLimitMessage(content) {
+  const text = String(content || "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  return /(?:rate limit|too many requests|request frequency)/i.test(text)
+    || /(?:生成频率|请求频率|访问频率).{0,20}(?:达到限制|过高|受限)/.test(text)
+    || /(?:速率限制|请求过于频繁)/.test(text);
+}
+
 function isTerminalImageFailureMessage(content) {
   const text = String(content || "").replace(/\s+/g, " ").trim();
   if (!text) return false;
   return isImagePolicyFailureMessage(text)
+    || isImageRateLimitMessage(text)
     || /(?:can't|cannot|unable to|won't)\s+(?:create|generate|help with).{0,120}(?:image|content|request)/i.test(text)
     || /(?:无法生成|不能生成)/.test(text);
 }
 
 function throwIfTerminalImageFailure(content, options = {}) {
   const message = String(content || "").trim();
+  const policyFailure = isImagePolicyFailureMessage(message);
+  const rateLimited = isImageRateLimitMessage(message);
   const failed = options.policyOnly
-    ? isImagePolicyFailureMessage(message)
-    : isTerminalImageFailureMessage(message);
+    ? policyFailure
+    : (policyFailure || rateLimited || isTerminalImageFailureMessage(message));
   if (!failed) return;
   const error = new Error(message);
   error.upstreamExplicitFailure = true;
   error.upstreamStatus = "failed";
-  error.status = 400;
-  error.code = "content_policy";
+  error.upstreamText = message;
+  error.status = rateLimited ? 429 : 400;
+  error.code = policyFailure
+    ? "content_policy"
+    : (rateLimited ? "rate_limit" : "upstream_text_response");
   throw error;
 }
 
 function throwIfTextImageResponse(content, options = {}) {
   const message = String(content || "").trim();
-  if (!message || isSkippedMainlineContent(message)) return;
-  const error = new Error(message);
-  error.upstreamText = message;
+  const usableMessage = message && !isSkippedMainlineContent(message) ? message : "";
+  if (!usableMessage && options.retryableCar !== true) return;
+  const error = new Error(usableMessage || "Gemini 上游没有返回生成图。");
+  error.upstreamText = usableMessage;
   error.upstreamExplicitFailure = true;
   error.upstreamStatus = "failed";
   error.status = 400;
@@ -1646,6 +1661,28 @@ export class ChatplusClient {
       error.status = result.status;
       error.code = "IMAGE_DOWNLOAD_FAILED";
       throw error;
+    }
+    if (
+      !result.contentType.toLowerCase().startsWith("image/")
+      && Number(context.fileDownloadDepth || 0) === 0
+      && /^\/backend-api\/files\/[^/]+\/download\/?$/i.test(new URL(source).pathname)
+    ) {
+      let payload = null;
+      try {
+        payload = JSON.parse(result.buffer.toString("utf8"));
+      } catch {
+        payload = null;
+      }
+      const nextValue = String(payload?.download_url || payload?.downloadUrl || payload?.url || "").trim();
+      if (nextValue) {
+        const nextUrl = new URL(nextValue, this.baseUrl);
+        if (["http:", "https:"].includes(nextUrl.protocol) && nextUrl.toString() !== source) {
+          return this.downloadResultImage(nextUrl.toString(), {
+            ...context,
+            fileDownloadDepth: 1
+          });
+        }
+      }
     }
     if (!result.contentType.toLowerCase().startsWith("image/")) {
       const error = new Error("图片保存失败：上游返回的不是图片。");

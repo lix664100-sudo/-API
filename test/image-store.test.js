@@ -31,6 +31,15 @@ test("smart image storage treats Gemini result links as temporary", () => {
   );
 });
 
+test("smart image storage treats authenticated file download links as temporary", () => {
+  assert.equal(
+    shouldMirrorImageUrl("https://one.aishare.icu/backend-api/files/file_123/download", {
+      imageStorage: { mode: "smart" }
+    }),
+    true
+  );
+});
+
 test("required image mirroring saves the result locally", async () => {
   const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
   globalThis.fetch = async () => new Response(imageBytes, {
