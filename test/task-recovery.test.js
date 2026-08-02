@@ -887,7 +887,7 @@ test("有上游编号的旧任务超过等待时间后保持等待上游", async
   }
 });
 
-test("synchronous Gemini image waits for temporary mirror recovery", async () => {
+test("synchronous image waits for a temporary proxy mirror failure", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -952,8 +952,9 @@ test("synchronous Gemini image waits for temporary mirror recovery", async () =>
     downloadedUrls.push(url);
     downloadAttempt += 1;
     if (downloadAttempt <= 2) {
-      const error = new Error("temporary image is not ready");
-      error.status = 500;
+      const error = new Error("curl: (97) connection to proxy closed");
+      error.code = "CURL_PROXY_ERROR";
+      error.curlCode = 97;
       throw error;
     }
     return {

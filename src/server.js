@@ -1085,6 +1085,28 @@ function imageEditResponse(task) {
   };
 }
 
+async function findImageTask(taskId) {
+  const normalized = String(taskId || "").trim();
+  if (!normalized) return null;
+  return await getTask(normalized) || await getTaskBySourceTaskId(normalized);
+}
+
+app.get("/v1/images/tasks/:id", { preHandler: requireApiKey }, async (request, reply) => {
+  const task = await findImageTask(request.params.id);
+  if (!task) {
+    return reply.code(404).send({
+      error: {
+        code: "IMAGE_TASK_NOT_FOUND",
+        message: "任务不存在。"
+      }
+    });
+  }
+
+  const status = String(task.status || "").toLowerCase();
+  if (!["success", "failed", "interrupted"].includes(status)) reply.code(202);
+  return imageEditResponse(task);
+});
+
 app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, reply) => {
   try {
     let requestMeta = apiRequestMeta(request);

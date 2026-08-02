@@ -77,6 +77,21 @@ async function runAccountCheckStep(step, work) {
   throw error;
 }
 
+function curlProcessError(code, stderr) {
+  const message = stderr || `curl 退出码：${code}`;
+  const error = new Error(code === 28 ? "聊天站响应慢，代理可能可用但请求超时。" : message);
+  error.curlCode = code;
+  if (code === 28) {
+    error.status = 504;
+    error.code = "CURL_TIMEOUT";
+  } else if (code === 97) {
+    error.code = "CURL_PROXY_ERROR";
+  } else {
+    error.code = `CURL_${code}`;
+  }
+  return error;
+}
+
 function runCurl(args, input = "") {
   return new Promise((resolve, reject) => {
     const child = spawn(CURL_COMMAND, args, { windowsHide: true });
@@ -94,10 +109,7 @@ function runCurl(args, input = "") {
         resolve(stdout);
         return;
       }
-      const message = stderr || `curl 退出码：${code}`;
-      const error = new Error(code === 28 ? "聊天站响应慢，代理可能可用但请求超时。" : message);
-      if (code === 28) error.status = 504;
-      reject(error);
+      reject(curlProcessError(code, stderr));
     });
     if (input) child.stdin.end(input);
     else child.stdin.end();
@@ -121,10 +133,7 @@ function runCurlBuffer(args, input = "") {
         resolve(Buffer.concat(stdout));
         return;
       }
-      const message = stderr || `curl 退出码：${code}`;
-      const error = new Error(code === 28 ? "聊天站响应慢，代理可能可用但请求超时。" : message);
-      if (code === 28) error.status = 504;
-      reject(error);
+      reject(curlProcessError(code, stderr));
     });
     if (input) child.stdin.end(input);
     else child.stdin.end();

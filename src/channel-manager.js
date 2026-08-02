@@ -1123,13 +1123,15 @@ function retryableImageMirrorError(error) {
   const status = Number(error?.status || error?.statusCode || 0);
   if ([404, 408, 425, 429].includes(status) || status >= 500) return true;
   if ([
+    "CURL_PROXY_ERROR",
+    "CURL_TIMEOUT",
     "IMAGE_DOWNLOAD_TIMEOUT",
     "ETIMEDOUT",
     "ECONNRESET",
     "EAI_AGAIN",
     "UND_ERR_CONNECT_TIMEOUT"
   ].includes(String(error?.code || "").toUpperCase())) return true;
-  return /fetch failed|timed? ?out|connection reset/i.test(String(error?.message || ""));
+  return /fetch failed|timed? ?out|connection reset|connection to proxy closed|proxy handshake/i.test(String(error?.message || ""));
 }
 
 async function mirrorTaskImageUrls(imageUrls, config, downloadImage, options = {}) {
