@@ -973,6 +973,92 @@
         object-fit: cover;
       }
 
+      .task-preview-trigger {
+        display: block;
+        width: 86px;
+        height: 62px;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        cursor: pointer;
+      }
+
+      .task-preview-trigger:hover .task-thumb {
+        border-color: var(--brand);
+      }
+
+      .task-preview-trigger:focus-visible {
+        outline: 2px solid var(--brand);
+        outline-offset: 2px;
+      }
+
+      .task-compare-note {
+        margin: 0 0 18px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .task-compare-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 24px;
+      }
+
+      .task-compare-section {
+        min-width: 0;
+      }
+
+      .task-compare-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 10px;
+      }
+
+      .task-compare-title {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      .task-compare-count {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .task-compare-images {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+      }
+
+      .task-compare-images .ant-image {
+        display: block;
+        width: 100%;
+      }
+
+      .task-compare-images .ant-image-img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 4 / 3;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--panel-soft);
+        object-fit: contain;
+      }
+
+      .task-compare-empty {
+        display: grid;
+        min-height: 240px;
+        place-items: center;
+        border: 1px dashed var(--line);
+        border-radius: 6px;
+        background: var(--panel-soft);
+      }
+
       .toolbar-note {
         color: var(--muted);
         font-size: 12px;
@@ -1155,7 +1241,8 @@
         }
 
         .task-error-item,
-        .task-json-grid {
+        .task-json-grid,
+        .task-compare-grid {
           grid-template-columns: 1fr;
         }
 
@@ -2378,6 +2465,45 @@
         return { rows, error: "" };
       }
 
+      function uniqueImageUrls(values = []) {
+        const urls = Array.isArray(values) ? values : [];
+        return [...new Set(urls
+          .map((value) => typeof value === "string" ? value.trim() : "")
+          .filter(Boolean))];
+      }
+
+      function taskInputImageUrls(row = {}) {
+        const requestFiles = Array.isArray(row?.requestJson?.files) ? row.requestJson.files : [];
+        return uniqueImageUrls([
+          ...(Array.isArray(row.inputImageUrls) ? row.inputImageUrls : []),
+          ...requestFiles.map((file) => file?.previewUrl)
+        ]);
+      }
+
+      function taskOutputImageUrls(row = {}) {
+        return uniqueImageUrls(row.imageUrls);
+      }
+
+      function taskComparisonSection(title, urls, emptyText) {
+        return h("section", { className: "task-compare-section", key: title }, [
+          h("div", { className: "task-compare-header", key: "header" }, [
+            h("h3", { className: "task-compare-title", key: "title" }, title),
+            urls.length ? h("span", { className: "task-compare-count", key: "count" }, `${urls.length} 张`) : null
+          ]),
+          urls.length
+            ? h(Image.PreviewGroup, { key: "gallery" }, h("div", { className: "task-compare-images" }, urls.map((url, index) => h(Image, {
+                key: url,
+                src: url,
+                alt: `${title} ${index + 1}`,
+                preview: { mask: "查看大图" }
+              }))))
+            : h("div", { className: "task-compare-empty", key: "empty" }, h(Empty, {
+                image: Empty.PRESENTED_IMAGE_SIMPLE,
+                description: emptyText
+              }))
+        ]);
+      }
+
       function taskTypeLabel(type) {
         const map = {
           chat: "对话",
@@ -3426,6 +3552,7 @@
         const [accountImporting, setAccountImporting] = useState(false);
         const [editingChannel, setEditingChannel] = useState(null);
         const [editingAccount, setEditingAccount] = useState(null);
+        const [taskPreview, setTaskPreview] = useState(null);
 
         const [chatForm] = Form.useForm();
         const [editForm] = Form.useForm();
@@ -4988,10 +5115,22 @@
             title: "预览",
             dataIndex: "imageUrls",
             width: 104,
-            render: (urls, row) => {
-              const previewUrls = urls?.length ? urls : row.inputImageUrls || [];
-              return previewUrls.length
-                ? h(Image, { className: "task-thumb", src: previewUrls[0], preview: { src: previewUrls[0] } })
+            render: (_urls, row) => {
+              const inputUrls = taskInputImageUrls(row);
+              const outputUrls = taskOutputImageUrls(row);
+              const thumbnailUrl = outputUrls[0] || inputUrls[0];
+              return thumbnailUrl
+                ? h("button", {
+                    type: "button",
+                    className: "task-preview-trigger",
+                    "aria-label": "查看原图和生成结果",
+                    onClick: () => setTaskPreview(row)
+                  }, h(Image, {
+                    className: "task-thumb",
+                    src: thumbnailUrl,
+                    alt: "任务图片预览",
+                    preview: false
+                  }))
                 : h("div", { className: "task-thumb" });
             }
           },
@@ -5721,6 +5860,21 @@
                   }
                 ]
               })
+            ])
+          ]),
+          h(Modal, {
+            title: "原图与生成结果",
+            open: Boolean(taskPreview),
+            onCancel: () => setTaskPreview(null),
+            footer: null,
+            centered: true,
+            width: 1080,
+            destroyOnHidden: true
+          }, [
+            h("p", { className: "task-compare-note", key: "note" }, "点击图片可查看大图。"),
+            h("div", { className: "task-compare-grid", key: "comparison" }, [
+              taskComparisonSection("原图", taskInputImageUrls(taskPreview || {}), "该任务未保存原图"),
+              taskComparisonSection("生成结果", taskOutputImageUrls(taskPreview || {}), "暂无生成结果")
             ])
           ]),
           h(Modal, {

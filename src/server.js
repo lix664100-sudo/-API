@@ -65,7 +65,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const adminDir = path.join(rootDir, "admin");
 const adminVendorDir = path.join(adminDir, "vendor");
-const previewDir = path.join(rootDir, "outputs", "previews");
+const previewDir = resultImageDir;
+const legacyPreviewDir = path.join(rootDir, "outputs", "previews");
 const execAsync = promisify(exec);
 
 const adminSessionCookie = "shareai_admin_session";
@@ -496,9 +497,18 @@ function assignInputField(input, fieldname, value) {
 async function savePreviewImage(buffer, part) {
   if (!String(part.mimetype || "").startsWith("image/")) return "";
   await mkdir(previewDir, { recursive: true });
-  const filename = `${Date.now()}-${randomUUID()}${imageExtension(part.mimetype, part.filename)}`;
+  const filename = `preview-${Date.now()}-${randomUUID()}${imageExtension(part.mimetype, part.filename)}`;
   await writeFile(path.join(previewDir, filename), buffer);
   return `/uploads/previews/${filename}`;
+}
+
+async function readPreviewImage(filename) {
+  try {
+    return await readFile(path.join(previewDir, filename));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    return readFile(path.join(legacyPreviewDir, filename));
+  }
 }
 
 function imageMimeFromBuffer(buffer) {
@@ -629,13 +639,15 @@ app.addHook("preHandler", async (request, reply) => {
 app.get("/uploads/previews/:filename", async (request, reply) => {
   const filename = path.basename(String(request.params.filename || ""));
   if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) throw badRequest("图片地址不正确。");
-  const file = await readFile(path.join(previewDir, filename));
+  const file = await readPreviewImage(filename);
   reply.type(previewContentType(filename)).send(file);
 });
 
 app.get("/uploads/results/:filename", async (request, reply) => {
   const filename = path.basename(String(request.params.filename || ""));
-  if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) throw badRequest("图片地址不正确。");
+  if (!/^[a-zA-Z0-9_.-]+$/.test(filename) || filename.startsWith("preview-")) {
+    throw badRequest("图片地址不正确。");
+  }
   const file = await readFile(path.join(resultImageDir, filename));
   reply.type(imageContentType(filename)).send(file);
 });
@@ -1029,7 +1041,7 @@ app.post("/api/draw/edit", async (request, reply) => {
   let admissionTransferred = false;
   try {
     admission = await reserveImageRequestAdmission(request, requestMeta);
-    const parsed = await readImageInput(request, { maxFiles: 3 });
+    const parsed = await readImageInput(request, { maxFiles: 3, savePreview: true });
     input = parsed.input;
     files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
@@ -1105,7 +1117,7 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
   let admissionTransferred = false;
   try {
     admission = await reserveImageRequestAdmission(request, requestMeta);
-    const parsed = await readImageInput(request, { maxFiles: 3 });
+    const parsed = await readImageInput(request, { maxFiles: 3, savePreview: true });
     input = parsed.input;
     files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);

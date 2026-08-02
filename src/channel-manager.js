@@ -2491,7 +2491,7 @@ function chatImageCount(input = {}) {
   return uploaded + embedded;
 }
 
-function chatPreviewUrls(input = {}) {
+function inputPreviewUrls(input = {}) {
   return imageFiles(input.files || input.file)
     .map((file) => file.previewUrl || "")
     .filter(Boolean);
@@ -2573,7 +2573,7 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
     ratio: input.ratio_label || input.ratio || "",
     imageCount: imageCount ?? Number(input.image_count || input.n || 1),
     imageUrls: [],
-    inputImageUrls: inputImageUrls || [],
+    inputImageUrls: inputImageUrls || inputPreviewUrls(input),
     errorMessage: "",
     channelId: target.channel.id,
     channelName: target.channel.name,
@@ -3227,7 +3227,7 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
     taskType: "chat",
     prompt: cleanChatPrompt(input),
     imageCount: chatImageCount(input),
-    inputImageUrls: chatPreviewUrls(input),
+    inputImageUrls: inputPreviewUrls(input),
     raw: { endpoint: "/v1/chat/completions" },
     requestMeta
   });
@@ -3678,7 +3678,7 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
       taskType: "chat",
       prompt: cleanChatPrompt(input),
       imageCount: chatImageCount(input),
-      inputImageUrls: chatPreviewUrls(input),
+      inputImageUrls: inputPreviewUrls(input),
       raw: { endpoint: "/v1/chat/completions" },
       requestMeta
     });

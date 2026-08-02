@@ -1662,7 +1662,12 @@ test("聊天生图等待上游任务会继续占用并发名额", async () => {
 
     await Promise.all(Array.from({ length: 5 }, (_item, index) => queueImageTask({
       input: { channel: "chatplus", prompt: `job-${index + 1}` },
-      files: [{ filename: `source-${index + 1}.png`, mimetype: "image/png", buffer: Buffer.from("x") }]
+      files: [{
+        filename: `source-${index + 1}.png`,
+        mimetype: "image/png",
+        previewUrl: `/uploads/previews/source-${index + 1}.png`,
+        buffer: Buffer.from("x")
+      }]
     })));
 
     let tasks = [];
@@ -1674,6 +1679,10 @@ test("聊天生图等待上游任务会继续占用并发名额", async () => {
 
     assert.equal(submittedJobs.length, 5);
     assert.equal(ownWaitingTasks(tasks).length, 5);
+    assert.deepEqual(
+      tasks.find((task) => task.prompt === "job-1")?.inputImageUrls,
+      ["/uploads/previews/source-1.png"]
+    );
     await assert.rejects(
       () => queueImageTask({
         input: { channel: "chatplus", prompt: "job-6" },
