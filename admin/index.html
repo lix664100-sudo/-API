@@ -3941,6 +3941,12 @@
           return usage;
         }, [statRecords]);
 
+        function todayUsageText(label, value, total, unit) {
+          const count = numberValue(value);
+          const percent = total > 0 ? Math.round((count / total) * 100) : 0;
+          return `${label} ${count} ${unit} · ${percent}%`;
+        }
+
         function markTaskListInteraction() {
           taskManualActionAtRef.current = Date.now();
         }
@@ -4952,7 +4958,7 @@
             }
           },
           {
-            title: h(Tooltip, { title: "全部账号相同就是均分；数值越大，分到的任务越多。" }, h("span", null, "分流")),
+            title: h(Tooltip, { title: "这里是目标比例；系统会根据今日实际使用量自动追平。" }, h("span", null, "分流目标")),
             dataIndex: "routingWeight",
             width: 160,
             render: (_, row) => {
@@ -4963,7 +4969,7 @@
               return h("div", { className: "routing-share" }, [
                 h("div", { className: "routing-share-meta", key: "meta" }, [
                   h("span", { className: "routing-share-weight", key: "weight" }, `${weight} 份`),
-                  h("span", { key: "percent" }, row.enabled === false ? "已停用" : `约 ${percent}%`)
+                  h("span", { key: "percent" }, row.enabled === false ? "已停用" : `目标 ${percent}%`)
                 ]),
                 h(Progress, {
                   key: "progress",
@@ -4978,16 +4984,25 @@
             }
           },
           {
-            title: "今日使用",
-            width: 150,
+            title: h(Tooltip, { title: "百分比按当前渠道今日实际成功完成的数量计算。" }, h("span", null, "今日实际")),
+            width: 190,
             render: (_, row) => {
               const usage = accountTodayUsage.get(row.id) || {};
               const rowChannel = channels.find((item) => item.id === row.channelId);
+              const totals = selectedAccounts.reduce((current, account) => {
+                const accountUsage = accountTodayUsage.get(account.id) || {};
+                current.drawingImages += numberValue(accountUsage.drawingImages);
+                current.chatImages += numberValue(accountUsage.chatImages);
+                current.chats += numberValue(accountUsage.chats);
+                return current;
+              }, { drawingImages: 0, chatImages: 0, chats: 0 });
               const items = [];
-              if (channelAbilityEnabled(rowChannel, "drawing")) items.push(h("strong", { key: "drawing" }, `绘图站 ${numberValue(usage.drawingImages)} 张`));
+              if (channelAbilityEnabled(rowChannel, "drawing")) {
+                items.push(h("strong", { key: "drawing" }, todayUsageText("绘图站", usage.drawingImages, totals.drawingImages, "张")));
+              }
               if (channelAbilityEnabled(rowChannel, "chatplus")) {
-                items.push(h(items.length ? "span" : "strong", { key: "chatImage" }, `聊天生图 ${numberValue(usage.chatImages)} 张`));
-                items.push(h("span", { key: "dialogs" }, `对话 ${numberValue(usage.chats)} 次`));
+                items.push(h(items.length ? "span" : "strong", { key: "chatImage" }, todayUsageText("聊天生图", usage.chatImages, totals.chatImages, "张")));
+                items.push(h("span", { key: "dialogs" }, todayUsageText("对话", usage.chats, totals.chats, "次")));
               }
               return h("div", { className: "account-usage" }, items.length ? items : "-");
             }

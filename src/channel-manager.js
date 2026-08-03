@@ -3,20 +3,28 @@ import { ChatplusClient } from "./channels/chatplus.js";
 import { DrawingClient, drawingRetryAfterSeconds, drawingSevereFailureReason, drawingUpstreamText } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
 import { checkProxyReachability, safeProxyEndpoint } from "./proxy.js";
-import { getTask, listTasks, loadConfig, recordTaskStat, updateAccountStatus, upsertTask } from "./storage.js";
+import {
+  getTask,
+  listTasks,
+  listTodayAccountRoutingUsage,
+  loadConfig,
+  recordTaskStat,
+  updateAccountStatus,
+  upsertTask
+} from "./storage.js";
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
 const defaultTaskConcurrency = { chat: 3, drawingImage: 2, chatImage: 2 };
 const scheduledChatTasks = new Set();
 const scheduledImageTasks = new Set();
 const activeTaskCounts = new Map();
+const activeRoutingLoads = new Map();
 const activeDrawingModelCounts = new Map();
 const activeSubmittedTaskIds = new Set();
 const activeAccountAuthTasks = new Map();
 const activeChatplusAccountWork = new Map();
 const activeChatQuotaProbes = new Set();
 const clientCache = new Map();
-const accountRoutingState = new Map();
 const accountRecoveryTasks = new Map();
 const accountRecoveryRetryAt = new Map();
 const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
@@ -30,6 +38,7 @@ const IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS = 20;
 const WAIT_IMAGE_MIRROR_TIMEOUT_MS = Math.max(1000, Number(process.env.WAIT_IMAGE_MIRROR_TIMEOUT_MS || 90_000));
 const WAIT_IMAGE_MIRROR_RETRY_MS = Math.max(250, Number(process.env.WAIT_IMAGE_MIRROR_RETRY_MS || 1000));
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
+let routingReservationQueue = Promise.resolve();
 
 function normalizeSourceTaskId(value) {
   const text = String(Array.isArray(value) ? value[0] : value || "").trim();
@@ -451,6 +460,27 @@ function taskSlotKey(slot, target = {}, input = {}) {
   return [slot, modelKey, accountId].filter(Boolean).join(":") || slot;
 }
 
+function routingLoadKey(slot, target = {}) {
+  return `${slot}:${String(target?.account?.id || "").trim()}`;
+}
+
+function requestedRoutingLoad(slot, input = {}) {
+  if (slot === "chat") return 1;
+  const requested = Math.floor(Number(input.image_count || input.n || 1));
+  return Math.min(100, Math.max(1, Number.isFinite(requested) ? requested : 1));
+}
+
+function activeRoutingLoad(slot, target = {}) {
+  return activeRoutingLoads.get(routingLoadKey(slot, target)) || 0;
+}
+
+function updateActiveRoutingLoad(slot, target, difference) {
+  const key = routingLoadKey(slot, target);
+  const next = Math.max(0, (activeRoutingLoads.get(key) || 0) + difference);
+  if (next) activeRoutingLoads.set(key, next);
+  else activeRoutingLoads.delete(key);
+}
+
 function taskSlotBusyLabel(slot, target = {}) {
   const accountName = String(target?.account?.name || target?.account?.username || "").trim();
   return !accountName
@@ -512,6 +542,8 @@ async function tryReserveTaskSlot(slot, target = {}, input = {}) {
   const occupied = count + durableState.total - Math.min(durableState.active, count);
   if (occupied >= taskSlotLimit(slot, target)) return null;
   activeTaskCounts.set(key, count + 1);
+  const routingLoad = requestedRoutingLoad(slot, input);
+  updateActiveRoutingLoad(slot, target, routingLoad);
   const drawingModelKey = slot === "drawingImage" ? targetImageModelKey(target, input) : "";
   if (drawingModelKey) {
     activeDrawingModelCounts.set(
@@ -526,6 +558,7 @@ async function tryReserveTaskSlot(slot, target = {}, input = {}) {
     const next = Math.max(0, (activeTaskCounts.get(key) || 0) - 1);
     if (next) activeTaskCounts.set(key, next);
     else activeTaskCounts.delete(key);
+    updateActiveRoutingLoad(slot, target, -routingLoad);
     if (drawingModelKey) {
       const nextModelCount = Math.max(0, activeCountForDrawingModel(drawingModelKey) - 1);
       if (nextModelCount) activeDrawingModelCounts.set(drawingModelKey, nextModelCount);
@@ -1702,34 +1735,52 @@ function accountRoutingWeight(account) {
   return Math.min(100, Math.max(1, Number.isFinite(weight) ? weight : 1));
 }
 
-function balancedAccountOrder(accounts, routingKey) {
-  if (accounts.length < 2) return accounts;
+function completedRoutingLoad(usage, target, slot) {
+  const account = usage?.accounts?.[target?.account?.id] || {};
+  if (slot === "drawingImage") return Number(account.drawingImages || 0);
+  if (slot === "chatImage") return Number(account.chatImages || 0);
+  return Number(account.chats || 0);
+}
 
-  const activeIds = new Set(accounts.map((account) => account.id));
-  const signature = accounts.map((account) => `${account.id}:${accountRoutingWeight(account)}`).join("|");
-  const currentState = accountRoutingState.get(routingKey);
-  const scores = currentState?.signature === signature ? currentState.scores : new Map();
-  for (const accountId of scores.keys()) {
-    if (!activeIds.has(accountId)) scores.delete(accountId);
-  }
+function routingGroupKey(target, taskType) {
+  return `${target?.channel?.id || "channel"}:${targetTaskSlot(target, taskType)}`;
+}
 
-  const totalWeight = accounts.reduce((total, account) => total + accountRoutingWeight(account), 0);
-  for (const account of accounts) {
-    scores.set(account.id, (scores.get(account.id) || 0) + accountRoutingWeight(account));
-  }
+async function orderTargetsByRoutingUsage(targets, taskType, input = {}) {
+  if (targets.length < 2) return targets;
+  const usage = await listTodayAccountRoutingUsage();
+  const groups = new Map();
 
-  const selected = accounts.reduce((best, account) =>
-    (scores.get(account.id) || 0) > (scores.get(best.id) || 0) ? account : best
-  );
-  scores.set(selected.id, (scores.get(selected.id) || 0) - totalWeight);
-  accountRoutingState.set(routingKey, { signature, scores });
+  targets.forEach((target, index) => {
+    const key = routingGroupKey(target, taskType);
+    const group = groups.get(key) || [];
+    group.push({ target, index });
+    groups.set(key, group);
+  });
 
-  return [
-    selected,
-    ...accounts
-      .filter((account) => account.id !== selected.id)
-      .sort((a, b) => (scores.get(b.id) || 0) - (scores.get(a.id) || 0))
-  ];
+  return [...groups.values()].flatMap((group) => group
+    .map((item) => {
+      const slot = targetTaskSlot(item.target, taskType);
+      const load = completedRoutingLoad(usage, item.target, slot)
+        + activeRoutingLoad(slot, item.target)
+        + requestedRoutingLoad(slot, input);
+      return {
+        ...item,
+        load,
+        weight: accountRoutingWeight(item.target.account)
+      };
+    })
+    .sort((left, right) => (
+      left.load * right.weight - right.load * left.weight
+      || left.index - right.index
+    ))
+    .map((item) => item.target));
+}
+
+function withRoutingReservationLock(work) {
+  const run = routingReservationQueue.catch(() => {}).then(work);
+  routingReservationQueue = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 function orderTargetsByImageSource(config, taskType, targets) {
@@ -1760,10 +1811,7 @@ function selectTargets(config, requestedChannel = "auto", taskType = "text2img",
         const abilityAccounts = accounts.filter((account) =>
           !(ability === "chatplus" && !options.includeCooling && accountCooling(account))
         );
-        const orderedAccounts = options.balanced && !requestedAccountId
-          ? balancedAccountOrder(abilityAccounts, `${channel.id}:${ability}:${taskType}`)
-          : abilityAccounts;
-        for (const account of orderedAccounts) {
+        for (const account of abilityAccounts) {
           targets.push({ channel: shareAIAbilityChannel(channel, ability), account });
         }
       }
@@ -1772,10 +1820,7 @@ function selectTargets(config, requestedChannel = "auto", taskType = "text2img",
     const channelAccounts = accounts.filter((account) =>
       !(channel.type === "chatplus" && !options.includeCooling && accountCooling(account))
     );
-    const orderedAccounts = options.balanced && !requestedAccountId
-      ? balancedAccountOrder(channelAccounts, `${channel.id}:${taskType}`)
-      : channelAccounts;
-    for (const account of orderedAccounts) {
+    for (const account of channelAccounts) {
       targets.push({ channel, account });
     }
   }
@@ -2080,7 +2125,6 @@ export async function reserveImageTaskAdmission(input = {}) {
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
     accountId: requestedAccountId,
-    balanced: true,
     skipKnownQuotaEmpty: true,
     input
   });
@@ -2343,24 +2387,27 @@ async function ensureTargetReady(config, target, taskType, attempts, options = {
 }
 
 async function reserveFirstAvailableTarget(targets, taskType, options = {}) {
-  const attempts = [];
-  for (const target of targets) {
-    if (options.confirmBeforeReserve && !(await options.confirmBeforeReserve(target, attempts))) continue;
-    const slot = targetTaskSlot(target, taskType);
-    const release = await tryReserveTaskSlot(slot, target, options.input || {});
-    if (release) return { target, release, attempts };
-    attempts.push(targetBusyAttempt(target, taskType));
-  }
-  if (attempts.length && attempts.every((attempt) => attempt.quotaEmpty)) {
-    throw targetsFailedError(attempts);
-  }
-  const details = attemptErrorMessage(attempts);
-  const error = new Error(details ? `并发上限：${details}` : "并发上限");
-  error.status = 429;
-  error.code = "CONCURRENCY_LIMIT";
-  error.busy = true;
-  error.attempts = attempts;
-  throw error;
+  return withRoutingReservationLock(async () => {
+    const attempts = [];
+    const orderedTargets = await orderTargetsByRoutingUsage(targets, taskType, options.input || {});
+    for (const target of orderedTargets) {
+      if (options.confirmBeforeReserve && !(await options.confirmBeforeReserve(target, attempts))) continue;
+      const slot = targetTaskSlot(target, taskType);
+      const release = await tryReserveTaskSlot(slot, target, options.input || {});
+      if (release) return { target, release, attempts, orderedTargets };
+      attempts.push(targetBusyAttempt(target, taskType));
+    }
+    if (attempts.length && attempts.every((attempt) => attempt.quotaEmpty)) {
+      throw targetsFailedError(attempts);
+    }
+    const details = attemptErrorMessage(attempts);
+    const error = new Error(details ? `并发上限：${details}` : "并发上限");
+    error.status = 429;
+    error.code = "CONCURRENCY_LIMIT";
+    error.busy = true;
+    error.attempts = attempts;
+    throw error;
+  });
 }
 
 function consumeAdmissionReservation(admission, targets, input = {}) {
@@ -2380,7 +2427,8 @@ function consumeAdmissionReservation(admission, targets, input = {}) {
     target,
     release: admission.release,
     handoff: admission.handoff,
-    attempts: Array.isArray(admission.attempts) ? admission.attempts : []
+    attempts: Array.isArray(admission.attempts) ? admission.attempts : [],
+    orderedTargets: Array.isArray(admission.orderedTargets) ? admission.orderedTargets : []
   };
 }
 
@@ -2392,26 +2440,27 @@ async function selectImageExecutionTargets(
   admission,
   options = {}
 ) {
-  const hasAdmission = Boolean(admission?.release);
-  const select = (balanced) => selectReadyTargets(config, requestedChannel, "img2img", {
+  const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
     ...options,
     accountId: requestedAccountId,
-    balanced,
     input
   });
-  let targets = await select(!hasAdmission);
   const reserved = consumeAdmissionReservation(admission, targets, input);
-  if (reserved || !hasAdmission) return { targets, reserved };
-
-  targets = await select(true);
-  return { targets, reserved: null };
+  return { targets, reserved };
 }
 
 function orderedTargets(targets, reserved) {
   if (!reserved?.target) return targets;
+  const preferredOrder = Array.isArray(reserved.orderedTargets)
+    ? reserved.orderedTargets
+      .map((ordered) => targets.find((target) => sameTarget(target, ordered)))
+      .filter(Boolean)
+    : [];
+  const remaining = targets.filter((target) => !preferredOrder.some((ordered) => sameTarget(target, ordered)));
+  const fallbackTargets = [...preferredOrder, ...remaining];
   return [
     reserved.target,
-    ...targets.filter((target) => !sameTarget(target, reserved.target))
+    ...fallbackTargets.filter((target) => !sameTarget(target, reserved.target))
   ];
 }
 
@@ -2943,7 +2992,10 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
   const attempts = [...(reserved?.attempts || [])];
   let reservedRelease = reserved?.release || null;
   try {
-    for (const target of orderedTargets(targets, reserved)) {
+    const executionTargets = Array.isArray(options.orderedTargets)
+      ? options.orderedTargets
+      : orderedTargets(targets, reserved);
+    for (const target of executionTargets) {
       const { channel, account } = target;
       let release = null;
       const usingReserved = reservedRelease && sameTarget(target, reserved?.target);
@@ -3137,7 +3189,7 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   }
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
-  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true, input });
+  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { input });
   if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel, input });
 
   const reserved = await reserveFirstAvailableTarget(targets, "text2img", { input });
@@ -3212,7 +3264,7 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true, input });
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, input });
   if (!targets.length) {
     throw noUsableTargetError("chat", {
       config,
@@ -3662,7 +3714,7 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, balanced: true, input });
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, input });
   if (!targets.length) {
     throw noUsableTargetError("chat", {
       config,
@@ -3704,64 +3756,76 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
   }
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
-  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { balanced: true, input });
+  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { input });
   if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel, input });
 
-  const attempts = [];
-  for (const target of targets) {
-    const { channel, account } = target;
-    let submitted = false;
-    const release = await tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target, input);
-    if (!release) {
-      attempts.push(targetBusyAttempt(target, "text2img"));
-      continue;
-    }
-    try {
-      const finishedTask = await runChatplusAccountWork(channel, account, async () => {
-        if (!(await ensureTargetReady(config, target, "text2img", attempts))) return null;
-        const client = getWorkClient(config, channel, account);
-        const chatplusConcurrentSubmit = wait && channel.type === "chatplus";
-        let result = await client.createTextTask({
-          ...imageInputForTarget(target, input),
-          onSubmitted: () => {
-            submitted = true;
-          },
-          ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
-          waitForImages: wait
-        });
-        if (wait && channel.type === "drawing") result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
-        result = await mirrorTaskImages(result, config, client, { waitForReady: wait });
-        const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
-        await upsertTask(task);
-        if (isFinishedTask(task.status)) await recordTaskStat(task);
-        await updateAccountAfterTask(account, channel, task);
-        scheduleDrawingQuotaRefresh(account, channel);
-        return task;
-      }, {
-        parallel: wait && channel.type === "chatplus",
-        noQueue: wait && channel.type !== "chatplus",
-        slot: targetTaskSlot(target, "text2img"),
-        modelKey: targetChatModelKey(target, input),
-        quotaProbe: targetConfirmedQuotaBlocksTask(target, "text2img") && targetConfirmedQuotaRetryDue(target),
-        blockingSlots: ["chatImage"]
-      });
-      if (finishedTask) return finishedTask;
-    } catch (error) {
-      if (submitted) throw error;
-      if (isTerminalTaskFailureError(error)) {
-        pushAttempt(attempts, target, error.message || "调用失败");
-        continue;
+  const reserved = await reserveFirstAvailableTarget(targets, "text2img", { input });
+  const attempts = [...reserved.attempts];
+  let reservedRelease = reserved.release;
+  try {
+    for (const target of orderedTargets(targets, reserved)) {
+      const { channel, account } = target;
+      let submitted = false;
+      let release = null;
+      if (reservedRelease && sameTarget(target, reserved.target)) {
+        release = reservedRelease;
+        reservedRelease = null;
+      } else {
+        release = await tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target, input);
+        if (!release) {
+          attempts.push(targetBusyAttempt(target, "text2img"));
+          continue;
+        }
       }
-      pushAttempt(attempts, target, error.message || "调用失败", {
-        busy: Boolean(error.busy),
-        quotaEmpty: channel.type === "chatplus"
-          ? isExplicitChatQuotaError(error)
-          : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
-      });
-      if (!error.busy) await updateTargetStatusAfterError(account, channel, error);
-    } finally {
-      release();
+      try {
+        const finishedTask = await runChatplusAccountWork(channel, account, async () => {
+          if (!(await ensureTargetReady(config, target, "text2img", attempts))) return null;
+          const client = getWorkClient(config, channel, account);
+          const chatplusConcurrentSubmit = wait && channel.type === "chatplus";
+          let result = await client.createTextTask({
+            ...imageInputForTarget(target, input),
+            onSubmitted: () => {
+              submitted = true;
+            },
+            ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
+            waitForImages: wait
+          });
+          if (wait && channel.type === "drawing") result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
+          result = await mirrorTaskImages(result, config, client, { waitForReady: wait });
+          const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
+          await upsertTask(task);
+          if (isFinishedTask(task.status)) await recordTaskStat(task);
+          await updateAccountAfterTask(account, channel, task);
+          scheduleDrawingQuotaRefresh(account, channel);
+          return task;
+        }, {
+          parallel: wait && channel.type === "chatplus",
+          noQueue: wait && channel.type !== "chatplus",
+          slot: targetTaskSlot(target, "text2img"),
+          modelKey: targetChatModelKey(target, input),
+          quotaProbe: targetConfirmedQuotaBlocksTask(target, "text2img") && targetConfirmedQuotaRetryDue(target),
+          blockingSlots: ["chatImage"]
+        });
+        if (finishedTask) return finishedTask;
+      } catch (error) {
+        if (submitted) throw error;
+        if (isTerminalTaskFailureError(error)) {
+          pushAttempt(attempts, target, error.message || "调用失败");
+          continue;
+        }
+        pushAttempt(attempts, target, error.message || "调用失败", {
+          busy: Boolean(error.busy),
+          quotaEmpty: channel.type === "chatplus"
+            ? isExplicitChatQuotaError(error)
+            : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
+        });
+        if (!error.busy) await updateTargetStatusAfterError(account, channel, error);
+      } finally {
+        release?.();
+      }
     }
+  } finally {
+    reservedRelease?.();
   }
   throw targetsFailedError(attempts);
 }
@@ -3796,8 +3860,11 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
     });
   }
   const reserved = selection.reserved;
+  const executionTargets = reserved
+    ? orderedTargets(targets, reserved)
+    : await orderTargetsByRoutingUsage(targets, "img2img", input);
 
-  const task = queuedTask({ input: { ...input, files }, target: reserved?.target || targets[0], taskType: "img2img", requestMeta });
+  const task = queuedTask({ input: { ...input, files }, target: reserved?.target || executionTargets[0], taskType: "img2img", requestMeta });
   try {
     reserved?.handoff?.();
     await upsertTask(task);
@@ -3810,7 +3877,8 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   try {
     finalTask = await runQueuedImageTask(task, input, files, reserved, {
       fastQuotaRefresh: true,
-      waitForChatplusImages: true
+      waitForChatplusImages: true,
+      orderedTargets: executionTargets
     });
   } finally {
     scheduledImageTasks.delete(task.id);

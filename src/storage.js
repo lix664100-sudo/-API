@@ -26,6 +26,7 @@ let configWriteQueue = Promise.resolve();
 let statsRevision = 0;
 let statsSnapshot = null;
 const intradayStatsCache = new Map();
+let todayAccountRoutingUsageCache = null;
 let tasksLoadPromise = null;
 let storageDatabase = null;
 let storageDatabasePromise = null;
@@ -299,6 +300,7 @@ export async function closeStorage() {
   tasksLoadPromise = null;
   statsSnapshot = null;
   intradayStatsCache.clear();
+  todayAccountRoutingUsageCache = null;
   tasksSnapshot = {
     ready: false,
     tasks: [],
@@ -1712,8 +1714,53 @@ export async function recordTaskStat(task) {
     statsSnapshot = null;
     statsRevision += 1;
     intradayStatsCache.clear();
+    todayAccountRoutingUsageCache = null;
     return record;
   });
+}
+
+export async function listTodayAccountRoutingUsage(now = Date.now()) {
+  await statsWriteQueue.catch(() => {});
+  const day = dateKeyInShanghai(now);
+  if (
+    todayAccountRoutingUsageCache?.day === day
+    && todayAccountRoutingUsageCache.revision === statsRevision
+  ) {
+    return todayAccountRoutingUsageCache.value;
+  }
+
+  const start = Date.parse(`${day}T00:00:00+08:00`);
+  const end = start + 24 * 60 * 60 * 1000;
+  const database = await getStorageDatabase();
+  const records = database.prepare(`
+    SELECT payload
+    FROM task_stats
+    WHERE time >= ? AND time < ?
+  `).all(start, end).map((row) => JSON.parse(row.payload));
+  const accounts = {};
+
+  for (const record of records) {
+    const accountId = String(record?.accountId || "").trim();
+    if (!accountId) continue;
+    const current = accounts[accountId] || {
+      drawingImages: 0,
+      chatImages: 0,
+      chats: 0
+    };
+    if (record?.taskType === "chat") {
+      current.chats += taskStatCount(record);
+    } else if (imageTaskTypes.has(record?.taskType)) {
+      const images = taskStatValue(record, "successImages");
+      const channelGroup = String(record?.channelGroup || "").toLowerCase();
+      if (channelGroup === "chatplus") current.chatImages += images;
+      else if (channelGroup === "drawing") current.drawingImages += images;
+    }
+    accounts[accountId] = current;
+  }
+
+  const value = { day, accounts };
+  todayAccountRoutingUsageCache = { day, revision: statsRevision, value };
+  return value;
 }
 
 export async function listIntradayTaskStats(day) {
