@@ -2325,9 +2325,13 @@
         return chatModelsForChannel(channel)
           .filter((item) => item.enabled)
           .map((item) => {
-            const usage = status.meta?.referenceUsage?.[item.key];
-            if (!usage) return "";
-            if (usage.quotaResetAt) return `${item.name} ${formatDateTime(usage.quotaResetAt)}`;
+            const usage = status.meta?.referenceUsage?.[item.key] || {};
+            const confirmedResetAt = confirmedChatQuotaEmpty(status)
+              && chatModelKey(status.quotaModel || status.meta?.chatModel) === item.key
+              ? status.quotaResetAt
+              : "";
+            const quotaResetAt = confirmedResetAt || usage.quotaResetAt;
+            if (quotaResetAt) return `${item.name} ${formatDateTime(quotaResetAt)}`;
             if (usage.period) return `${item.name} 每 ${usage.period}`;
             return "";
           })

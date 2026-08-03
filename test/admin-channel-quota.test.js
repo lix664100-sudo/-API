@@ -15,6 +15,28 @@ const aggregateChatReferenceUsage = vm.runInNewContext(
   `(${functionSource.replace(/^function /, "function ")})`
 );
 
+const resetFunctionMatch = adminHtml.match(
+  /function chatQuotaResetTexts\(channel, status = \{\}\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function accountBalanceForTotal/
+);
+
+assert.ok(resetFunctionMatch, "管理后台中应存在聊天额度重置时间显示方法");
+
+const resetFunctionSource = resetFunctionMatch[0].replace(
+  /\r?\n\r?\n      function accountBalanceForTotal$/,
+  ""
+);
+const chatQuotaResetTexts = vm.runInNewContext(
+  `(${resetFunctionSource.replace(/^function /, "function ")})`,
+  {
+    chatModelsForChannel: () => [{ key: "gpt", name: "GPT", enabled: true }],
+    chatModelKey: (value) => String(value || "").trim().toLowerCase(),
+    confirmedChatQuotaEmpty: (status = {}) => (
+      status.status === "quota_empty" && status.quotaConfirmedByUpstream === true
+    ),
+    formatDateTime: (value) => value
+  }
+);
+
 function shareAIAccount({ enabled = true, referenceUsage = {} } = {}) {
   return {
     enabled,
@@ -123,5 +145,51 @@ test("没有任何有效额度数据时不显示虚假的零额度", () => {
   assert.deepEqual(
     structuredClone(aggregateChatReferenceUsage(accounts, "shareai", ["gpt"])),
     {}
+  );
+});
+
+test("GPT 已明确用完时优先显示准确恢复时间", () => {
+  const status = {
+    status: "quota_empty",
+    quotaConfirmedByUpstream: true,
+    quotaModel: "gpt",
+    quotaResetAt: "2026-08-03T22:32:05+08:00",
+    meta: {
+      chatModel: "gpt",
+      referenceUsage: {
+        gpt: {
+          quotaResetAt: "",
+          period: "12h"
+        }
+      }
+    }
+  };
+
+  assert.deepEqual(
+    structuredClone(chatQuotaResetTexts({}, status)),
+    ["GPT 2026-08-03T22:32:05+08:00"]
+  );
+});
+
+test("GPT 恢复后没有准确时间时才显示额度周期", () => {
+  const status = {
+    status: "ok",
+    quotaConfirmedByUpstream: false,
+    quotaModel: "",
+    quotaResetAt: "",
+    meta: {
+      chatModel: "gpt",
+      referenceUsage: {
+        gpt: {
+          quotaResetAt: "",
+          period: "12h"
+        }
+      }
+    }
+  };
+
+  assert.deepEqual(
+    structuredClone(chatQuotaResetTexts({}, status)),
+    ["GPT 每 12h"]
   );
 });
