@@ -911,6 +911,47 @@
         gap: 0 12px;
       }
 
+      .proxy-assign-controls {
+        display: grid;
+        grid-template-columns: minmax(280px, 1.35fr) minmax(260px, 1fr);
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .proxy-assign-field {
+        display: grid;
+        align-content: start;
+        gap: 7px;
+      }
+
+      .proxy-assign-label {
+        color: #344054;
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .proxy-assign-account {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .proxy-assign-account-name {
+        overflow: hidden;
+        color: #101828;
+        font-weight: 650;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .proxy-assign-muted {
+        overflow: hidden;
+        color: var(--muted);
+        font-size: 12px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
       .model-route-list {
         display: grid;
         gap: 10px;
@@ -1263,6 +1304,7 @@
         .detail-grid,
         .upstream-detail-grid,
         .form-grid,
+        .proxy-assign-controls,
         .model-route-grid {
           grid-template-columns: 1fr;
         }
@@ -1741,7 +1783,7 @@
           h("div", { className: "task-channel-line", key: "generated", title: `生成：${generated}` }, [
             h("span", { className: "task-channel-label", key: "label" }, "生成："),
             h("span", { className: "task-channel-value", key: "value" }, generated)
-          ])
+          ]),
         ]);
       }
 
@@ -2481,6 +2523,62 @@
         } catch {
           return "格式不正确";
         }
+      }
+
+      function parseProxyAssignText(value) {
+        const text = String(value || "").trim();
+        if (!text) return [];
+        const parsed = window.Papa
+          ? window.Papa.parse(text, { delimiter: ",", skipEmptyLines: "greedy" }).data
+          : text.split(/\r?\n/).map((line) => [line]);
+        const proxies = (parsed || [])
+          .map((row) => (Array.isArray(row) ? row : [row]).find((cell) => String(cell ?? "").trim()))
+          .map((cell) => String(cell ?? "").trim())
+          .filter(Boolean);
+        if (["proxy", "proxyurl", "代理", "代理ip", "代理 ip"].includes(String(proxies[0] || "").toLowerCase())) {
+          proxies.shift();
+        }
+        return proxies;
+      }
+
+      function proxyAssignView(preview) {
+        const rows = preview?.rows || [];
+        const proxies = preview?.proxies || [];
+        const usedByChannel = new Map();
+        rows.forEach((row) => {
+          if (!row.proxyUrl) return;
+          const used = usedByChannel.get(row.channelId) || new Set();
+          used.add(row.proxyUrl);
+          usedByChannel.set(row.channelId, used);
+        });
+        const channelSource = preview?.unusedByChannel || [];
+        const unusedByChannel = (preview?.channelIds || []).map((channelId) => {
+          const channel = channelSource.find((item) => item.channelId === channelId) || {};
+          const used = usedByChannel.get(channelId) || new Set();
+          return {
+            channelId,
+            channelName: channel.channelName || rows.find((row) => row.channelId === channelId)?.channelName || "未命名渠道",
+            proxies: proxies.filter((proxy) => !used.has(proxy))
+          };
+        });
+        return {
+          accounts: rows.length,
+          assigned: rows.filter((row) => row.proxyUrl).length,
+          serverIp: rows.filter((row) => !row.proxyUrl).length,
+          cleared: rows.filter((row) => row.previousProxyUrl && !row.proxyUrl).length,
+          changed: rows.filter((row) => row.previousProxyUrl !== row.proxyUrl).length,
+          unusedByChannel
+        };
+      }
+
+      function proxyAssignResult(row) {
+        if (row.previousProxyUrl === row.proxyUrl) {
+          return row.proxyUrl
+            ? h(Tag, { color: "green" }, "保留原代理")
+            : h(Tag, null, "服务器 IP");
+        }
+        if (row.proxyUrl) return h(Tag, { color: "blue" }, row.previousProxyUrl ? "更换代理" : "分配代理");
+        return h(Tag, { color: row.previousProxyUrl ? "orange" : "default" }, row.previousProxyUrl ? "清空代理" : "服务器 IP");
       }
 
       function parseAccountImportText(text, currentAccounts, channelId) {
@@ -3660,6 +3758,13 @@
         const [accountImportRows, setAccountImportRows] = useState([]);
         const [accountImportError, setAccountImportError] = useState("");
         const [accountImporting, setAccountImporting] = useState(false);
+        const [proxyAssignOpen, setProxyAssignOpen] = useState(false);
+        const [proxyAssignText, setProxyAssignText] = useState("");
+        const [proxyAssignChannelIds, setProxyAssignChannelIds] = useState([]);
+        const [proxyAssignAllowReuse, setProxyAssignAllowReuse] = useState(false);
+        const [proxyAssignPreview, setProxyAssignPreview] = useState(null);
+        const [proxyAssignPreviewing, setProxyAssignPreviewing] = useState(false);
+        const [proxyAssignSaving, setProxyAssignSaving] = useState(false);
         const [editingChannel, setEditingChannel] = useState(null);
         const [editingAccount, setEditingAccount] = useState(null);
         const [taskPreview, setTaskPreview] = useState(null);
@@ -3681,6 +3786,7 @@
         const chatChannels = channels.filter((item) => item.type === "chatplus" || item.type === "shareai");
         const selectedChannel = channels.find((item) => item.id === selectedChannelId) || channels[0] || null;
         const selectedAccounts = selectedChannel ? accounts.filter((item) => item.channelId === selectedChannel.id) : [];
+        const proxyAssignSummary = proxyAssignView(proxyAssignPreview);
         const accountModalChannel = channels.find((item) => item.id === (editingAccount?.channelId || selectedChannel?.id)) || selectedChannel;
         const accountModalDrawingEnabled = channelAbilityEnabled(accountModalChannel, "drawing");
         const accountModalChatEnabled = channelAbilityEnabled(accountModalChannel, "chatplus");
@@ -4651,6 +4757,299 @@
           }
         }
 
+        function openProxyAssign() {
+          const enabledChannelIds = channels.filter((channel) => channel.enabled !== false).map((channel) => channel.id);
+          setProxyAssignText("");
+          setProxyAssignChannelIds(enabledChannelIds.length ? enabledChannelIds : channels.map((channel) => channel.id));
+          setProxyAssignAllowReuse(false);
+          setProxyAssignPreview(null);
+          setProxyAssignOpen(true);
+        }
+
+        function readProxyAssignFile(file) {
+          if (file.size > 2 * 1024 * 1024) {
+            message.error("代理文件不能超过 2 MB");
+            return false;
+          }
+          const reader = new FileReader();
+          reader.onload = () => {
+            setProxyAssignText(String(reader.result || ""));
+            setProxyAssignPreview(null);
+          };
+          reader.onerror = () => message.error("代理文件读取失败，请重新选择");
+          reader.readAsText(file, "utf-8");
+          return false;
+        }
+
+        async function previewProxyAssignments() {
+          if (proxyAssignPreviewing) return;
+          const proxies = parseProxyAssignText(proxyAssignText);
+          if (!proxyAssignChannelIds.length) {
+            message.warning("请选择应用渠道");
+            return;
+          }
+          if (!proxies.length) {
+            message.warning("请先导入代理 IP");
+            return;
+          }
+          if (proxies.length > 500) {
+            message.warning("每次最多导入 500 个代理 IP，请拆分后重试");
+            return;
+          }
+          setProxyAssignPreviewing(true);
+          setProxyAssignPreview(null);
+          try {
+            const preview = await api("/api/accounts/proxies/preview", {
+              method: "POST",
+              body: {
+                channelIds: proxyAssignChannelIds,
+                proxies,
+                allowReuse: proxyAssignAllowReuse
+              }
+            });
+            setProxyAssignPreview(preview);
+            if (preview.duplicateCount) message.info(`已自动去除 ${preview.duplicateCount} 个重复代理 IP`);
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setProxyAssignPreviewing(false);
+          }
+        }
+
+        function updateProxyAssignment(rowKey, proxyUrl) {
+          setProxyAssignPreview((current) => current ? {
+            ...current,
+            rows: current.rows.map((row) => row.key === rowKey ? { ...row, proxyUrl: proxyUrl || "" } : row)
+          } : current);
+        }
+
+        async function submitProxyAssignments() {
+          if (!proxyAssignPreview || proxyAssignSaving) return;
+          setProxyAssignSaving(true);
+          try {
+            const response = await api("/api/accounts/proxies/apply", {
+              method: "POST",
+              body: {
+                channelIds: proxyAssignPreview.channelIds,
+                proxies: proxyAssignPreview.proxies,
+                allowReuse: proxyAssignPreview.allowReuse,
+                snapshot: proxyAssignPreview.snapshot,
+                assignments: proxyAssignPreview.rows.map((row) => ({
+                  accountId: row.accountId,
+                  channelId: row.channelId,
+                  proxyUrl: row.proxyUrl || ""
+                }))
+              }
+            });
+            setConfig(response.config);
+            setProxyAssignOpen(false);
+            setProxyAssignPreview(null);
+            await refreshRuntimeStatus();
+            const result = response.result || {};
+            message.success(`代理分配已应用：使用代理 ${result.assigned || 0} 个账号，清空旧代理 ${result.cleared || 0} 个账号`);
+          } catch (error) {
+            if (String(error.message || "").includes("重新预览")) setProxyAssignPreview(null);
+            message.error(error.message);
+          } finally {
+            setProxyAssignSaving(false);
+          }
+        }
+
+        function confirmProxyAssignments() {
+          if (!proxyAssignPreview) return;
+          Modal.confirm({
+            title: "确认应用代理分配？",
+            content: `将让 ${proxyAssignSummary.assigned} 个账号使用代理，${proxyAssignSummary.serverIp} 个账号使用服务器 IP；其中会清空 ${proxyAssignSummary.cleared} 个账号的旧代理。`,
+            okText: "确认应用",
+            cancelText: "返回检查",
+            onOk: submitProxyAssignments
+          });
+        }
+
+        function renderProxyAssignModal() {
+          return h(Modal, {
+            title: "批量分配代理",
+            open: proxyAssignOpen,
+            onCancel: () => {
+              if (!proxyAssignSaving && !proxyAssignPreviewing) setProxyAssignOpen(false);
+            },
+            onOk: confirmProxyAssignments,
+            okText: "确认应用",
+            okButtonProps: {
+              disabled: !proxyAssignPreview?.rows?.length || proxyAssignPreviewing
+            },
+            cancelText: "取消",
+            cancelButtonProps: { disabled: proxyAssignSaving },
+            confirmLoading: proxyAssignSaving,
+            maskClosable: !proxyAssignSaving && !proxyAssignPreviewing,
+            width: 1080,
+            destroyOnHidden: true
+          }, [
+            h(Alert, {
+              key: "scope",
+              type: "info",
+              showIcon: true,
+              message: "每个渠道都会单独使用整批代理",
+              description: proxyAssignAllowReuse
+                ? "同一渠道内可以重复使用代理；不同渠道之间也可以使用同一个代理。"
+                : "同一渠道内每个代理最多分给一个账号；不同渠道之间可以使用同一个代理。",
+              style: { marginBottom: 14 }
+            }),
+            h("div", { className: "proxy-assign-controls", key: "controls" }, [
+              h("div", { className: "proxy-assign-field", key: "channels" }, [
+                h("div", { className: "proxy-assign-label" }, "应用渠道"),
+                h(Select, {
+                  mode: "multiple",
+                  value: proxyAssignChannelIds,
+                  options: channels.map((channel) => ({
+                    label: `${channel.name}${channel.enabled === false ? "（已停用）" : ""}`,
+                    value: channel.id
+                  })),
+                  placeholder: "请选择渠道",
+                  showSearch: true,
+                  optionFilterProp: "label",
+                  maxTagCount: "responsive",
+                  onChange: (value) => {
+                    setProxyAssignChannelIds(value);
+                    setProxyAssignPreview(null);
+                  }
+                })
+              ]),
+              h("div", { className: "proxy-assign-field", key: "reuse" }, [
+                h("div", { className: "proxy-assign-label" }, "单个渠道内"),
+                h(Segmented, {
+                  block: true,
+                  value: proxyAssignAllowReuse ? "reuse" : "unique",
+                  options: [
+                    { label: "每个 IP 只用一次", value: "unique" },
+                    { label: "允许重复使用", value: "reuse" }
+                  ],
+                  onChange: (value) => {
+                    setProxyAssignAllowReuse(value === "reuse");
+                    setProxyAssignPreview(null);
+                  }
+                })
+              ])
+            ]),
+            h("div", { className: "proxy-assign-field", key: "import", style: { marginBottom: 12 } }, [
+              h("div", { className: "proxy-assign-label" }, "代理 IP"),
+              h(Space, { size: 8, wrap: true }, [
+                h(Upload, {
+                  accept: ".txt,.csv,text/plain,text/csv",
+                  beforeUpload: readProxyAssignFile,
+                  showUploadList: false,
+                  maxCount: 1
+                }, h(Button, { icon: Icon.UploadOutlined ? h(Icon.UploadOutlined) : null }, "选择文件")),
+                h(Button, {
+                  type: "primary",
+                  ghost: true,
+                  loading: proxyAssignPreviewing,
+                  onClick: previewProxyAssignments
+                }, proxyAssignPreview ? "重新预览" : "预览分配")
+              ]),
+              h(Input.TextArea, {
+                value: proxyAssignText,
+                onChange: (event) => {
+                  setProxyAssignText(event.target.value);
+                  setProxyAssignPreview(null);
+                },
+                rows: 5,
+                placeholder: "每行一个代理 IP，例如：proxy.example.com|1080|user|password|2026-12-31"
+              })
+            ]),
+            h(Alert, {
+              key: "warning",
+              type: "warning",
+              showIcon: true,
+              message: "未分到新 IP 的账号会清空原代理，包括停用账号。",
+              style: { marginBottom: 14 }
+            }),
+            proxyAssignPreview
+              ? h("div", { key: "preview" }, [
+                  h(Space, { size: 6, wrap: true, style: { marginBottom: 10 } }, [
+                    h(Tag, { color: "blue" }, `使用代理 ${proxyAssignSummary.assigned} 个账号`),
+                    h(Tag, null, `服务器 IP ${proxyAssignSummary.serverIp} 个账号`),
+                    h(Tag, { color: proxyAssignSummary.cleared ? "orange" : "default" }, `清空旧代理 ${proxyAssignSummary.cleared} 个账号`),
+                    proxyAssignPreview.duplicateCount
+                      ? h(Tag, null, `已去除重复 ${proxyAssignPreview.duplicateCount} 个`)
+                      : null
+                  ]),
+                  proxyAssignSummary.unusedByChannel.some((channel) => channel.proxies.length)
+                    ? h(Alert, {
+                        type: "info",
+                        showIcon: true,
+                        message: "未使用的代理 IP",
+                        description: h("div", null, proxyAssignSummary.unusedByChannel
+                          .filter((channel) => channel.proxies.length)
+                          .map((channel) => h("div", { key: channel.channelId }, `${channel.channelName}：${channel.proxies.map((proxy) => `代理 ${proxyAssignPreview.proxies.indexOf(proxy) + 1} · ${accountImportProxyLabel(proxy)}`).join("、")}`))),
+                        style: { marginBottom: 10 }
+                      })
+                    : null,
+                  h(Table, {
+                    rowKey: "key",
+                    size: "small",
+                    pagination: proxyAssignPreview.rows.length > 8 ? { pageSize: 8, showSizeChanger: false } : false,
+                    scroll: { x: 940 },
+                    dataSource: proxyAssignPreview.rows,
+                    locale: { emptyText: "所选渠道没有账号" },
+                    columns: [
+                      { title: "渠道", dataIndex: "channelName", width: 140, ellipsis: true },
+                      {
+                        title: "账号",
+                        dataIndex: "accountName",
+                        width: 220,
+                        render: (_value, row) => h("div", { className: "proxy-assign-account" }, [
+                          h("div", { className: "proxy-assign-account-name", key: "name" }, [
+                            row.accountName,
+                            row.enabled ? null : h(Tag, { key: "disabled", style: { marginInlineStart: 6 } }, "已停用")
+                          ]),
+                          h("div", { className: "proxy-assign-muted", key: "username" }, row.username)
+                        ])
+                      },
+                      {
+                        title: "当前 IP",
+                        dataIndex: "previousProxyUrl",
+                        width: 170,
+                        render: (value) => value
+                          ? h(Tag, { color: "default" }, accountImportProxyLabel(value))
+                          : h(Tag, null, "服务器 IP")
+                      },
+                      {
+                        title: "应用后",
+                        dataIndex: "proxyUrl",
+                        width: 280,
+                        render: (value, row) => h(Select, {
+                          value: value || "",
+                          style: { width: "100%" },
+                          showSearch: true,
+                          optionFilterProp: "label",
+                          popupMatchSelectWidth: 320,
+                          options: [
+                            { label: "服务器 IP（清空代理）", value: "" },
+                            ...proxyAssignPreview.proxies.map((proxy, index) => ({
+                              label: `代理 ${index + 1} · ${accountImportProxyLabel(proxy)}`,
+                              value: proxy,
+                              disabled: !proxyAssignPreview.allowReuse && proxyAssignPreview.rows.some((other) =>
+                                other.channelId === row.channelId && other.key !== row.key && other.proxyUrl === proxy
+                              )
+                            }))
+                          ],
+                          onChange: (nextValue) => updateProxyAssignment(row.key, nextValue)
+                        })
+                      },
+                      {
+                        title: "结果",
+                        key: "result",
+                        width: 110,
+                        render: (_value, row) => proxyAssignResult(row)
+                      }
+                    ]
+                  })
+                ])
+              : null
+          ]);
+        }
+
         async function deleteAccount(id) {
           try {
             setConfig(await api(`/api/accounts/${id}`, { method: "DELETE" }));
@@ -5542,8 +5941,9 @@
                         : null,
                       h("div", { className: "section-title" }, [
                         h("h3", null, "渠道账号"),
-                        h(Space, { size: 8 }, [
+                        h(Space, { size: 8, wrap: true }, [
                           h(Button, { icon: Icon.UploadOutlined ? h(Icon.UploadOutlined) : null, onClick: openAccountImport, disabled: !channels.length }, "批量导入"),
+                          h(Button, { icon: Icon.ApartmentOutlined ? h(Icon.ApartmentOutlined) : null, onClick: openProxyAssign, disabled: !accounts.length }, "批量分配代理"),
                           h(Button, { type: "primary", icon: Icon.PlusOutlined ? h(Icon.PlusOutlined) : null, onClick: () => openAccountModal(null), disabled: !channels.length }, "新增账号")
                         ])
                       ]),
@@ -6224,7 +6624,8 @@
                   })
                 ])
               : null
-          ])
+          ]),
+          renderProxyAssignModal()
         ]);
       }
 

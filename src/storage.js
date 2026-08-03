@@ -1,8 +1,8 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomInt, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { safeProxyEndpoint } from "./proxy.js";
+import { normalizeProxyUrl, safeProxyEndpoint } from "./proxy.js";
 
 const rootDir = process.cwd();
 const dataDir = path.resolve(rootDir, process.env.DATA_DIR || "data");
@@ -19,6 +19,7 @@ const imageTaskTypes = new Set(["text2img", "img2img"]);
 const statRecordLimit = 50000;
 const intradayIntervalMinutes = 30;
 const accountImportLimit = 500;
+const proxyBatchLimit = 500;
 let statsWriteQueue = Promise.resolve();
 let runtimeStatsWriteQueue = Promise.resolve();
 let tasksWriteQueue = Promise.resolve();
@@ -987,6 +988,293 @@ export async function importAccounts(input = {}) {
       skipped
     };
     return { accounts: [...current.accounts, ...imported] };
+  });
+
+  return { config, result };
+}
+
+function proxyBatchError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function proxyBatchKey(value) {
+  try {
+    return new URL(normalizeProxyUrl(value)).href;
+  } catch {
+    return "";
+  }
+}
+
+function proxyBatchExpiryTime(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const dateText = /^\d{4}-\d{2}-\d{2}$/.test(text)
+    ? `${text}T23:59:59+08:00`
+    : text;
+  const time = Date.parse(dateText);
+  return Number.isFinite(time) ? time : Number.NaN;
+}
+
+function normalizeProxyBatch(source) {
+  if (!Array.isArray(source) || !source.length) {
+    throw proxyBatchError("请先导入代理 IP。");
+  }
+  if (source.length > proxyBatchLimit) {
+    throw proxyBatchError(`每次最多导入 ${proxyBatchLimit} 个代理 IP，请拆分后重试。`);
+  }
+
+  const entries = [];
+  const byKey = new Map();
+  let duplicateCount = 0;
+  source.forEach((value, index) => {
+    const proxyUrl = String(value ?? "").trim();
+    if (!proxyUrl) return;
+    const endpoint = safeProxyEndpoint(proxyUrl);
+    const key = proxyBatchKey(proxyUrl);
+    if (proxyUrl.length > 2048 || !endpoint.proxyHost || !key) {
+      throw proxyBatchError(`第 ${index + 1} 行的代理 IP 格式不正确。`);
+    }
+    const expiryTime = proxyBatchExpiryTime(endpoint.expiresAt);
+    if (Number.isNaN(expiryTime)) {
+      throw proxyBatchError(`第 ${index + 1} 行的代理 IP 格式不正确。`);
+    }
+    if (expiryTime !== null && expiryTime < Date.now()) {
+      throw proxyBatchError(`第 ${index + 1} 行的代理 IP 已到期。`);
+    }
+    if (byKey.has(key)) {
+      duplicateCount += 1;
+      return;
+    }
+    const entry = { key, proxyUrl };
+    entries.push(entry);
+    byKey.set(key, entry);
+  });
+
+  if (!entries.length) throw proxyBatchError("请先导入代理 IP。");
+  return { entries, byKey, duplicateCount };
+}
+
+function normalizeProxyBatchChannelIds(source) {
+  const channelIds = [...new Set(
+    (Array.isArray(source) ? source : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  )];
+  if (!channelIds.length) throw proxyBatchError("请选择应用渠道。");
+  return channelIds;
+}
+
+function resolveProxyBatchChannels(config, channelIds) {
+  const channelMap = new Map(config.channels.map((channel) => [channel.id, channel]));
+  return channelIds.map((channelId) => {
+    const channel = channelMap.get(channelId);
+    if (!channel) throw proxyBatchError("所选渠道不存在，请刷新后重试。", 409);
+    return channel;
+  });
+}
+
+function shuffled(items) {
+  const result = [...items];
+  for (let index = result.length - 1; index > 0; index -= 1) {
+    const swapIndex = randomInt(index + 1);
+    [result[index], result[swapIndex]] = [result[swapIndex], result[index]];
+  }
+  return result;
+}
+
+function automaticProxyAssignments(accounts, proxyBatch, allowReuse) {
+  const assignments = new Map(accounts.map((account) => [account.id, ""]));
+  const enabledAccounts = accounts.filter((account) => account.enabled !== false);
+  const usage = new Map(proxyBatch.entries.map((entry) => [entry.key, 0]));
+  const assignedAccountIds = new Set();
+
+  for (const account of enabledAccounts) {
+    const key = proxyBatchKey(account.proxyUrl);
+    const imported = proxyBatch.byKey.get(key);
+    if (!imported || (!allowReuse && usage.get(key) > 0)) continue;
+    assignments.set(account.id, imported.proxyUrl);
+    assignedAccountIds.add(account.id);
+    usage.set(key, usage.get(key) + 1);
+  }
+
+  const remainingAccounts = enabledAccounts.filter((account) => !assignedAccountIds.has(account.id));
+  const previouslyProxied = shuffled(remainingAccounts.filter((account) => String(account.proxyUrl || "").trim()));
+  const withoutProxy = shuffled(remainingAccounts.filter((account) => !String(account.proxyUrl || "").trim()));
+  const prioritizedAccounts = [...previouslyProxied, ...withoutProxy];
+
+  if (!allowReuse) {
+    const available = shuffled(proxyBatch.entries.filter((entry) => usage.get(entry.key) === 0));
+    prioritizedAccounts.slice(0, available.length).forEach((account, index) => {
+      assignments.set(account.id, available[index].proxyUrl);
+      usage.set(available[index].key, 1);
+    });
+    return { assignments, usage };
+  }
+
+  for (const account of prioritizedAccounts) {
+    const minimumUsage = Math.min(...proxyBatch.entries.map((entry) => usage.get(entry.key)));
+    const candidates = proxyBatch.entries.filter((entry) => usage.get(entry.key) === minimumUsage);
+    const selected = candidates[randomInt(candidates.length)];
+    assignments.set(account.id, selected.proxyUrl);
+    usage.set(selected.key, usage.get(selected.key) + 1);
+  }
+  return { assignments, usage };
+}
+
+function proxyAssignmentSummary(rows, unusedByChannel) {
+  return {
+    channels: new Set(rows.map((row) => row.channelId)).size,
+    accounts: rows.length,
+    assigned: rows.filter((row) => row.proxyUrl).length,
+    cleared: rows.filter((row) => row.previousProxyUrl && !row.proxyUrl).length,
+    changed: rows.filter((row) => row.previousProxyUrl !== row.proxyUrl).length,
+    unchanged: rows.filter((row) => row.previousProxyUrl === row.proxyUrl).length,
+    unused: unusedByChannel.reduce((total, channel) => total + channel.proxies.length, 0)
+  };
+}
+
+export async function previewAccountProxyAssignments(input = {}) {
+  const channelIds = normalizeProxyBatchChannelIds(input.channelIds);
+  const proxyBatch = normalizeProxyBatch(input.proxies);
+  const allowReuse = input.allowReuse === true;
+  const config = await loadConfig();
+  const channels = resolveProxyBatchChannels(config, channelIds);
+  const rows = [];
+  const unusedByChannel = [];
+
+  for (const channel of channels) {
+    const accounts = config.accounts.filter((account) => account.channelId === channel.id);
+    const { assignments, usage } = automaticProxyAssignments(accounts, proxyBatch, allowReuse);
+    accounts.forEach((account) => {
+      rows.push({
+        key: `${channel.id}:${account.id}`,
+        channelId: channel.id,
+        channelName: channel.name,
+        accountId: account.id,
+        accountName: account.name || account.username || "未命名账号",
+        username: account.username || "",
+        enabled: account.enabled !== false,
+        previousProxyUrl: String(account.proxyUrl || "").trim(),
+        proxyUrl: assignments.get(account.id) || ""
+      });
+    });
+    unusedByChannel.push({
+      channelId: channel.id,
+      channelName: channel.name,
+      proxies: proxyBatch.entries
+        .filter((entry) => usage.get(entry.key) === 0)
+        .map((entry) => entry.proxyUrl)
+    });
+  }
+
+  return {
+    channelIds,
+    allowReuse,
+    proxies: proxyBatch.entries.map((entry) => entry.proxyUrl),
+    duplicateCount: proxyBatch.duplicateCount,
+    rows,
+    snapshot: rows.map((row) => ({
+      accountId: row.accountId,
+      channelId: row.channelId,
+      proxyUrl: row.previousProxyUrl,
+      enabled: row.enabled
+    })),
+    unusedByChannel,
+    summary: proxyAssignmentSummary(rows, unusedByChannel)
+  };
+}
+
+function assertProxyAssignmentSnapshot(accounts, snapshot) {
+  if (!Array.isArray(snapshot) || snapshot.length !== accounts.length) {
+    throw proxyBatchError("账号或代理状态已经变化，请重新预览后再保存。", 409);
+  }
+  const currentById = new Map(accounts.map((account) => [account.id, account]));
+  const seen = new Set();
+  for (const item of snapshot) {
+    const accountId = String(item?.accountId || "");
+    const current = currentById.get(accountId);
+    if (
+      !current
+      || seen.has(accountId)
+      || current.channelId !== String(item?.channelId || "")
+      || String(current.proxyUrl || "").trim() !== String(item?.proxyUrl || "").trim()
+      || (current.enabled !== false) !== (item?.enabled !== false)
+    ) {
+      throw proxyBatchError("账号或代理状态已经变化，请重新预览后再保存。", 409);
+    }
+    seen.add(accountId);
+  }
+}
+
+function normalizeProxyAssignments(accounts, source, proxyBatch, allowReuse) {
+  if (!Array.isArray(source) || source.length !== accounts.length) {
+    throw proxyBatchError("预览内容不完整，请重新预览后再保存。");
+  }
+  const accountById = new Map(accounts.map((account) => [account.id, account]));
+  const assignments = new Map();
+  const usedByChannel = new Map();
+
+  for (const item of source) {
+    const accountId = String(item?.accountId || "");
+    const account = accountById.get(accountId);
+    if (!account || assignments.has(accountId)) {
+      throw proxyBatchError("预览内容不完整，请重新预览后再保存。");
+    }
+    const requestedProxy = String(item?.proxyUrl || "").trim();
+    if (!requestedProxy) {
+      assignments.set(accountId, "");
+      continue;
+    }
+    const key = proxyBatchKey(requestedProxy);
+    const imported = proxyBatch.byKey.get(key);
+    if (!imported) throw proxyBatchError("分配结果中包含未导入的代理 IP，请重新预览。");
+    if (!allowReuse) {
+      const used = usedByChannel.get(account.channelId) || new Set();
+      if (used.has(key)) throw proxyBatchError("同一渠道不能重复使用同一个代理。");
+      used.add(key);
+      usedByChannel.set(account.channelId, used);
+    }
+    assignments.set(accountId, imported.proxyUrl);
+  }
+  return assignments;
+}
+
+export async function applyAccountProxyAssignments(input = {}) {
+  const channelIds = normalizeProxyBatchChannelIds(input.channelIds);
+  const proxyBatch = normalizeProxyBatch(input.proxies);
+  const allowReuse = input.allowReuse === true;
+  let result = null;
+
+  const config = await updateConfig((current) => {
+    resolveProxyBatchChannels(current, channelIds);
+    const selectedChannels = new Set(channelIds);
+    const accounts = current.accounts.filter((account) => selectedChannels.has(account.channelId));
+    assertProxyAssignmentSnapshot(accounts, input.snapshot);
+    const assignments = normalizeProxyAssignments(accounts, input.assignments, proxyBatch, allowReuse);
+    const nextAccounts = current.accounts.map((account) => {
+      if (!selectedChannels.has(account.channelId)) return account;
+      const proxyUrl = assignments.get(account.id);
+      if (String(account.proxyUrl || "").trim() === proxyUrl) return account;
+      const meta = { ...(account.meta || {}) };
+      delete meta.proxyCheck;
+      return { ...account, proxyUrl, meta };
+    });
+    const rows = accounts.map((account) => ({
+      channelId: account.channelId,
+      previousProxyUrl: String(account.proxyUrl || "").trim(),
+      proxyUrl: assignments.get(account.id) || ""
+    }));
+    result = {
+      channels: channelIds.length,
+      accounts: accounts.length,
+      assigned: rows.filter((row) => row.proxyUrl).length,
+      cleared: rows.filter((row) => row.previousProxyUrl && !row.proxyUrl).length,
+      changed: rows.filter((row) => row.previousProxyUrl !== row.proxyUrl).length,
+      unchanged: rows.filter((row) => row.previousProxyUrl === row.proxyUrl).length
+    };
+    return { accounts: nextAccounts };
   });
 
   return { config, result };

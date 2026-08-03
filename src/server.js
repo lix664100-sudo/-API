@@ -40,6 +40,7 @@ import {
   updateCommandEnvironment
 } from "./git-update.js";
 import {
+  applyAccountProxyAssignments,
   closeStorage,
   getTask,
   getTaskBySourceTaskId,
@@ -50,6 +51,7 @@ import {
   listTaskStatsSummary,
   listTasks,
   loadConfig,
+  previewAccountProxyAssignments,
   publicConfig,
   recordTaskStat,
   recordRuntimeStat,
@@ -876,6 +878,29 @@ app.post("/api/accounts/import", async (request) => {
       result: imported.result
     }
   };
+});
+
+app.post("/api/accounts/proxies/preview", async (request, reply) => {
+  try {
+    return { ok: true, data: await previewAccountProxyAssignments(request.body || {}) };
+  } catch (error) {
+    return sendError(reply, error);
+  }
+});
+
+app.post("/api/accounts/proxies/apply", async (request, reply) => {
+  try {
+    const applied = await applyAccountProxyAssignments(request.body || {});
+    return {
+      ok: true,
+      data: {
+        config: publicConfig(applied.config),
+        result: applied.result
+      }
+    };
+  } catch (error) {
+    return sendError(reply, error);
+  }
 });
 
 app.delete("/api/accounts/:id", async (request) => {
