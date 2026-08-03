@@ -352,6 +352,11 @@ test("image fallback stores the real chat image channel before the final image i
     let stored = (await listTasks()).find((task) => task.sourceTaskId === sourceTaskId);
     assert.equal(stored.channelType, "chatplus");
     assert.equal(stored.channelId, "shareai:chatplus");
+    assert.deepEqual(
+      stored.submissionChannels.map((item) => [item.channelId, item.accountId]),
+      [["shareai:chatplus", "fallback-account"]]
+    );
+    assert.deepEqual(stored.generationChannels, []);
 
     const refreshResults = await refreshProcessingTasks();
     const refreshed = refreshResults.find((item) => item.id === stored.id);
@@ -367,6 +372,14 @@ test("image fallback stores the real chat image channel before the final image i
     assert.equal(stored.status, "success");
     assert.equal(stored.channelType, "chatplus");
     assert.equal(stored.imageUrls.length, 1);
+    assert.deepEqual(
+      stored.submissionChannels.map((item) => [item.channelId, item.accountId]),
+      [["shareai:chatplus", "fallback-account"]]
+    );
+    assert.deepEqual(
+      stored.generationChannels.map((item) => [item.channelId, item.accountId]),
+      [["shareai:chatplus", "fallback-account"]]
+    );
   } finally {
     finishChatTask?.();
     DrawingClient.prototype.check = originalDrawingCheck;
@@ -746,11 +759,83 @@ test("wait image task returns upstream policy refusal without wrapping it as tim
         assert.equal(error.code, "content_policy");
         assert.equal(error.task.status, "failed");
         assert.equal(error.task.responseJson.message, message);
+        assert.deepEqual(
+          error.task.submissionChannels.map((item) => [item.channelId, item.accountId]),
+          [["shareai:chatplus", "account-policy-wait"]]
+        );
+        assert.deepEqual(error.task.generationChannels, []);
         return true;
       }
     );
   } finally {
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+  }
+});
+
+test("提交结果无法确认时不会换账号重发，并保存首次提交渠道", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    imageStorage: { mode: "never", autoCleanup: false, retentionDays: 7 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        chatBaseUrl: "https://chat.example.test",
+        enabledAbilities: { drawing: false, chatplus: true },
+        defaultChatModel: "gemini"
+      }
+    }],
+    accounts: ["first", "second"].map((name) => ({
+      id: `uncertain-${name}`,
+      channelId: "shareai",
+      name: `Uncertain ${name}`,
+      username: `${name}@example.test`,
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }))
+  });
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let submissionCount = 0;
+  ChatplusClient.prototype.createImageTask = async () => {
+    submissionCount += 1;
+    const error = new Error("connection reset");
+    error.code = "ECONNRESET";
+    error.imageSubmissionAttempted = true;
+    throw error;
+  };
+
+  try {
+    await assert.rejects(
+      () => createImageTask({
+        input: { channel: "chatplus", model: "gemini", prompt: "提交结果不确定测试" },
+        files: [{ filename: "source.png", mimetype: "image/png" }],
+        wait: true
+      }),
+      (error) => {
+        assert.equal(error.task.status, "failed");
+        assert.equal(error.task.responseJson.code, "IMAGE_SUBMISSION_UNCERTAIN");
+        assert.equal(error.task.raw.submitted, true);
+        assert.equal(error.task.raw.submissionResultUncertain, true);
+        assert.equal(error.task.submissionChannels.length, 1);
+        assert.equal(error.task.generationChannels.length, 0);
+        return true;
+      }
+    );
+    assert.equal(submissionCount, 1);
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+    await saveConfig(config);
   }
 });
 
@@ -1083,6 +1168,14 @@ test("Gemini 旧图片地址失效后会读取新地址并恢复", async () => {
     assert.equal(downloadedUrls.includes(newUrl), true);
     assert.equal(recovered.raw.imageMirrorPending, false);
     assert.deepEqual(recovered.raw.originalImageUrls, [newUrl]);
+    assert.deepEqual(
+      recovered.submissionChannels.map((item) => [item.channelId, item.accountId]),
+      [["shareai:chatplus", "account-gemini-fresh-url"]]
+    );
+    assert.deepEqual(
+      recovered.generationChannels.map((item) => [item.channelId, item.accountId]),
+      [["shareai:chatplus", "account-gemini-fresh-url"]]
+    );
     localFilename = path.basename(new URL(recovered.imageUrls[0]).pathname);
   } finally {
     ChatplusClient.prototype.getTask = originalGetTask;

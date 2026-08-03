@@ -2,7 +2,16 @@ import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
 import { DrawingClient, drawingRetryAfterSeconds, drawingSevereFailureReason, drawingUpstreamText } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
-import { checkProxyReachability, safeProxyEndpoint } from "./proxy.js";
+import {
+  checkProxyReachability,
+  isProxyConnectionError,
+  normalizeProxyUrl,
+  proxyCircuitState,
+  recordProxyCircuitFailure,
+  resetProxyCircuit,
+  runWithProxyCircuit,
+  safeProxyEndpoint
+} from "./proxy.js";
 import {
   getTask,
   listTasks,
@@ -27,6 +36,9 @@ const activeChatQuotaProbes = new Set();
 const clientCache = new Map();
 const accountRecoveryTasks = new Map();
 const accountRecoveryRetryAt = new Map();
+const activeProxyChecks = new Map();
+const persistedProxyStatuses = new Map();
+const proxyStatusWrites = new Map();
 const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
 const CHAT_USAGE_RECOVERY_CHECK_MS = 60 * 60 * 1000;
 const DRAWING_FAILURE_LIMIT = 3;
@@ -37,6 +49,14 @@ const IMAGE_MIRROR_RECOVERY_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS = 20;
 const WAIT_IMAGE_MIRROR_TIMEOUT_MS = Math.max(1000, Number(process.env.WAIT_IMAGE_MIRROR_TIMEOUT_MS || 90_000));
 const WAIT_IMAGE_MIRROR_RETRY_MS = Math.max(250, Number(process.env.WAIT_IMAGE_MIRROR_RETRY_MS || 1000));
+const PROXY_GUARDED_CLIENT_METHODS = new Set([
+  "check",
+  "createChatCompletion",
+  "createImageTask",
+  "createTextTask",
+  "getTask",
+  "uploadImage"
+]);
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 let routingReservationQueue = Promise.resolve();
 
@@ -114,7 +134,10 @@ function proxyCheckMeta(result) {
     proxyHost: result.proxyHost || "",
     proxyLabel: result.proxyLabel || "",
     checkedAt: result.checkedAt || new Date().toISOString(),
-    message: result.ok ? "" : result.message || "代理不可用"
+    message: result.ok ? "" : result.message || "代理不可用",
+    cooldownUntil: result.cooldownUntil || "",
+    attemptCount: Number(result.attemptCount || 0),
+    latencyMs: Number(result.latencyMs || 0)
   };
 }
 
@@ -658,7 +681,17 @@ function getClient(config, channel, account) {
 }
 
 function getWorkClient(config, channel, account) {
-  return getClient(config, channel, account);
+  const client = getClient(config, channel, account);
+  return new Proxy(client, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function" || !PROXY_GUARDED_CLIENT_METHODS.has(property)) return value;
+      return (...args) => runAccountProxyWork(
+        account,
+        () => value.apply(target, args)
+      );
+    }
+  });
 }
 
 function shareAIAbilityChannel(channel, ability) {
@@ -790,6 +823,21 @@ function isExplicitChatQuotaError(error) {
 
 function isTerminalTaskFailureError(error) {
   return Boolean(error?.upstreamExplicitFailure);
+}
+
+function imageSubmissionFailure(error) {
+  if (
+    error?.imageSubmissionAttempted !== true
+    || error?.upstreamExplicitFailure
+    || error?.imageQuotaExhausted
+  ) {
+    return error;
+  }
+  const failure = new Error("上游没有确认本次生成结果。为避免重复消耗图片额度，系统未再次提交。");
+  failure.status = Number(error?.status || error?.statusCode || 0) || 502;
+  failure.code = "IMAGE_SUBMISSION_UNCERTAIN";
+  failure.imageSubmissionAttempted = true;
+  return failure;
 }
 
 function accountStatusFromError(error, options = {}) {
@@ -1152,6 +1200,73 @@ function usableImageResultUrls(urls = []) {
   }))];
 }
 
+function taskRouteEntry(channel = {}, account = {}) {
+  return {
+    channelId: String(channel.id || "").trim(),
+    channelName: String(channel.name || "").trim(),
+    channelType: String(channel.type || "").trim(),
+    accountId: String(account.id || "").trim(),
+    accountName: String(account.name || account.username || "").trim()
+  };
+}
+
+function normalizedTaskRoute(value = {}) {
+  if (!value || typeof value !== "object") return null;
+  const route = taskRouteEntry({
+    id: value.channelId,
+    name: value.channelName,
+    type: value.channelType
+  }, {
+    id: value.accountId,
+    name: value.accountName
+  });
+  return route.channelId || route.channelName || route.accountId || route.accountName ? route : null;
+}
+
+function taskRouteKey(route) {
+  return [
+    route.channelId || route.channelName,
+    route.accountId || route.accountName
+  ].join("::");
+}
+
+function mergeTaskRoutes(...groups) {
+  const routes = [];
+  const seen = new Set();
+  for (const group of groups) {
+    for (const value of Array.isArray(group) ? group : []) {
+      const route = normalizedTaskRoute(value);
+      if (!route) continue;
+      const key = taskRouteKey(route);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      routes.push(route);
+    }
+  }
+  return routes;
+}
+
+function resultHasGeneratedImage(result = {}) {
+  return String(result.status || "").toLowerCase() === "success"
+    && result.taskType !== "chat"
+    && (usableImageResultUrls(result.imageUrls).length > 0 || Number(result.imageCount || 0) > 0);
+}
+
+function markTaskSubmissionAttempt(task, channel, account, options = {}) {
+  const now = new Date().toISOString();
+  return {
+    ...task,
+    submissionChannels: mergeTaskRoutes(task.submissionChannels, [taskRouteEntry(channel, account)]),
+    raw: {
+      ...(task.raw || {}),
+      queued: false,
+      submitted: true,
+      submittedAt: task.raw?.submittedAt || now,
+      ...(options.resultUncertain ? { submissionResultUncertain: true } : {})
+    }
+  };
+}
+
 function retryableImageMirrorError(error) {
   const status = Number(error?.status || error?.statusCode || 0);
   if ([404, 408, 425, 429].includes(status) || status >= 500) return true;
@@ -1229,6 +1344,8 @@ export function imageTaskClientView(task = {}) {
     modelId: task.modelId || "",
     imageCount: imageUrls.length,
     imageUrls,
+    submissionChannels: mergeTaskRoutes(task.submissionChannels),
+    generationChannels: mergeTaskRoutes(task.generationChannels),
     errorMessage: task.errorMessage || "",
     createdAt: task.createdAt || null,
     completedAt: task.completedAt || null
@@ -1380,6 +1497,8 @@ async function updateAccountAfterTask(account, channel, result = {}) {
 
 function mergeRefreshedTask(task, result, channel, account) {
   const status = result.status || task.status;
+  const route = taskRouteEntry(channel, account);
+  const wasSubmitted = Boolean(task.raw?.submitted || savedTaskExternalId(task) || savedTaskExternalId(result));
   return {
     ...task,
     externalId: result.externalId || task.externalId,
@@ -1398,6 +1517,11 @@ function mergeRefreshedTask(task, result, channel, account) {
     channelType: channel.type,
     accountId: account.id,
     accountName: account.name,
+    submissionChannels: mergeTaskRoutes(task.submissionChannels, wasSubmitted ? [route] : []),
+    generationChannels: mergeTaskRoutes(
+      task.generationChannels,
+      resultHasGeneratedImage({ ...result, status }) ? [route] : []
+    ),
     completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : task.completedAt || null,
     requestJson: task.requestJson || null,
     responseJson: attachResponseSourceTaskId(taskResponseJson(result), task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson)),
@@ -1836,6 +1960,7 @@ function noChatTargetsError(config, requestedChannel) {
 
 function wrapTask({ result, channel, account, attempts, requestJson = null, requestMeta = {} }) {
   const status = result.status || "unknown";
+  const route = taskRouteEntry(channel, account);
   const meta = taskRequestMeta(requestMeta);
   const sourceTaskId = meta.sourceTaskId || sourceTaskIdFrom(requestJson);
   const requestMetaPayload = sourceTaskId && !meta.sourceTaskId ? { ...meta, sourceTaskId } : meta;
@@ -1858,6 +1983,8 @@ function wrapTask({ result, channel, account, attempts, requestJson = null, requ
     channelType: channel.type,
     accountId: account.id,
     accountName: account.name,
+    submissionChannels: savedTaskExternalId(result) ? [route] : [],
+    generationChannels: resultHasGeneratedImage({ ...result, status }) ? [route] : [],
     requestMeta: requestMetaPayload,
     network: taskNetworkMeta(account),
     attempts,
@@ -2026,7 +2153,7 @@ async function recoverTarget(config, target) {
         await runChatplusAccountWork(
           target.channel,
           target.account,
-          () => getClient(config, target.channel, target.account).check({
+          () => getWorkClient(config, target.channel, target.account).check({
             model: target.channel.type === "chatplus" ? currentStatus.quotaModel || "" : ""
           })
         )
@@ -2056,7 +2183,13 @@ async function recoverTarget(config, target) {
         ? preserveConfirmedChatQuota(currentStatus, errorStatus)
         : errorStatus;
       await updateTargetAccountStatus(target.account.id, target.channel, status);
-      accountRecoveryRetryAt.set(key, Date.now() + ACCOUNT_RECOVERY_RETRY_MS);
+      const proxyRetryAt = Date.parse(error?.proxyCooldownUntil || "");
+      accountRecoveryRetryAt.set(
+        key,
+        Number.isFinite(proxyRetryAt) && proxyRetryAt > Date.now()
+          ? proxyRetryAt
+          : Date.now() + ACCOUNT_RECOVERY_RETRY_MS
+      );
       return null;
     } finally {
       accountRecoveryTasks.delete(key);
@@ -2256,7 +2389,7 @@ async function updateTargetStatusForWork(target, patch) {
 
 async function refreshQuotaBeforeUse(config, target, attempts) {
   try {
-    const status = await getClient(config, target.channel, target.account).check();
+    const status = await getWorkClient(config, target.channel, target.account).check();
     const previousStatus = targetQuotaStatus(target);
     const expiredDrawingCooldown = target.channel.type === "drawing"
       && previousStatus.status === "cooldown"
@@ -2313,7 +2446,7 @@ async function refreshDrawingQuota(account, channel) {
   if (channel.type !== "drawing") return;
   const config = await loadRuntimeConfig();
   const currentAccount = config.accounts.find((item) => item.id === account.id) || account;
-  const status = await getClient(config, channel, currentAccount).check();
+  const status = await getWorkClient(config, channel, currentAccount).check();
   await withAccountAuthLock(account, async () => {
     const latestConfig = await loadRuntimeConfig();
     const latestAccount = latestConfig.accounts.find((item) => item.id === account.id) || account;
@@ -2342,43 +2475,153 @@ function proxyTargetUrl(channel = {}) {
     || (channel.type === "drawing" ? "https://drawing.aishare.icu" : "https://www.chatplus.cc");
 }
 
-async function saveProxyCheck(account, result) {
-  const config = await loadConfig();
-  const current = config.accounts.find((item) => item.id === account.id) || account;
-  await updateAccountStatus(account.id, {
-    meta: {
-      ...(current.meta || {}),
-      proxyCheck: proxyCheckMeta(result)
+async function saveProxyCheck(account, result, options = {}) {
+  const proxyValue = accountProxyValue(account);
+  const proxyKey = normalizeProxyUrl(proxyValue) || `account:${account.id}`;
+  const signature = [
+    result.ok ? "ok" : "failed",
+    result.cooldownUntil || "",
+    result.realIp || ""
+  ].join("::");
+  if (options.force !== true && persistedProxyStatuses.get(proxyKey) === signature) return;
+  persistedProxyStatuses.set(proxyKey, signature);
+
+  const previousWrite = proxyStatusWrites.get(proxyKey) || Promise.resolve();
+  const currentWrite = previousWrite.catch(() => {}).then(async () => {
+    const config = await loadConfig();
+    const matchingIds = String(proxyValue || "").trim()
+      ? config.accounts
+          .filter((item) => normalizeProxyUrl(accountProxyValue(item)) === proxyKey)
+          .map((item) => item.id)
+      : [account.id];
+
+    for (const accountId of matchingIds) {
+      const latestConfig = await loadConfig();
+      const current = latestConfig.accounts.find((item) => item.id === accountId);
+      if (!current) continue;
+      await updateAccountStatus(accountId, {
+        meta: {
+          ...(current.meta || {}),
+          proxyCheck: proxyCheckMeta(result)
+        }
+      });
     }
   });
+  proxyStatusWrites.set(proxyKey, currentWrite);
+
+  try {
+    await currentWrite;
+  } catch (error) {
+    if (persistedProxyStatuses.get(proxyKey) === signature) {
+      persistedProxyStatuses.delete(proxyKey);
+    }
+    throw error;
+  } finally {
+    if (proxyStatusWrites.get(proxyKey) === currentWrite) proxyStatusWrites.delete(proxyKey);
+  }
 }
 
-async function ensureProxyReady(target, attempts) {
-  const proxyValue = accountProxyValue(target.account);
-  if (!String(proxyValue).trim()) return true;
-
-  const result = await checkProxyReachability(proxyValue, proxyTargetUrl(target.channel));
-  await saveProxyCheck(target.account, result);
-  if (result.ok) return true;
-
-  pushAttempt(attempts, target, `${result.message || "代理不可用"}，已跳过这个账号。`, { proxyFailed: true });
-  return false;
+function automaticProxyCheckResult(account, ok, error = null, state = {}) {
+  const previous = account.meta?.proxyCheck || {};
+  return {
+    ok,
+    ...safeProxyEndpoint(accountProxyValue(account)),
+    realIp: ok ? String(previous.realIp || previous.ip || "").trim() : "",
+    checkedAt: new Date().toISOString(),
+    message: ok ? "" : error?.message || "代理不可用",
+    cooldownUntil: ok ? "" : state.retryAt || error?.proxyCooldownUntil || ""
+  };
 }
 
-async function checkAccountProxy(account, channel) {
+async function saveAutomaticProxyCheck(account, result) {
+  try {
+    await saveProxyCheck(account, result);
+  } catch (error) {
+    console.error("保存代理状态失败：", error);
+  }
+}
+
+async function runAccountProxyWork(account, work) {
+  const proxyValue = accountProxyValue(account);
+  if (!String(proxyValue).trim()) return work();
+
+  const before = proxyCircuitState(proxyValue);
+  try {
+    const value = await runWithProxyCircuit(proxyValue, work);
+    if (before.status !== "closed" || account.meta?.proxyCheck?.status === "failed") {
+      await saveAutomaticProxyCheck(account, automaticProxyCheckResult(account, true));
+    }
+    return value;
+  } catch (error) {
+    const after = proxyCircuitState(proxyValue);
+    if (error?.code === "PROXY_COOLDOWN" || (isProxyConnectionError(error) && after.status === "open")) {
+      await saveAutomaticProxyCheck(account, automaticProxyCheckResult(account, false, error, after));
+    }
+    throw error;
+  }
+}
+
+function proxyCheckCacheKey(proxyValue, channel) {
+  const targetUrl = proxyTargetUrl(channel);
+  try {
+    return `${normalizeProxyUrl(proxyValue)}::${new URL(targetUrl).origin}`;
+  } catch {
+    return `${normalizeProxyUrl(proxyValue)}::${targetUrl}`;
+  }
+}
+
+function checkedProxyError(result) {
+  const error = new Error(result.message || "代理不可用");
+  error.code = "PROXY_CHECK_FAILED";
+  error.status = 503;
+  error.proxyFailed = true;
+  error.proxyCooldownUntil = result.cooldownUntil || "";
+  return error;
+}
+
+async function checkAccountProxy(account, channel, sharedChecks = null) {
   const proxyValue = accountProxyValue(account);
   if (!String(proxyValue).trim()) return null;
 
-  const result = await checkProxyReachability(proxyValue, proxyTargetUrl(channel));
-  if (!result.ok) {
-    await saveProxyCheck(account, result);
-    throw new Error(result.message || "代理不可用");
+  const cacheKey = proxyCheckCacheKey(proxyValue, channel);
+  let pendingCheck = sharedChecks?.get(cacheKey);
+  if (!pendingCheck) {
+    pendingCheck = activeProxyChecks.get(cacheKey);
+    if (!pendingCheck) {
+      pendingCheck = (async () => {
+        const checked = await checkProxyReachability(proxyValue, proxyTargetUrl(channel));
+        if (checked.ok) {
+          resetProxyCircuit(proxyValue);
+          const result = { ...checked, cooldownUntil: "" };
+          await saveProxyCheck(account, result, { force: true });
+          return result;
+        }
+
+        const failure = checkedProxyError(checked);
+        const state = await recordProxyCircuitFailure(
+          proxyValue,
+          failure,
+          checked.attemptCount || 2
+        );
+        const result = { ...checked, cooldownUntil: state.retryAt || "" };
+        await saveProxyCheck(account, result, { force: true });
+        return result;
+      })();
+      activeProxyChecks.set(cacheKey, pendingCheck);
+      const clearActiveCheck = () => {
+        if (activeProxyChecks.get(cacheKey) === pendingCheck) activeProxyChecks.delete(cacheKey);
+      };
+      pendingCheck.then(clearActiveCheck, clearActiveCheck);
+    }
+    sharedChecks?.set(cacheKey, pendingCheck);
   }
+
+  const result = await pendingCheck;
+  if (!result.ok) throw checkedProxyError(result);
   return result;
 }
 
 async function ensureTargetReady(config, target, taskType, attempts, options = {}) {
-  if (!(await ensureProxyReady(target, attempts))) return false;
   if (!shouldRefreshQuotaBeforeUse(target, taskType)) return true;
   if (options.skipQuotaRefresh) {
     return refreshQuotaBeforeUseFast(config, target, attempts);
@@ -2631,6 +2874,8 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
     channelType: target.channel.type,
     accountId: target.account.id,
     accountName: target.account.name,
+    submissionChannels: [],
+    generationChannels: [],
     requestMeta: requestMetaPayload,
     network: taskNetworkMeta(target.account),
     attempts: [],
@@ -2686,11 +2931,14 @@ async function failQueuedTask(task, error, attempts = []) {
 
 async function finishQueuedTask(task, result, channel, account, attempts) {
   const status = result.status || task.status;
+  const wrapped = wrapTask({ result, channel, account, attempts, requestJson: task.requestJson, requestMeta: task.requestMeta });
   const nextTask = {
-    ...wrapTask({ result, channel, account, attempts, requestJson: task.requestJson, requestMeta: task.requestMeta }),
+    ...wrapped,
     id: task.id,
     status,
     createdAt: task.createdAt,
+    submissionChannels: mergeTaskRoutes(task.submissionChannels, wrapped.submissionChannels),
+    generationChannels: mergeTaskRoutes(task.generationChannels, wrapped.generationChannels),
     completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : null
   };
   if (!isFinishedTask(status) && task.raw?.submitted === true && savedTaskExternalId(nextTask)) {
@@ -2731,6 +2979,10 @@ async function persistSubmittedTask(task, result, channel, account, attempts) {
         }
       : {})
   };
+  submittedTask.submissionChannels = mergeTaskRoutes(
+    task.submissionChannels,
+    [taskRouteEntry(channel, account)]
+  );
   await upsertTask(submittedTask);
   activeSubmittedTaskIds.add(submittedTask.id);
   return submittedTask;
@@ -2902,6 +3154,15 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           }
           return keepSubmittedTaskRecoverable(taskState, error, attempts);
         }
+        if (error.imageSubmissionAttempted === true) {
+          const failure = imageSubmissionFailure(error);
+          pushAttempt(attempts, target, failure.message);
+          taskState = markTaskSubmissionAttempt(taskState, channel, account, { resultUncertain: failure !== error });
+          if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
+            await updateTargetStatusAfterError(account, channel, error);
+          }
+          return failQueuedTask(taskState, failure, attempts);
+        }
         if (isTerminalTaskFailureError(error)) {
           pushAttempt(attempts, target, error.message || "调用失败");
           continue;
@@ -2979,6 +3240,7 @@ async function waitForUpstreamTask(client, result, timeoutSec) {
       if (isFinishedTask(lastResult?.status)) return lastResult;
     } catch (error) {
       lastError = error;
+      if (error?.code === "PROXY_COOLDOWN") break;
     }
   }
   return waitingUpstreamResult(result, lastResult, lastError);
@@ -3053,6 +3315,15 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           }
           return keepSubmittedTaskRecoverable(taskState, error, attempts);
         }
+        if (error.imageSubmissionAttempted === true) {
+          const failure = imageSubmissionFailure(error);
+          pushAttempt(attempts, target, failure.message);
+          taskState = markTaskSubmissionAttempt(taskState, channel, account, { resultUncertain: failure !== error });
+          if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
+            await updateTargetStatusAfterError(account, channel, error);
+          }
+          return failQueuedTask(taskState, failure, attempts);
+        }
         if (isTerminalTaskFailureError(error)) {
           pushAttempt(attempts, target, error.message || "调用失败");
           continue;
@@ -3078,6 +3349,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
 }
 
 async function finishChatTask(task, result, channel, account, attempts, responseJson = null) {
+  const route = taskRouteEntry(channel, account);
   const nextTask = {
     ...task,
     externalId: result.externalId || task.externalId,
@@ -3094,6 +3366,11 @@ async function finishChatTask(task, result, channel, account, attempts, response
     channelType: channel.type,
     accountId: account.id,
     accountName: account.name,
+    submissionChannels: mergeTaskRoutes(
+      task.submissionChannels,
+      result.externalId ? [route] : []
+    ),
+    generationChannels: mergeTaskRoutes(task.generationChannels),
     network: taskNetworkMeta(account),
     attempts,
     responseJson: responseJson || chatCompletionResponseJson({ result, channel }),
@@ -3414,7 +3691,7 @@ function accountCheckTimeoutStatus(currentStatus = {}, error) {
 
 async function checkShareAIAbility(config, channel, account, ability) {
   const abilityChannel = shareAIAbilityChannel(channel, ability);
-  const client = getClient(config, abilityChannel, account);
+  const client = getWorkClient(config, abilityChannel, account);
   const currentStatus = ability === "chatplus"
     ? account.meta?.abilities?.chatplus || {}
     : account.meta?.abilities?.drawing || {};
@@ -3552,7 +3829,7 @@ function preserveDrawingCooldown(account, status) {
   };
 }
 
-export async function checkAccount(accountId) {
+export async function checkAccount(accountId, options = {}) {
   const config = await loadRuntimeConfig();
   const account = config.accounts.find((item) => item.id === accountId);
   if (!account) throw new Error("账号不存在。");
@@ -3593,7 +3870,8 @@ export async function checkAccount(accountId) {
     : "";
   const proxyResult = await checkAccountProxy(
     account,
-    channel.type === "shareai" ? shareAIAbilityChannel(channel, proxyAbility) : channel
+    channel.type === "shareai" ? shareAIAbilityChannel(channel, proxyAbility) : channel,
+    options.proxyChecks
   );
   if (channel.type === "shareai") {
     const abilities = ["drawing", "chatplus"].filter((ability) => channelAbilityEnabled(channel, ability));
@@ -3610,7 +3888,7 @@ export async function checkAccount(accountId) {
     if (status.status !== "ok") throw new Error(status.message || "检测失败");
     return status;
   }
-  const client = getClient(config, channel, account);
+  const client = getWorkClient(config, channel, account);
   try {
     const checked = successfulAccountCheckStatus(
       await runChatplusAccountWork(channel, account, () => client.check())
@@ -3657,13 +3935,18 @@ export async function checkAccount(accountId) {
 export async function checkAllAccounts() {
   const config = await loadRuntimeConfig();
   const results = [];
+  const proxyChecks = new Map();
   for (const account of config.accounts) {
     if (account.enabled === false) {
       results.push({ accountId: account.id, ok: false, skipped: true, message: "账号已停用，已跳过检测。" });
       continue;
     }
     try {
-      results.push({ accountId: account.id, ok: true, data: await checkAccount(account.id) });
+      results.push({
+        accountId: account.id,
+        ok: true,
+        data: await checkAccount(account.id, { proxyChecks })
+      });
     } catch (error) {
       results.push({ accountId: account.id, ok: false, message: error.message });
     }
@@ -3809,6 +4092,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         if (finishedTask) return finishedTask;
       } catch (error) {
         if (submitted) throw error;
+        if (error.imageSubmissionAttempted === true) throw imageSubmissionFailure(error);
         if (isTerminalTaskFailureError(error)) {
           pushAttempt(attempts, target, error.message || "调用失败");
           continue;

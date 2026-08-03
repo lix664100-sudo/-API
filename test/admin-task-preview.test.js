@@ -19,6 +19,16 @@ function loadTaskPreviewHelpers() {
   return context.helpers;
 }
 
+function loadTaskRouteHelpers() {
+  const start = adminHtml.indexOf("function compactErrorText");
+  const end = adminHtml.indexOf("function cleanAttemptReason", start);
+  assert.ok(start >= 0 && end > start, "任务渠道流向辅助逻辑必须存在");
+
+  const context = {};
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskSubmissionRouteText, taskGenerationRouteText };`, context);
+  return context.helpers;
+}
+
 function localValue(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -69,4 +79,46 @@ test("两个改图入口都会保存原图预览，并纳入现有图片清理�
   assert.match(serverSource, /return readFile\(path\.join\(legacyPreviewDir, filename\)\);/);
   assert.match(serverSource, /const filename = `preview-\$\{Date\.now\(\)\}-\$\{randomUUID\(\)\}/);
   assert.match(serverSource, /filename\.startsWith\("preview-"\)/);
+});
+
+test("任务渠道按首次提交和全部成功渠道显示，并自动去重", () => {
+  const { taskSubmissionRouteText, taskGenerationRouteText } = loadTaskRouteHelpers();
+  const row = {
+    taskType: "img2img",
+    submissionChannels: [
+      { channelId: "a", channelName: "渠道A", accountId: "1", accountName: "账号A" },
+      { channelId: "b", channelName: "渠道B", accountId: "2", accountName: "账号B" }
+    ],
+    generationChannels: [
+      { channelId: "a", channelName: "渠道A", accountId: "1", accountName: "账号A" },
+      { channelId: "b", channelName: "渠道B", accountId: "2", accountName: "账号B" },
+      { channelId: "b", channelName: "渠道B", accountId: "2", accountName: "账号B" },
+      { channelId: "c", channelName: "渠道C" }
+    ]
+  };
+
+  assert.equal(taskSubmissionRouteText(row), "渠道A · 账号A");
+  assert.equal(taskGenerationRouteText(row), "渠道A · 账号A / 渠道B · 账号B / 渠道C");
+  assert.match(adminHtml, /"提交："/);
+  assert.match(adminHtml, /"生成："/);
+});
+
+test("旧任务和未提交任务也有明确的渠道状态", () => {
+  const { taskSubmissionRouteText, taskGenerationRouteText } = loadTaskRouteHelpers();
+  const legacy = {
+    externalId: "conversation-old",
+    status: "success",
+    taskType: "img2img",
+    imageCount: 1,
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号//聊天生图",
+    accountId: "account-old",
+    accountName: "旧账号"
+  };
+
+  assert.equal(taskSubmissionRouteText(legacy), "ShareAI账号/聊天生图 · 旧账号");
+  assert.equal(taskGenerationRouteText(legacy), "ShareAI账号/聊天生图 · 旧账号");
+  assert.equal(taskSubmissionRouteText({ taskType: "img2img" }), "未提交");
+  assert.equal(taskGenerationRouteText({ taskType: "img2img", status: "failed" }), "未成功");
+  assert.equal(taskGenerationRouteText({ taskType: "chat", status: "success" }), "不适用");
 });

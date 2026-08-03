@@ -1105,6 +1105,8 @@ function taskSearchHaystack(task = {}, searchTextCache = null) {
     task.prompt,
     task.accountName,
     task.channelName,
+    JSON.stringify(task.submissionChannels || []),
+    JSON.stringify(task.generationChannels || []),
     task.errorMessage,
     response.message,
     JSON.stringify(request)

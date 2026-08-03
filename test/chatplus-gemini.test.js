@@ -326,10 +326,11 @@ test("Gemini 同时返回原图和生成图时只保留生成图", async () => {
   ]);
 });
 
-test("Gemini 没有生成图也没有文字时会自动换车", async () => {
+test("Gemini 没有生成图也没有文字时只提交一次", async () => {
   const testClient = client();
   const cars = ["source-only-car", "image-car"];
   const selectedCars = [];
+  const submitted = [];
   testClient.prepareChatSession = async (input, ignoredCarIds) => {
     const carId = cars.find((item) => !ignoredCarIds.has(item));
     assert.ok(carId);
@@ -354,32 +355,54 @@ test("Gemini 没有生成图也没有文字时会自动换车", async () => {
     };
   };
 
-  const result = await testClient.createImageTask({
-    prompt: "只返回图片",
-    model: "gemini",
-    files: [fakeImageFile()],
-    onSubmitted: async () => {}
-  });
+  await assert.rejects(
+    () => testClient.createImageTask({
+      prompt: "只返回图片",
+      model: "gemini",
+      files: [fakeImageFile()],
+      onSubmitted: async (value) => submitted.push(value)
+    }),
+    (error) => error.code === "upstream_text_response"
+  );
 
-  assert.deepEqual(selectedCars, ["source-only-car", "image-car"]);
-  assert.deepEqual(result.imageUrls, ["https://example.test/generated-image.png"]);
+  assert.deepEqual(selectedCars, ["source-only-car"]);
+  assert.equal(submitted.length, 1);
 });
 
-test("Gemini 生图只返回文字时会自动换车并继续出图", async () => {
+test("Gemini 只返回文字时停止当前任务并让该车位冷却", async () => {
   const testClient = client();
-  const cars = ["text-only-car", "image-car"];
+  const cars = [
+    {
+      id: "text-only-car",
+      status: 1,
+      count: 0,
+      cooldown: 0,
+      desc: "ok",
+      label: "ok",
+      imageRemaining: 20,
+      isPro: false,
+      isUltra: false,
+      isVirtual: false,
+      realCarIDs: []
+    },
+    {
+      id: "image-car",
+      status: 1,
+      count: 0,
+      cooldown: 0,
+      desc: "ok",
+      label: "ok",
+      imageRemaining: 10,
+      isPro: false,
+      isUltra: false,
+      isVirtual: false,
+      realCarIDs: []
+    }
+  ];
   const selectedCars = [];
   const submitted = [];
-  testClient.prepareChatSession = async (input, ignoredCarIds) => {
-    const carId = cars.find((item) => !ignoredCarIds.has(item));
-    assert.ok(carId);
-    ignoredCarIds.add(carId);
-    return {
-      route: testClient.chatRouteForInput(input),
-      selected: { carId, carType: "gemini" },
-      init: {}
-    };
-  };
+  testClient.fetchCars = async () => cars;
+  testClient.enterCar = async () => {};
   testClient.sendGeminiConversation = async (_prompt, _input, route, selected) => {
     selectedCars.push(selected.carId);
     const hasImage = selected.carId === "image-car";
@@ -395,13 +418,20 @@ test("Gemini 生图只返回文字时会自动换车并继续出图", async () =
     };
   };
 
+  await assert.rejects(
+    () => testClient.createImageTask({
+      prompt: "只返回图片",
+      model: "gemini",
+      files: [fakeImageFile()],
+      onSubmitted: async (value) => submitted.push(value)
+    }),
+    (error) => error.code === "upstream_text_response"
+  );
   const result = await testClient.createImageTask({
-    prompt: "只返回图片",
+    prompt: "第二个任务",
     model: "gemini",
     files: [fakeImageFile()],
-    onSubmitted: async (value) => {
-      submitted.push(value);
-    }
+    onSubmitted: async (value) => submitted.push(value)
   });
 
   assert.deepEqual(selectedCars, ["text-only-car", "image-car"]);
@@ -410,7 +440,7 @@ test("Gemini 生图只返回文字时会自动换车并继续出图", async () =
   assert.deepEqual(result.imageUrls, ["https://example.test/generated-image.png"]);
 });
 
-test("Gemini 连续五个车位只返回文字时失败并保留最后回复", async () => {
+test("Gemini 返回文字失败时只消耗一次提交并保留回复", async () => {
   const testClient = client();
   const selectedCars = [];
   const submitted = [];
@@ -450,14 +480,56 @@ test("Gemini 连续五个车位只返回文字时失败并保留最后回复", a
       assert.equal(error.code, "upstream_text_response");
       assert.equal(error.upstreamExplicitFailure, true);
       assert.equal(error.upstreamText, "我只能提供修改建议，无法生成这张图片。");
-      assert.match(error.message, /已自动尝试 5 个 Gemini 生图车位/);
+      assert.equal(error.message, "我只能提供修改建议，无法生成这张图片。");
       return true;
     }
   );
 
-  assert.equal(selectedCars.length, 5);
-  assert.equal(new Set(selectedCars).size, 5);
-  assert.equal(submitted.length, 5);
+  assert.equal(selectedCars.length, 1);
+  assert.equal(submitted.length, 1);
+});
+
+test("Gemini 提交结果无法确认时不会换车重发", async () => {
+  const testClient = client();
+  testClient.geminiSession = {
+    at: "token-at",
+    sid: "123456",
+    bl: "boq_assistant-bard-web-server_test",
+    pushId: "feeds/test",
+    uploadClientPctx: "CgcSBWjK7pYx",
+    sourcePath: "/app"
+  };
+  testClient.uploadGeminiImages = async () => [["uploaded-image", "source.png"]];
+  let selectedCount = 0;
+  let submissionCount = 0;
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    selectedCount += 1;
+    const carId = `uncertain-car-${selectedCount}`;
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.http = async () => {
+    submissionCount += 1;
+    const error = new Error("connection reset");
+    error.code = "ECONNRESET";
+    throw error;
+  };
+
+  await assert.rejects(
+    () => testClient.createImageTask({
+      prompt: "只返回图片",
+      model: "gemini",
+      files: [fakeImageFile()]
+    }),
+    (error) => error.imageSubmissionAttempted === true
+  );
+
+  assert.equal(selectedCount, 1);
+  assert.equal(submissionCount, 1);
 });
 
 test("Gemini 明确触发内容安全限制时不会重复换车", async () => {

@@ -367,6 +367,33 @@
         white-space: nowrap;
       }
 
+      .task-channel-flow {
+        display: grid;
+        gap: 4px;
+        min-width: 0;
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      .task-channel-line {
+        display: flex;
+        align-items: flex-start;
+        gap: 4px;
+        min-width: 0;
+      }
+
+      .task-channel-label {
+        flex: 0 0 auto;
+        color: var(--muted);
+      }
+
+      .task-channel-value {
+        min-width: 0;
+        overflow-wrap: anywhere;
+        color: var(--ink);
+        font-weight: 650;
+      }
+
       .task-meta {
         display: flex;
         flex-wrap: wrap;
@@ -1561,6 +1588,7 @@
       function taskFailureSummaryText(row, value) {
         const attempts = taskAttempts(row);
         if (!attempts.length) return "";
+        if (row?.raw?.submitted === true || taskSubmissionRoutes(row).length) return "";
         const text = String(value || "");
         const messages = attempts.map((item) => String(item.message || "")).join("；");
         if (/并发上限/.test(text) || attempts.every((item) => item.busy || /正在处理中/.test(String(item.message || "")))) {
@@ -1635,6 +1663,86 @@
         return compactErrorText(value)
           .replace(/\/\/(?=聊天生图)/g, "/")
           .replace(/\/+/g, (match, offset, source) => source.slice(Math.max(0, offset - 6), offset) === "https:" ? match : "/");
+      }
+
+      function taskRouteItems(value) {
+        const routes = [];
+        const seen = new Set();
+        for (const item of Array.isArray(value) ? value : []) {
+          if (!item || typeof item !== "object") continue;
+          const route = {
+            channelId: compactErrorText(item.channelId),
+            channelName: compactChannelName(item.channelName),
+            accountId: compactErrorText(item.accountId),
+            accountName: compactErrorText(item.accountName)
+          };
+          if (!route.channelId && !route.channelName && !route.accountId && !route.accountName) continue;
+          const key = `${route.channelId || route.channelName}::${route.accountId || route.accountName}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          routes.push(route);
+        }
+        return routes;
+      }
+
+      function taskLegacyRoute(row) {
+        return taskRouteItems([{
+          channelId: row?.channelId,
+          channelName: row?.channelName,
+          accountId: row?.accountId,
+          accountName: row?.accountName
+        }])[0] || null;
+      }
+
+      function taskSubmissionRoutes(row) {
+        const saved = taskRouteItems(row?.submissionChannels);
+        if (saved.length) return saved;
+        const submitted = row?.raw?.submitted === true || Boolean(row?.externalId);
+        const legacy = submitted ? taskLegacyRoute(row) : null;
+        return legacy ? [legacy] : [];
+      }
+
+      function taskGenerationRoutes(row) {
+        const saved = taskRouteItems(row?.generationChannels);
+        if (saved.length) return saved;
+        const succeeded = String(row?.status || "").toLowerCase() === "success";
+        const hasImage = (Array.isArray(row?.imageUrls) && row.imageUrls.some(Boolean))
+          || Number(row?.imageCount || 0) > 0;
+        const legacy = succeeded && row?.taskType !== "chat" && hasImage ? taskLegacyRoute(row) : null;
+        return legacy ? [legacy] : [];
+      }
+
+      function taskRouteLabel(route) {
+        const channel = compactChannelName(route?.channelName || route?.channelId || "");
+        const account = compactErrorText(route?.accountName || route?.accountId || "");
+        if (channel && account) return `${channel} · ${account}`;
+        return channel || account || "未知渠道";
+      }
+
+      function taskSubmissionRouteText(row) {
+        const first = taskSubmissionRoutes(row)[0];
+        return first ? taskRouteLabel(first) : "未提交";
+      }
+
+      function taskGenerationRouteText(row) {
+        if (row?.taskType === "chat") return "不适用";
+        const routes = taskGenerationRoutes(row);
+        return routes.length ? routes.map(taskRouteLabel).join(" / ") : "未成功";
+      }
+
+      function taskChannelFlow(row) {
+        const submitted = taskSubmissionRouteText(row);
+        const generated = taskGenerationRouteText(row);
+        return h("div", { className: "task-channel-flow" }, [
+          h("div", { className: "task-channel-line", key: "submitted", title: `提交：${submitted}` }, [
+            h("span", { className: "task-channel-label", key: "label" }, "提交："),
+            h("span", { className: "task-channel-value", key: "value" }, submitted)
+          ]),
+          h("div", { className: "task-channel-line", key: "generated", title: `生成：${generated}` }, [
+            h("span", { className: "task-channel-label", key: "label" }, "生成："),
+            h("span", { className: "task-channel-value", key: "value" }, generated)
+          ])
+        ]);
       }
 
       function cleanAttemptReason(value) {
@@ -1728,6 +1836,8 @@
           row?.prompt,
           row?.accountName,
           row?.channelName,
+          JSON.stringify(row?.submissionChannels || []),
+          JSON.stringify(row?.generationChannels || []),
           row?.errorMessage,
           taskUpstreamText(row),
           response.message,
@@ -4948,11 +5058,13 @@
               const reason = drawing.cooldownReason === "drawing_rate_limited"
                 ? "绘图站提示上传过于频繁，已按上游要求暂停该账号绘图"
                 : "绘图站上游连续失败 3 次，已暂停该账号绘图";
-              const tooltip = `${reason}；${formatDateTime(drawing.cooldownUntil)} 自动恢复。`;
+              const chatplusAvailable = channelAbilityEnabled(rowChannel, "chatplus")
+                && chatDisplayStatus(abilityStatus(row, "chatplus")) === "ok";
+              const tooltip = `${chatplusAvailable ? "聊天生图正常，不受本次冷却影响。" : ""}${reason}；${formatDateTime(drawing.cooldownUntil)} 自动恢复。`;
               return h(Space, { direction: "vertical", size: 2, align: "start" }, [
                 h("span", { key: "status" }, statusTag(displayStatus)),
                 h(Tooltip, { key: "cooldown", title: tooltip },
-                  h(Tag, { color: "orange" }, `绘图冷却中 · ${drawingCooldownText(row)}`)
+                  h(Tag, { color: "orange" }, `${chatplusAvailable ? "仅绘图站冷却" : "绘图站冷却中"} · ${drawingCooldownText(row)}`)
                 )
               ]);
             }
@@ -5152,8 +5264,7 @@
           { title: "状态", dataIndex: "status", width: 90, render: statusTag },
           { title: "类型", dataIndex: "taskType", width: 90, render: taskTypeLabel },
           { title: "模型", width: 180, render: (_, row) => taskModelText(row) },
-          { title: "渠道", dataIndex: "channelName", width: 150 },
-          { title: "账号", dataIndex: "accountName", width: 120 },
+          { title: "渠道", width: 270, render: (_, row) => taskChannelFlow(row) },
           {
             title: "描述",
             dataIndex: "prompt",

@@ -936,7 +936,7 @@ function throwIfTerminalImageFailure(content, options = {}) {
 function throwIfTextImageResponse(content, options = {}) {
   const message = String(content || "").trim();
   const usableMessage = message && !isSkippedMainlineContent(message) ? message : "";
-  if (!usableMessage && options.retryableCar !== true) return;
+  if (!usableMessage && options.retryableCar !== true && options.requireResult !== true) return;
   const error = new Error(usableMessage || "Gemini 上游没有返回生成图。");
   error.upstreamText = usableMessage;
   error.upstreamExplicitFailure = true;
@@ -2011,6 +2011,10 @@ export class ChatplusClient {
     rememberBadCar(this.account?.id, selected?.carType, selected?.carId);
   }
 
+  rememberImageFailedCar(selected) {
+    rememberBadCar(this.account?.id, selected?.carType, selected?.carId);
+  }
+
   rememberProCarsUnavailable(error) {
     if (isProCarPlanMismatchError(error)) {
       this.proCarsUnavailableUntil = Date.now() + BAD_CAR_TTL_MS;
@@ -2371,6 +2375,7 @@ export class ChatplusClient {
       "f.req": JSON.stringify([null, JSON.stringify(request)])
     });
     if (this.geminiSession.at) form.set("at", this.geminiSession.at);
+    if (input.imageSubmissionState) input.imageSubmissionState.started = true;
     const response = await this.http(`${GEMINI_REQUEST_PATH}?${params.toString()}`, {
       method: "POST",
       body: form.toString(),
@@ -2588,6 +2593,7 @@ export class ChatplusClient {
     let statsigId = imageGeneration ? await this.grokStatsigId("POST", conversationPath) : "";
     let response = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (input.imageSubmissionState) input.imageSubmissionState.started = true;
       response = await this.http(conversationPath, {
         method: "POST",
         body,
@@ -2691,26 +2697,31 @@ export class ChatplusClient {
     for (let attempt = 0; attempt < MAX_CHAT_CAR_ATTEMPTS; attempt += 1) {
       let selected = null;
       let activeRoute = null;
+      const imageSubmissionState = { started: false };
+      const requestInput = input.imageGeneration === true
+        ? { ...input, imageSubmissionState }
+        : input;
       try {
         const session = input.concurrentSubmit === true
-          ? await this.prepareReusableChatSession(input, ignoredCarIds, 1)
-          : await this.prepareChatSession(input, ignoredCarIds, 1);
+          ? await this.prepareReusableChatSession(requestInput, ignoredCarIds, 1)
+          : await this.prepareChatSession(requestInput, ignoredCarIds, 1);
         const { route, init } = session;
         activeRoute = route;
         const submitClient = input.concurrentSubmit === true ? this.createSubmitClient(session) : this;
         selected = session.selected;
         if (route.key === "grok") {
-          const conversation = await runSubmitStep(() => submitClient.sendGrokConversation(prompt, input, route, selected));
+          const conversation = await runSubmitStep(() => submitClient.sendGrokConversation(prompt, requestInput, route, selected));
           return { ...conversation, submitSessionSnapshot: submitClient.sessionSnapshot() };
         }
         if (route.key === "gemini") {
-          const conversation = await runSubmitStep(() => submitClient.sendGeminiConversation(prompt, input, route, selected));
+          const conversation = await runSubmitStep(() => submitClient.sendGeminiConversation(prompt, requestInput, route, selected));
           return { ...conversation, submitSessionSnapshot: submitClient.sessionSnapshot() };
         }
         const model = route.model || init?.default_model_slug || submitClient.defaultModel || this.defaultModel;
-        const imageAssets = await runSubmitStep(() => submitClient.uploadChatImages(input.files || []));
+        const imageAssets = await runSubmitStep(() => submitClient.uploadChatImages(requestInput.files || []));
         const { body, messageId } = submitClient.buildConversationBody(prompt, model, imageAssets);
 
+        if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.started = true;
         const response = await runSubmitStep(() => submitClient.http("/backend-api/conversation", {
           method: "POST",
           body,
@@ -2746,7 +2757,13 @@ export class ChatplusClient {
           submitSessionSnapshot: submitClient.sessionSnapshot()
         };
       } catch (error) {
-        if (error.noRetry || error.imageQuotaExhausted) {
+        if (imageSubmissionState.started) {
+          error.imageSubmissionAttempted = true;
+          if (selected && error.code === "INVALID_UPSTREAM_RESPONSE") {
+            this.rememberImageFailedCar(selected);
+          }
+        }
+        if (error.noRetry || error.imageQuotaExhausted || error.imageSubmissionAttempted) {
           if (error.quotaConfirmedByUpstream === true) {
             error.quotaModel = activeRoute?.key || "";
           }
@@ -2772,6 +2789,15 @@ export class ChatplusClient {
   }
 
   async withImageQuotaFallback(prompt, input, work) {
+    if (input.imageGeneration === true) {
+      const conversation = await this.sendConversation(prompt, input, new Set());
+      try {
+        return await work(conversation);
+      } catch (error) {
+        error.imageSubmissionAttempted = true;
+        throw error;
+      }
+    }
     const ignoredCarIds = new Set();
     const quotaErrors = [];
     const textResponseErrors = [];
@@ -2936,16 +2962,16 @@ export class ChatplusClient {
         preferImageCar: true,
         requireConversationId: true
       }, async (conversation) => {
-        throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
+        throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         if (["gemini", "grok"].includes(conversation.route?.key)) {
           const imageUrls = conversation.imageUrls || [];
           if (!imageUrls.length) {
-            const retryableCar = conversation.route?.key === "gemini";
-            if (retryableCar) {
+            if (conversation.route?.key === "gemini") {
               throwIfTerminalImageFailure(conversation.directContent, { policyOnly: true });
+              this.rememberImageFailedCar(conversation.selected);
             }
-            throwIfTextImageResponse(conversation.directContent, { retryableCar });
+            throwIfTextImageResponse(conversation.directContent, { requireResult: true });
           }
           return { ...conversation, imageUrls };
         }
@@ -2990,16 +3016,16 @@ export class ChatplusClient {
         preferImageCar: true,
         requireConversationId: true
       }, async (conversation) => {
-        throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
+        throwIfImageGenerationLimit(extractAssistantText(conversation.events));
         if (["gemini", "grok"].includes(conversation.route?.key)) {
           const imageUrls = conversation.imageUrls || [];
           if (!imageUrls.length) {
-            const retryableCar = conversation.route?.key === "gemini";
-            if (retryableCar) {
+            if (conversation.route?.key === "gemini") {
               throwIfTerminalImageFailure(conversation.directContent, { policyOnly: true });
+              this.rememberImageFailedCar(conversation.selected);
             }
-            throwIfTextImageResponse(conversation.directContent, { retryableCar });
+            throwIfTextImageResponse(conversation.directContent, { requireResult: true });
           }
           return { ...conversation, imageUrls };
         }
