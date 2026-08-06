@@ -268,6 +268,64 @@ test("账号检测连续两次请求超时会记录具体失败步骤", async ()
   assert.equal(usageAttempts, 2);
 });
 
+test("读取旧任务遇到登录失效会重新登录并回到原车位", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { baseUrl: "https://one.aishare.icu" } },
+    account: { id: "account-task-session", username: "task-session@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  client.portalLoggedIn = true;
+  client.cookies = ["expired=session"];
+  client.carId = "stale-car";
+
+  let resetCount = 0;
+  let loginCount = 0;
+  let enterCarCount = 0;
+  let detailReadCount = 0;
+  const resetSession = client.resetSession.bind(client);
+  client.resetSession = () => {
+    resetCount += 1;
+    resetSession();
+  };
+  client.performPortalLogin = async () => {
+    loginCount += 1;
+    client.portalLoggedIn = true;
+    client.cookies = ["portal=fresh"];
+  };
+  client.enterCar = async (carId, carType) => {
+    enterCarCount += 1;
+    client.carId = carId;
+    client.carType = carType;
+    client.cookies.push(`car=${carId}`);
+  };
+  client.json = async (pathName) => {
+    assert.equal(pathName, "/backend-api/conversation/conversation-session-recovery");
+    detailReadCount += 1;
+    if (detailReadCount === 1) {
+      const error = new Error("身份验证失败，请重新登录");
+      error.status = 401;
+      throw error;
+    }
+    return { mapping: {} };
+  };
+  client.imageUrlsFrom = async () => [];
+
+  const result = await client.getTask("conversation-session-recovery", {
+    carId: "original-car",
+    carType: "chatgpt"
+  });
+
+  assert.equal(result.status, "waiting_upstream");
+  assert.equal(resetCount, 1);
+  assert.equal(loginCount, 1);
+  assert.equal(enterCarCount, 1);
+  assert.equal(detailReadCount, 2);
+  assert.equal(client.carId, "original-car");
+  assert.equal(client.cookies.includes("expired=session"), false);
+  assert.equal(client.cookies.includes("portal=fresh"), true);
+});
+
 test("第一次账号检测超时保留可用状态，连续两次才异常，成功后清零", async () => {
   const config = await loadConfig();
   await saveConfig({

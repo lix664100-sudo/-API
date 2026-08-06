@@ -32,6 +32,7 @@ const activeDrawingModelCounts = new Map();
 const activeSubmittedTaskIds = new Set();
 const activeAccountAuthTasks = new Map();
 const activeChatplusAccountWork = new Map();
+const activeTaskRefreshes = new Map();
 const activeChatQuotaProbes = new Set();
 const clientCache = new Map();
 const accountRecoveryTasks = new Map();
@@ -45,6 +46,7 @@ const DRAWING_FAILURE_LIMIT = 3;
 const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
 const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
 const FAST_QUOTA_REFRESH_TIMEOUT_MS = 5000;
+const UPSTREAM_RESULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS = 20;
 const WAIT_IMAGE_MIRROR_TIMEOUT_MS = Math.max(1000, Number(process.env.WAIT_IMAGE_MIRROR_TIMEOUT_MS || 90_000));
@@ -1156,13 +1158,164 @@ function refreshedTaskWaitState(task, result, timeoutSec) {
     raw: {
       ...(result.raw || {}),
       waitingUpstream: true,
-      waitingSince: task.raw?.waitingSince || new Date().toISOString()
+      waitingSince: task.raw?.waitingSince || task.raw?.submittedAt || task.createdAt || new Date().toISOString()
     }
   };
 }
 
 function isTerminalRefreshError(error) {
   return error?.code === "INVALID_UPSTREAM_RESPONSE";
+}
+
+function checkedRefreshResult(result = {}) {
+  const checkedAt = new Date().toISOString();
+  return {
+    ...result,
+    raw: {
+      ...(result.raw || {}),
+      refreshError: false,
+      refreshErrorCount: 0,
+      refreshErrorFirstAt: "",
+      refreshErrorLastAt: "",
+      refreshErrorMessage: "",
+      refreshErrorCode: "",
+      refreshErrorStatus: "",
+      lastUpstreamCheckAt: checkedAt,
+      lastUpstreamCheckStatus: result.status || "unknown"
+    }
+  };
+}
+
+function upstreamWaitStartedAt(task = {}) {
+  const value = task.raw?.waitingSince || task.raw?.submittedAt || task.createdAt || "";
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function upstreamResultWaitExpired(task, now = Date.now()) {
+  if (task.status !== "waiting_upstream") return false;
+  const startedAt = upstreamWaitStartedAt(task);
+  return Number.isFinite(startedAt) && now - startedAt >= UPSTREAM_RESULT_WAIT_TIMEOUT_MS;
+}
+
+function refreshErrorRaw(task, error, now) {
+  return {
+    ...(task.raw || {}),
+    refreshError: true,
+    refreshErrorCount: Number(task.raw?.refreshErrorCount || 0) + 1,
+    refreshErrorFirstAt: task.raw?.refreshErrorFirstAt || now,
+    refreshErrorLastAt: now,
+    refreshErrorMessage: error?.message || "暂时无法查询上游任务。",
+    refreshErrorCode: error?.code || "",
+    refreshErrorStatus: error?.status || error?.statusCode || "",
+    lastUpstreamCheckAt: now,
+    lastUpstreamCheckStatus: "error"
+  };
+}
+
+function taskSourceTaskId(task = {}) {
+  return task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson);
+}
+
+async function interruptExpiredUpstreamWait(task) {
+  const interruptedAt = new Date().toISOString();
+  const message = "连续 30 分钟未能确认生成结果，任务已停止自动查询；不计入失败，可手动重新查询。";
+  const interruptedTask = {
+    ...task,
+    status: "interrupted",
+    errorMessage: "",
+    responseJson: attachResponseSourceTaskId({ ok: null, message }, taskSourceTaskId(task)),
+    raw: {
+      ...(task.raw || {}),
+      waitingUpstream: false,
+      upstreamWaitExpired: true,
+      upstreamWaitExpiredAt: interruptedAt,
+      manualRefreshAvailable: true,
+      interrupted: true,
+      interruptedAt,
+      interruptedReason: message
+    },
+    completedAt: interruptedAt
+  };
+  await upsertTask(interruptedTask);
+  return interruptedTask;
+}
+
+function retryableInterruptedUpstreamTask(task = {}) {
+  return task.status === "interrupted"
+    && (task.raw?.upstreamWaitExpired === true || task.raw?.manualRefreshAvailable === true);
+}
+
+async function keepUpstreamRefreshRecoverable(task, error, timeoutSec, options = {}) {
+  const now = new Date().toISOString();
+  const raw = refreshErrorRaw(task, error, now);
+  if (options.manualRetry) {
+    const message = "重新查询后仍无法确认生成结果；任务保持停止状态，不计入失败。";
+    const interruptedTask = {
+      ...task,
+      status: "interrupted",
+      errorMessage: "",
+      responseJson: attachResponseSourceTaskId({ ok: null, message }, taskSourceTaskId(task)),
+      raw: {
+        ...raw,
+        waitingUpstream: false,
+        upstreamWaitExpired: true,
+        manualRefreshAvailable: true,
+        interrupted: true,
+        manualRefreshAt: now,
+        interruptedReason: message
+      },
+      completedAt: task.completedAt || now
+    };
+    await upsertTask(interruptedTask);
+    return interruptedTask;
+  }
+
+  const waitState = refreshedTaskWaitState(task, {
+    ...task,
+    errorMessage: "",
+    raw
+  }, timeoutSec);
+  const message = "暂时无法查询生成结果，系统会自动重试。";
+  const waitingTask = {
+    ...task,
+    status: waitState.status || task.status,
+    errorMessage: "",
+    responseJson: attachResponseSourceTaskId({ ok: null, message }, taskSourceTaskId(task)),
+    raw: {
+      ...(task.raw || {}),
+      ...(waitState.raw || raw)
+    },
+    completedAt: null
+  };
+  if (upstreamResultWaitExpired(waitingTask)) return interruptExpiredUpstreamWait(waitingTask);
+  await upsertTask(waitingTask);
+  return waitingTask;
+}
+
+async function keepInterruptedAfterManualRefresh(task, result, channel, account) {
+  const checkedAt = new Date().toISOString();
+  const message = "重新查询后，上游仍未返回最终结果；任务保持停止状态，不计入失败。";
+  const refreshedTask = mergeRefreshedTask({ ...task, completedAt: null }, result, channel, account);
+  const interruptedTask = {
+    ...refreshedTask,
+    status: "interrupted",
+    errorMessage: "",
+    responseJson: attachResponseSourceTaskId({ ok: null, message }, taskSourceTaskId(task)),
+    raw: {
+      ...(refreshedTask.raw || {}),
+      waitingUpstream: false,
+      upstreamWaitExpired: true,
+      manualRefreshAvailable: true,
+      interrupted: true,
+      manualRefreshAt: checkedAt,
+      interruptedAt: task.raw?.interruptedAt || checkedAt,
+      interruptedReason: message
+    },
+    completedAt: task.completedAt || checkedAt
+  };
+  await upsertTask(interruptedTask);
+  return interruptedTask;
 }
 
 function failedRefreshResult(task, externalId, error) {
@@ -1545,7 +1698,34 @@ async function interruptDisabledRefreshTask(task, channel, account) {
       interrupted: true,
       interruptedAt,
       interruptedReason: message,
-      disabledRefreshSkipped: true
+      disabledRefreshSkipped: true,
+      manualRefreshAvailable: true
+    },
+    completedAt: interruptedAt
+  };
+  await upsertTask(interruptedTask);
+  return interruptedTask;
+}
+
+async function interruptMissingRefreshTarget(task, error) {
+  const interruptedAt = new Date().toISOString();
+  const reason = /账号/.test(String(error?.message || ""))
+    ? "任务所属渠道没有可用账号，系统已停止自动查询；不计入失败。账号恢复后可手动重新查询。"
+    : "任务所属渠道已不存在，系统已停止自动查询；不计入失败。渠道恢复后可手动重新查询。";
+  const interruptedTask = {
+    ...task,
+    status: "interrupted",
+    errorMessage: "",
+    responseJson: attachResponseSourceTaskId({ ok: null, message: reason }, taskSourceTaskId(task)),
+    raw: {
+      ...(task.raw || {}),
+      waitingUpstream: false,
+      refreshTargetMissing: true,
+      refreshTargetMessage: error?.message || "",
+      manualRefreshAvailable: true,
+      interrupted: true,
+      interruptedAt,
+      interruptedReason: reason
     },
     completedAt: interruptedAt
   };
@@ -1574,13 +1754,21 @@ async function interruptUnrecoverableGeminiTask(task) {
   return interruptedTask;
 }
 
-export async function refreshTask(taskId) {
+async function refreshTaskOnce(taskId) {
   const task = await getTask(taskId);
   if (!task) throw new Error("任务不存在。");
-  if (!needsTaskRefresh(task)) return task;
+  const manualRetry = retryableInterruptedUpstreamTask(task);
+  if (!needsTaskRefresh(task) && !manualRetry) return task;
 
   const config = await loadRuntimeConfig();
-  const { channel, account } = inferRefreshTarget(config, task);
+  let channel;
+  let account;
+  try {
+    ({ channel, account } = inferRefreshTarget(config, task));
+  } catch (error) {
+    if (!/找不到这个任务所属的渠道|这个渠道还没有可用账号/.test(String(error?.message || ""))) throw error;
+    return interruptMissingRefreshTarget(task, error);
+  }
   if (refreshTargetDisabled(channel, account)) {
     return interruptDisabledRefreshTask(task, channel, account);
   }
@@ -1641,17 +1829,40 @@ export async function refreshTask(taskId) {
   }
 
   let refreshedResult;
+  let refreshReadSucceeded = false;
   try {
     refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
       carId: task.raw?.selectedCarId,
       carType: task.raw?.selectedCarType
     }));
+    refreshReadSucceeded = true;
   } catch (error) {
     if (storedMirrorError) {
       return keepSubmittedTaskRecoverable(task, storedMirrorError, task.attempts || []);
     }
-    if (!isTerminalRefreshError(error)) throw error;
+    if (!isTerminalRefreshError(error)) {
+      return keepUpstreamRefreshRecoverable(task, error, config.waitTimeoutSec, { manualRetry });
+    }
     refreshedResult = failedRefreshResult(task, externalId, error);
+  }
+  if (refreshReadSucceeded) refreshedResult = checkedRefreshResult(refreshedResult);
+  if (manualRetry && !isFinishedTask(refreshedResult?.status)) {
+    return keepInterruptedAfterManualRefresh(task, refreshedResult, channel, account);
+  }
+  if (manualRetry) {
+    refreshedResult = {
+      ...refreshedResult,
+      raw: {
+        ...(refreshedResult.raw || {}),
+        waitingUpstream: false,
+        upstreamWaitExpired: false,
+        upstreamWaitExpiredAt: "",
+        manualRefreshAvailable: false,
+        interrupted: false,
+        interruptedAt: "",
+        interruptedReason: ""
+      }
+    };
   }
   let refreshInput = refreshedTaskWaitState(task, refreshedResult, config.waitTimeoutSec);
   if (storedMirrorError) {
@@ -1669,14 +1880,20 @@ export async function refreshTask(taskId) {
     };
   }
 
+  if (!storedMirrorError && !isFinishedTask(refreshInput.status)) {
+    const waitingTask = mergeRefreshedTask(task, refreshInput, channel, account);
+    if (upstreamResultWaitExpired(waitingTask)) return interruptExpiredUpstreamWait(waitingTask);
+  }
+
   let result;
   try {
     result = await mirrorTaskImages(refreshInput, config, client);
   } catch (error) {
-    if (!storedMirrorError) throw error;
     const replacementUrls = usableImageResultUrls(refreshInput.imageUrls);
+    if (!replacementUrls.length && !storedMirrorError) throw error;
     return keepSubmittedTaskRecoverable({
       ...task,
+      externalId: refreshedResult?.externalId || task.externalId,
       imageCount: replacementUrls.length,
       imageUrls: replacementUrls,
       raw: {
@@ -1687,13 +1904,25 @@ export async function refreshTask(taskId) {
       }
     }, error, task.attempts || []);
   }
-  const nextTask = mergeRefreshedTask(task, result, channel, account);
+  const mergeBaseTask = manualRetry ? { ...task, completedAt: null } : task;
+  const nextTask = mergeRefreshedTask(mergeBaseTask, result, channel, account);
   await upsertTask(nextTask);
   if (isFinishedTask(nextTask.status)) {
     await recordTaskStat(nextTask);
     await updateAccountAfterTask(account, channel, nextTask);
   }
   return nextTask;
+}
+
+export async function refreshTask(taskId) {
+  const key = String(taskId || "");
+  const active = activeTaskRefreshes.get(key);
+  if (active) return active;
+  const refresh = refreshTaskOnce(taskId).finally(() => {
+    if (activeTaskRefreshes.get(key) === refresh) activeTaskRefreshes.delete(key);
+  });
+  activeTaskRefreshes.set(key, refresh);
+  return refresh;
 }
 
 function isLostLocalChatTask(task) {

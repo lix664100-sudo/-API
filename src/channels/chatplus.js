@@ -221,7 +221,7 @@ function rememberBadCar(accountId, carType, carId) {
 
 function isAuthSessionError(error) {
   const text = `${error?.message || ""} ${error?.body || ""} ${error?.status || error?.statusCode || ""}`;
-  return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|unauthorized|forbidden/i.test(text);
+  return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|unauthorized|forbidden|session expired/i.test(text);
 }
 
 function isProCarPlanMismatchError(error) {
@@ -2873,13 +2873,23 @@ export class ChatplusClient {
     await this.loginPortal();
     const readDetail = async () => {
       const payload = await this.json(`/backend-api/conversation/${encodeURIComponent(externalId)}`);
-      if (!payload || typeof payload !== "object") throw new Error("上游暂时没有返回有效任务状态。");
+      if (!payload || typeof payload !== "object") {
+        const error = new Error("上游暂时没有返回有效任务状态。");
+        error.code = "UPSTREAM_TASK_STATE_UNAVAILABLE";
+        throw error;
+      }
+      const payloadMessage = [payload?.detail?.message, payload?.message, payload?.msg]
+        .find((value) => typeof value === "string" && value.trim());
+      if (payloadMessage) {
+        const payloadError = new Error(payloadMessage.trim());
+        payloadError.status = payload?.status || payload?.statusCode || "";
+        if (isAuthSessionError(payloadError)) throw payloadError;
+      }
       return payload;
     };
-    let detail = null;
-    try {
-      detail = await readDetail();
-    } catch (_directError) {
+    const restoreConversationSession = async (reset = false) => {
+      if (reset) await this.sessionLock(async () => this.resetSession());
+      await this.loginPortal();
       if (context.carId) {
         this.carId = String(context.carId);
         this.carType = String(context.carType || "chatgpt");
@@ -2887,7 +2897,20 @@ export class ChatplusClient {
       } else if (!this.carId) {
         await this.login();
       }
+    };
+    let detail = null;
+    try {
       detail = await readDetail();
+    } catch (directError) {
+      const resetAfterDirectRead = isAuthSessionError(directError);
+      await restoreConversationSession(resetAfterDirectRead);
+      try {
+        detail = await readDetail();
+      } catch (retryError) {
+        if (resetAfterDirectRead || !isAuthSessionError(retryError)) throw retryError;
+        await restoreConversationSession(true);
+        detail = await readDetail();
+      }
     }
     const imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
     if (imageUrls.length) {

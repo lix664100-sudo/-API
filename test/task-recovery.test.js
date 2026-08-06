@@ -972,6 +972,278 @@ test("有上游编号的旧任务超过等待时间后保持等待上游", async
   }
 });
 
+test("等待上游查询异常会记录原因，连续三十分钟后停止且可手动重查", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    waitTimeoutSec: 300,
+    accounts: [{
+      id: "account-upstream-timeout",
+      channelId: "shareai",
+      name: "上游等待测试账号",
+      username: "upstream-timeout@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const id = "task-upstream-refresh-timeout";
+  const submittedAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  await upsertTask({
+    id,
+    externalId: "conversation-upstream-refresh-timeout",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    modelId: "gpt",
+    prompt: "上游查询异常测试",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-upstream-timeout",
+    accountName: "上游等待测试账号",
+    imageCount: 0,
+    imageUrls: [],
+    raw: {
+      queued: false,
+      submitted: true,
+      submittedAt,
+      waitingUpstream: true,
+      waitingSince: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      selectedCarId: "car-upstream-timeout",
+      selectedCarType: "chatgpt"
+    },
+    createdAt: submittedAt,
+    completedAt: null
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  const statsBefore = await listTaskStats();
+  ChatplusClient.prototype.getTask = async () => {
+    const error = new Error("身份验证失败，请重新登录");
+    error.status = 401;
+    throw error;
+  };
+
+  try {
+    const first = await refreshTask(id);
+    assert.equal(first.status, "waiting_upstream");
+    assert.equal(first.raw.refreshError, true);
+    assert.equal(first.raw.refreshErrorCount, 1);
+    assert.match(first.raw.refreshErrorMessage, /身份验证失败/);
+    assert.match(first.responseJson.message, /自动重试/);
+    const firstErrorAt = first.raw.refreshErrorFirstAt;
+
+    await upsertTask({
+      ...first,
+      raw: {
+        ...first.raw,
+        waitingSince: new Date(Date.now() - 31 * 60 * 1000).toISOString()
+      }
+    });
+    const interrupted = await refreshTask(id);
+    assert.equal(interrupted.status, "interrupted");
+    assert.equal(interrupted.errorMessage, "");
+    assert.equal(interrupted.raw.refreshErrorCount, 2);
+    assert.equal(interrupted.raw.refreshErrorFirstAt, firstErrorAt);
+    assert.equal(interrupted.raw.upstreamWaitExpired, true);
+    assert.equal(interrupted.raw.waitingUpstream, false);
+    assert.match(interrupted.responseJson.message, /连续 30 分钟/);
+    assert.match(interrupted.responseJson.message, /不计入失败/);
+    assert.deepEqual(await listTaskStats(), statsBefore);
+
+    ChatplusClient.prototype.getTask = async (externalId) => ({
+      externalId,
+      status: "failed",
+      imageCount: 0,
+      imageUrls: [],
+      errorMessage: "上游明确返回任务失败。",
+      raw: { conversationId: externalId }
+    });
+    const retried = await refreshTask(id);
+    assert.equal(retried.status, "failed");
+    assert.equal(retried.errorMessage, "上游明确返回任务失败。");
+    assert.equal(retried.raw.upstreamWaitExpired, false);
+    assert.equal(retried.raw.interrupted, false);
+    assert.equal(retried.raw.refreshError, false);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    await saveConfig(config);
+  }
+});
+
+test("上游持续返回处理中超过三十分钟也会停止自动查询", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    waitTimeoutSec: 300,
+    accounts: [{
+      id: "account-upstream-pending-timeout",
+      channelId: "shareai",
+      name: "上游处理中测试账号",
+      username: "upstream-pending@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const id = "task-upstream-pending-timeout";
+  const waitingSince = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+  await upsertTask({
+    id,
+    externalId: "conversation-upstream-pending-timeout",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    modelId: "gpt",
+    prompt: "上游长期处理中测试",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-upstream-pending-timeout",
+    accountName: "上游处理中测试账号",
+    imageCount: 0,
+    imageUrls: [],
+    raw: {
+      queued: false,
+      submitted: true,
+      submittedAt: waitingSince,
+      waitingUpstream: true,
+      waitingSince,
+      selectedCarId: "car-upstream-pending-timeout",
+      selectedCarType: "chatgpt"
+    },
+    createdAt: waitingSince,
+    completedAt: null
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  ChatplusClient.prototype.getTask = async (externalId) => ({
+    externalId,
+    status: "waiting_upstream",
+    imageCount: 0,
+    imageUrls: [],
+    errorMessage: "",
+    raw: { conversationId: externalId }
+  });
+
+  try {
+    const result = await refreshTask(id);
+    assert.equal(result.status, "interrupted");
+    assert.equal(result.raw.upstreamWaitExpired, true);
+    assert.equal(result.raw.refreshError, false);
+    assert.equal(result.raw.lastUpstreamCheckStatus, "waiting_upstream");
+    assert.match(result.responseJson.message, /停止自动查询/);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    await saveConfig(config);
+  }
+});
+
+test("刷新时拿到无效图片文件会保留任务并继续尝试保存", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    publicBaseUrl: "https://api.example.test",
+    imageStorage: { mode: "smart", autoCleanup: false, retentionDays: 7 },
+    accounts: [{
+      id: "account-invalid-image-refresh",
+      channelId: "shareai",
+      name: "图片保存测试账号",
+      username: "invalid-image-refresh@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const id = "task-invalid-image-refresh";
+  const imageUrl = "https://one.aishare.icu/backend-api/files/file-invalid/download";
+  const waitingSince = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  await upsertTask({
+    id,
+    externalId: "conversation-invalid-image-refresh",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    modelId: "gpt",
+    prompt: "无效图片保存测试",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-invalid-image-refresh",
+    accountName: "图片保存测试账号",
+    imageCount: 0,
+    imageUrls: [],
+    raw: {
+      queued: false,
+      submitted: true,
+      submittedAt: waitingSince,
+      waitingUpstream: true,
+      waitingSince,
+      selectedCarId: "car-invalid-image-refresh",
+      selectedCarType: "chatgpt"
+    },
+    createdAt: waitingSince,
+    completedAt: null
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  const originalDownloadResultImage = ChatplusClient.prototype.downloadResultImage;
+  ChatplusClient.prototype.getTask = async (externalId) => ({
+    externalId,
+    status: "success",
+    imageCount: 1,
+    imageUrls: [imageUrl],
+    errorMessage: "",
+    raw: {
+      conversationId: externalId,
+      selectedCarId: "car-invalid-image-refresh",
+      selectedCarType: "chatgpt"
+    }
+  });
+  ChatplusClient.prototype.downloadResultImage = async () => {
+    const error = new Error("图片保存失败：上游返回的不是图片。");
+    error.code = "INVALID_IMAGE_DOWNLOAD";
+    throw error;
+  };
+
+  try {
+    const result = await refreshTask(id);
+    assert.equal(result.status, "waiting_upstream");
+    assert.equal(result.raw.upstreamCompleted, true);
+    assert.equal(result.raw.imageMirrorPending, true);
+    assert.equal(result.raw.imageMirrorRetryCount, 1);
+    assert.equal(result.raw.resultSaveErrorCode, "INVALID_IMAGE_DOWNLOAD");
+    assert.deepEqual(result.raw.originalImageUrls, [imageUrl]);
+    assert.match(result.responseJson.message, /重新保存/);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    ChatplusClient.prototype.downloadResultImage = originalDownloadResultImage;
+    await upsertTask({
+      ...(await getTask(id)),
+      status: "interrupted",
+      completedAt: new Date().toISOString()
+    });
+    await saveConfig(config);
+  }
+});
+
 test("synchronous image waits for a temporary proxy mirror failure", async () => {
   const config = await loadConfig();
   await saveConfig({
@@ -1405,6 +1677,93 @@ test("停用账号的等待上游旧任务不会继续登录刷新", async () =>
     assert.match(stored.responseJson.message, /账号已停用/);
   } finally {
     ChatplusClient.prototype.getTask = originalGetTask;
+  }
+});
+
+test("旧任务所属账号缺失时会停止自动查询，账号恢复后可手动重查", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: []
+  });
+
+  const id = "task-missing-refresh-account";
+  const waitingSince = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  await upsertTask({
+    id,
+    externalId: "conversation-missing-refresh-account",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    modelId: "gpt",
+    prompt: "缺失账号恢复测试",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-missing-refresh",
+    accountName: "已删除账号",
+    imageCount: 0,
+    imageUrls: [],
+    raw: {
+      queued: false,
+      submitted: true,
+      submittedAt: waitingSince,
+      waitingUpstream: true,
+      waitingSince
+    },
+    createdAt: waitingSince,
+    completedAt: null
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  let getTaskCount = 0;
+  ChatplusClient.prototype.getTask = async (externalId) => {
+    getTaskCount += 1;
+    return {
+      externalId,
+      status: "failed",
+      imageCount: 0,
+      imageUrls: [],
+      errorMessage: "上游明确返回任务失败。",
+      raw: { conversationId: externalId }
+    };
+  };
+
+  try {
+    const interrupted = await refreshTask(id);
+    assert.equal(getTaskCount, 0);
+    assert.equal(interrupted.status, "interrupted");
+    assert.equal(interrupted.raw.refreshTargetMissing, true);
+    assert.equal(interrupted.raw.manualRefreshAvailable, true);
+    assert.match(interrupted.responseJson.message, /没有可用账号/);
+    assert.match(interrupted.responseJson.message, /不计入失败/);
+
+    await saveConfig({
+      ...config,
+      defaultChannel: "shareai",
+      accounts: [{
+        id: "account-missing-refresh",
+        channelId: "shareai",
+        name: "恢复后的账号",
+        username: "recovered-refresh@example.com",
+        password: "test",
+        enabled: true,
+        status: "ok",
+        meta: {
+          abilities: {
+            chatplus: { status: "ok", message: "聊天账号可用" }
+          }
+        }
+      }]
+    });
+    const retried = await refreshTask(id);
+    assert.equal(getTaskCount, 1);
+    assert.equal(retried.status, "failed");
+    assert.equal(retried.raw.manualRefreshAvailable, false);
+    assert.equal(retried.raw.interrupted, false);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    await saveConfig(config);
   }
 });
 

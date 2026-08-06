@@ -2692,6 +2692,25 @@
         ]);
       }
 
+      function taskWaitingIssueText(row) {
+        if (!["waiting_upstream", "interrupted"].includes(String(row?.status || ""))) return "";
+        if (row?.raw?.imageMirrorPending && row?.raw?.resultSaveError) {
+          return "结果保存异常：图片已经生成，但上游返回的文件暂时无法保存。";
+        }
+        const text = String(row?.raw?.refreshErrorMessage || "").trim();
+        if (!text) return "";
+        if (/401|403|身份验证失败|重新登录|未登录|登录.{0,8}(?:失效|过期)|unauthorized|forbidden|session expired/i.test(text)) {
+          return "查询结果异常：上游登录状态失效。";
+        }
+        if (/没有返回有效任务状态|TASK_STATE_UNAVAILABLE/i.test(text)) {
+          return "查询结果异常：上游暂未返回有效任务状态。";
+        }
+        if (/服务器|网络|超时|timeout|timed out|fetch failed|ECONN|EAI_AGAIN|502|503|504/i.test(text)) {
+          return "查询结果异常：上游服务暂时无法访问。";
+        }
+        return "查询结果异常：暂时无法读取生成结果。";
+      }
+
       function taskOutputImageUrls(row = {}) {
         return uniqueImageUrls(row.imageUrls);
       }
@@ -3729,6 +3748,7 @@
         const [clearingCooldownAccountIds, setClearingCooldownAccountIds] = useState([]);
         const [updating, setUpdating] = useState(false);
         const [upstreamLoadingTaskId, setUpstreamLoadingTaskId] = useState("");
+        const [retryingTaskId, setRetryingTaskId] = useState("");
         const [imageStorageStats, setImageStorageStats] = useState(null);
         const [runtimeStatus, setRuntimeStatus] = useState(null);
         const [imageStorageCleaning, setImageStorageCleaning] = useState(false);
@@ -4276,6 +4296,32 @@
               : error.message || "读取上游详情失败。");
           } finally {
             setUpstreamLoadingTaskId("");
+          }
+        }
+
+        async function retryTaskResult(row) {
+          if (!row?.id || retryingTaskId) return;
+          setRetryingTaskId(row.id);
+          try {
+            const result = await api(`/api/tasks/${encodeURIComponent(row.id)}/refresh`, {
+              method: "POST",
+              body: {},
+              timeoutMs: 90000
+            });
+            setTasks((current) => current.map((item) => String(item.id) === String(result?.id) ? result : item));
+            await Promise.all([
+              loadTaskPage({ page: 1, showLoading: false, background: true }),
+              refreshRuntimeStatus().catch(() => null)
+            ]);
+            if (result?.status === "success") message.success("已查到生成结果。");
+            else if (["failed", "cancelled"].includes(result?.status)) message.warning("已查到上游最终状态。");
+            else message.info(result?.responseJson?.message || "上游仍未返回最终结果，任务保持停止状态。");
+          } catch (error) {
+            message.error(error?.code === "REQUEST_TIMEOUT"
+              ? "重新查询超时，请稍后再试。"
+              : error.message || "重新查询失败。");
+          } finally {
+            setRetryingTaskId("");
           }
         }
 
@@ -5675,8 +5721,22 @@
               h("div", { className: "primary-text" }, row.prompt || "-"),
               taskMetaLine(row, config, { onInspectUpstream: openTaskUpstreamDetail, upstreamLoadingTaskId }),
               row.status === "interrupted"
-                ? h("div", { className: "task-response" }, row.responseJson?.message || "服务重启时任务被中断，结果无法确认；此任务不计失败。")
+                ? h("div", { className: "task-response" }, [
+                    h("span", { key: "message" }, row.responseJson?.message || "服务重启时任务被中断，结果无法确认；此任务不计失败。"),
+                    (row.raw?.upstreamWaitExpired || row.raw?.manualRefreshAvailable)
+                      ? h(Button, {
+                          key: "retry",
+                          type: "link",
+                          size: "small",
+                          loading: String(retryingTaskId) === String(row.id),
+                          disabled: Boolean(retryingTaskId) && String(retryingTaskId) !== String(row.id),
+                          icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null,
+                          onClick: () => retryTaskResult(row)
+                        }, "重新查询")
+                      : null
+                  ])
                 : null,
+              taskWaitingIssueText(row) ? h("div", { className: "task-response" }, taskWaitingIssueText(row)) : null,
               row.responseText ? h("div", { className: "task-response" }, row.responseText) : null,
               taskErrorDisplay(row),
               taskJsonGrid(row),
@@ -5822,7 +5882,7 @@
                     Icon.ClusterOutlined ? h(Icon.ClusterOutlined) : null,
                     "实时并发"
                   ]),
-                  h("div", { className: "capacity-subtitle" }, "可用数量只统计状态正常的账号；等待上游不会占用调用名额")
+                  h("div", { className: "capacity-subtitle" }, "可用数量只统计状态正常的账号；等待上游不会占用调用名额，连续 30 分钟没有结果会自动停止查询")
                 ]),
                 h(Tooltip, { title: "达到可用并发上限后，新任务会立即返回繁忙，不进入处理列表。" },
                   h(Tag, { color: "blue" }, "满载立即拒绝")
@@ -6060,7 +6120,7 @@
                             }))
                       ]),
                       h("div", { className: "task-toolbar" }, [
-                        h("span", { className: "toolbar-note" }, "处理中和等待上游会自动查询；结果待确认不会记为失败"),
+                        h("span", { className: "toolbar-note" }, "处理中和等待上游会自动查询；连续 30 分钟没有结果会停止查询，且不记为失败"),
                         h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refreshProcessing, loading }, "刷新处理中")
                       ]),
                       h(Table, {
@@ -6318,7 +6378,7 @@
                         h(Alert, {
                           type: "info",
                           showIcon: true,
-                          message: "任务提交上游后，超过等待时间会改为“等待上游”并释放并发，只有上游明确失败才会记为失败。",
+                          message: "任务提交上游后，超过等待时间会改为“等待上游”并释放并发；连续 30 分钟仍没有结果会停止自动查询，只有上游明确失败才会记为失败。",
                           style: { marginBottom: 0 }
                         })
                       ]),
