@@ -235,6 +235,24 @@ function isCarPlanMismatchError(error) {
     || /\u4e0d\u662f\s*Ultra\s*\u7528\u6237|\u5347\u7ea7\u540e\u4f7f\u7528\u8be5\u8f66|not.{0,24}ultra|ultra.{0,24}user|(?:upgrade|\u5347\u7ea7).{0,24}(?:car|\u8be5\u8f66|\u8f66\u4f4d|Ultra)/i.test(text);
 }
 
+function isChatSubscriptionExpiredText(value) {
+  return /用户没有有效的\s*chatgpt\s*订阅|没有可用的\s*chatgpt\s*套餐|(?:chatgpt|gpt).{0,18}(?:订阅|套餐).{0,12}(?:过期|无效)|no valid.{0,20}(?:subscription|plan)|(?:subscription|plan).{0,20}(?:expired|invalid|not valid)/i.test(String(value || ""));
+}
+
+function chatSubscriptionExpiredError(expireAt = "") {
+  const error = new Error("GPT 套餐已过期，请续费后重新检测。");
+  error.code = "CHAT_SUBSCRIPTION_EXPIRED";
+  error.status = 403;
+  error.subscriptionExpired = true;
+  error.expireAt = expireAt;
+  return error;
+}
+
+function chatUsageExpired(usage = {}) {
+  const expiresAt = Date.parse(usage.expireAt || "");
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
 function fileNameFromMime(mimeType, fallback = "image.png") {
   const ext = {
     "image/png": ".png",
@@ -2026,6 +2044,7 @@ export class ChatplusClient {
     const timeoutSec = Number(input.checkTimeoutSec || 0);
     const requestOptions = timeoutSec > 0 ? { timeoutSec } : {};
     const errors = [];
+    let subscriptionExpiredAttempts = 0;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const selected = await this.selectCar(route, ignoredCarIds, requestOptions);
       ignoredCarIds.add(selected.carId);
@@ -2036,6 +2055,9 @@ export class ChatplusClient {
         const init = route.key === "gpt" ? await this.loadInit(requestOptions) : {};
         return { route, selected, init };
       } catch (error) {
+        if (route.key === "gpt" && isChatSubscriptionExpiredText(`${error?.message || ""} ${error?.body || ""}`)) {
+          subscriptionExpiredAttempts += 1;
+        }
         const retryableCarError = isAuthSessionError(error) || isCarPlanMismatchError(error);
         if (retryableCarError) {
           this.rememberProCarsUnavailable(error);
@@ -2049,7 +2071,13 @@ export class ChatplusClient {
         errors.push(`${selected.carId}：${error.message || "进入失败"}`);
       }
     }
-    throw new Error(`${route.name} 自动找车失败：${errors.join("；")}`);
+    const error = new Error(`${route.name} 自动找车失败：${errors.join("；")}`);
+    if (route.key === "gpt" && errors.length > 0 && subscriptionExpiredAttempts === errors.length) {
+      error.code = "CHAT_SUBSCRIPTION_EXPIRED";
+      error.status = 403;
+      error.subscriptionExpired = true;
+    }
+    throw error;
   }
 
   async check(options = {}) {
@@ -2061,6 +2089,9 @@ export class ChatplusClient {
         () => this.loadAccountUsages(requestOptions)
       );
       const usage = referenceUsage[usageRoute.key] || referenceUsage.gpt;
+      if (usageRoute.key === "gpt" && chatUsageExpired(usage)) {
+        throw chatSubscriptionExpiredError(usage.expireAt);
+      }
       const { init, route, selected } = await runAccountCheckStep(
         `进入 ${usageRoute.name} 页面`,
         () => this.prepareChatSession({

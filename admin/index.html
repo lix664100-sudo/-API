@@ -557,6 +557,29 @@
         font-size: 12px;
       }
 
+      .account-status {
+        display: grid;
+        gap: 4px;
+        min-width: 0;
+      }
+
+      .account-status-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+
+      .account-status-tags .ant-tag {
+        margin-inline-end: 0;
+      }
+
+      .account-status-time {
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.3;
+        white-space: nowrap;
+      }
+
       .routing-share {
         display: grid;
         gap: 5px;
@@ -2183,6 +2206,14 @@
         return status.status === "quota_empty" && status.quotaConfirmedByUpstream === true;
       }
 
+      function chatSubscriptionExpired(status = {}) {
+        if (status.status === "subscription_expired") return true;
+        const modelKey = chatModelKey(status.meta?.chatModel || status.quotaModel || "gpt") || "gpt";
+        const expireAt = status.meta?.referenceUsage?.[modelKey]?.expireAt || status.expireAt || "";
+        const expireTime = Date.parse(expireAt);
+        return Number.isFinite(expireTime) && expireTime <= Date.now();
+      }
+
       function accountQuotaResetText(account, channel) {
         if (channel?.type === "shareai") {
           const drawing = abilityStatus(account, "drawing");
@@ -2204,9 +2235,32 @@
         if (channel?.type === "shareai") {
           const drawing = abilityStatus(account, "drawing");
           const chatplus = abilityStatus(account, "chatplus");
-          const expireAt = channelAbilityEnabled(channel, "drawing") ? drawing.expireAt : "";
-          const chatExpireAt = channelAbilityEnabled(channel, "chatplus") ? chatplus.expireAt : "";
-          return formatDateTime(expireAt || chatExpireAt || account.expireAt);
+          if (channelAbilityEnabled(channel, "chatplus")) {
+            if (chatplus.status === "subscription_expired") return "已过期";
+            const activeModel = chatModelsForChannel(channel).find((item) => item.enabled && item.default)
+              || chatModelsForChannel(channel).find((item) => item.enabled);
+            const modelExpireAt = activeModel
+              ? chatplus.meta?.referenceUsage?.[activeModel.key]?.expireAt
+              : "";
+            const chatExpireAt = modelExpireAt || chatplus.expireAt;
+            const chatExpireTime = Date.parse(chatExpireAt || "");
+            if (Number.isFinite(chatExpireTime) && chatExpireTime <= Date.now()) return "已过期";
+            return formatDateTime(chatExpireAt || drawing.expireAt || account.expireAt);
+          }
+          return formatDateTime(drawing.expireAt || account.expireAt);
+        }
+        if (channel?.type === "chatplus") {
+          if (account.status === "subscription_expired") return "已过期";
+          const activeModel = chatModelsForChannel(channel).find((item) => item.enabled && item.default)
+            || chatModelsForChannel(channel).find((item) => item.enabled);
+          const modelExpireAt = activeModel
+            ? account.meta?.referenceUsage?.[activeModel.key]?.expireAt
+            : "";
+          const expireAt = modelExpireAt || account.expireAt;
+          const expireTime = Date.parse(expireAt || "");
+          return Number.isFinite(expireTime) && expireTime <= Date.now()
+            ? "已过期"
+            : formatDateTime(expireAt);
         }
         return formatDateTime(account.expireAt);
       }
@@ -2288,12 +2342,14 @@
             const values = usages.map((usage) => String(usage[key] || "").trim());
             return values.every(Boolean) && new Set(values).size === 1 ? values[0] : "";
           };
+          const expireAt = commonValue("expireAt");
           referenceUsage[modelKey] = {
             quota,
             balance,
             used: Math.max(0, quota - balance),
             quotaResetAt: commonValue("quotaResetAt"),
-            period: commonValue("period")
+            period: commonValue("period"),
+            ...(expireAt ? { expireAt } : {})
           };
         });
 
@@ -2302,6 +2358,7 @@
 
       function chatQuotaText(account, channel, status = {}) {
         const modelName = checkedChatModelName(account, channel);
+        if (chatSubscriptionExpired(status)) return `${modelName} 套餐已过期`;
         if (confirmedChatQuotaEmpty(status)) {
           return status.quotaReason === "image_quota"
             ? `${modelName} 生图已用完`
@@ -2391,6 +2448,7 @@
       function statusInfo(status) {
         const map = {
           ok: ["success", "可用"],
+          subscription_expired: ["error", "套餐已过期"],
           disconnected: ["warning", "自动换线中"],
           quota_empty: ["warning", "额度不足"],
           check_timeout: ["warning", "检测超时"],
@@ -2411,6 +2469,16 @@
       function statusTag(status) {
         const [color, text] = statusInfo(status);
         return h(Tag, { color }, text);
+      }
+
+      function labeledStatusTag(key, label, status) {
+        const [color, text] = statusInfo(status);
+        const content = status === "subscription_expired"
+          ? `${label} 套餐已过期`
+          : /^[A-Za-z]/.test(label)
+            ? `${label} ${text}`
+            : `${label}${text}`;
+        return h(Tag, { key, color }, content);
       }
 
       function pipeProxyExpireText(value) {
@@ -3553,6 +3621,7 @@
         const statuses = relatedAccounts
           .filter((item) => item.enabled !== false)
           .map((item) => accountEffectiveStatus(item, channel));
+        if (statuses.some((status) => status === "subscription_expired")) return "subscription_expired";
         if (statuses.some((status) => status === "disconnected")) return "disconnected";
         if (statuses.some((status) => status === "error" || status === "failed")) return "error";
         if (statuses.some((status) => status === "ok")) return "ok";
@@ -3561,6 +3630,7 @@
       }
 
       function chatDisplayStatus(status = {}) {
+        if (chatSubscriptionExpired(status)) return "subscription_expired";
         if (confirmedChatQuotaEmpty(status)) return "quota_empty";
         if (status.status === "quota_empty") return "ok";
         return status.status || "unknown";
@@ -3583,11 +3653,13 @@
             referenceUsage
           }
         });
+        const expired = statuses.find((item) => chatDisplayStatus(item) === "subscription_expired");
+        if (expired) return withReferenceUsage({ ...expired, status: "subscription_expired" });
         const available = statuses.find((item) => chatDisplayStatus(item) === "ok");
         if (available) return withReferenceUsage({ ...available, status: "ok", quotaConfirmedByUpstream: false });
         const explicitEmpty = statuses.find(confirmedChatQuotaEmpty);
         if (explicitEmpty && statuses.every((item) => confirmedChatQuotaEmpty(item))) return withReferenceUsage(explicitEmpty);
-        const unavailable = statuses.find((item) => ["error", "failed", "disconnected", "disabled"].includes(chatDisplayStatus(item)));
+        const unavailable = statuses.find((item) => ["subscription_expired", "error", "failed", "disconnected", "disabled"].includes(chatDisplayStatus(item)));
         return withReferenceUsage(unavailable || statuses[0] || { status: "unknown" });
       }
 
@@ -3600,6 +3672,7 @@
           channelAbilityEnabled(channel, "chatplus") ? chatDisplayStatus(abilityStatus(account, "chatplus")) : ""
         ].filter(Boolean);
         if (!statuses.length) return account.status || "unknown";
+        if (statuses.includes("subscription_expired")) return "subscription_expired";
         if (statuses.includes("disconnected")) return "disconnected";
         if (statuses.some((status) => status === "error" || status === "failed")) return "error";
         if (statuses.includes("ok")) return "ok";
@@ -5496,25 +5569,51 @@
           {
             title: "状态",
             dataIndex: "status",
-            width: 150,
+            width: 210,
             render: (_, row) => {
               const rowChannel = channels.find((item) => item.id === row.channelId);
               const effectiveStatus = accountEffectiveStatus(row, rowChannel);
               const displayStatus = accountCheckDisplayStatus(row, rowChannel) || effectiveStatus;
               if (row.enabled === false) return statusTag("disabled");
-              if (!channelAbilityEnabled(rowChannel, "drawing") || !drawingAccountIsCooling(row)) return statusTag(displayStatus);
-              const drawing = drawingCooldownStatus(row);
-              const reason = drawing.cooldownReason === "drawing_rate_limited"
-                ? "绘图站提示上传过于频繁，已按上游要求暂停该账号绘图"
-                : "绘图站上游连续失败 3 次，已暂停该账号绘图";
-              const chatplusAvailable = channelAbilityEnabled(rowChannel, "chatplus")
-                && chatDisplayStatus(abilityStatus(row, "chatplus")) === "ok";
-              const tooltip = `${chatplusAvailable ? "聊天生图正常，不受本次冷却影响。" : ""}${reason}；${formatDateTime(drawing.cooldownUntil)} 自动恢复。`;
-              return h(Space, { direction: "vertical", size: 2, align: "start" }, [
-                h("span", { key: "status" }, statusTag(displayStatus)),
-                h(Tooltip, { key: "cooldown", title: tooltip },
-                  h(Tag, { color: "orange" }, `${chatplusAvailable ? "仅绘图站冷却" : "绘图站冷却中"} · ${drawingCooldownText(row)}`)
-                )
+              const tags = [];
+              const statusTimes = [];
+
+              if (rowChannel?.type === "shareai") {
+                if (channelAbilityEnabled(rowChannel, "drawing")) {
+                  const drawing = abilityStatus(row, "drawing");
+                  if (drawing.lastCheckAt) statusTimes.push(drawing.lastCheckAt);
+                  if (drawingAccountIsCooling(row)) {
+                    const cooldown = drawingCooldownStatus(row);
+                    const reason = cooldown.cooldownReason === "drawing_rate_limited"
+                      ? "绘图站提示上传过于频繁，已按上游要求暂停该账号绘图"
+                      : "绘图站上游连续失败 3 次，已暂停该账号绘图";
+                    const chatplusAvailable = channelAbilityEnabled(rowChannel, "chatplus")
+                      && chatDisplayStatus(abilityStatus(row, "chatplus")) === "ok";
+                    const tooltip = `${chatplusAvailable ? "聊天生图正常，不受本次冷却影响。" : ""}${reason}；${formatDateTime(cooldown.cooldownUntil)} 自动恢复。`;
+                    tags.push(h(Tooltip, { key: "drawing-cooldown", title: tooltip },
+                      h(Tag, { color: "orange" }, `${chatplusAvailable ? "仅绘图站冷却" : "绘图站冷却中"} · ${drawingCooldownText(row)}`)
+                    ));
+                  } else {
+                    tags.push(labeledStatusTag("drawing", "绘图", drawing.status || "unknown"));
+                  }
+                }
+                if (channelAbilityEnabled(rowChannel, "chatplus")) {
+                  const chatplus = abilityStatus(row, "chatplus");
+                  if (chatplus.lastCheckAt) statusTimes.push(chatplus.lastCheckAt);
+                  const chatStatus = accountCheckDisplayStatus(row, rowChannel) || chatDisplayStatus(chatplus);
+                  tags.push(labeledStatusTag("chatplus", checkedChatModelName(row, rowChannel), chatStatus));
+                }
+              } else {
+                tags.push(h("span", { key: "status" }, statusTag(displayStatus)));
+                if (row.lastCheckAt) statusTimes.push(row.lastCheckAt);
+              }
+
+              const updatedAt = statusTimes
+                .filter((value) => Number.isFinite(Date.parse(value)))
+                .sort((left, right) => Date.parse(right) - Date.parse(left))[0] || row.lastCheckAt || "";
+              return h("div", { className: "account-status" }, [
+                h("div", { className: "account-status-tags", key: "tags" }, tags.length ? tags : [statusTag(displayStatus)]),
+                h("span", { className: "account-status-time", key: "time" }, updatedAt ? `状态更新 ${formatDateTime(updatedAt)}` : "尚未检测")
               ]);
             }
           },
@@ -5954,6 +6053,7 @@
                     h(Select, { value: statusFilter, onChange: setStatusFilter, options: [
                       { label: "全部状态", value: "all" },
                       { label: "可用", value: "ok" },
+                      { label: "套餐已过期", value: "subscription_expired" },
                       { label: "自动换线中", value: "disconnected" },
                       { label: "额度不足", value: "quota_empty" },
                       { label: "异常", value: "error" },

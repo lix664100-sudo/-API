@@ -217,6 +217,7 @@ function targetRuntimeAvailable(target, taskType) {
   if (!target?.channel || !target?.account) return false;
   if (target.channel.enabled === false || target.account.enabled === false) return false;
   const status = targetQuotaStatus(target);
+  if (targetSubscriptionExpired(target)) return false;
   const confirmedQuotaBlocks = targetConfirmedQuotaBlocksTask(target, taskType);
   const quotaProbeReady = target?.channel?.type === "chatplus"
     && String(status.status || "").toLowerCase() === "quota_empty"
@@ -794,6 +795,16 @@ function isChatLoginStateText(text) {
   return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登/i.test(String(text || ""));
 }
 
+function isChatSubscriptionExpiredError(error) {
+  if (error?.subscriptionExpired === true || error?.code === "CHAT_SUBSCRIPTION_EXPIRED") return true;
+  const text = [
+    error?.message || "",
+    error?.body || "",
+    JSON.stringify(error?.payload || {})
+  ].join(" ");
+  return /用户没有有效的\s*chatgpt\s*订阅|没有可用的\s*chatgpt\s*套餐|(?:chatgpt|gpt).{0,18}(?:订阅|套餐).{0,12}(?:过期|无效)|no valid.{0,20}(?:subscription|plan)|(?:subscription|plan).{0,20}(?:expired|invalid|not valid)/i.test(text);
+}
+
 function isDisconnectedError(error) {
   return isChatLoginStateText([
     error?.message || "",
@@ -843,6 +854,20 @@ function imageSubmissionFailure(error) {
 }
 
 function accountStatusFromError(error, options = {}) {
+  if (isChatSubscriptionExpiredError(error)) {
+    return {
+      status: "subscription_expired",
+      quota: null,
+      balance: null,
+      used: null,
+      quotaResetAt: "",
+      expireAt: error?.expireAt || "",
+      cooldownUntil: null,
+      quotaReason: "",
+      quotaConfirmedByUpstream: false,
+      message: "GPT 套餐已过期，请续费后重新检测。"
+    };
+  }
   const explicitChatQuotaOnly = options.explicitChatQuotaOnly === true;
   const quotaEmpty = explicitChatQuotaOnly
     ? isExplicitChatQuotaError(error)
@@ -924,12 +949,13 @@ async function updateTargetAccountStatus(accountId, channel, patch) {
 
   const drawing = abilities.drawing || {};
   const chatplus = abilities.chatplus || {};
+  const subscriptionExpired = [drawing.status, chatplus.status].includes("subscription_expired");
   const disconnected = [drawing.status, chatplus.status].includes("disconnected");
   const ok = [drawing.status, chatplus.status].includes("ok");
   const failed = [drawing.status, chatplus.status].some((status) => ["error", "failed"].includes(status));
   const quotaEmpty = [drawing.status, chatplus.status].includes("quota_empty");
   return updateAccountStatus(accountId, {
-    status: disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : patch.status || account.status || "unknown",
+    status: subscriptionExpired ? "subscription_expired" : disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : patch.status || account.status || "unknown",
     quota: drawing.quota ?? account.quota ?? null,
     balance: drawing.balance ?? account.balance ?? null,
     quotaResetAt: drawing.quotaResetAt || chatplus.quotaResetAt || account.quotaResetAt || "",
@@ -974,6 +1000,12 @@ export async function clearAccountCooldown(accountId) {
 }
 
 async function markChatCooldown(accountId, channel, error) {
+  if (isChatSubscriptionExpiredError(error)) {
+    await updateTargetAccountStatus(accountId, channel, accountStatusFromError(error, {
+      explicitChatQuotaOnly: true
+    }));
+    return;
+  }
   const cooldownUntil = new Date(Date.now() + CHAT_COOLDOWN_MS).toISOString();
   const disconnected = isDisconnectedError(error);
   await updateTargetAccountStatus(accountId, channel, {
@@ -2256,7 +2288,8 @@ function targetAbilityCooling(target) {
 
 function targetKnownUnavailable(target) {
   const status = String(targetQuotaStatus(target).status || "unknown").toLowerCase();
-  return ["error", "failed", "disconnected", "disabled"].includes(status);
+  return targetSubscriptionExpired(target)
+    || ["error", "failed", "disconnected", "disabled"].includes(status);
 }
 
 function targetQuotaEmpty(target) {
@@ -2298,6 +2331,18 @@ function chatRecoveryUsage(status = {}) {
   }
   const directUsage = status.meta?.recoveryUsage;
   return directUsage && typeof directUsage === "object" ? directUsage : null;
+}
+
+function statusSubscriptionExpired(status = {}) {
+  if (String(status.status || "").toLowerCase() === "subscription_expired") return true;
+  const usage = chatRecoveryUsage(status);
+  const expiresAt = Date.parse(usage?.expireAt || status.expireAt || "");
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
+function targetSubscriptionExpired(target) {
+  return target?.channel?.type === "chatplus"
+    && statusSubscriptionExpired(targetQuotaStatus(target));
 }
 
 function targetConfirmedQuotaBlocksTask(target, taskType) {
@@ -2348,6 +2393,7 @@ function targetNeedsRecovery(target) {
   const quotaStatus = targetQuotaStatus(target);
   const status = String(quotaStatus.status || "unknown").toLowerCase();
   if (target?.channel?.type === "chatplus") {
+    if (statusSubscriptionExpired(quotaStatus)) return true;
     if (status === "quota_empty") {
       return targetQuotaEmpty(target) && targetConfirmedQuotaRetryDue(target);
     }
@@ -2365,7 +2411,7 @@ function targetNeedsRecovery(target) {
     if (Number.isFinite(resetAt) && resetAt <= Date.now()) return true;
     return false;
   }
-  return ["error", "failed", "disconnected"].includes(status);
+  return ["error", "failed", "disconnected", "subscription_expired"].includes(status);
 }
 
 async function recoverTarget(config, target) {
@@ -3962,6 +4008,9 @@ async function checkShareAIAbility(config, channel, account, ability) {
 }
 
 function readableCheckErrorMessage(error) {
+  if (isChatSubscriptionExpiredError(error)) {
+    return "GPT 套餐已过期，请续费后重新检测。";
+  }
   const message = String(error?.message || "").trim();
   if (/proxy/i.test(message) && /timeout|timed out|ETIMEDOUT|Failed connect/i.test(message)) {
     return "目标网站打不开，可能是服务器 IP 被限制或代理不可用。";
@@ -3978,12 +4027,13 @@ function readableCheckErrorMessage(error) {
 function combinedShareAIStatus(results) {
   const drawing = results.drawing.data;
   const chatplus = results.chatplus.data;
+  const subscriptionExpired = [drawing.status, chatplus.status].includes("subscription_expired");
   const disconnected = [drawing.status, chatplus.status].includes("disconnected");
   const ok = [drawing.status, chatplus.status].includes("ok");
   const failed = [drawing.status, chatplus.status].some((status) => ["error", "failed"].includes(status));
   const quotaEmpty = [drawing.status, chatplus.status].includes("quota_empty");
   return {
-    status: disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : "error",
+    status: subscriptionExpired ? "subscription_expired" : disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : "error",
     quota: drawing.quota ?? null,
     balance: drawing.balance ?? null,
     quotaResetAt: drawing.quotaResetAt || chatplus.quotaResetAt || "",
@@ -4006,6 +4056,7 @@ function combinedEnabledShareAIStatus(results) {
   const drawing = results.drawing?.data || {};
   const chatplus = results.chatplus?.data || {};
   const statuses = [drawing.status, chatplus.status].filter(Boolean);
+  const subscriptionExpired = statuses.includes("subscription_expired");
   const disconnected = statuses.includes("disconnected");
   const ok = statuses.includes("ok");
   const failed = statuses.some((status) => ["error", "failed"].includes(status));
@@ -4016,7 +4067,7 @@ function combinedEnabledShareAIStatus(results) {
   ].filter(Boolean);
 
   return {
-    status: disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : "error",
+    status: subscriptionExpired ? "subscription_expired" : disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : "error",
     quota: drawing.quota ?? chatplus.quota ?? null,
     balance: drawing.balance ?? chatplus.balance ?? null,
     quotaResetAt: drawing.quotaResetAt || chatplus.quotaResetAt || "",

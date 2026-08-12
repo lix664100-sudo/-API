@@ -197,6 +197,95 @@ test("账号检测遇到失效车位后会自动换车", async () => {
   assert.equal(enteredCount, 3);
 });
 
+test("GPT 套餐时间已过期时不再沿用旧的可用状态", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-expired-plan", username: "expired-plan@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let sessionCount = 0;
+  client.loadAccountUsages = async () => ({
+    gpt: {
+      quota: 220,
+      used: 0,
+      balance: 220,
+      quotaResetAt: "",
+      expireAt: new Date(Date.now() - 60_000).toISOString(),
+      period: "12h"
+    }
+  });
+  client.prepareChatSession = async () => {
+    sessionCount += 1;
+    return {
+      init: {},
+      route: { key: "gpt" },
+      selected: { carId: "expired-car", strategy: "balanced" }
+    };
+  };
+
+  await assert.rejects(
+    client.check(),
+    (error) => error.code === "CHAT_SUBSCRIPTION_EXPIRED"
+  );
+  assert.equal(sessionCount, 0);
+});
+
+test("无有效 GPT 订阅时即使绘图可用也标记套餐已过期", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-no-subscription",
+      channelId: "shareai",
+      name: "套餐过期测试账号",
+      username: "no-subscription@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", message: "绘图账号可用" },
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalChatCheck = ChatplusClient.prototype.check;
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  DrawingClient.prototype.check = async () => ({
+    status: "ok",
+    quota: 100,
+    balance: 80,
+    message: "绘图账号可用"
+  });
+  ChatplusClient.prototype.check = async () => {
+    const error = new Error("GPT 自动找车失败：车位一：用户没有有效的chatgpt订阅；车位二：用户没有有效的chatgpt订阅");
+    error.code = "CHAT_SUBSCRIPTION_EXPIRED";
+    error.subscriptionExpired = true;
+    throw error;
+  };
+
+  try {
+    await assert.rejects(
+      checkAccount("account-no-subscription"),
+      /GPT 套餐已过期/
+    );
+
+    const stored = await loadConfig();
+    const account = stored.accounts.find((item) => item.id === "account-no-subscription");
+    assert.equal(account.status, "subscription_expired");
+    assert.equal(account.meta.abilities.drawing.status, "ok");
+    assert.equal(account.meta.abilities.chatplus.status, "subscription_expired");
+    assert.equal(account.meta.abilities.chatplus.expireAt, "");
+  } finally {
+    ChatplusClient.prototype.check = originalChatCheck;
+    DrawingClient.prototype.check = originalDrawingCheck;
+  }
+});
+
 test("账号检测步骤超时后会自动重试并使用二十秒等待时间", async () => {
   const client = new ChatplusClient({
     config: {},
@@ -1056,6 +1145,67 @@ test("没有任务时后台也会自动恢复失效的聊天线路", async () =>
     const results = await recoverUnavailableChatAccounts();
     const stored = await loadConfig();
     const account = stored.accounts.find((item) => item.id === "account-background-recovery");
+
+    assert.equal(checkCount, 1);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].recovered, true);
+    assert.equal(account.status, "ok");
+    assert.equal(account.meta.abilities.chatplus.status, "ok");
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
+});
+
+test("套餐续费后后台会自动恢复过期账号", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-subscription-recovery",
+      channelId: "shareai",
+      name: "套餐续费恢复账号",
+      username: "subscription-recovery@example.com",
+      password: "test",
+      enabled: true,
+      status: "subscription_expired",
+      message: "GPT 套餐已过期",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", message: "绘图积分不足" },
+          chatplus: { status: "subscription_expired", message: "GPT 套餐已过期" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: null,
+      balance: null,
+      expireAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      message: "聊天账号可用",
+      meta: {
+        chatModel: "gpt",
+        referenceUsage: {
+          gpt: {
+            quota: 220,
+            balance: 220,
+            expireAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+          }
+        }
+      }
+    };
+  };
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const account = stored.accounts.find((item) => item.id === "account-subscription-recovery");
 
     assert.equal(checkCount, 1);
     assert.equal(results.length, 1);

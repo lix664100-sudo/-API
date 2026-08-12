@@ -37,6 +37,68 @@ const chatQuotaResetTexts = vm.runInNewContext(
   }
 );
 
+const expireFunctionMatch = adminHtml.match(
+  /function accountExpireText\(account, channel\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function channelAbilityEnabled/
+);
+
+assert.ok(expireFunctionMatch, "管理后台中应存在套餐到期时间显示方法");
+
+const expireFunctionSource = expireFunctionMatch[0].replace(
+  /\r?\n\r?\n      function channelAbilityEnabled$/,
+  ""
+);
+const accountExpireText = vm.runInNewContext(
+  `(${expireFunctionSource.replace(/^function /, "function ")})`,
+  {
+    abilityStatus: (account, key) => account?.meta?.abilities?.[key] || {},
+    channelAbilityEnabled: (channel, ability) => channel?.settings?.enabledAbilities?.[ability] !== false,
+    chatModelsForChannel: () => [{ key: "gpt", name: "GPT", enabled: true, default: true }],
+    formatDateTime: (value) => value || "-"
+  }
+);
+
+const effectiveStatusFunctionMatch = adminHtml.match(
+  /function accountEffectiveStatus\(account, channel\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function accountCheckDisplayStatus/
+);
+
+assert.ok(effectiveStatusFunctionMatch, "管理后台中应存在账号状态汇总方法");
+
+const effectiveStatusFunctionSource = effectiveStatusFunctionMatch[0].replace(
+  /\r?\n\r?\n      function accountCheckDisplayStatus$/,
+  ""
+);
+const accountEffectiveStatus = vm.runInNewContext(
+  `(${effectiveStatusFunctionSource.replace(/^function /, "function ")})`,
+  {
+    abilityStatus: (account, key) => account?.meta?.abilities?.[key] || {},
+    channelAbilityEnabled: (channel, ability) => channel?.settings?.enabledAbilities?.[ability] !== false,
+    chatDisplayStatus: (status = {}) => status.status || "unknown"
+  }
+);
+
+const aggregateStatusFunctionMatch = adminHtml.match(
+  /function aggregateChatStatus\(accounts, channel\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function accountEffectiveStatus/
+);
+
+assert.ok(aggregateStatusFunctionMatch, "管理后台中应存在聊天状态汇总方法");
+
+const aggregateStatusFunctionSource = aggregateStatusFunctionMatch[0].replace(
+  /\r?\n\r?\n      function accountEffectiveStatus$/,
+  ""
+);
+const aggregateChatStatus = vm.runInNewContext(
+  `(${aggregateStatusFunctionSource.replace(/^function /, "function ")})`,
+  {
+    abilityStatus: (account, key) => account?.meta?.abilities?.[key] || {},
+    aggregateChatReferenceUsage,
+    chatDisplayStatus: (status = {}) => status.status || "unknown",
+    chatModelsForChannel: () => [{ key: "gpt", name: "GPT", enabled: true }],
+    confirmedChatQuotaEmpty: (status = {}) => (
+      status.status === "quota_empty" && status.quotaConfirmedByUpstream === true
+    )
+  }
+);
+
 function shareAIAccount({ enabled = true, referenceUsage = {} } = {}) {
   return {
     enabled,
@@ -148,6 +210,28 @@ test("没有任何有效额度数据时不显示虚假的零额度", () => {
   );
 });
 
+test("渠道汇总中 GPT 套餐过期优先于其他账号可用", () => {
+  const available = shareAIAccount({
+    referenceUsage: {
+      gpt: { quota: 220, balance: 76, expireAt: "2026-08-20T00:00:00+08:00" }
+    }
+  });
+  const expired = shareAIAccount({
+    referenceUsage: {
+      gpt: { quota: 220, balance: 0, expireAt: "2026-08-10T00:00:00+08:00" }
+    }
+  });
+  expired.meta.abilities.chatplus.status = "subscription_expired";
+
+  const status = aggregateChatStatus([available, expired], { type: "shareai" });
+
+  assert.equal(status.status, "subscription_expired");
+  assert.equal(
+    aggregateChatReferenceUsage([expired], "shareai", ["gpt"]).gpt.expireAt,
+    "2026-08-10T00:00:00+08:00"
+  );
+});
+
 test("GPT 已明确用完时优先显示准确恢复时间", () => {
   const status = {
     status: "quota_empty",
@@ -192,4 +276,67 @@ test("GPT 恢复后没有准确时间时才显示额度周期", () => {
     structuredClone(chatQuotaResetTexts({}, status)),
     ["GPT 每 12h"]
   );
+});
+
+test("套餐到期列优先显示 GPT 自己的到期时间", () => {
+  const account = {
+    expireAt: "账号到期时间",
+    meta: {
+      abilities: {
+        drawing: { status: "ok", expireAt: "绘图到期时间" },
+        chatplus: {
+          status: "ok",
+          expireAt: "聊天到期时间",
+          meta: {
+            referenceUsage: {
+              gpt: { expireAt: "GPT 到期时间" }
+            }
+          }
+        }
+      }
+    }
+  };
+  const channel = {
+    type: "shareai",
+    settings: { enabledAbilities: { drawing: true, chatplus: true }, defaultChatModel: "gpt" }
+  };
+
+  assert.equal(accountExpireText(account, channel), "GPT 到期时间");
+});
+
+test("GPT 套餐已过期时不再显示旧的未来日期", () => {
+  const account = {
+    expireAt: "旧的账号到期时间",
+    meta: {
+      abilities: {
+        drawing: { status: "ok", expireAt: "旧的绘图到期时间" },
+        chatplus: { status: "subscription_expired", expireAt: "旧的聊天到期时间" }
+      }
+    }
+  };
+  const channel = {
+    type: "shareai",
+    settings: { enabledAbilities: { drawing: true, chatplus: true }, defaultChatModel: "gpt" }
+  };
+
+  assert.equal(accountExpireText(account, channel), "已过期");
+});
+
+test("GPT 套餐过期时整体状态不能被绘图可用覆盖", () => {
+  const account = {
+    enabled: true,
+    status: "ok",
+    meta: {
+      abilities: {
+        drawing: { status: "ok" },
+        chatplus: { status: "subscription_expired" }
+      }
+    }
+  };
+  const channel = {
+    type: "shareai",
+    settings: { enabledAbilities: { drawing: true, chatplus: true } }
+  };
+
+  assert.equal(accountEffectiveStatus(account, channel), "subscription_expired");
 });
