@@ -71,7 +71,7 @@ test("任务缩略图打开原图与生成结果弹窗，并支持多图放大�
 });
 
 test("两个改图入口都会保存原图预览，并纳入现有图片清理目录", () => {
-  const previewEnabledReads = serverSource.match(/readImageInput\(request, \{ maxFiles: 3, savePreview: true \}\)/g) || [];
+  const previewEnabledReads = serverSource.match(/readImageInput\(request, \{ maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true \}\)/g) || [];
 
   assert.equal(previewEnabledReads.length, 2);
   assert.match(serverSource, /const previewDir = resultImageDir;/);

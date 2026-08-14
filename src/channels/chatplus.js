@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "../image-limits.js";
 import { normalizeProxyUrl } from "../proxy.js";
 
 const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
@@ -806,11 +807,10 @@ function normalizeChatFiles(input, messages) {
     ...(Array.isArray(input.files) ? input.files : input.file ? [input.file] : []),
     ...collectMessageImageFiles(messages)
   ].filter(Boolean);
-  if (files.length > 5) {
-    const error = new Error("对话最多只能上传 5 张图片。");
-    error.status = 400;
-    throw error;
-  }
+  assertInputImageCount(
+    files.length,
+    `对话最多只能上传 ${MAX_INPUT_IMAGE_COUNT} 张图片。`
+  );
   return files;
 }
 

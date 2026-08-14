@@ -936,7 +936,7 @@
 
       .proxy-assign-controls {
         display: grid;
-        grid-template-columns: minmax(280px, 1.35fr) minmax(260px, 1fr);
+        grid-template-columns: minmax(260px, 1.2fr) minmax(210px, 0.8fr) minmax(260px, 1fr);
         gap: 12px;
         margin-bottom: 12px;
       }
@@ -1456,6 +1456,11 @@
 
       const channelTypeOptions = [
         { label: "ShareAI账号", value: "shareai" }
+      ];
+      const proxyAssignmentTargetOptions = [
+        { label: "当前 IP 可用的账号", value: "usable" },
+        { label: "当前 IP 已到期的账号", value: "expired" },
+        { label: "当前没有 IP 的账号", value: "empty" }
       ];
       const channelTypeLabels = {
         shareai: "ShareAI账号",
@@ -2624,13 +2629,15 @@
           usedByChannel.set(row.channelId, used);
         });
         const channelSource = preview?.unusedByChannel || [];
+        const unavailableSource = preview?.unavailableByChannel || [];
         const unusedByChannel = (preview?.channelIds || []).map((channelId) => {
           const channel = channelSource.find((item) => item.channelId === channelId) || {};
           const used = usedByChannel.get(channelId) || new Set();
+          const unavailable = new Set(unavailableSource.find((item) => item.channelId === channelId)?.proxies || []);
           return {
             channelId,
             channelName: channel.channelName || rows.find((row) => row.channelId === channelId)?.channelName || "未命名渠道",
-            proxies: proxies.filter((proxy) => !used.has(proxy))
+            proxies: proxies.filter((proxy) => !used.has(proxy) && !unavailable.has(proxy))
           };
         });
         return {
@@ -3858,10 +3865,12 @@
         const [proxyAssignOpen, setProxyAssignOpen] = useState(false);
         const [proxyAssignText, setProxyAssignText] = useState("");
         const [proxyAssignChannelIds, setProxyAssignChannelIds] = useState([]);
+        const [proxyAssignTargetType, setProxyAssignTargetType] = useState("");
         const [proxyAssignAllowReuse, setProxyAssignAllowReuse] = useState(false);
         const [proxyAssignPreview, setProxyAssignPreview] = useState(null);
         const [proxyAssignPreviewing, setProxyAssignPreviewing] = useState(false);
         const [proxyAssignSaving, setProxyAssignSaving] = useState(false);
+        const [proxyClearSaving, setProxyClearSaving] = useState(false);
         const [editingChannel, setEditingChannel] = useState(null);
         const [editingAccount, setEditingAccount] = useState(null);
         const [taskPreview, setTaskPreview] = useState(null);
@@ -4883,7 +4892,8 @@
         function openProxyAssign() {
           const enabledChannelIds = channels.filter((channel) => channel.enabled !== false).map((channel) => channel.id);
           setProxyAssignText("");
-          setProxyAssignChannelIds(enabledChannelIds.length ? enabledChannelIds : channels.map((channel) => channel.id));
+          setProxyAssignChannelIds(selectedChannel ? [selectedChannel.id] : enabledChannelIds.slice(0, 1));
+          setProxyAssignTargetType("");
           setProxyAssignAllowReuse(false);
           setProxyAssignPreview(null);
           setProxyAssignOpen(true);
@@ -4911,6 +4921,10 @@
             message.warning("请选择应用渠道");
             return;
           }
+          if (!proxyAssignTargetType) {
+            message.warning("请选择分配对象");
+            return;
+          }
           if (!proxies.length) {
             message.warning("请先导入代理 IP");
             return;
@@ -4927,6 +4941,7 @@
               body: {
                 channelIds: proxyAssignChannelIds,
                 proxies,
+                targetType: proxyAssignTargetType,
                 allowReuse: proxyAssignAllowReuse
               }
             });
@@ -4955,6 +4970,7 @@
               body: {
                 channelIds: proxyAssignPreview.channelIds,
                 proxies: proxyAssignPreview.proxies,
+                targetType: proxyAssignPreview.targetType,
                 allowReuse: proxyAssignPreview.allowReuse,
                 snapshot: proxyAssignPreview.snapshot,
                 assignments: proxyAssignPreview.rows.map((row) => ({
@@ -4969,7 +4985,7 @@
             setProxyAssignPreview(null);
             await refreshRuntimeStatus();
             const result = response.result || {};
-            message.success(`代理分配已应用：使用代理 ${result.assigned || 0} 个账号，清空旧代理 ${result.cleared || 0} 个账号`);
+            message.success(`代理分配已应用：已修改 ${result.changed || 0} 个账号`);
           } catch (error) {
             if (String(error.message || "").includes("重新预览")) setProxyAssignPreview(null);
             message.error(error.message);
@@ -4980,12 +4996,65 @@
 
         function confirmProxyAssignments() {
           if (!proxyAssignPreview) return;
+          if (!proxyAssignSummary.changed) {
+            message.info("当前预览没有需要修改的账号");
+            return;
+          }
           Modal.confirm({
             title: "确认应用代理分配？",
-            content: `将让 ${proxyAssignSummary.assigned} 个账号使用代理，${proxyAssignSummary.serverIp} 个账号使用服务器 IP；其中会清空 ${proxyAssignSummary.cleared} 个账号的旧代理。`,
+            content: `共有 ${proxyAssignSummary.accounts} 个账号符合条件，本次将修改 ${proxyAssignSummary.changed} 个账号${proxyAssignSummary.cleared ? `，其中清除 ${proxyAssignSummary.cleared} 个账号的原代理` : ""}。未分到新 IP 的账号保持原样。`,
             okText: "确认应用",
             cancelText: "返回检查",
             onOk: submitProxyAssignments
+          });
+        }
+
+        function confirmClearSelectedChannelProxies() {
+          if (proxyClearSaving) return;
+          if (!proxyAssignChannelIds.length) {
+            message.warning("请选择要清除的渠道");
+            return;
+          }
+          const selectedChannelIds = [...proxyAssignChannelIds];
+          const selectedChannelSet = new Set(selectedChannelIds);
+          const scopedAccounts = accounts.filter((account) => selectedChannelSet.has(account.channelId));
+          const proxyCount = scopedAccounts.filter((account) => String(account.proxyUrl || "").trim()).length;
+          if (!proxyCount) {
+            message.info("所选渠道没有需要清除的代理 IP");
+            return;
+          }
+          const snapshot = scopedAccounts.map((account) => ({
+            accountId: account.id,
+            channelId: account.channelId,
+            proxyUrl: String(account.proxyUrl || "").trim(),
+            enabled: account.enabled !== false
+          }));
+          Modal.confirm({
+            title: "确认清除所选渠道的全部代理 IP？",
+            content: `将清除 ${proxyCount} 个账号的代理 IP，之后这些账号会使用服务器 IP。此操作不能自动恢复。`,
+            okText: "确认清除",
+            okButtonProps: { danger: true },
+            cancelText: "取消",
+            onOk: async () => {
+              if (proxyClearSaving) return;
+              setProxyClearSaving(true);
+              try {
+                const response = await api("/api/accounts/proxies/clear", {
+                  method: "POST",
+                  body: { channelIds: selectedChannelIds, snapshot }
+                });
+                setConfig(response.config);
+                setProxyAssignOpen(false);
+                setProxyAssignPreview(null);
+                await refreshRuntimeStatus();
+                message.success(`已清除 ${response.result?.cleared || 0} 个账号的代理 IP`);
+              } catch (error) {
+                await refreshAccountStatus();
+                message.error(error.message);
+              } finally {
+                setProxyClearSaving(false);
+              }
+            }
           });
         }
 
@@ -4994,17 +5063,17 @@
             title: "批量分配代理",
             open: proxyAssignOpen,
             onCancel: () => {
-              if (!proxyAssignSaving && !proxyAssignPreviewing) setProxyAssignOpen(false);
+              if (!proxyAssignSaving && !proxyAssignPreviewing && !proxyClearSaving) setProxyAssignOpen(false);
             },
             onOk: confirmProxyAssignments,
             okText: "确认应用",
             okButtonProps: {
-              disabled: !proxyAssignPreview?.rows?.length || proxyAssignPreviewing
+              disabled: !proxyAssignPreview?.rows?.length || !proxyAssignSummary.changed || proxyAssignPreviewing || proxyClearSaving
             },
             cancelText: "取消",
-            cancelButtonProps: { disabled: proxyAssignSaving },
+            cancelButtonProps: { disabled: proxyAssignSaving || proxyClearSaving },
             confirmLoading: proxyAssignSaving,
-            maskClosable: !proxyAssignSaving && !proxyAssignPreviewing,
+            maskClosable: !proxyAssignSaving && !proxyAssignPreviewing && !proxyClearSaving,
             width: 1080,
             destroyOnHidden: true
           }, [
@@ -5034,6 +5103,26 @@
                   maxTagCount: "responsive",
                   onChange: (value) => {
                     setProxyAssignChannelIds(value);
+                    setProxyAssignPreview(null);
+                  }
+                }),
+                h(Button, {
+                  danger: true,
+                  icon: Icon.DeleteOutlined ? h(Icon.DeleteOutlined) : null,
+                  loading: proxyClearSaving,
+                  disabled: !proxyAssignChannelIds.length || proxyAssignSaving || proxyAssignPreviewing,
+                  onClick: confirmClearSelectedChannelProxies,
+                  style: { justifySelf: "start" }
+                }, "清除所选渠道全部 IP")
+              ]),
+              h("div", { className: "proxy-assign-field", key: "target" }, [
+                h("div", { className: "proxy-assign-label" }, "分配对象"),
+                h(Select, {
+                  value: proxyAssignTargetType || undefined,
+                  options: proxyAssignmentTargetOptions,
+                  placeholder: "请选择分配对象",
+                  onChange: (value) => {
+                    setProxyAssignTargetType(value);
                     setProxyAssignPreview(null);
                   }
                 })
@@ -5082,9 +5171,10 @@
             ]),
             h(Alert, {
               key: "warning",
-              type: "warning",
+              type: "info",
               showIcon: true,
-              message: "未分到新 IP 的账号会清空原代理，包括停用账号。",
+              message: "只修改符合所选条件的启用账号",
+              description: "未分到新 IP 的账号、其他类型账号和停用账号都会保持原样。",
               style: { marginBottom: 14 }
             }),
             proxyAssignPreview
@@ -5149,13 +5239,24 @@
                           popupMatchSelectWidth: 320,
                           options: [
                             { label: "服务器 IP（清空代理）", value: "" },
-                            ...proxyAssignPreview.proxies.map((proxy, index) => ({
-                              label: `代理 ${index + 1} · ${accountImportProxyLabel(proxy)}`,
-                              value: proxy,
-                              disabled: !proxyAssignPreview.allowReuse && proxyAssignPreview.rows.some((other) =>
-                                other.channelId === row.channelId && other.key !== row.key && other.proxyUrl === proxy
-                              )
-                            }))
+                            ...(row.previousProxyUrl && !proxyAssignPreview.proxies.includes(row.previousProxyUrl)
+                              ? [{ label: `保留当前 IP · ${accountImportProxyLabel(row.previousProxyUrl)}`, value: row.previousProxyUrl }]
+                              : []),
+                            ...proxyAssignPreview.proxies.map((proxy, index) => {
+                              const usedByOtherType = (proxyAssignPreview.unavailableByChannel || []).some((channel) =>
+                                channel.channelId === row.channelId && channel.proxies.includes(proxy)
+                              );
+                              return {
+                                label: `代理 ${index + 1} · ${accountImportProxyLabel(proxy)}${usedByOtherType && !proxyAssignPreview.allowReuse ? "（正被其他账号使用）" : ""}`,
+                                value: proxy,
+                                disabled: !proxyAssignPreview.allowReuse && (
+                                  usedByOtherType
+                                  || proxyAssignPreview.rows.some((other) =>
+                                    other.channelId === row.channelId && other.key !== row.key && other.proxyUrl === proxy
+                                  )
+                                )
+                              };
+                            })
                           ],
                           onChange: (nextValue) => updateProxyAssignment(row.key, nextValue)
                         })

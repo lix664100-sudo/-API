@@ -34,6 +34,7 @@ import {
   runAutoCleanupResultImages,
   setRuntimePublicBaseUrl
 } from "./image-store.js";
+import { MAX_INPUT_IMAGE_COUNT } from "./image-limits.js";
 import {
   inspectGitUpdateState,
   redactGitProxyCredentials,
@@ -41,6 +42,7 @@ import {
 } from "./git-update.js";
 import {
   applyAccountProxyAssignments,
+  clearAccountProxies,
   closeStorage,
   getTask,
   getTaskBySourceTaskId,
@@ -903,6 +905,21 @@ app.post("/api/accounts/proxies/apply", async (request, reply) => {
   }
 });
 
+app.post("/api/accounts/proxies/clear", async (request, reply) => {
+  try {
+    const cleared = await clearAccountProxies(request.body || {});
+    return {
+      ok: true,
+      data: {
+        config: publicConfig(cleared.config),
+        result: cleared.result
+      }
+    };
+  } catch (error) {
+    return sendError(reply, error);
+  }
+});
+
 app.delete("/api/accounts/:id", async (request) => {
   const config = await removeAccount(request.params.id);
   return { ok: true, data: publicConfig(config) };
@@ -1066,11 +1083,11 @@ app.post("/api/draw/edit", async (request, reply) => {
   let admissionTransferred = false;
   try {
     admission = await reserveImageRequestAdmission(request, requestMeta);
-    const parsed = await readImageInput(request, { maxFiles: 3, savePreview: true });
+    const parsed = await readImageInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
     input = parsed.input;
     files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
-    if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
+    if (!files.length) throw badRequest(`请上传 1 到 ${MAX_INPUT_IMAGE_COUNT} 张源图，字段名用 image。`);
     let task;
     if (request.query?.wait === "1") {
       task = await createImageTask({ input, files, wait: true, requestMeta, admission });
@@ -1136,7 +1153,7 @@ app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, 
   try {
     let requestMeta = apiRequestMeta(request);
     if (isMultipartRequest(request)) {
-      const { input, files } = await readMultipartInput(request, { maxFiles: 5, savePreview: true });
+      const { input, files } = await readMultipartInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
       requestMeta = mergeInputSourceTaskId(requestMeta, input);
       if (request.query?.wait === "0") {
         const task = await queueChatCompletion({ ...input, files }, requestMeta);
@@ -1164,11 +1181,11 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
   let admissionTransferred = false;
   try {
     admission = await reserveImageRequestAdmission(request, requestMeta);
-    const parsed = await readImageInput(request, { maxFiles: 3, savePreview: true });
+    const parsed = await readImageInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
     input = parsed.input;
     files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
-    if (!files.length) throw badRequest("请上传 1 到 3 张源图，字段名用 image。");
+    if (!files.length) throw badRequest(`请上传 1 到 ${MAX_INPUT_IMAGE_COUNT} 张源图，字段名用 image。`);
     const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta, admission });
     admissionTransferred = true;
     if (task.status !== "success") reply.code(202);

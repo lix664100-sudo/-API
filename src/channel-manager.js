@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
 import { DrawingClient, drawingRetryAfterSeconds, drawingSevereFailureReason, drawingUpstreamText } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
+import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "./image-limits.js";
 import {
   checkProxyReachability,
   isProxyConnectionError,
@@ -3021,17 +3022,13 @@ function imageFiles(inputFiles) {
   return Array.isArray(inputFiles) ? inputFiles.filter(Boolean) : inputFiles ? [inputFiles] : [];
 }
 
-function assertImageFileCount(files, maxFiles = 3) {
+function assertImageFileCount(files) {
   if (!files.length) {
     const error = new Error("请上传源图。");
     error.status = 400;
     throw error;
   }
-  if (files.length > maxFiles) {
-    const error = new Error(`最多只能上传 ${maxFiles} 张源图。`);
-    error.status = 400;
-    throw error;
-  }
+  assertInputImageCount(files.length, `最多只能上传 ${MAX_INPUT_IMAGE_COUNT} 张源图。`);
 }
 
 function contentPartText(part) {
@@ -3077,11 +3074,10 @@ function cleanChatPrompt(input = {}) {
 }
 
 function assertChatInput(input = {}) {
-  if (chatImageCount(input) > 5) {
-    const error = new Error("对话最多只能上传 5 张图片。");
-    error.status = 400;
-    throw error;
-  }
+  assertInputImageCount(
+    chatImageCount(input),
+    `对话最多只能上传 ${MAX_INPUT_IMAGE_COUNT} 张图片。`
+  );
   if (!cleanChatPrompt(input)) {
     const error = new Error("请输入对话内容，或上传图片。");
     error.status = 400;
@@ -3769,7 +3765,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
     throw error;
   }
   const files = imageFiles(inputFiles || file);
-  assertImageFileCount(files, 3);
+  assertImageFileCount(files);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
@@ -4400,7 +4396,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
     throw error;
   }
   const files = imageFiles(inputFiles || file);
-  assertImageFileCount(files, 3);
+  assertImageFileCount(files);
   if (!wait) return queueImageTask({ input, files, requestMeta, admission });
 
   const config = await loadRuntimeConfig();
