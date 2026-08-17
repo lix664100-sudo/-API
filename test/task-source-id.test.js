@@ -330,6 +330,72 @@ test("chatplus text-only image wait returns upstream text immediately", async ()
   );
 });
 
+test("chatplus image wait treats prompt JSON as an intermediate response", async () => {
+  const promptEnvelope = JSON.stringify({ prompt: "整理后的绘图提示词" });
+  const resultUrl = "https://one.example.test/generated-after-prompt.png";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-prompt-account", username: "prompt@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  let imageReadCount = 0;
+  client.imageUrlsFrom = async () => {
+    imageReadCount += 1;
+    return imageReadCount === 1 ? [] : [resultUrl];
+  };
+  client.json = async () => ({
+    mapping: {
+      assistant: {
+        message: {
+          author: { role: "assistant" },
+          content: { parts: [promptEnvelope] }
+        }
+      }
+    }
+  });
+
+  const imageUrls = await client.waitForConversationImages([{
+    message: {
+      author: { role: "assistant" },
+      content: { parts: [promptEnvelope] }
+    }
+  }], "conversation-with-prompt-envelope", 30, { generatedOnly: true });
+
+  assert.deepEqual(imageUrls, [resultUrl]);
+  assert.equal(imageReadCount, 2);
+});
+
+test("chatplus task refresh keeps prompt JSON in progress", async () => {
+  const promptEnvelope = JSON.stringify({ prompt: "整理后的绘图提示词" });
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-prompt-refresh-account", username: "prompt-refresh@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  client.loginPortal = async () => {};
+  client.imageUrlsFrom = async () => [];
+  client.json = async () => ({
+    mapping: {
+      assistant: {
+        message: {
+          author: { role: "assistant" },
+          content: { parts: [promptEnvelope] }
+        }
+      }
+    }
+  });
+
+  const task = await client.getTask("conversation-with-prompt-envelope");
+
+  assert.equal(task.status, "waiting_upstream");
+  assert.equal(task.errorMessage, "");
+  assert.deepEqual(task.imageUrls, []);
+});
+
 test("chatplus image wait ignores skipped mainline marker and keeps waiting", async () => {
   const marker = "{\"skipped_mainline\":true}";
   const resultUrl = "https://one.example.test/generated-result.png";

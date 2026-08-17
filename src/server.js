@@ -15,11 +15,13 @@ import {
   clearAccountCooldown,
   createChatCompletion,
   createImageTask,
+  createTextTask,
   getRuntimeStatus,
   imageTaskClientView,
   inspectUpstreamTask,
   queueChatCompletion,
   queueImageTask,
+  queueTextTask,
   recoverUnavailableChatAccounts,
   reserveImageTaskAdmission,
   refreshProcessingTasks,
@@ -1153,6 +1155,27 @@ app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, 
     return await createChatCompletion(input, requestMeta);
   } catch (error) {
     return sendError(reply, error);
+  }
+});
+
+app.post("/v1/images/generations", { preHandler: requireApiKey }, async (request, reply) => {
+  let requestMeta = apiRequestMeta(request);
+  let input = {};
+  try {
+    input = normalizeFields(request.body || {});
+    requestMeta = mergeInputSourceTaskId(requestMeta, input);
+    const task = request.query?.wait === "0"
+      ? await queueTextTask(input, requestMeta)
+      : await createTextTask(input, true, requestMeta);
+    if (task.status !== "success") reply.code(202);
+    return imageEditResponse(task);
+  } catch (error) {
+    return sendError(reply, error, {
+      requestMeta,
+      input,
+      files: [],
+      taskType: "text2img"
+    });
   }
 });
 
