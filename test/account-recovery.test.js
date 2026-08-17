@@ -6,6 +6,7 @@ import path from "node:path";
 
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-account-recovery-"));
 process.env.DATA_DIR = dataDir;
+const activeSubscriptionExpireAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
 const { closeStorage, loadConfig, saveConfig } = await import("../src/storage.js");
 const { checkAccount, clearAccountCooldown, createChatCompletion, createImageTask, createTextTask, getRuntimeStatus, recoverUnavailableChatAccounts } = await import("../src/channel-manager.js");
@@ -172,7 +173,7 @@ test("账号检测遇到失效车位后会自动换车", async () => {
       used: 31,
       balance: 189,
       quotaResetAt: "2026-07-22T19:32:29+08:00",
-      expireAt: "2026-08-16T05:22:44+08:00",
+      expireAt: activeSubscriptionExpireAt,
       period: "12h"
     }
   });
@@ -190,7 +191,7 @@ test("账号检测遇到失效车位后会自动换车", async () => {
     used: 31,
     balance: 189,
     quotaResetAt: "2026-07-22T19:32:29+08:00",
-    expireAt: "2026-08-16T05:22:44+08:00",
+    expireAt: activeSubscriptionExpireAt,
     period: "12h"
   });
   assert.equal(result.meta.selectedCarId, "car-3");
@@ -308,7 +309,7 @@ test("账号检测步骤超时后会自动重试并使用二十秒等待时间",
         used: 1,
         balance: 69,
         quotaResetAt: "",
-        expireAt: "2026-08-16T05:22:44+08:00",
+        expireAt: activeSubscriptionExpireAt,
         period: "24h"
       }
     };
@@ -653,7 +654,7 @@ test("PLUS 车位有图片额度时账号检测不会误判为无额度", async 
       used: 106,
       balance: 114,
       quotaResetAt: "2026-07-26T07:36:45+08:00",
-      expireAt: "2026-08-16T05:22:44+08:00",
+      expireAt: activeSubscriptionExpireAt,
       period: "12h"
     }
   });
@@ -745,7 +746,7 @@ test("后台显示额度为零时仍会检测真实车位并保持可用", async
       used: 220,
       balance: 0,
       quotaResetAt: "2026-07-22T19:32:29+08:00",
-      expireAt: "2026-08-16T05:22:44+08:00",
+      expireAt: activeSubscriptionExpireAt,
       period: "12h"
     }
   });
@@ -791,7 +792,7 @@ test("额度恢复核验会检查指定模型的额度和页面", async () => {
     used: 0,
     balance: 70,
     quotaResetAt: "2026-07-30T00:00:00+08:00",
-    expireAt: "2026-08-16T05:22:44+08:00",
+    expireAt: activeSubscriptionExpireAt,
     period: "24h"
   };
   client.loadAccountUsages = async () => ({

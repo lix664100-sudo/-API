@@ -951,6 +951,22 @@ function throwIfTerminalImageFailure(content, options = {}) {
   throw error;
 }
 
+function isImagePromptEnvelope(content) {
+  const message = String(content || "").trim();
+  if (!message.startsWith("{") || !message.endsWith("}")) return false;
+  try {
+    const payload = JSON.parse(message);
+    return payload
+      && typeof payload === "object"
+      && !Array.isArray(payload)
+      && Object.keys(payload).length === 1
+      && typeof payload.prompt === "string"
+      && Boolean(payload.prompt.trim());
+  } catch {
+    return false;
+  }
+}
+
 function throwIfTextImageResponse(content, options = {}) {
   const message = String(content || "").trim();
   const usableMessage = message && !isSkippedMainlineContent(message) ? message : "";
@@ -2866,11 +2882,14 @@ export class ChatplusClient {
 
   async waitForConversationImages(events, conversationId, timeoutSec, options = {}) {
     const initialContent = extractAssistantText(events);
-    throwIfImageGenerationLimit(initialContent);
+    const initialPromptEnvelope = isImagePromptEnvelope(initialContent);
+    if (!initialPromptEnvelope) throwIfImageGenerationLimit(initialContent);
     let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: options.generatedOnly });
     if (imageUrls.length || !conversationId) return imageUrls;
-    throwIfTerminalImageFailure(initialContent);
-    throwIfTextImageResponse(initialContent);
+    if (!initialPromptEnvelope) {
+      throwIfTerminalImageFailure(initialContent);
+      throwIfTextImageResponse(initialContent);
+    }
 
     const timeoutMs = Math.max(5, Number(timeoutSec || this.config.waitTimeoutSec || DEFAULT_CHAT_HTTP_TIMEOUT_SEC)) * 1000;
     const deadline = Date.now() + timeoutMs;
@@ -2878,11 +2897,14 @@ export class ChatplusClient {
       try {
         const detail = await this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}`);
         const content = extractAssistantText(detail);
-        throwIfImageGenerationLimit(content);
+        const promptEnvelope = isImagePromptEnvelope(content);
+        if (!promptEnvelope) throwIfImageGenerationLimit(content);
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
-        throwIfTerminalImageFailure(content);
-        throwIfTextImageResponse(content);
+        if (!promptEnvelope) {
+          throwIfTerminalImageFailure(content);
+          throwIfTextImageResponse(content);
+        }
         const explicitState = explicitConversationState(detail);
         if (explicitState) {
           const error = new Error(explicitState.message);
@@ -2955,7 +2977,8 @@ export class ChatplusClient {
       };
     }
     const content = extractAssistantText(detail);
-    if (isImageGenerationLimitMessage(content)) {
+    const promptEnvelope = isImagePromptEnvelope(content);
+    if (!promptEnvelope && isImageGenerationLimitMessage(content)) {
       return {
         externalId,
         status: "failed",
@@ -2965,7 +2988,7 @@ export class ChatplusClient {
         raw: detail
       };
     }
-    if (isTerminalImageFailureMessage(content)) {
+    if (!promptEnvelope && isTerminalImageFailureMessage(content)) {
       return {
         externalId,
         status: "failed",
@@ -2975,7 +2998,7 @@ export class ChatplusClient {
         raw: detail
       };
     }
-    if (content) {
+    if (!promptEnvelope && content) {
       return {
         externalId,
         status: "failed",
