@@ -940,6 +940,109 @@ test("GPT 聊天生图被 403 拒绝时保留上游原文", async () => {
   );
 });
 
+test("GPT 聊天生图返回 403 登录失效时会重新登录并换车", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-relogin-on-403", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  const selectedCars = [];
+  let requestCount = 0;
+  let resetCount = 0;
+  const resetSession = client.resetSession.bind(client);
+  client.resetSession = () => {
+    resetCount += 1;
+    resetSession();
+  };
+  client.prepareChatSession = async (_input, ignoredCarIds) => {
+    const carId = ignoredCarIds.has("expired-login-car") ? "healthy-login-car" : "expired-login-car";
+    ignoredCarIds.add(carId);
+    selectedCars.push(carId);
+    return {
+      route: { key: "gpt", model: "" },
+      init: { default_model_slug: "gpt-5-6-thinking" },
+      selected: { carId, carType: "chatgpt" }
+    };
+  };
+  client.uploadChatImages = async () => [];
+  client.http = async () => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return {
+        status: 403,
+        headers: {},
+        body: JSON.stringify({ detail: { message: "您的账号在其他设备登录，请重新登录" } })
+      };
+    }
+    return {
+      status: 200,
+      headers: {},
+      body: "data: {\"conversation_id\":\"conversation-after-relogin\"}\n\ndata: [DONE]\n\n"
+    };
+  };
+
+  const result = await client.sendConversation("403 重新登录测试", {
+    imageGeneration: true,
+    requireConversationId: true
+  });
+
+  assert.equal(requestCount, 2);
+  assert.equal(resetCount, 1);
+  assert.equal(result.conversationId, "conversation-after-relogin");
+  assert.deepEqual(selectedCars, ["expired-login-car", "healthy-login-car"]);
+});
+
+test("GPT 聊天生图外层 403 包含聊天记录 401 时会换车", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-switch-on-wrapped-401", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  const selectedCars = [];
+  let requestCount = 0;
+  client.prepareChatSession = async (_input, ignoredCarIds) => {
+    const carId = ignoredCarIds.has("deleted-chat-car") ? "healthy-chat-car" : "deleted-chat-car";
+    ignoredCarIds.add(carId);
+    selectedCars.push(carId);
+    return {
+      route: { key: "gpt", model: "" },
+      init: { default_model_slug: "gpt-5-6-thinking" },
+      selected: { carId, carType: "chatgpt" }
+    };
+  };
+  client.uploadChatImages = async () => [];
+  client.http = async () => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return {
+        status: 403,
+        headers: {},
+        body: JSON.stringify({
+          detail: {
+            message: "后端返回错误：401。该车队的聊天记录已删除，请点击【换车继续聊】。"
+          }
+        })
+      };
+    }
+    return {
+      status: 200,
+      headers: {},
+      body: "data: {\"conversation_id\":\"conversation-after-switch\"}\n\ndata: [DONE]\n\n"
+    };
+  };
+
+  const result = await client.sendConversation("403 包含 401 换车测试", {
+    imageGeneration: true,
+    requireConversationId: true
+  });
+
+  assert.equal(requestCount, 2);
+  assert.equal(result.conversationId, "conversation-after-switch");
+  assert.deepEqual(selectedCars, ["deleted-chat-car", "healthy-chat-car"]);
+});
+
 test("GPT 聊天生图明确返回 401 时会换下一个车位", async () => {
   const client = new ChatplusClient({
     config: {},

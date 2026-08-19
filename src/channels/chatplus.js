@@ -257,10 +257,15 @@ function isAuthSessionError(error) {
   return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|unauthorized|forbidden|session expired/i.test(text);
 }
 
+function isExplicitAuthSessionError(error) {
+  const text = `${error?.message || ""} ${error?.body || ""} ${error?.upstreamText || ""}`;
+  return /\b401\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|聊天记录.{0,12}(?:删除|已删除)|换车继续聊|unauthorized|session expired/i.test(text);
+}
+
 function isRetryableImageSubmissionRejection(error) {
-  return error?.imageSubmissionAttempted === true
-    && error?.upstreamExplicitFailure === true
-    && Number(error?.status || error?.statusCode || 0) === 401;
+  if (error?.imageSubmissionAttempted !== true || error?.upstreamExplicitFailure !== true) return false;
+  const status = Number(error?.status || error?.statusCode || 0);
+  return status === 401 || (status === 403 && isExplicitAuthSessionError(error));
 }
 
 function isProCarPlanMismatchError(error) {
