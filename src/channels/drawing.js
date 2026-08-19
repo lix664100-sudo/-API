@@ -3,6 +3,7 @@ import { ProxyAgent } from "proxy-agent";
 import { normalizeProxyUrl } from "../proxy.js";
 
 const ACCOUNT_CHECK_TIMEOUT_MS = 3000;
+const MIN_DRAWING_BALANCE_FOR_IMAGE = 2;
 
 function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
@@ -54,9 +55,9 @@ function numberOrNull(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-function isZeroOrLess(value) {
+export function drawingBalanceInsufficient(value) {
   const number = numberOrNull(value);
-  return number !== null && number <= 0;
+  return number !== null && number < MIN_DRAWING_BALANCE_FOR_IMAGE;
 }
 
 function compactText(value, limit = 300) {
@@ -377,7 +378,7 @@ export class DrawingClient {
     const stats = {};
     const balance = profile?.balance ?? profile?.quota_points ?? stats?.balance ?? null;
     const quota = profile?.quota_points ?? profile?.quota ?? stats?.quota ?? null;
-    const quotaEmpty = isZeroOrLess(balance);
+    const quotaEmpty = drawingBalanceInsufficient(balance);
     return {
       status: quotaEmpty ? "quota_empty" : "ok",
       balance,

@@ -355,6 +355,89 @@ test("image admission skips known empty drawing quota before upload", async () =
   );
 });
 
+test("drawing check treats one point as insufficient for image generation", async () => {
+  const client = new DrawingClient({
+    config: {},
+    channel: { settings: {} },
+    account: {
+      username: "drawing-check@example.test",
+      password: "test"
+    },
+    sessionLock: async (work) => work()
+  });
+  client.ensureLogin = async () => {};
+  client.request = async (pathName) => {
+    assert.equal(pathName, "/api/v1/profile");
+    return { balance: 1, quota_points: 100 };
+  };
+
+  const status = await client.check();
+
+  assert.equal(status.status, "quota_empty");
+  assert.equal(status.balance, 1);
+  assert.equal(status.message, "绘图积分不足");
+});
+
+test("image admission skips drawing accounts with one point but keeps two-point accounts", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "drawing",
+    concurrency: { chat: 3, drawingImage: 2, chatImage: 1 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        defaultModelId: 1
+      }
+    }],
+    accounts: [
+      {
+        id: "drawing-one-point",
+        channelId: "shareai",
+        name: "Drawing One Point",
+        username: "drawing-one-point@example.test",
+        password: "test",
+        enabled: true,
+        status: "ok",
+        meta: {
+          abilities: {
+            drawing: { status: "ok", quota: 100, balance: 1 }
+          }
+        }
+      },
+      {
+        id: "drawing-two-points",
+        channelId: "shareai",
+        name: "Drawing Two Points",
+        username: "drawing-two-points@example.test",
+        password: "test",
+        enabled: true,
+        status: "ok",
+        meta: {
+          abilities: {
+            drawing: { status: "ok", quota: 100, balance: 2 }
+          }
+        }
+      }
+    ]
+  });
+
+  const admitted = await reserveImageTaskAdmission({
+    channel: "drawing",
+    prompt: "skip one point account"
+  });
+
+  try {
+    assert.equal(admitted.target.account.id, "drawing-two-points");
+  } finally {
+    admitted.release();
+  }
+});
+
 test("image admission refreshes expired drawing quota before upload", async () => {
   const config = await loadConfig();
   await saveConfig({

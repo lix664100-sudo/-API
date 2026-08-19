@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { ChatplusClient } from "./channels/chatplus.js";
-import { DrawingClient, drawingRetryAfterSeconds, drawingSevereFailureReason, drawingUpstreamText } from "./channels/drawing.js";
+import {
+  DrawingClient,
+  drawingBalanceInsufficient,
+  drawingRetryAfterSeconds,
+  drawingSevereFailureReason,
+  drawingUpstreamText
+} from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
 import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "./image-limits.js";
 import {
@@ -218,6 +224,13 @@ function targetRuntimeAvailable(target, taskType) {
   if (!target?.channel || !target?.account) return false;
   if (target.channel.enabled === false || target.account.enabled === false) return false;
   const status = targetQuotaStatus(target);
+  if (
+    target.channel.type === "drawing"
+    && String(status.status || "").toLowerCase() === "ok"
+    && drawingBalanceInsufficient(status.balance)
+  ) {
+    return false;
+  }
   if (targetSubscriptionExpired(target)) return false;
   const confirmedQuotaBlocks = targetConfirmedQuotaBlocksTask(target, taskType);
   const quotaProbeReady = target?.channel?.type === "chatplus"
@@ -2300,6 +2313,13 @@ function targetQuotaEmpty(target) {
   return quotaEmpty && status.quotaConfirmedByUpstream === true;
 }
 
+function targetDrawingBalanceInsufficient(target) {
+  const status = targetQuotaStatus(target);
+  return target?.channel?.type === "drawing"
+    && String(status.status || "").toLowerCase() === "ok"
+    && drawingBalanceInsufficient(status.balance);
+}
+
 function statusAccountUsageEmpty(status = {}) {
   return String(status.status || "").toLowerCase() === "quota_empty"
     && status.quotaReason === "chat_usage_limit"
@@ -2373,6 +2393,7 @@ function admissionTargets(targets, taskType, options = {}) {
   const skipKnownQuotaEmpty = options.skipKnownQuotaEmpty === true;
   return targets.filter((target) => !(
     targetKnownUnavailable(target)
+      || (taskType !== "chat" && targetDrawingBalanceInsufficient(target))
       || (
         targetConfirmedQuotaBlocksTask(target, taskType)
         && !targetConfirmedQuotaRetryDue(target)
