@@ -1114,7 +1114,9 @@ function conversationSubmitError(response) {
   } catch {
     payload = null;
   }
-  const detail = String(payload?.detail?.message || payload?.message || "").trim();
+  const payloadDetail = typeof payload?.detail === "string" ? payload.detail : payload?.detail?.message;
+  const detail = String(payloadDetail || payload?.message || "").trim();
+  const upstreamText = detail || String(response.body || "").trim();
   const usage = chatUsageLimitFromText(detail || response.body);
   const error = usage
     ? chatUsageLimitError(
@@ -1124,6 +1126,12 @@ function conversationSubmitError(response) {
     : new Error(detail || `聊天站提交失败：${response.status}`);
   error.status = response.status;
   error.body = response.body;
+  error.upstreamText = upstreamText;
+  if (response.status >= 400 && response.status < 500) {
+    error.code ||= `UPSTREAM_HTTP_${response.status}`;
+    error.upstreamExplicitFailure = true;
+    error.upstreamStatus = "failed";
+  }
   return error;
 }
 
@@ -1285,6 +1293,12 @@ function chatModelKey(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function configuredChatModel(value, modelKey = "") {
+  const model = String(value || "").trim();
+  if (chatModelKey(modelKey) === "gpt" && chatModelKey(model) === "gpt-5-5-instant") return "";
+  return model;
+}
+
 const drawingModelRequestKeys = new Set([
   "auto",
   "1",
@@ -1313,7 +1327,7 @@ function requestedChatModel(input = {}) {
 }
 
 const chatModelRoutes = [
-  { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", carTier: "auto" },
+  { key: "gpt", name: "GPT", carType: "chatgpt", model: "", strategy: "balanced", carTier: "auto" },
   { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", carTier: "auto" },
   { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", carTier: "auto" }
 ];
@@ -1345,7 +1359,7 @@ function normalizeChatModelRoute(route = {}) {
     key: key || fallback.key,
     name: String(route.name || fallback.name || key || "model").trim(),
     carType: String(route.carType || fallback.carType || "chatgpt").trim(),
-    model: String(route.model || fallback.model || "").trim(),
+    model: configuredChatModel(route.model || fallback.model, key || fallback.key),
     strategy: String(route.strategy || fallback.strategy || "balanced").trim(),
     carTier: normalizeCarTier(route.carTier || fallback.carTier),
     enabled: route.enabled !== false,
@@ -1363,7 +1377,7 @@ function resolveChatModelRoute(settings = {}, requestedModel = "") {
     const fallback = defaultRouteForKey(requested || chatModelKey(settings.defaultChatModel) || "gpt");
     return {
       ...fallback,
-      model: String(requestedModel || settings.defaultModel || fallback.model || "").trim()
+      model: configuredChatModel(requestedModel || settings.defaultModel || fallback.model, fallback.key)
     };
   }
 

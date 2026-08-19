@@ -858,6 +858,88 @@ test("聊天总额度上限返回会立即停止换车并保留刷新时间", as
   assert.equal(prepareCount, 1);
 });
 
+test("GPT 聊天生图会忽略旧模型并使用网页当前模型", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: {
+      id: "shareai:chatplus",
+      settings: {
+        defaultChatModel: "gpt",
+        chatModels: [{
+          key: "gpt",
+          name: "GPT",
+          carType: "chatgpt",
+          model: "gpt-5-5-instant",
+          enabled: true,
+          default: true
+        }]
+      }
+    },
+    account: { id: "account-current-gpt-model", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let submittedModel = "";
+  client.prepareChatSession = async (input) => ({
+    route: client.chatRouteForInput(input),
+    init: { default_model_slug: "gpt-5-6-thinking" },
+    selected: { carId: "current-gpt-car", carType: "chatgpt" }
+  });
+  client.uploadChatImages = async () => [];
+  client.http = async (pathName, options) => {
+    assert.equal(pathName, "/backend-api/conversation");
+    submittedModel = options.body.model;
+    return {
+      status: 200,
+      headers: {},
+      body: "data: {\"conversation_id\":\"conversation-current-model\"}\n\ndata: [DONE]\n\n"
+    };
+  };
+
+  const result = await client.sendConversation("当前模型测试", {
+    imageGeneration: true,
+    requireConversationId: true
+  });
+
+  assert.equal(submittedModel, "gpt-5-6-thinking");
+  assert.equal(result.upstreamModel, "gpt-5-6-thinking");
+  assert.equal(result.conversationId, "conversation-current-model");
+});
+
+test("GPT 聊天生图被 403 拒绝时保留上游原文", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-submit-refused", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  client.prepareChatSession = async () => ({
+    route: { key: "gpt", model: "" },
+    init: { default_model_slug: "gpt-5-6-thinking" },
+    selected: { carId: "refused-gpt-car", carType: "chatgpt" }
+  });
+  client.uploadChatImages = async () => [];
+  client.http = async () => ({
+    status: 403,
+    headers: {},
+    body: JSON.stringify({ detail: { message: "当前模型不允许提交图片生成请求。" } })
+  });
+
+  await assert.rejects(
+    client.sendConversation("拒绝原文测试", {
+      imageGeneration: true,
+      requireConversationId: true
+    }),
+    (error) => {
+      assert.equal(error.message, "当前模型不允许提交图片生成请求。");
+      assert.equal(error.code, "UPSTREAM_HTTP_403");
+      assert.equal(error.upstreamText, "当前模型不允许提交图片生成请求。");
+      assert.equal(error.upstreamExplicitFailure, true);
+      assert.equal(error.imageSubmissionAttempted, true);
+      return true;
+    }
+  );
+});
+
 test("Grok 和 Gemini 即使返回 403，也会优先识别明确用完提示", async () => {
   const client = new ChatplusClient({
     config: {},

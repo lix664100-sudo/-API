@@ -741,6 +741,7 @@ test("wait image task returns upstream policy refusal without wrapping it as tim
     const error = new Error(message);
     error.upstreamExplicitFailure = true;
     error.upstreamStatus = "failed";
+    error.upstreamText = message;
     error.status = 400;
     error.code = "content_policy";
     throw error;
@@ -759,6 +760,7 @@ test("wait image task returns upstream policy refusal without wrapping it as tim
         assert.equal(error.code, "content_policy");
         assert.equal(error.task.status, "failed");
         assert.equal(error.task.responseJson.message, message);
+        assert.equal(error.task.responseJson.upstreamText, message);
         assert.deepEqual(
           error.task.submissionChannels.map((item) => [item.channelId, item.accountId]),
           [["shareai:chatplus", "account-policy-wait"]]

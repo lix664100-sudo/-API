@@ -1480,7 +1480,7 @@
       ];
 
       const chatModelDefaults = [
-        { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", carTier: "auto", enabled: true, default: true },
+        { key: "gpt", name: "GPT", carType: "chatgpt", model: "", strategy: "balanced", carTier: "auto", enabled: true, default: true },
         { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", carTier: "auto", enabled: true, default: false },
         { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", carTier: "auto", enabled: true, default: false }
       ];
@@ -3933,15 +3933,21 @@
         function defaultEditRouteForAccount(account, sourceChannels = channels, sourceConfig = config) {
           const channel = channelForAccount(account);
           const abilities = accountImageAbilities(account);
-          if (abilities.chatplus && !abilities.drawing) return "chatplus:auto";
+          if (abilities.chatplus && (!abilities.drawing || sourceConfig?.imageSourcePriority !== "drawing")) return "chatplus:auto";
           const channelId = channel?.id || sourceConfig?.defaultChannel || "auto";
           return `drawing:${defaultModelForChannel(channelId, sourceChannels, sourceConfig)}`;
         }
 
         function defaultEditRouteValue(defaultChannel, sourceChannels = channels, sourceConfig = config) {
           const channel = sourceChannels.find((item) => item.id === defaultChannel);
+          const prefersChat = sourceConfig?.imageSourcePriority !== "drawing";
+          if (!channel && prefersChat && sourceChannels.some((item) => (
+            item.type === "chatplus" || (item.type === "shareai" && channelAbilityEnabled(item, "chatplus"))
+          ))) return "chatplus:auto";
           if (channel?.type === "chatplus") return "chatplus:auto";
-          if (channel?.type === "shareai" && !channelAbilityEnabled(channel, "drawing") && channelAbilityEnabled(channel, "chatplus")) {
+          if (channel?.type === "shareai"
+            && channelAbilityEnabled(channel, "chatplus")
+            && (!channelAbilityEnabled(channel, "drawing") || prefersChat)) {
             return "chatplus:auto";
           }
           return `drawing:${defaultModelForChannel(defaultChannel, sourceChannels, sourceConfig)}`;
@@ -4584,15 +4590,6 @@
             chatForm.setFieldValue("model", "");
           }
         }, [chatForm, chatTestModelOptions]);
-
-        useEffect(() => {
-          if (!selectedEditAccountValue) return;
-          const account = accounts.find((item) => item.id === selectedEditAccountValue);
-          const nextRoute = account
-            ? defaultEditRouteForAccount(account)
-            : defaultEditRouteValue(config?.defaultChannel, channels, config);
-          if (nextRoute) editForm.setFieldValue("routeModel", nextRoute);
-        }, [selectedEditAccountValue, accounts, channels, config]);
 
         useEffect(() => {
           const currentRoute = editForm.getFieldValue("routeModel");

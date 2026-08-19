@@ -1,6 +1,7 @@
 import { randomBytes, randomInt, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { normalizeProxyUrl, safeProxyEndpoint } from "./proxy.js";
 
@@ -51,7 +52,7 @@ const defaultConcurrency = {
 };
 
 const defaultChatModels = [
-  { key: "gpt", name: "GPT", carType: "chatgpt", model: "gpt-5-5-instant", strategy: "balanced", carTier: "auto", enabled: true, default: true },
+  { key: "gpt", name: "GPT", carType: "chatgpt", model: "", strategy: "balanced", carTier: "auto", enabled: true, default: true },
   { key: "grok", name: "Grok", carType: "grok", model: "", strategy: "balanced", carTier: "auto", enabled: true, default: false },
   { key: "gemini", name: "Gemini", carType: "gemini", model: "", strategy: "thinking", carTier: "auto", enabled: true, default: false }
 ];
@@ -119,7 +120,15 @@ async function writeJson(file, value) {
   await ensureDir();
   const tempFile = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tempFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rename(tempFile, file);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(tempFile, file);
+      return;
+    } catch (error) {
+      if (!["EACCES", "EBUSY", "EPERM"].includes(error?.code) || attempt >= 4) throw error;
+      await delay(20 * (2 ** attempt));
+    }
+  }
 }
 
 function storageTaskId(task = {}) {
@@ -375,11 +384,12 @@ function normalizeChatModels(settings = {}, migrateAutoSelection = false) {
     const migratedEnabled = migrateAutoSelection && item?.enabled === false && ["grok", "gemini"].includes(key)
       ? true
       : item?.enabled !== false;
+    const configuredModel = String(item?.model || (key === "gpt" ? legacy.model : base.model || "")).trim();
     return {
       key,
       name: String(item?.name || base.name || key).trim(),
       carType: String(item?.carType || (key === "gpt" ? legacy.carType : base.carType || "")).trim(),
-      model: String(item?.model || (key === "gpt" ? legacy.model : base.model || "")).trim(),
+      model: key === "gpt" && normalizeChatModelKey(configuredModel) === "gpt-5-5-instant" ? "" : configuredModel,
       strategy: String(item?.strategy || base.strategy || "balanced").trim(),
       carTier: normalizeCarTier(item?.carTier || base.carTier),
       enabled: migratedEnabled,
@@ -429,6 +439,8 @@ function normalizeShareAIChannel(channels = []) {
   delete settings.baseUrl;
   delete settings.carId;
   delete settings.carType;
+  delete settings.model;
+  delete settings.defaultModel;
   delete settings.imageSourcePriority;
 
   return [{
@@ -479,6 +491,8 @@ function normalizeShareAISettings(channel = {}, legacy = {}) {
   delete settings.baseUrl;
   delete settings.carId;
   delete settings.carType;
+  delete settings.model;
+  delete settings.defaultModel;
   delete settings.imageSourcePriority;
   return settings;
 }

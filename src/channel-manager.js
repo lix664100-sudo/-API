@@ -864,6 +864,8 @@ function imageSubmissionFailure(error) {
   failure.status = Number(error?.status || error?.statusCode || 0) || 502;
   failure.code = "IMAGE_SUBMISSION_UNCERTAIN";
   failure.imageSubmissionAttempted = true;
+  failure.upstreamText = String(error?.upstreamText || error?.body || "").trim();
+  failure.upstreamStatus = error?.upstreamStatus || "";
   return failure;
 }
 
