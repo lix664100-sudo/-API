@@ -1950,6 +1950,73 @@ test("后台可以用服务器账号读取上游聊天详情", async () => {
   }
 });
 
+test("已提交但被中间 JSON 误判失败的聊天生图会自动恢复", async () => {
+  const originalConfig = await loadConfig();
+  await saveConfig({
+    ...originalConfig,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-recover-early-image-json",
+      channelId: "shareai",
+      name: "中间结果恢复测试账号",
+      username: "recover-early-image-json@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok"
+    }]
+  });
+
+  const intermediateMessage = JSON.stringify({
+    prompt: null,
+    size: null,
+    n: 1,
+    referenced_image_ids: ["file-source"]
+  });
+  await upsertTask({
+    id: "task-recover-early-image-json",
+    externalId: "conversation-recover-early-image-json",
+    status: "failed",
+    taskType: "img2img",
+    prompt: "恢复延迟图片",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-recover-early-image-json",
+    accountName: "中间结果恢复测试账号",
+    imageCount: 0,
+    imageUrls: [],
+    errorMessage: intermediateMessage,
+    responseJson: { status: "failed", message: intermediateMessage },
+    raw: {
+      submitted: true,
+      conversationId: "conversation-recover-early-image-json"
+    },
+    createdAt: new Date().toISOString(),
+    completedAt: new Date().toISOString()
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  ChatplusClient.prototype.getTask = async () => ({
+    externalId: "conversation-recover-early-image-json",
+    status: "success",
+    imageCount: 1,
+    imageUrls: ["https://one.example.test/recovered.png"],
+    errorMessage: "",
+    raw: { conversationId: "conversation-recover-early-image-json" }
+  });
+
+  try {
+    const recovered = await refreshTask("task-recover-early-image-json");
+    assert.equal(recovered.status, "success");
+    assert.equal(recovered.imageCount, 1);
+    assert.deepEqual(recovered.imageUrls, ["https://one.example.test/recovered.png"]);
+    assert.equal(recovered.errorMessage, "");
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    await saveConfig(originalConfig);
+  }
+});
+
 test("聊天生图异步提交拿到编号后不等待图片", async () => {
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },

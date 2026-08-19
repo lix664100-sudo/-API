@@ -770,12 +770,31 @@ function isPendingTask(status) {
   return ["processing", "queued", "pending", "unknown", "waiting_upstream"].includes(status);
 }
 
+function isRecoverableChatImageFailure(task = {}) {
+  if (task.channelType !== "chatplus" || task.raw?.submitted !== true) return false;
+  if (!["img2img", "text2img"].includes(task.taskType)) return false;
+  const message = String(task.errorMessage || task.responseJson?.message || "").trim();
+  if (!message) return false;
+  try {
+    const payload = JSON.parse(message);
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+    if (payload.skipped_mainline === true) return true;
+    return Object.prototype.hasOwnProperty.call(payload, "prompt")
+      && Object.prototype.hasOwnProperty.call(payload, "size")
+      && Object.prototype.hasOwnProperty.call(payload, "n")
+      && Array.isArray(payload.referenced_image_ids);
+  } catch {
+    return false;
+  }
+}
+
 function isFinishedTask(status) {
   return ["success", "failed", "cancelled"].includes(status);
 }
 
-function needsTaskRefresh(task) {
-  return isPendingTask(task.status) || (task.status === "failed" && !task.errorMessage);
+function needsTaskRefresh(task = {}) {
+  return isPendingTask(task.status)
+    || (task.status === "failed" && (!task.errorMessage || isRecoverableChatImageFailure(task)));
 }
 
 function accountCooling(account) {
@@ -1166,7 +1185,9 @@ export async function inspectUpstreamTask(taskId) {
     status: result.status || task.status || "",
     imageCount: Number(result.imageCount || 0),
     imageUrls: result.imageUrls || [],
-    errorMessage: result.errorMessage || task.errorMessage || task.responseJson?.message || "",
+    errorMessage: result.status === "success"
+      ? ""
+      : result.errorMessage || task.errorMessage || task.responseJson?.message || "",
     channelId: channel.id,
     channelName: channel.name,
     accountId: account.id,
@@ -1721,7 +1742,7 @@ function mergeRefreshedTask(task, result, channel, account) {
     imageCount: result.imageCount ?? task.imageCount,
     imageUrls: result.imageUrls || task.imageUrls || [],
     upstreamText: resultUpstreamText(result) || task.upstreamText || "",
-    errorMessage: taskErrorMessage(result, task),
+    errorMessage: status === "success" ? "" : taskErrorMessage(result, task),
     channelId: channel.id,
     channelName: channel.name,
     channelType: channel.type,
