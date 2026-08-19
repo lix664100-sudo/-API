@@ -1291,7 +1291,11 @@ async function interruptExpiredUpstreamWait(task) {
 
 function retryableInterruptedUpstreamTask(task = {}) {
   return task.status === "interrupted"
-    && (task.raw?.upstreamWaitExpired === true || task.raw?.manualRefreshAvailable === true);
+    && (
+      task.raw?.upstreamWaitExpired === true
+      || task.raw?.manualRefreshAvailable === true
+      || task.raw?.imageMirrorGaveUp === true
+    );
 }
 
 async function keepUpstreamRefreshRecoverable(task, error, timeoutSec, options = {}) {
@@ -1389,16 +1393,20 @@ function failedRefreshResult(task, externalId, error) {
   };
 }
 
+function isTemporaryGeneratedImageUrl(value) {
+  const source = String(value || "").trim();
+  if (!source) return false;
+  try {
+    return /^\/image_generation_content\/[^/]+$/i.test(new URL(source).pathname.replace(/\/+$/, ""));
+  } catch {
+    return /(?:^|\/)image_generation_content\/[^/?#]+(?:$|[?#])/i.test(source);
+  }
+}
+
 function usableImageResultUrls(urls = []) {
   return [...new Set((Array.isArray(urls) ? urls : []).filter((value) => {
     const source = String(value || "").trim();
-    if (!source) return false;
-    if (/(?:^|\/)image_generation_content\/[^/?#]+(?:$|[?#])/i.test(source)) return false;
-    try {
-      return !/^\/image_generation_content\/[^/]+$/i.test(new URL(source).pathname.replace(/\/+$/, ""));
-    } catch {
-      return !/(?:^|\/)image_generation_content\/[^/?#]+(?:$|[?#])/i.test(source);
-    }
+    return Boolean(source) && !isTemporaryGeneratedImageUrl(source);
   }))];
 }
 
@@ -1829,10 +1837,12 @@ async function refreshTaskOnce(taskId) {
 
   const taskStillActive = scheduledImageTasks.has(task.id) || activeSubmittedTaskIds.has(task.id);
   const originalImageUrls = storedOriginalImageUrls(task);
+  const hadTemporaryGeneratedImageUrl = Array.isArray(task.raw?.originalImageUrls)
+    && task.raw.originalImageUrls.some(isTemporaryGeneratedImageUrl);
   let storedMirrorError = null;
   if (originalImageUrls.length) {
     if (taskStillActive) return task;
-    if (imageMirrorRecoveryExpired(task)) {
+    if (imageMirrorRecoveryExpired(task) && !(manualRetry && hadTemporaryGeneratedImageUrl)) {
       const now = new Date().toISOString();
       return interruptExpiredImageMirror(
         task,
