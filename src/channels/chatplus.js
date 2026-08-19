@@ -225,6 +225,12 @@ function isAuthSessionError(error) {
   return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|unauthorized|forbidden|session expired/i.test(text);
 }
 
+function isRetryableImageSubmissionRejection(error) {
+  return error?.imageSubmissionAttempted === true
+    && error?.upstreamExplicitFailure === true
+    && Number(error?.status || error?.statusCode || 0) === 401;
+}
+
 function isProCarPlanMismatchError(error) {
   const text = `${error?.message || ""} ${error?.body || ""}`.replace(/\s+/g, " ");
   return /不是\s*Pro\s*用户|not.{0,12}(?:a\s+)?pro\s+user/i.test(text);
@@ -2823,6 +2829,12 @@ export class ChatplusClient {
           if (selected && error.code === "INVALID_UPSTREAM_RESPONSE") {
             this.rememberImageFailedCar(selected);
           }
+        }
+        if (selected && isRetryableImageSubmissionRejection(error)) {
+          this.rememberAuthFailedCar(selected);
+          await this.sessionLock(async () => this.resetSession());
+          errors.push(error.message || "上游拒绝了当前聊天车位");
+          continue;
         }
         if (error.noRetry || error.imageQuotaExhausted || error.imageSubmissionAttempted) {
           if (error.quotaConfirmedByUpstream === true) {

@@ -940,6 +940,55 @@ test("GPT 聊天生图被 403 拒绝时保留上游原文", async () => {
   );
 });
 
+test("GPT 聊天生图明确返回 401 时会换下一个车位", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-switch-on-401", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  const selectedCars = [];
+  let requestCount = 0;
+  client.prepareChatSession = async (_input, ignoredCarIds) => {
+    const carId = ignoredCarIds.has("deleted-chat-car") ? "healthy-chat-car" : "deleted-chat-car";
+    ignoredCarIds.add(carId);
+    selectedCars.push(carId);
+    return {
+      route: { key: "gpt", model: "" },
+      init: { default_model_slug: "gpt-5-6-thinking" },
+      selected: { carId, carType: "chatgpt" }
+    };
+  };
+  client.uploadChatImages = async () => [];
+  client.http = async () => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return {
+        status: 401,
+        headers: {},
+        body: JSON.stringify({
+          detail: {
+            message: "该车队的聊天记录已删除，请点击【换车继续聊】。"
+          }
+        })
+      };
+    }
+    return {
+      status: 200,
+      headers: {},
+      body: "data: {\"conversation_id\":\"conversation-healthy\"}\n\ndata: [DONE]\n\n"
+    };
+  };
+  const result = await client.sendConversation("401 换车测试", {
+    imageGeneration: true,
+    requireConversationId: true
+  });
+
+  assert.equal(requestCount, 2);
+  assert.equal(result.conversationId, "conversation-healthy");
+  assert.deepEqual(selectedCars, ["deleted-chat-car", "healthy-chat-car"]);
+});
+
 test("Grok 和 Gemini 即使返回 403，也会优先识别明确用完提示", async () => {
   const client = new ChatplusClient({
     config: {},
