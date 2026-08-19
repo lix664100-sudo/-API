@@ -704,9 +704,9 @@ function isPlaceholderGeminiImageUrl(value) {
   if (!source) return false;
   try {
     const url = new URL(source);
-    return /^\/image_generation_content\/\d+$/i.test(url.pathname.replace(/\/+$/, ""));
+    return /^\/image_generation_content\/[^/]+$/i.test(url.pathname.replace(/\/+$/, ""));
   } catch {
-    return /(?:^|\/)image_generation_content\/\d+(?:$|[?#])/i.test(source);
+    return /(?:^|\/)image_generation_content\/[^/?#]+(?:$|[?#])/i.test(source);
   }
 }
 

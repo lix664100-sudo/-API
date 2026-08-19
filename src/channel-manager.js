@@ -1393,10 +1393,11 @@ function usableImageResultUrls(urls = []) {
   return [...new Set((Array.isArray(urls) ? urls : []).filter((value) => {
     const source = String(value || "").trim();
     if (!source) return false;
+    if (/(?:^|\/)image_generation_content\/[^/?#]+(?:$|[?#])/i.test(source)) return false;
     try {
-      return !/^\/image_generation_content\/\d+$/i.test(new URL(source).pathname.replace(/\/+$/, ""));
+      return !/^\/image_generation_content\/[^/]+$/i.test(new URL(source).pathname.replace(/\/+$/, ""));
     } catch {
-      return !/(?:^|\/)image_generation_content\/\d+(?:$|[?#])/i.test(source);
+      return !/(?:^|\/)image_generation_content\/[^/?#]+(?:$|[?#])/i.test(source);
     }
   }))];
 }

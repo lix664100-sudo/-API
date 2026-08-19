@@ -1271,7 +1271,7 @@ test("synchronous image waits for a temporary proxy mirror failure", async () =>
 
   const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
   const originalDownloadResultImage = ChatplusClient.prototype.downloadResultImage;
-  const placeholderUrl = "http://googleusercontent.com/image_generation_content/421";
+  const placeholderUrl = "http://googleusercontent.com/image_generation_content/0_462";
   const upstreamUrl = "https://one.aishare.icu/gemini/images/gg-dl/recoverable-image";
   let downloadAttempt = 0;
   const downloadedUrls = [];

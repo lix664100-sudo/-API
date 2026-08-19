@@ -285,7 +285,7 @@ test("Gemini 返回图片时直接算成功，不再走 GPT 详情接口", async
     headers: {},
     body: geminiResponse({
       text: "已完成",
-      imageUrl: "http://googleusercontent.com/image_generation_content/421 http://googleusercontent.com/image_generation_content/404 /gemini/images/gg-dl/generated-image"
+      imageUrl: "http://googleusercontent.com/image_generation_content/0_462 http://googleusercontent.com/image_generation_content/0_463 /gemini/images/gg-dl/generated-image"
     })
   });
 
