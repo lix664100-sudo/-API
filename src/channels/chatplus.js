@@ -7,6 +7,10 @@ const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
 const ACCOUNT_CHECK_TIMEOUT_SEC = 20;
 const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 300;
 const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
+const CONVERSATION_READ_HEADERS = Object.freeze({
+  "cache-control": "no-cache",
+  pragma: "no-cache"
+});
 const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
 const GEMINI_REQUEST_PATH = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
@@ -1851,6 +1855,16 @@ export class ChatplusClient {
     return payload;
   }
 
+  async conversationDetail(conversationId, options = {}) {
+    return this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+      ...options,
+      headers: {
+        ...CONVERSATION_READ_HEADERS,
+        ...(options.headers || {})
+      }
+    });
+  }
+
   resetSession() {
     this.cookies = [];
     this.portalLoggedIn = false;
@@ -2064,12 +2078,12 @@ export class ChatplusClient {
     });
   }
 
-  async login() {
+  async login(options = {}) {
     const route = resolveChatModelRoute(this.channel?.settings || {}, "");
-    const selected = await this.selectCar(route);
+    const selected = await this.selectCar(route, new Set(), options);
     this.carId = selected.carId;
     this.carType = selected.carType;
-    await this.enterCar(this.carId, this.carType);
+    await this.enterCar(this.carId, this.carType, options);
   }
 
   async getInit() {
@@ -3016,7 +3030,7 @@ export class ChatplusClient {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
-        const detail = await this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}`);
+        const detail = await this.conversationDetail(conversationId);
         const content = extractAssistantText(detail);
         const promptEnvelope = isImagePromptEnvelope(content);
         if (!promptEnvelope) throwIfImageGenerationLimit(content);
@@ -3044,9 +3058,11 @@ export class ChatplusClient {
 
   async getTask(externalId, context = {}) {
     if (!externalId) throw new Error("缺少上游任务编号。");
-    await this.loginPortal();
+    const timeoutSec = Number(context.timeoutSec || 0);
+    const requestOptions = timeoutSec > 0 ? { timeoutSec } : {};
+    await this.loginPortal(requestOptions);
     const readDetail = async () => {
-      const payload = await this.json(`/backend-api/conversation/${encodeURIComponent(externalId)}`);
+      const payload = await this.conversationDetail(externalId, requestOptions);
       if (!payload || typeof payload !== "object") {
         const error = new Error("上游暂时没有返回有效任务状态。");
         error.code = "UPSTREAM_TASK_STATE_UNAVAILABLE";
@@ -3063,13 +3079,13 @@ export class ChatplusClient {
     };
     const restoreConversationSession = async (reset = false) => {
       if (reset) await this.sessionLock(async () => this.resetSession());
-      await this.loginPortal();
+      await this.loginPortal(requestOptions);
       if (context.carId) {
         this.carId = String(context.carId);
         this.carType = String(context.carType || "chatgpt");
-        await this.enterCar(this.carId, this.carType);
+        await this.enterCar(this.carId, this.carType, requestOptions);
       } else if (!this.carId) {
-        await this.login();
+        await this.login(requestOptions);
       }
     };
     let detail = null;
@@ -3282,7 +3298,7 @@ export class ChatplusClient {
           let detailContent = "";
           if (conversationId && !["grok", "gemini"].includes(route?.key)) {
             try {
-              const detail = await this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}`);
+              const detail = await this.conversationDetail(conversationId);
               detailContent = extractAssistantText(detail);
               imageUrls = [...new Set([...imageUrls, ...(await this.imageUrlsFrom(detail, { generatedOnly: true }))])];
             } catch {

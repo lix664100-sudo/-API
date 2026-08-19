@@ -9,6 +9,7 @@ import {
 } from "./channels/drawing.js";
 import { mirrorImageUrls } from "./image-store.js";
 import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "./image-limits.js";
+import { createFastTaskRefresher } from "./fast-task-refresher.js";
 import {
   checkProxyReachability,
   isProxyConnectionError,
@@ -53,6 +54,7 @@ const DRAWING_FAILURE_LIMIT = 3;
 const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
 const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
 const FAST_QUOTA_REFRESH_TIMEOUT_MS = 5000;
+const FAST_TASK_REFRESH_TIMEOUT_SEC = 30;
 const UPSTREAM_RESULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS = 20;
@@ -1937,7 +1939,8 @@ async function refreshTaskOnce(taskId) {
   try {
     refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
       carId: task.raw?.selectedCarId,
-      carType: task.raw?.selectedCarType
+      carType: task.raw?.selectedCarType,
+      timeoutSec: FAST_TASK_REFRESH_TIMEOUT_SEC
     }));
     refreshReadSucceeded = true;
   } catch (error) {
@@ -2029,6 +2032,29 @@ export async function refreshTask(taskId) {
   return refresh;
 }
 
+function fastTaskRefreshEligible(task = {}) {
+  return Boolean(
+    task.id
+    && task.channelType === "chatplus"
+    && ["img2img", "text2img"].includes(task.taskType)
+    && task.raw?.submitted === true
+    && savedTaskExternalId(task)
+    && needsTaskRefresh(task)
+  );
+}
+
+const fastTaskRefresher = createFastTaskRefresher({
+  refresh: (taskId) => refreshTask(taskId),
+  shouldContinue: fastTaskRefreshEligible
+});
+
+function scheduleFastTaskRefresh(task) {
+  if (!fastTaskRefreshEligible(task)) return null;
+  const refresh = fastTaskRefresher.schedule(task.id);
+  refresh?.catch((error) => console.error(error));
+  return refresh;
+}
+
 function isLostLocalChatTask(task) {
   return task.taskType === "chat" && isPendingTask(task.status) && task.raw?.queued && !scheduledChatTasks.has(task.id);
 }
@@ -2083,7 +2109,9 @@ export async function refreshProcessingTasks() {
         results.push({ id: task.id, ok: true, data: await failLostLocalChatTask(task) });
         continue;
       }
-      results.push({ id: task.id, ok: true, data: await refreshTask(task.id) });
+      const refreshed = await refreshTask(task.id);
+      scheduleFastTaskRefresh(refreshed);
+      results.push({ id: task.id, ok: true, data: refreshed });
     } catch (error) {
       results.push({ id: task.id, ok: false, message: error.message });
     }
@@ -3303,6 +3331,7 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
   if (isFinishedTask(nextTask.status)) await recordTaskStat(nextTask);
   await updateAccountAfterTask(account, channel, nextTask);
   scheduleDrawingQuotaRefresh(account, channel);
+  scheduleFastTaskRefresh(nextTask);
   return nextTask;
 }
 
@@ -3439,6 +3468,7 @@ async function keepSubmittedTaskRecoverable(task, error, attempts = []) {
     }
   };
   await upsertTask(nextTask);
+  scheduleFastTaskRefresh(nextTask);
   return nextTask;
 }
 

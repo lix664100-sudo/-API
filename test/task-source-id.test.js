@@ -396,6 +396,33 @@ test("chatplus task refresh keeps prompt JSON in progress", async () => {
   assert.deepEqual(task.imageUrls, []);
 });
 
+test("chatplus task refresh bypasses cached conversation results", async () => {
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-refresh-account", username: "refresh@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  const loginOptions = [];
+  let detailRequest = null;
+  client.loginPortal = async (options) => {
+    loginOptions.push(options);
+  };
+  client.json = async (pathName, options) => {
+    detailRequest = { pathName, options };
+    return { mapping: {} };
+  };
+
+  const task = await client.getTask("conversation-no-cache", { timeoutSec: 30 });
+
+  assert.equal(task.status, "waiting_upstream");
+  assert.equal(detailRequest.pathName, "/backend-api/conversation/conversation-no-cache");
+  assert.equal(detailRequest.options.timeoutSec, 30);
+  assert.equal(detailRequest.options.headers["cache-control"], "no-cache");
+  assert.equal(detailRequest.options.headers.pragma, "no-cache");
+  assert.deepEqual(loginOptions, [{ timeoutSec: 30 }]);
+});
+
 test("chatplus task refresh keeps image parameters in progress until the image appears", async () => {
   const imageParameters = JSON.stringify({
     prompt: null,
