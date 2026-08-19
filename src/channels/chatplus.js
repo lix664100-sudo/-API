@@ -93,24 +93,56 @@ function curlProcessError(code, stderr) {
   return error;
 }
 
-function runCurl(args, input = "") {
+function runCurl(args, input = "", options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(CURL_COMMAND, args, { windowsHide: true });
     let stdout = "";
     let stderr = "";
+    let abortError = null;
+    let settled = false;
+    const abortWhen = typeof options.abortWhen === "function" ? options.abortWhen : null;
+    const finishResolve = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
     child.stdout.on("data", (data) => {
       stdout += data;
+      if (!abortWhen || abortError) return;
+      try {
+        const candidate = abortWhen(stdout.length > 32768 ? stdout.slice(-32768) : stdout);
+        if (candidate instanceof Error) {
+          abortError = candidate;
+          child.kill();
+        }
+      } catch (error) {
+        abortError = error;
+        child.kill();
+      }
     });
     child.stderr.on("data", (data) => {
       stderr += data;
     });
-    child.on("error", reject);
+    child.on("error", (error) => {
+      if (abortError) return;
+      finishReject(error);
+    });
     child.on("close", (code) => {
-      if (!code) {
-        resolve(stdout);
+      if (abortError) {
+        abortError.body = stdout;
+        finishReject(abortError);
         return;
       }
-      reject(curlProcessError(code, stderr));
+      if (!code) {
+        finishResolve(stdout);
+        return;
+      }
+      finishReject(curlProcessError(code, stderr));
     });
     if (input) child.stdin.end(input);
     else child.stdin.end();
@@ -892,13 +924,23 @@ function isImageGenerationLimitMessage(content) {
     || /(?:图片|图像).{0,12}(?:生成).{0,24}(?:额度|配额|上限|限制).{0,16}(?:用完|耗尽|达到|已满)/.test(text);
 }
 
-function throwIfImageGenerationLimit(content) {
+function isPlusPlanImageGenerationLimitMessage(content) {
+  const text = String(content || "").replace(/\s+/g, " ").trim();
+  return /(?:you(?:'|’)ve|you have) hit (?:the )?plus plan limit for image generation(?:s| requests)?/i.test(text);
+}
+
+function imageCarQuotaError(content = "") {
+  const error = new Error("当前车位的图片生成次数已用完，正在切换其他车位。");
+  error.imageCarQuotaExhausted = true;
+  error.plusPlanLimit = isPlusPlanImageGenerationLimitMessage(content);
+  error.upstreamText = String(content || "").replace(/\s+/g, " ").trim();
+  error.status = 429;
+  return error;
+}
+
+function throwIfImageGenerationLimit(content, options = {}) {
   if (!isImageGenerationLimitMessage(content)) return;
-  const error = new Error("当前账户的图片生成额度已用完，正在切换下一个账户。");
-  error.imageQuotaExhausted = true;
-  error.quotaEmpty = true;
-  error.quotaReason = "image_quota";
-  error.quotaConfirmedByUpstream = true;
+  const error = options.car ? imageCarQuotaError(content) : imageQuotaError();
   throw error;
 }
 
@@ -1573,8 +1615,15 @@ function geminiThinkingModeForRoute(route = {}) {
   return String(route.strategy || "").toLowerCase() === "thinking" ? 0 : 4;
 }
 
+function savedProCarRestriction(account = {}, channel = {}) {
+  const ability = String(channel?.ability || "");
+  const abilityMeta = ability ? account.meta?.abilities?.[ability]?.meta : null;
+  return abilityMeta?.proCarsUnavailable === true
+    || account.meta?.chatplusProCarsUnavailable === true;
+}
+
 export class ChatplusClient {
-  constructor({ config, channel, account, sessionLock }) {
+  constructor({ config, channel, account, sessionLock, onProCarsUnavailable }) {
     this.config = config;
     this.channel = channel;
     this.account = account;
@@ -1593,10 +1642,11 @@ export class ChatplusClient {
       sourcePath: "/app"
     };
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
+    this.onProCarsUnavailable = typeof onProCarsUnavailable === "function" ? onProCarsUnavailable : null;
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWorks = new Map();
     this.concurrentChatSessions = new Map();
-    this.proCarsUnavailableUntil = 0;
+    this.proCarsUnavailableUntil = savedProCarRestriction(account, channel) ? Infinity : 0;
   }
 
   makeContextSignature({ channel, account }) {
@@ -1608,7 +1658,7 @@ export class ChatplusClient {
     ].join("::");
   }
 
-  updateContext({ config, channel, account, sessionLock }) {
+  updateContext({ config, channel, account, sessionLock, onProCarsUnavailable }) {
     const nextSignature = this.makeContextSignature({ channel, account });
     const changed = nextSignature !== this.contextSignature;
     this.config = config;
@@ -1616,10 +1666,13 @@ export class ChatplusClient {
     this.account = account;
     this.baseUrl = trimSlash(channel?.settings?.baseUrl || "https://www.chatplus.cc");
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
+    this.onProCarsUnavailable = typeof onProCarsUnavailable === "function" ? onProCarsUnavailable : null;
     if (changed) {
       this.contextSignature = nextSignature;
-      this.proCarsUnavailableUntil = 0;
+      this.proCarsUnavailableUntil = savedProCarRestriction(account, channel) ? Infinity : 0;
       this.resetSession();
+    } else if (savedProCarRestriction(account, channel)) {
+      this.proCarsUnavailableUntil = Infinity;
     }
   }
 
@@ -1649,6 +1702,7 @@ export class ChatplusClient {
     const args = ["-sS", "-i"];
     if (options.followRedirect) args.push("-L");
     args.push("--connect-timeout", String(DEFAULT_CONNECT_TIMEOUT_SEC));
+    if (typeof options.abortWhen === "function") args.push("--no-buffer");
     args.push("--max-time", String(requestTimeoutSec(options, this.config)));
     const proxyUrl = proxyUrlFor(this.account);
     if (proxyUrl) args.push("--proxy", proxyUrl);
@@ -1664,7 +1718,9 @@ export class ChatplusClient {
       args.push("--data-binary", "@-");
       if (!headers["content-type"] && !options.rawBody) args.push("-H", "content-type: application/json");
     }
-    const result = splitHttp(await runCurl(args, input));
+    const result = splitHttp(await runCurl(args, input, {
+      abortWhen: options.abortWhen
+    }));
     setCookiesFromHeaders(this.cookies, result.headers);
     return result;
   }
@@ -2081,8 +2137,19 @@ export class ChatplusClient {
 
   rememberProCarsUnavailable(error) {
     if (isProCarPlanMismatchError(error)) {
-      this.proCarsUnavailableUntil = Date.now() + BAD_CAR_TTL_MS;
+      this.proCarsUnavailableUntil = Infinity;
+      Promise.resolve(this.onProCarsUnavailable?.()).catch((persistError) => {
+        console.error("保存账号车位等级失败：", persistError);
+      });
     }
+  }
+
+  rememberPlusPlanLimit(error) {
+    if (!error?.plusPlanLimit) return;
+    this.proCarsUnavailableUntil = Infinity;
+    Promise.resolve(this.onProCarsUnavailable?.()).catch((persistError) => {
+      console.error("保存账号车位等级失败：", persistError);
+    });
   }
 
   async prepareChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
@@ -2768,6 +2835,7 @@ export class ChatplusClient {
 
   async sendConversation(prompt, input = {}, ignoredCarIds = new Set()) {
     const errors = [];
+    const imageCarQuotaErrors = [];
     const runSubmitStep = input.concurrentSubmit === true
       ? async (work) => work()
       : async (work) => this.sessionLock(work);
@@ -2802,6 +2870,9 @@ export class ChatplusClient {
         const response = await runSubmitStep(() => submitClient.http("/backend-api/conversation", {
           method: "POST",
           body,
+          abortWhen: requestInput.imageGeneration === true
+            ? (chunk) => isImageGenerationLimitMessage(chunk) ? imageCarQuotaError(chunk) : null
+            : null,
           headers: {
             accept: "text/event-stream",
             referer: `${this.baseUrl}/`
@@ -2812,7 +2883,7 @@ export class ChatplusClient {
         }
 
         const events = parseSse(response.body);
-        throwIfImageGenerationLimit(extractAssistantText(events));
+        throwIfImageGenerationLimit(extractAssistantText(events), { car: requestInput.imageGeneration === true });
         let conversationId = "";
         for (const event of events) {
           if (event.conversation_id) conversationId = event.conversation_id;
@@ -2839,6 +2910,13 @@ export class ChatplusClient {
           if (selected && error.code === "INVALID_UPSTREAM_RESPONSE") {
             this.rememberImageFailedCar(selected);
           }
+        }
+        if (selected && error.imageCarQuotaExhausted === true) {
+          this.rememberImageFailedCar(selected);
+          this.rememberPlusPlanLimit(error);
+          await this.sessionLock(async () => this.resetSession());
+          imageCarQuotaErrors.push(error.message || "当前车位不能继续生图");
+          continue;
         }
         if (selected && isRetryableImageSubmissionRejection(error)) {
           this.rememberAuthFailedCar(selected);
@@ -2868,7 +2946,9 @@ export class ChatplusClient {
         errors.push(error.message || "调用失败");
       }
     }
-    throw new Error(`自动换车失败：${errors.join("；")}`);
+    const error = new Error(`自动换车失败：${[...imageCarQuotaErrors, ...errors].join("；")}`);
+    if (imageCarQuotaErrors.length) error.imageCarQuotaExhausted = true;
+    throw error;
   }
 
   async withImageQuotaFallback(prompt, input, work) {

@@ -672,12 +672,36 @@ function clientCacheKey(channel, account) {
   ].join("::");
 }
 
+async function persistProCarRestriction(channel, account) {
+  const config = await loadRuntimeConfig();
+  const current = config.accounts.find((item) => item.id === account.id);
+  if (!current) return;
+  const ability = channelAbilityKey(channel);
+  if (ability) {
+    const abilityStatus = current.meta?.abilities?.[ability] || {};
+    await updateTargetAccountStatus(account.id, channel, {
+      meta: {
+        ...(abilityStatus.meta || {}),
+        proCarsUnavailable: true
+      }
+    });
+    return;
+  }
+  await updateAccountStatus(account.id, {
+    meta: {
+      ...(current.meta || {}),
+      chatplusProCarsUnavailable: true
+    }
+  });
+}
+
 function clientContext(config, channel, account) {
   return {
     config,
     channel,
     account,
-    sessionLock: (work) => withAccountAuthLock(account, work)
+    sessionLock: (work) => withAccountAuthLock(account, work),
+    onProCarsUnavailable: () => persistProCarRestriction(channel, account)
   };
 }
 
@@ -3499,7 +3523,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
             ? isExplicitChatQuotaError(error)
             : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
         });
-        if (!error.busy) {
+        if (!error.busy && !error.imageCarQuotaExhausted) {
           await updateTargetStatusAfterError(account, channel, error);
         }
       } finally {
@@ -3660,7 +3684,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
             ? isExplicitChatQuotaError(error)
             : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
         });
-        if (!error.busy) {
+        if (!error.busy && !error.imageCarQuotaExhausted) {
           await updateTargetStatusAfterError(account, channel, error);
         }
       } finally {
@@ -4434,7 +4458,9 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
             ? isExplicitChatQuotaError(error)
             : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
         });
-        if (!error.busy) await updateTargetStatusAfterError(account, channel, error);
+        if (!error.busy && !error.imageCarQuotaExhausted) {
+          await updateTargetStatusAfterError(account, channel, error);
+        }
       } finally {
         release?.();
       }

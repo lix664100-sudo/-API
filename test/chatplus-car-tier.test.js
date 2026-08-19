@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 
@@ -112,4 +113,109 @@ test("chatplus switches ordinary accounts from PRO cars to a regular car", async
   const nextSession = await client.prepareChatSession({}, new Set(), 1);
   assert.deepEqual(entered, ["regular-car"]);
   assert.equal(nextSession.selected.carId, "regular-car");
+});
+
+test("Plus image limit stops the stream immediately and switches to a regular car", async () => {
+  let requestCount = 0;
+  const server = createServer((request, response) => {
+    requestCount += 1;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (requestCount === 1) {
+      response.write("data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"parts\":[\"You've hit the Plus plan limit for image generation requests.\"]}}}\n\n");
+      const timer = setTimeout(() => response.end("data: [DONE]\n\n"), 5000);
+      request.on("close", () => clearTimeout(timer));
+      return;
+    }
+    response.end("data: {\"conversation_id\":\"conversation-regular\"}\n\ndata: [DONE]\n\n");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const selectedCars = [];
+  let restrictionSaved = 0;
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: {
+      id: "shareai:chatplus",
+      ability: "chatplus",
+      settings: {
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        defaultChatModel: "gpt",
+        chatModels: [{
+          key: "gpt",
+          name: "GPT",
+          carType: "chatgpt",
+          strategy: "image",
+          carTier: "auto",
+          enabled: true,
+          default: true
+        }]
+      }
+    },
+    account: { id: "account-plus-stream", username: "plus@example.test", password: "test" },
+    sessionLock: async (work) => work(),
+    onProCarsUnavailable: async () => {
+      restrictionSaved += 1;
+    }
+  });
+  client.portalLoggedIn = true;
+  client.fetchCars = async () => [
+    car({ id: "plus-limit-car", label: "PLUS", imageRemaining: 100 }),
+    car({ id: "pro-car", label: "PRO", isPro: true, imageRemaining: 90 }),
+    car({ id: "regular-car", label: "PLUS", imageRemaining: 1 })
+  ];
+  client.enterCar = async (carId) => {
+    selectedCars.push(carId);
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.uploadChatImages = async () => [];
+
+  const startedAt = Date.now();
+  try {
+    const result = await client.sendConversation("生成图片", {
+      imageGeneration: true,
+      requireConversationId: true
+    });
+
+    assert.equal(result.conversationId, "conversation-regular");
+    assert.deepEqual(selectedCars, ["plus-limit-car", "regular-car"]);
+    assert.equal(requestCount, 2);
+    assert.equal(restrictionSaved, 1);
+    assert.ok(Date.now() - startedAt < 2000);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("saved Plus account restriction continues to skip PRO cars", async () => {
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", ability: "chatplus", settings: {} },
+    account: {
+      id: "account-saved-plus",
+      username: "saved-plus@example.test",
+      password: "test",
+      meta: {
+        abilities: {
+          chatplus: {
+            meta: { proCarsUnavailable: true }
+          }
+        }
+      }
+    },
+    sessionLock: async (work) => work()
+  });
+  client.fetchCars = async () => [
+    car({ id: "pro-car", label: "PRO", isPro: true, count: 0 }),
+    car({ id: "regular-car", label: "PLUS", count: 20 })
+  ];
+
+  const selected = await client.selectCar({
+    key: "gpt",
+    name: "GPT",
+    carType: "chatgpt",
+    strategy: "speed",
+    carTier: "auto"
+  });
+
+  assert.equal(selected.carId, "regular-car");
 });
