@@ -396,6 +396,52 @@ test("chatplus task refresh keeps prompt JSON in progress", async () => {
   assert.deepEqual(task.imageUrls, []);
 });
 
+test("chatplus task refresh keeps image parameters in progress until the image appears", async () => {
+  const imageParameters = JSON.stringify({
+    prompt: null,
+    size: null,
+    n: 1,
+    transparent_background: false,
+    is_style_transfer: false,
+    referenced_image_ids: ["file_0000000018b4822f8811592d655f3f38"]
+  });
+  const resultUrl = "https://one.example.test/generated-after-parameters.png";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-parameters-account", username: "parameters@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  client.loginPortal = async () => {};
+  let readCount = 0;
+  client.json = async () => {
+    readCount += 1;
+    return {
+      mapping: {
+        assistant: {
+          message: {
+            author: { role: "assistant" },
+            content: {
+              parts: readCount === 1
+                ? [imageParameters]
+                : [{ type: "image_url", image_url: resultUrl }]
+            }
+          }
+        }
+      }
+    };
+  };
+
+  const pending = await client.getTask("conversation-with-image-parameters");
+  assert.equal(pending.status, "waiting_upstream");
+  assert.equal(pending.errorMessage, "");
+
+  const completed = await client.getTask("conversation-with-image-parameters");
+  assert.equal(completed.status, "success");
+  assert.deepEqual(completed.imageUrls, [resultUrl]);
+});
+
 test("chatplus image wait ignores skipped mainline marker and keeps waiting", async () => {
   const marker = "{\"skipped_mainline\":true}";
   const resultUrl = "https://one.example.test/generated-result.png";
@@ -422,4 +468,32 @@ test("chatplus image wait ignores skipped mainline marker and keeps waiting", as
 
   assert.deepEqual(imageUrls, [resultUrl]);
   assert.equal(imageReadCount, 2);
+});
+
+test("chatplus task refresh keeps skipped mainline marker in progress", async () => {
+  const marker = "{\"skipped_mainline\":true}";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-marker-refresh-account", username: "marker-refresh@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  client.loginPortal = async () => {};
+  client.json = async () => ({
+    mapping: {
+      assistant: {
+        message: {
+          author: { role: "assistant" },
+          content: { parts: [marker] }
+        }
+      }
+    }
+  });
+
+  const task = await client.getTask("conversation-with-skipped-mainline");
+
+  assert.equal(task.status, "waiting_upstream");
+  assert.equal(task.errorMessage, "");
+  assert.deepEqual(task.imageUrls, []);
 });

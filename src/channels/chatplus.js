@@ -962,15 +962,25 @@ function isImagePromptEnvelope(content) {
   if (!message.startsWith("{") || !message.endsWith("}")) return false;
   try {
     const payload = JSON.parse(message);
-    return payload
+    if (payload
       && typeof payload === "object"
       && !Array.isArray(payload)
       && Object.keys(payload).length === 1
       && typeof payload.prompt === "string"
-      && Boolean(payload.prompt.trim());
+      && Boolean(payload.prompt.trim())) return true;
+    return isImageGenerationParametersEnvelope(payload);
   } catch {
     return false;
   }
+}
+
+function isImageGenerationParametersEnvelope(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  return Object.prototype.hasOwnProperty.call(payload, "prompt")
+    && Object.prototype.hasOwnProperty.call(payload, "size")
+    && Object.prototype.hasOwnProperty.call(payload, "n")
+    && Object.prototype.hasOwnProperty.call(payload, "referenced_image_ids")
+    && Array.isArray(payload.referenced_image_ids);
 }
 
 function throwIfTextImageResponse(content, options = {}) {
@@ -3004,7 +3014,8 @@ export class ChatplusClient {
     }
     const content = extractAssistantText(detail);
     const promptEnvelope = isImagePromptEnvelope(content);
-    if (!promptEnvelope && isImageGenerationLimitMessage(content)) {
+    const intermediateResponse = promptEnvelope || isSkippedMainlineContent(content);
+    if (!intermediateResponse && isImageGenerationLimitMessage(content)) {
       return {
         externalId,
         status: "failed",
@@ -3014,7 +3025,7 @@ export class ChatplusClient {
         raw: detail
       };
     }
-    if (!promptEnvelope && isTerminalImageFailureMessage(content)) {
+    if (!intermediateResponse && isTerminalImageFailureMessage(content)) {
       return {
         externalId,
         status: "failed",
@@ -3024,7 +3035,7 @@ export class ChatplusClient {
         raw: detail
       };
     }
-    if (!promptEnvelope && content) {
+    if (!intermediateResponse && content) {
       return {
         externalId,
         status: "failed",
