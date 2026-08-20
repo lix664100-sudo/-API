@@ -43,7 +43,7 @@ import {
 } from "./erp-media-admin.js";
 import { createErpMediaCatalog } from "./erp-media-catalog.js";
 import { erpMediaConfig } from "./erp-media-config.js";
-import { registerErpMediaRoutes } from "./erp-media-routes.js";
+import { createErpMediaApiKeyGuard, registerErpMediaRoutes } from "./erp-media-routes.js";
 import { createErpMediaStore } from "./erp-media-store.js";
 import {
   inspectGitUpdateState,
@@ -117,7 +117,7 @@ await registerErpMediaRoutes(app, {
   config: erpMediaConfig,
   catalog: erpMediaCatalog,
   store: erpMediaStore,
-  requireApiKey,
+  requireMediaApiKey: createErpMediaApiKeyGuard(erpMediaConfig.apiKey),
 });
 
 function taskFileJson(file) {

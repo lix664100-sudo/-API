@@ -1,4 +1,5 @@
 import path from "node:path";
+import { timingSafeEqual } from "node:crypto";
 
 import { MediaStoreError } from "./erp-media-store.js";
 
@@ -45,6 +46,26 @@ export function createBoundedGate(concurrency, queueLimit) {
 function cleanText(value, maximum = 200) {
   const text = String(value || "").trim();
   return text.length <= maximum ? text : "";
+}
+
+function safeTextEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left || ""));
+  const rightBuffer = Buffer.from(String(right || ""));
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+export function createErpMediaApiKeyGuard(expectedApiKey) {
+  const expected = cleanText(expectedApiKey, 500);
+  return async function requireErpMediaApiKey(request, reply) {
+    const authorization = cleanText(request.headers.authorization, 600);
+    const bearer = authorization.toLowerCase().startsWith("bearer ")
+      ? authorization.slice(7).trim()
+      : "";
+    const supplied = cleanText(request.headers["x-api-key"] || bearer, 500);
+    if (!expected || !supplied || !safeTextEqual(supplied, expected)) {
+      return reply.code(401).send({ ok: false, message: "媒体服务密钥不正确。" });
+    }
+  };
 }
 
 function fieldValue(part) {
@@ -131,14 +152,14 @@ function setReadHeaders(reply, media, fileSize) {
 }
 
 export async function registerErpMediaRoutes(app, options = {}) {
-  const { config, catalog, store, requireApiKey } = options;
-  if (!config || !catalog || !store || typeof requireApiKey !== "function") {
+  const { config, catalog, store, requireMediaApiKey } = options;
+  if (!config || !catalog || !store || typeof requireMediaApiKey !== "function") {
     throw new TypeError("ERP media route dependencies are required");
   }
   const uploadGate = createBoundedGate(config.uploadConcurrency, config.uploadQueueLimit);
   const readGate = createBoundedGate(config.readConcurrency, config.readQueueLimit);
 
-  app.get("/v1/erp-media/capabilities", { preHandler: requireApiKey }, async () => ({
+  app.get("/v1/erp-media/capabilities", { preHandler: requireMediaApiKey }, async () => ({
     ok: true,
     data: {
       version: 1,
@@ -151,7 +172,7 @@ export async function registerErpMediaRoutes(app, options = {}) {
     },
   }));
 
-  app.post("/v1/erp-media", { preHandler: requireApiKey }, async (request, reply) => {
+  app.post("/v1/erp-media", { preHandler: requireMediaApiKey }, async (request, reply) => {
     let releaseUpload;
     try {
       releaseUpload = await uploadGate.acquire();

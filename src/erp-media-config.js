@@ -2,6 +2,7 @@ import path from "node:path";
 
 const MB = 1024 * 1024;
 const GB = 1024 * MB;
+export const DEFAULT_ERP_MEDIA_API_KEY = "4f0e9d662741a453bc01f4c57253bdaa3f2a9398432ccb26b37800530952c52a";
 
 function positiveNumber(value, fallback, minimum = 1) {
   const parsed = Number(value);
@@ -25,6 +26,7 @@ export function loadErpMediaConfig(env = process.env, rootDir = process.cwd()) {
     dataDir,
     mediaDir,
     tempDir,
+    apiKey: String(env.ERP_MEDIA_API_KEY || DEFAULT_ERP_MEDIA_API_KEY).trim(),
     databaseFile: path.resolve(dataDir, env.ERP_MEDIA_DATABASE_FILE || "erp-media.sqlite"),
     publicBaseUrl: cleanBaseUrl(env.PUBLIC_BASE_URL),
     uploadConcurrency: positiveInteger(env.ERP_MEDIA_UPLOAD_CONCURRENCY, 3),

@@ -684,7 +684,8 @@ async function persistProCarRestriction(channel, account) {
     await updateTargetAccountStatus(account.id, channel, {
       meta: {
         ...(abilityStatus.meta || {}),
-        proCarsUnavailable: true
+        proCarsUnavailable: true,
+        proCarsUnavailableReason: "plan_mismatch"
       }
     });
     return;
@@ -692,7 +693,8 @@ async function persistProCarRestriction(channel, account) {
   await updateAccountStatus(account.id, {
     meta: {
       ...(current.meta || {}),
-      chatplusProCarsUnavailable: true
+      chatplusProCarsUnavailable: true,
+      chatplusProCarsUnavailableReason: "plan_mismatch"
     }
   });
 }

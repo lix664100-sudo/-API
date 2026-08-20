@@ -13,6 +13,8 @@ const CONVERSATION_READ_HEADERS = Object.freeze({
 });
 const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
+const IMAGE_CAR_RECHECK_MS = 5 * 60 * 1000;
+const RECENT_IMAGE_SUCCESS_TTL_MS = 6 * 60 * 60 * 1000;
 const GEMINI_REQUEST_PATH = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
 const GEMINI_UPLOAD_PREFLIGHT_PATH = "/_/BardChatUi/data/batchexecute";
 const GEMINI_UPLOAD_PREFLIGHT_RPC_ID = "ESY5D";
@@ -36,6 +38,7 @@ const GROK_STATSIG_SEED = Buffer.from(
 );
 const GROK_STATSIG_FINGERPRINT = "3bab9506b851eb851eb840e8f5c28f5c28f80e8f5c28f5c28f806b851eb851eb8400";
 const badCarUntil = new Map();
+const recentImageCarSuccessAt = new Map();
 
 function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
@@ -251,9 +254,24 @@ function isBadCar(accountId, carType, carId) {
   return false;
 }
 
-function rememberBadCar(accountId, carType, carId) {
+function rememberBadCar(accountId, carType, carId, until = Date.now() + BAD_CAR_TTL_MS) {
   if (!carId) return;
-  badCarUntil.set(badCarKey(accountId, carType, carId), Date.now() + BAD_CAR_TTL_MS);
+  badCarUntil.set(badCarKey(accountId, carType, carId), until);
+}
+
+function rememberImageCarSuccess(accountId, carType, carId) {
+  if (!carId) return;
+  const key = badCarKey(accountId, carType, carId);
+  badCarUntil.delete(key);
+  recentImageCarSuccessAt.set(key, Date.now());
+}
+
+function recentImageCarSuccess(accountId, carType, carId) {
+  const key = badCarKey(accountId, carType, carId);
+  const succeededAt = recentImageCarSuccessAt.get(key) || 0;
+  if (succeededAt > Date.now() - RECENT_IMAGE_SUCCESS_TTL_MS) return succeededAt;
+  if (succeededAt) recentImageCarSuccessAt.delete(key);
+  return 0;
 }
 
 function isAuthSessionError(error) {
@@ -933,16 +951,39 @@ function isImageGenerationLimitMessage(content) {
     || /(?:图片|图像).{0,12}(?:生成).{0,24}(?:额度|配额|上限|限制).{0,16}(?:用完|耗尽|达到|已满)/.test(text);
 }
 
-function isPlusPlanImageGenerationLimitMessage(content) {
+function imageCarQuotaRetryAt(content, now = Date.now()) {
   const text = String(content || "").replace(/\s+/g, " ").trim();
-  return /(?:you(?:'|’)ve|you have) hit (?:the )?plus plan limit for image generation(?:s| requests)?/i.test(text);
+  const absolute = text.match(/\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2}(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?(?:Z|\s*[+-]\d{2}:?\d{2})?)?)/)?.[1];
+  if (absolute) {
+    const parsed = Date.parse(absolute.replace(/\//g, "-"));
+    if (Number.isFinite(parsed) && parsed > now) return parsed;
+  }
+
+  const relative = text.match(/(?:reset(?:s|ting)?|refresh(?:es|ing)?|available|try again|恢复|重置|刷新|再试).{0,80}?(?:\bin\b|\bafter\b|后)\s*(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|秒钟?|分钟|小时|天)/i)
+    || text.match(/(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|秒钟?|分钟|小时|天)\s*(?:后|later).{0,40}?(?:reset|refresh|available|try again|恢复|重置|刷新|再试)/i);
+  if (!relative) return 0;
+
+  const amount = Number(relative[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return 0;
+  const unit = String(relative[2] || "").toLowerCase();
+  const unitMs = /天|day/.test(unit)
+    ? 24 * 60 * 60 * 1000
+    : /小时|hour|hr/.test(unit)
+      ? 60 * 60 * 1000
+      : /分钟|minute|min/.test(unit)
+        ? 60 * 1000
+        : 1000;
+  return now + amount * unitMs;
 }
 
 function imageCarQuotaError(content = "") {
-  const error = new Error("当前车位的图片生成次数已用完，正在切换其他车位。");
+  const retryAt = imageCarQuotaRetryAt(content);
+  const error = new Error(retryAt
+    ? `当前车位的图片生成次数已用完，将在 ${new Date(retryAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })} 恢复，正在切换其他车位。`
+    : "当前车位的图片生成次数已用完，正在切换其他车位，稍后会自动重新检测。");
   error.imageCarQuotaExhausted = true;
-  error.plusPlanLimit = isPlusPlanImageGenerationLimitMessage(content);
   error.upstreamText = String(content || "").replace(/\s+/g, " ").trim();
+  error.quotaResetAt = retryAt ? new Date(retryAt).toISOString() : "";
   error.status = 429;
   return error;
 }
@@ -1520,6 +1561,7 @@ function normalizeCar(raw = {}, carType = "chatgpt") {
   const desc = String(raw.desc || raw.statusText || raw.label || "").trim();
   const label = String(raw.label || "").trim();
   const isUltra = carIsUltra(raw, desc, label);
+  const rawImageRemaining = raw.usage?.image_gen?.remaining ?? raw.model_limits?.image_gen?.remaining;
   return {
     id: String(raw.carID || raw.carId || raw.car_id || raw.id || "").trim(),
     carType,
@@ -1528,7 +1570,8 @@ function normalizeCar(raw = {}, carType = "chatgpt") {
     cooldown: cooldowns.length ? Math.min(...cooldowns) : 0,
     desc,
     label,
-    imageRemaining: numeric(raw.usage?.image_gen?.remaining ?? raw.model_limits?.image_gen?.remaining ?? 0, 0),
+    imageRemaining: numeric(rawImageRemaining, 0),
+    imageRemainingKnown: rawImageRemaining !== undefined && rawImageRemaining !== null && rawImageRemaining !== "",
     isIQ: Boolean(raw.isIQ || raw.is_iq),
     isPro: carIsPro(raw, desc, label, isUltra),
     isUltra,
@@ -1544,23 +1587,36 @@ function isClearlyUnavailable(car) {
   return !car.id || car.status === 0 || /停用|维护|失败|不可用|禁用|busy|offline/.test(text);
 }
 
-function carScore(car, strategy = "balanced") {
+function carScore(car, strategy = "balanced", context = {}) {
   let score = 1000;
   const text = `${car.desc} ${car.label}`;
   if (car.cooldown > 0) score -= Math.min(car.cooldown, 3600) / 4;
   score -= car.count * (strategy === "speed" || strategy === "idle" ? 30 : 12);
   if (/空闲|推荐|正常/i.test(text)) score += 80;
-  if (strategy === "image") score += car.imageRemaining * 8 + (car.imageRemaining > 0 ? 120 : 0);
+  if (strategy === "image") {
+    const knownRemaining = car.imageRemainingKnown === true
+      || (car.imageRemainingKnown === undefined && Object.hasOwn(car, "imageRemaining"));
+    const candidateIds = car.isVirtual && car.realCarIDs.length ? car.realCarIDs : [car.id];
+    const succeededAt = knownRemaining && car.imageRemaining <= 0
+      ? 0
+      : Math.max(0, ...candidateIds.map((carId) => (
+          recentImageCarSuccess(context.accountId, car.carType || context.carType, carId)
+        )));
+    if (knownRemaining && car.imageRemaining <= 0) score -= 10000;
+    else if (succeededAt) score += 12000 + Math.min(1000, (succeededAt - (Date.now() - RECENT_IMAGE_SUCCESS_TTL_MS)) / 1000);
+    else if (knownRemaining) score += 8000 + Math.min(car.imageRemaining, 200) * 8;
+    else score += 2000;
+  }
   if (strategy === "thinking") score += (car.isIQ ? 140 : 0) + (car.isPro ? 80 : 0) + (car.isSuper ? 30 : 0);
   if (strategy === "balanced") score += Math.random() * 40;
   return score;
 }
 
-function rankedCars(cars, strategy) {
+function rankedCars(cars, strategy, context = {}) {
   const usable = cars.filter((car) => !isClearlyUnavailable(car));
   const source = usable.length ? usable : cars.filter((car) => car.id);
   return source
-    .map((car) => ({ car, score: carScore(car, strategy) + Math.random() }))
+    .map((car) => ({ car, score: carScore(car, strategy, context) + Math.random() }))
     .sort((a, b) => b.score - a.score)
     .map((item) => item.car);
 }
@@ -1577,9 +1633,18 @@ function carTierDisplayName(tier) {
   return " PRO 及以下";
 }
 
-function concreteCarId(car) {
+function concreteCarId(car, context = {}) {
   if (car.isVirtual && car.realCarIDs.length) {
-    return car.realCarIDs[Math.floor(Math.random() * Math.min(car.realCarIDs.length, 5))];
+    const candidates = car.realCarIDs.slice(0, 5);
+    const usable = candidates.filter((carId) => !isBadCar(context.accountId, car.carType || context.carType, carId));
+    const source = usable.length ? usable : candidates;
+    return source
+      .map((carId) => ({
+        carId,
+        succeededAt: recentImageCarSuccess(context.accountId, car.carType || context.carType, carId),
+        random: Math.random()
+      }))
+      .sort((left, right) => right.succeededAt - left.succeededAt || right.random - left.random)[0]?.carId || car.id;
   }
   return car.id;
 }
@@ -1627,8 +1692,13 @@ function geminiThinkingModeForRoute(route = {}) {
 function savedProCarRestriction(account = {}, channel = {}) {
   const ability = String(channel?.ability || "");
   const abilityMeta = ability ? account.meta?.abilities?.[ability]?.meta : null;
-  return abilityMeta?.proCarsUnavailable === true
-    || account.meta?.chatplusProCarsUnavailable === true;
+  return (
+    abilityMeta?.proCarsUnavailable === true
+    && abilityMeta?.proCarsUnavailableReason === "plan_mismatch"
+  ) || (
+    account.meta?.chatplusProCarsUnavailable === true
+    && account.meta?.chatplusProCarsUnavailableReason === "plan_mismatch"
+  );
 }
 
 export class ChatplusClient {
@@ -1981,7 +2051,10 @@ export class ChatplusClient {
     const cached = this.concurrentChatSessions.get(key);
     if (cached?.session) {
       const cachedCarId = cached.session.selected?.carId;
-      if (!ignoredCarIds.has(cachedCarId)) {
+      if (
+        !ignoredCarIds.has(cachedCarId)
+        && !isBadCar(this.account?.id, cached.session.selected?.carType, cachedCarId)
+      ) {
         if (cachedCarId) ignoredCarIds.add(cachedCarId);
         return this.cloneChatSession(cached.session);
       }
@@ -1990,7 +2063,10 @@ export class ChatplusClient {
     if (cached?.promise) {
       const session = await cached.promise;
       const cachedCarId = session.selected?.carId;
-      if (!ignoredCarIds.has(cachedCarId)) {
+      if (
+        !ignoredCarIds.has(cachedCarId)
+        && !isBadCar(this.account?.id, session.selected?.carType, cachedCarId)
+      ) {
         if (cachedCarId) ignoredCarIds.add(cachedCarId);
         return this.cloneChatSession(session);
       }
@@ -2120,8 +2196,12 @@ export class ChatplusClient {
     const cars = await this.fetchCars(route.carType, options);
     const tier = effectiveCarTier(route);
     const selectionStrategy = route.selectionStrategy || route.strategy;
-    const candidates = rankedCars(cars, selectionStrategy)
-      .map((car) => ({ car, carId: concreteCarId(car) }))
+    const selectionContext = {
+      accountId: this.account?.id,
+      carType: route.carType
+    };
+    const candidates = rankedCars(cars, selectionStrategy, selectionContext)
+      .map((car) => ({ car, carId: concreteCarId(car, selectionContext) }))
       .filter((item) => !ignoredCarIds.has(item.carId))
       .filter((item) => !isBadCar(this.account?.id, route.carType, item.carId));
     if (!candidates.length) throw new Error(`${route.name} 暂时没有可用车辆。`);
@@ -2150,8 +2230,17 @@ export class ChatplusClient {
     rememberBadCar(this.account?.id, selected?.carType, selected?.carId);
   }
 
-  rememberImageFailedCar(selected) {
-    rememberBadCar(this.account?.id, selected?.carType, selected?.carId);
+  rememberImageFailedCar(selected, error = null) {
+    const parsedResetAt = Date.parse(error?.quotaResetAt || "");
+    const cooldownMs = Math.max(0, Number(selected?.car?.cooldown || 0)) * 1000;
+    const retryAt = Number.isFinite(parsedResetAt) && parsedResetAt > Date.now()
+      ? parsedResetAt
+      : Date.now() + (cooldownMs || IMAGE_CAR_RECHECK_MS);
+    rememberBadCar(this.account?.id, selected?.carType, selected?.carId, retryAt);
+  }
+
+  rememberImageSuccessfulCar(selected) {
+    rememberImageCarSuccess(this.account?.id, selected?.carType, selected?.carId);
   }
 
   rememberProCarsUnavailable(error) {
@@ -2161,14 +2250,6 @@ export class ChatplusClient {
         console.error("保存账号车位等级失败：", persistError);
       });
     }
-  }
-
-  rememberPlusPlanLimit(error) {
-    if (!error?.plusPlanLimit) return;
-    this.proCarsUnavailableUntil = Infinity;
-    Promise.resolve(this.onProCarsUnavailable?.()).catch((persistError) => {
-      console.error("保存账号车位等级失败：", persistError);
-    });
   }
 
   async prepareChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
@@ -2931,8 +3012,7 @@ export class ChatplusClient {
           }
         }
         if (selected && error.imageCarQuotaExhausted === true) {
-          this.rememberImageFailedCar(selected);
-          this.rememberPlusPlanLimit(error);
+          this.rememberImageFailedCar(selected, error);
           await this.sessionLock(async () => this.resetSession());
           imageCarQuotaErrors.push(error.message || "当前车位不能继续生图");
           continue;
@@ -3104,6 +3184,10 @@ export class ChatplusClient {
     }
     const imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
     if (imageUrls.length) {
+      this.rememberImageSuccessfulCar({
+        carId: context.carId || this.carId,
+        carType: context.carType || this.carType
+      });
       return {
         externalId,
         status: "success",
@@ -3197,6 +3281,7 @@ export class ChatplusClient {
       });
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
       const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
+      if (imageUrls.length) this.rememberImageSuccessfulCar(selected);
 
       return {
         externalId: conversationId || messageId,
@@ -3251,6 +3336,7 @@ export class ChatplusClient {
       });
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
       const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
+      if (imageUrls.length) this.rememberImageSuccessfulCar(selected);
 
       return {
         externalId: conversationId || messageId,

@@ -10,7 +10,11 @@ import multipart from "@fastify/multipart";
 
 import { createErpMediaCatalog } from "../src/erp-media-catalog.js";
 import { loadErpMediaConfig } from "../src/erp-media-config.js";
-import { createBoundedGate, registerErpMediaRoutes } from "../src/erp-media-routes.js";
+import {
+  createBoundedGate,
+  createErpMediaApiKeyGuard,
+  registerErpMediaRoutes,
+} from "../src/erp-media-routes.js";
 import { createErpMediaStore } from "../src/erp-media-store.js";
 
 function pngBytes() {
@@ -44,6 +48,7 @@ async function setup(configOverrides = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "erp-media-routes-"));
   const config = {
     ...loadErpMediaConfig({}, root),
+    apiKey: "media-only-secret",
     publicBaseUrl: "https://media.example.test",
     minimumFreeBytes: 1,
     minimumFreePercent: 0,
@@ -60,11 +65,7 @@ async function setup(configOverrides = {}) {
     config,
     catalog,
     store,
-    requireApiKey: async (request, reply) => {
-      if (request.headers["x-api-key"] !== "secret") {
-        return reply.code(401).send({ ok: false, message: "unauthorized" });
-      }
-    },
+    requireMediaApiKey: createErpMediaApiKeyGuard(config.apiKey),
   });
   await app.ready();
   return {
@@ -90,7 +91,7 @@ async function upload(app, { key = "image-key", kind = "image", file } = {}) {
     method: "POST",
     url: "/v1/erp-media",
     headers: {
-      "x-api-key": "secret",
+      "x-api-key": "media-only-secret",
       "idempotency-key": key,
       "content-type": body.contentType,
     },
@@ -98,7 +99,7 @@ async function upload(app, { key = "image-key", kind = "image", file } = {}) {
   });
 }
 
-test("upload requires the existing API key and reuses an idempotent result", async () => {
+test("upload requires the dedicated media key and reuses an idempotent result", async () => {
   const context = await setup();
   try {
     const unauthorizedBody = multipartPayload({ installId: "install-1", mediaKind: "image" }, {
@@ -113,6 +114,13 @@ test("upload requires the existing API key and reuses an idempotent result", asy
       payload: unauthorizedBody.payload,
     });
     assert.equal(unauthorized.statusCode, 401);
+
+    const globalKey = await context.app.inject({
+      method: "GET",
+      url: "/v1/erp-media/capabilities",
+      headers: { "x-api-key": "unrelated-global-api-key" },
+    });
+    assert.equal(globalKey.statusCode, 401);
 
     const first = await upload(context.app);
     const second = await upload(context.app);
