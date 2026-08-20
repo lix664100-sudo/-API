@@ -33,10 +33,18 @@ import {
   getResultImageStorageStats,
   mirrorImageUrl,
   resultImageDir,
-  runAutoCleanupResultImages,
   setRuntimePublicBaseUrl
 } from "./image-store.js";
 import { MAX_INPUT_IMAGE_COUNT } from "./image-limits.js";
+import {
+  cleanupMediaStorage,
+  getMediaStorageStats,
+  runAutoCleanupMediaStorage,
+} from "./erp-media-admin.js";
+import { createErpMediaCatalog } from "./erp-media-catalog.js";
+import { erpMediaConfig } from "./erp-media-config.js";
+import { registerErpMediaRoutes } from "./erp-media-routes.js";
+import { createErpMediaStore } from "./erp-media-store.js";
 import {
   inspectGitUpdateState,
   redactGitProxyCredentials,
@@ -102,6 +110,15 @@ const app = Fastify({
 
 await app.register(cors, { origin: true });
 await app.register(multipart, { limits: { fileSize: 25 * 1024 * 1024 } });
+
+const erpMediaCatalog = createErpMediaCatalog({ databaseFile: erpMediaConfig.databaseFile });
+const erpMediaStore = createErpMediaStore({ config: erpMediaConfig, catalog: erpMediaCatalog });
+await registerErpMediaRoutes(app, {
+  config: erpMediaConfig,
+  catalog: erpMediaCatalog,
+  store: erpMediaStore,
+  requireApiKey,
+});
 
 function taskFileJson(file) {
   return {
@@ -696,7 +713,16 @@ app.get("/admin/vendor/:filename", async (request, reply) => {
     .send(file);
 });
 
-app.get("/api/health", async () => ({ ok: true, time: new Date().toISOString() }));
+app.get("/api/health", async () => ({
+  ok: true,
+  time: new Date().toISOString(),
+  capabilities: {
+    erpMedia: {
+      version: 1,
+      media: { image: true, video: true, cover: true },
+    },
+  },
+}));
 
 app.get("/api/auth/status", async (request) => {
   const session = getAdminSession(request);
@@ -821,13 +847,29 @@ app.post("/api/admin/mirror-image", async (request, reply) => {
 
 app.get("/api/admin/image-storage", async () => {
   const config = await loadConfig();
-  return { ok: true, data: await getResultImageStorageStats(config) };
+  return {
+    ok: true,
+    data: await getMediaStorageStats({
+      config,
+      store: erpMediaStore,
+      getGeneratedStats: getResultImageStorageStats,
+    }),
+  };
 });
 
 app.post("/api/admin/image-storage/cleanup", async (request) => {
   const config = await loadConfig();
   const mode = request.body?.mode === "all" ? "all" : "expired";
-  return { ok: true, data: await cleanupResultImages(config, { mode }) };
+  return {
+    ok: true,
+    data: await cleanupMediaStorage({
+      config,
+      store: erpMediaStore,
+      mode,
+      cleanupGenerated: cleanupResultImages,
+      getGeneratedStats: getResultImageStorageStats,
+    }),
+  };
 });
 
 app.get("/api/config", async () => {
@@ -1224,9 +1266,14 @@ function scheduleResultImageCleanup() {
   const cleanup = async () => {
     try {
       const config = await loadConfig();
-      await runAutoCleanupResultImages(config, { force: true });
+      await runAutoCleanupMediaStorage({
+        config,
+        store: erpMediaStore,
+        cleanupGenerated: cleanupResultImages,
+        getGeneratedStats: getResultImageStorageStats,
+      });
     } catch (error) {
-      app.log.warn({ error }, "result image cleanup failed");
+      app.log.warn({ error }, "media storage cleanup failed");
     }
   };
   cleanup();
@@ -1291,6 +1338,7 @@ function scheduleRuntimeStats() {
 }
 
 app.addHook("onClose", async () => {
+  erpMediaCatalog.close();
   await closeStorage();
 });
 
