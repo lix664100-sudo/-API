@@ -1432,6 +1432,24 @@
         vertical-align: top;
       }
 
+      .task-token-usage {
+        display: grid;
+        gap: 3px;
+        color: var(--ink);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .task-token-total {
+        font-size: 13px;
+        font-weight: 720;
+      }
+
+      .task-token-breakdown,
+      .task-token-note {
+        color: var(--muted);
+      }
+
       .task-copy-cell {
         min-width: 0;
       }
@@ -1971,8 +1989,15 @@
         return String(row?.status || "").toLowerCase() === "failed";
       }
 
+      function taskFailureType(row) {
+        return String(row?.responseJson?.failureType || row?.raw?.failureType || "").trim();
+      }
+
       function taskErrorText(row) {
         if (!isFailedTaskRow(row)) return "";
+        if (taskFailureType(row)) {
+          return row?.responseJson?.message || row?.errorMessage || "生图任务失败";
+        }
         const attempts = taskAttempts(row);
         const attemptText = attempts.map((item) => String(item.message || "")).filter(Boolean).join("；");
         const text = taskUpstreamText(row) || row?.errorMessage || row?.responseJson?.message || attemptText || "";
@@ -2215,7 +2240,7 @@
         const upstreamText = taskUpstreamText(row);
         if (row.status === "failed" && (row.responseJson || row.errorMessage)) {
           if (row.responseJson) {
-            return upstreamText
+            return upstreamText && !taskFailureType(row)
               ? { ...row.responseJson, message: upstreamText, upstreamText }
               : row.responseJson;
           }
@@ -6325,6 +6350,34 @@
           }
         ];
 
+        function chatTaskTokenUsage(row) {
+          const usage = row?.responseJson?.usage || row?.usage || null;
+          if (!usage || usage.estimated !== true) return null;
+          const input = Number(usage.prompt_tokens);
+          const output = Number(usage.completion_tokens);
+          const total = Number(usage.total_tokens);
+          if (![input, output, total].every((value) => Number.isFinite(value) && value >= 0)) return null;
+          return {
+            input,
+            output,
+            total,
+            imageCount: Math.max(0, Number(usage.image_count) || 0),
+            textOnly: usage.text_only === true
+          };
+        }
+
+        function chatTaskTokenUsageCell(row) {
+          const usage = chatTaskTokenUsage(row);
+          if (!usage) return "—";
+          return h("div", { className: "task-token-usage" }, [
+            h("span", { className: "task-token-total", key: "total" }, `合计 ${usage.total.toLocaleString("zh-CN")}`),
+            h("span", { className: "task-token-breakdown", key: "breakdown" }, `输入 ${usage.input.toLocaleString("zh-CN")} · 输出 ${usage.output.toLocaleString("zh-CN")}`),
+            usage.textOnly && usage.imageCount
+              ? h("span", { className: "task-token-note", key: "note" }, `图片 ${usage.imageCount} 张未计入`)
+              : null
+          ].filter(Boolean));
+        }
+
         function taskRecordContent(row, options = {}) {
           const inputImageUrls = taskInputImageUrls(row);
           return h("div", { className: "task-copy-cell" }, [
@@ -6425,6 +6478,7 @@
             width: 760,
             render: (_, row) => taskRecordContent(row, { chat: true })
           },
+          { title: "预计 TOKEN", width: 190, render: (_, row) => chatTaskTokenUsageCell(row) },
           { title: "耗时", width: 120, render: (_, row) => taskDuration(row, nowTick) }
         ];
 
@@ -6444,7 +6498,7 @@
               h("div", { key: "copy" }, [
                 h("div", { className: "task-record-context-title", key: "title" }, `${recordName}记录`),
                 h("div", { className: "task-record-context-desc", key: "desc" }, isChat
-                  ? "提问与回复默认显示摘要，完整内容可按需展开查看。"
+                  ? "提问与回复默认显示摘要，并记录文字的预计 TOKEN；完整内容可按需展开查看。"
                   : "集中查看原图、生成结果、处理渠道、耗时和异常原因。")
               ]),
               h("div", { className: "toolbar-note", key: "total" }, `当前筛选 ${taskTotal.toLocaleString("zh-CN")} 条`)
@@ -6551,7 +6605,7 @@
               dataSource: filteredTasks,
               loading: taskListLoading,
               tableLayout: "fixed",
-              scroll: { x: isChat ? 1420 : 1620 },
+              scroll: { x: isChat ? 1610 : 1620 },
               pagination: { pageSize: 8, showSizeChanger: false },
               locale: { emptyText: h(Empty, { description: `暂无${recordName}记录` }) }
             })

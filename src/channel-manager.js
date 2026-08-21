@@ -30,6 +30,7 @@ import {
   updateAccountStatus,
   upsertTask
 } from "./storage.js";
+import { estimateChatTokenUsage } from "./token-usage.js";
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
 const defaultTaskConcurrency = { chat: 3, drawingImage: 2, chatImage: 2 };
@@ -962,19 +963,21 @@ function isTerminalTaskFailureError(error) {
 }
 
 function imageSubmissionFailure(error) {
-  if (
-    error?.imageSubmissionAttempted !== true
-    || error?.upstreamExplicitFailure
-    || error?.imageQuotaExhausted
-  ) {
-    return error;
-  }
-  const failure = new Error("上游没有确认本次生成结果。为避免重复消耗图片额度，系统未再次提交。");
+  if (error?.imageSubmissionAttempted !== true) return error;
+  const report = imageFailureReport({}, error, {
+    submitted: error?.imageSubmissionConfirmed === true
+  });
+  const failure = new Error(report.message);
   failure.status = Number(error?.status || error?.statusCode || 0) || 502;
-  failure.code = "IMAGE_SUBMISSION_UNCERTAIN";
+  failure.code = error?.code || (report.submissionConfirmed ? "UPSTREAM_NO_IMAGE" : "IMAGE_SUBMISSION_NOT_CONFIRMED");
   failure.imageSubmissionAttempted = true;
-  failure.upstreamText = String(error?.upstreamText || error?.body || "").trim();
+  failure.imageSubmissionConfirmed = report.submissionConfirmed;
+  failure.failureType = report.failureType;
+  failure.failureReason = report.failureReason;
+  failure.failureStage = report.failureStage;
+  failure.upstreamText = report.upstreamText;
   failure.upstreamStatus = error?.upstreamStatus || "";
+  failure.upstreamExplicitFailure = error?.upstreamExplicitFailure === true;
   failure.selectedCarId = error?.selectedCarId || "";
   failure.selectedCarType = error?.selectedCarType || "";
   return failure;
@@ -1585,7 +1588,7 @@ function resultHasGeneratedImage(result = {}) {
     && (usableImageResultUrls(result.imageUrls).length > 0 || Number(result.imageCount || 0) > 0);
 }
 
-function markTaskSubmissionAttempt(task, channel, account, options = {}) {
+function markTaskSubmissionAttempt(task, channel, account) {
   const now = new Date().toISOString();
   return {
     ...task,
@@ -1594,8 +1597,7 @@ function markTaskSubmissionAttempt(task, channel, account, options = {}) {
       ...(task.raw || {}),
       queued: false,
       submitted: true,
-      submittedAt: task.raw?.submittedAt || now,
-      ...(options.resultUncertain ? { submissionResultUncertain: true } : {})
+      submittedAt: task.raw?.submittedAt || now
     }
   };
 }
@@ -1736,6 +1738,12 @@ export function imageTaskClientView(task = {}) {
     submissionChannels: mergeTaskRoutes(task.submissionChannels),
     generationChannels: mergeTaskRoutes(task.generationChannels),
     errorMessage: task.errorMessage || "",
+    ...(task.responseJson?.failureType ? {
+      failureType: task.responseJson.failureType,
+      submissionConfirmed: task.responseJson.submissionConfirmed === true,
+      failureReason: task.responseJson.failureReason || "",
+      failureStage: task.responseJson.failureStage || null
+    } : {}),
     createdAt: task.createdAt || null,
     completedAt: task.completedAt || null
   };
@@ -1889,6 +1897,14 @@ function mergeRefreshedTask(task, result, channel, account) {
   const route = taskRouteEntry(channel, account);
   const wasSubmitted = Boolean(task.raw?.submitted || savedTaskExternalId(task) || savedTaskExternalId(result));
   const mergedRaw = mergeTaskRaw(task.raw, result.raw);
+  const taskType = result.taskType || task.taskType;
+  const resultErrorMessage = taskErrorMessage(result, task);
+  const failure = status === "failed" && taskType !== "chat"
+    ? imageFailureReport({ ...task, taskType, raw: mergedRaw }, {
+        message: resultErrorMessage,
+        upstreamText: resultUpstreamText(result) || resultErrorMessage
+      }, { submitted: wasSubmitted })
+    : null;
   const submittedAtMs = Date.parse(task.raw?.submittedAt || "");
   const hasResultWaitTiming = (mergedRaw.stageTimings || []).some((entry) => entry.key === "result_wait");
   const resultWaitTiming = status === "success"
@@ -1903,13 +1919,13 @@ function mergeRefreshedTask(task, result, channel, account) {
     taskNo: result.taskNo || task.taskNo,
     status,
     prompt: result.prompt || task.prompt,
-    taskType: result.taskType || task.taskType,
+    taskType,
     modelId: result.modelId ?? task.modelId,
     ratio: result.ratio || task.ratio,
     imageCount: result.imageCount ?? task.imageCount,
     imageUrls: result.imageUrls || task.imageUrls || [],
-    upstreamText: resultUpstreamText(result) || task.upstreamText || "",
-    errorMessage: status === "success" ? "" : taskErrorMessage(result, task),
+    upstreamText: failure?.upstreamText || resultUpstreamText(result) || task.upstreamText || "",
+    errorMessage: status === "success" ? "" : failure?.message || resultErrorMessage,
     channelId: channel.id,
     channelName: channel.name,
     channelType: channel.type,
@@ -1922,8 +1938,12 @@ function mergeRefreshedTask(task, result, channel, account) {
     ),
     completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : task.completedAt || null,
     requestJson: task.requestJson || null,
-    responseJson: attachResponseSourceTaskId(taskResponseJson(result), task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson)),
+    responseJson: attachResponseSourceTaskId({
+      ...taskResponseJson(result),
+      ...(failure ? imageFailureResponseFields(failure) : {})
+    }, task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson)),
     raw: mergeTaskRaw(mergedRaw, {
+      ...(failure ? imageFailureRawFields(failure) : {}),
       stageTimings: resultWaitTiming ? [resultWaitTiming] : []
     })
   };
@@ -2468,6 +2488,14 @@ function noChatTargetsError(config, requestedChannel) {
 function wrapTask({ result, channel, account, attempts, requestJson = null, requestMeta = {} }) {
   const status = result.status || "unknown";
   const route = taskRouteEntry(channel, account);
+  const submitted = Boolean(savedTaskExternalId(result));
+  const resultErrorMessage = taskErrorMessage(result, {});
+  const failure = status === "failed" && result.taskType !== "chat"
+    ? imageFailureReport({ ...result, raw: result.raw || {}, submitted }, {
+        message: resultErrorMessage,
+        upstreamText: resultUpstreamText(result) || resultErrorMessage
+      }, { submitted })
+    : null;
   const meta = taskRequestMeta(requestMeta);
   const sourceTaskId = meta.sourceTaskId || sourceTaskIdFrom(requestJson);
   const requestMetaPayload = sourceTaskId && !meta.sourceTaskId ? { ...meta, sourceTaskId } : meta;
@@ -2483,22 +2511,28 @@ function wrapTask({ result, channel, account, attempts, requestJson = null, requ
     ratio: result.ratio,
     imageCount: result.imageCount,
     imageUrls: result.imageUrls || [],
-    upstreamText: resultUpstreamText(result),
-    errorMessage: taskErrorMessage(result, {}),
+    upstreamText: failure?.upstreamText || resultUpstreamText(result),
+    errorMessage: failure?.message || resultErrorMessage,
     channelId: channel.id,
     channelName: channel.name,
     channelType: channel.type,
     accountId: account.id,
     accountName: account.name,
-    submissionChannels: savedTaskExternalId(result) ? [route] : [],
+    submissionChannels: submitted ? [route] : [],
     generationChannels: resultHasGeneratedImage({ ...result, status }) ? [route] : [],
     requestMeta: requestMetaPayload,
     network: taskNetworkMeta(account),
     attempts,
     requestJson: requestPayload,
-    responseJson: attachResponseSourceTaskId(taskResponseJson(result), sourceTaskId),
+    responseJson: attachResponseSourceTaskId({
+      ...taskResponseJson(result),
+      ...(failure ? imageFailureResponseFields(failure) : {})
+    }, sourceTaskId),
     completedAt: isFinishedTask(status) ? new Date().toISOString() : null,
-    raw: result.raw || result
+    raw: {
+      ...(result.raw || result),
+      ...(failure ? imageFailureRawFields(failure) : {})
+    }
   };
 }
 
@@ -3254,6 +3288,7 @@ function targetsFailedError(attempts) {
   else if (chatUsageExhausted) message = "聊天额度已用完，请等待额度刷新后再试。";
   const error = new Error(message);
   error.attempts = attempts;
+  error.upstreamText = [...attempts].reverse().find((item) => compactFailureText(item.upstreamText))?.upstreamText || "";
   if (concurrencyLimited) {
     error.status = 429;
     error.code = "CONCURRENCY_LIMIT";
@@ -3431,17 +3466,109 @@ function readableAttemptError(attempts) {
   return attempts.map((item) => `${item.channelName}/${item.accountName}：${item.message}`).join("；");
 }
 
+function compactFailureText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function originalFailureText(value) {
+  return String(value || "").trim();
+}
+
+function readableFailureReason(value) {
+  const text = compactFailureText(value);
+  if (!text) return "没有收到可用的错误说明";
+  try {
+    const payload = JSON.parse(text);
+    const reason = [
+      payload?.detail?.message,
+      typeof payload?.detail === "string" ? payload.detail : "",
+      payload?.message,
+      payload?.error?.message,
+      typeof payload?.error === "string" ? payload.error : ""
+    ].find((item) => compactFailureText(item));
+    if (reason) return compactFailureText(reason);
+  } catch {
+    // The upstream response can also be plain text.
+  }
+  return text;
+}
+
+function failedTaskStage(task = {}, error = {}) {
+  const stages = [
+    ...(Array.isArray(task?.raw?.stageTimings) ? task.raw.stageTimings : []),
+    ...(error?.taskStageTiming ? [error.taskStageTiming] : [])
+  ];
+  const failed = [...stages].reverse().find((stage) => stage?.status === "failed");
+  if (!failed) return null;
+  return {
+    key: String(failed.key || "").trim(),
+    label: String(failed.label || failed.key || "").trim()
+  };
+}
+
+function imageFailureReport(task = {}, error = {}, options = {}) {
+  const submissionConfirmed = options.submitted !== undefined
+    ? options.submitted === true
+    : Boolean(task?.raw?.submitted || savedTaskExternalId(task) || error?.imageSubmissionConfirmed === true);
+  const upstreamText = originalFailureText(
+    error?.upstreamText
+      || error?.body
+      || error?.failureReason
+      || error?.message
+  );
+  const failureReason = readableFailureReason(error?.failureReason || upstreamText || error?.message);
+  const failureStage = failedTaskStage(task, error);
+  const stageText = !submissionConfirmed && failureStage?.label
+    ? `，停在“${failureStage.label}”`
+    : "";
+  return {
+    failureType: submissionConfirmed ? "upstream_no_image" : "submission_failed",
+    submissionConfirmed,
+    failureReason,
+    failureStage,
+    upstreamText,
+    message: submissionConfirmed
+      ? `上游生成失败：图片和生图要求已完整提交，但上游没有返回图片。上游回复：${failureReason}`
+      : `提交失败：图片和生图要求未完整提交到上游${stageText}。具体原因：${failureReason}`
+  };
+}
+
+function imageFailureResponseFields(report) {
+  return {
+    message: report.message,
+    failureType: report.failureType,
+    submissionConfirmed: report.submissionConfirmed,
+    failureReason: report.failureReason,
+    ...(report.failureStage ? { failureStage: report.failureStage } : {}),
+    ...(report.upstreamText ? { upstreamText: report.upstreamText } : {})
+  };
+}
+
+function imageFailureRawFields(report) {
+  return {
+    failureType: report.failureType,
+    submissionConfirmed: report.submissionConfirmed,
+    ...(report.failureStage ? { failureStage: report.failureStage } : {})
+  };
+}
+
 async function failQueuedTask(task, error, attempts = []) {
-  const responseMessage = error.message || readableAttemptError(attempts) || "任务失败";
+  const systemRejection = error?.busy === true
+    || error?.quotaEmpty === true
+    || ["CONCURRENCY_LIMIT", "QUOTA_EXHAUSTED", "CHAT_USAGE_LIMIT"].includes(String(error?.code || ""));
+  const failure = task.taskType !== "chat" && !systemRejection ? imageFailureReport(task, error) : null;
+  const responseMessage = failure?.message || error.message || readableAttemptError(attempts) || "任务失败";
   const statusCode = Number(error.status || error.statusCode || 0) || null;
-  const code = error.code || (statusCode === 429 ? "CONCURRENCY_LIMIT" : "");
-  const upstreamText = String(error.upstreamText || "").trim();
+  const code = error.code
+    || (statusCode === 429 ? "CONCURRENCY_LIMIT" : "")
+    || (failure?.submissionConfirmed ? "UPSTREAM_NO_IMAGE" : failure ? "IMAGE_SUBMISSION_FAILED" : "");
+  const upstreamText = failure?.upstreamText || originalFailureText(error.upstreamText || error.body);
   const sourceTaskId = task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson);
   const failedTask = {
     ...task,
     status: "failed",
     upstreamText: upstreamText || task.upstreamText || "",
-    errorMessage: error.message || readableAttemptError(attempts) || "任务失败",
+    errorMessage: responseMessage,
     statusCode,
     attempts,
     responseJson: {
@@ -3450,13 +3577,14 @@ async function failQueuedTask(task, error, attempts = []) {
       ...(sourceTaskId ? { sourceTaskId } : {}),
       ...(statusCode ? { status: statusCode } : {}),
       ...(code ? { code } : {}),
-      ...(upstreamText ? { upstreamText } : {}),
+      ...(failure ? imageFailureResponseFields(failure) : upstreamText ? { upstreamText } : {}),
       attempts: taskResponseJson(attempts)
     },
     completedAt: new Date().toISOString(),
     raw: mergeTaskRaw(task.raw, {
       ...(error?.selectedCarId ? { selectedCarId: error.selectedCarId } : {}),
       ...(error?.selectedCarType ? { selectedCarType: error.selectedCarType } : {}),
+      ...(failure ? imageFailureRawFields(failure) : {}),
       stageTimings: error?.taskStageTiming ? [error.taskStageTiming] : []
     })
   };
@@ -3704,8 +3832,10 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         }
         if (error.imageSubmissionAttempted === true) {
           const failure = imageSubmissionFailure(error);
-          pushAttempt(attempts, target, failure.message);
-          taskState = markTaskSubmissionAttempt(taskState, channel, account, { resultUncertain: failure !== error });
+          pushAttempt(attempts, target, failure.message, { upstreamText: failure.upstreamText || "" });
+          if (failure.imageSubmissionConfirmed === true) {
+            taskState = markTaskSubmissionAttempt(taskState, channel, account);
+          }
           if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
             await updateTargetStatusAfterError(account, channel, error);
           }
@@ -3717,6 +3847,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         }
         pushAttempt(attempts, target, error.message || "调用失败", {
           busy: Boolean(error.busy),
+          upstreamText: originalFailureText(error.upstreamText || error.body),
           quotaEmpty: channel.type === "chatplus"
             ? isExplicitChatQuotaError(error)
             : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
@@ -3874,8 +4005,10 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         }
         if (error.imageSubmissionAttempted === true) {
           const failure = imageSubmissionFailure(error);
-          pushAttempt(attempts, target, failure.message);
-          taskState = markTaskSubmissionAttempt(taskState, channel, account, { resultUncertain: failure !== error });
+          pushAttempt(attempts, target, failure.message, { upstreamText: failure.upstreamText || "" });
+          if (failure.imageSubmissionConfirmed === true) {
+            taskState = markTaskSubmissionAttempt(taskState, channel, account);
+          }
           if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
             await updateTargetStatusAfterError(account, channel, error);
           }
@@ -3887,6 +4020,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         }
         pushAttempt(attempts, target, error.message || "调用失败", {
           busy: Boolean(error.busy),
+          upstreamText: originalFailureText(error.upstreamText || error.body),
           quotaEmpty: channel.type === "chatplus"
             ? isExplicitChatQuotaError(error)
             : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
@@ -3966,7 +4100,11 @@ async function runChatCompletionTask(task, input) {
         if (typeof client.createChatCompletion !== "function") {
           throw new Error("这个渠道暂不支持对话。");
         }
-        const result = await mirrorTaskImages(await client.createChatCompletion(input), config, client);
+        const upstreamResult = await client.createChatCompletion(input);
+        const result = await mirrorTaskImages({
+          ...upstreamResult,
+          usage: upstreamResult.usage || estimateChatTokenUsage(input, upstreamResult.content)
+        }, config, client);
         const responseJson = chatCompletionResponseJson({ result, channel });
         const finishedTask = await finishChatTask(task, result, channel, account, attempts, responseJson);
           return { result, channel, account, task: finishedTask, responseJson };
@@ -4653,7 +4791,11 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
-        if (submitted) throw error;
+        if (submitted) {
+          error.imageSubmissionAttempted = true;
+          error.imageSubmissionConfirmed = true;
+          throw imageSubmissionFailure(error);
+        }
         if (error.imageSubmissionAttempted === true) throw imageSubmissionFailure(error);
         if (isTerminalTaskFailureError(error)) {
           pushAttempt(attempts, target, error.message || "调用失败");

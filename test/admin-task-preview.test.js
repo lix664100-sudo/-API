@@ -59,6 +59,26 @@ function loadTaskRecordHelpers() {
   return context.helpers;
 }
 
+function loadChatTokenUsageHelper() {
+  const start = adminHtml.indexOf("function chatTaskTokenUsage");
+  const end = adminHtml.indexOf("function chatTaskTokenUsageCell", start);
+  assert.ok(start >= 0 && end > start, "对话 TOKEN 展示逻辑必须存在");
+
+  const context = {};
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { chatTaskTokenUsage };`, context);
+  return context.helpers.chatTaskTokenUsage;
+}
+
+function loadTaskFailureHelpers() {
+  const start = adminHtml.indexOf("function taskAttempts");
+  const end = adminHtml.indexOf("function taskJsonPanel", start);
+  assert.ok(start >= 0 && end > start, "任务失败说明辅助逻辑必须存在");
+
+  const context = {};
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskErrorText, taskReturnJson, taskSubmissionRouteText };`, context);
+  return context.helpers;
+}
+
 function localValue(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -115,10 +135,39 @@ test("生图和对话记录独立展示，表格固定列宽避免长内容撑�
   assert.match(adminHtml, /taskRecordTabLabel\("image", "生图记录"/);
   assert.match(adminHtml, /taskRecordTabLabel\("chat", "对话记录"/);
   assert.match(adminHtml, /tableLayout: "fixed"/);
-  assert.match(adminHtml, /scroll: \{ x: isChat \? 1420 : 1620 \}/);
+  assert.match(adminHtml, /scroll: \{ x: isChat \? 1610 : 1620 \}/);
   assert.match(adminHtml, /\.task-copy-full[\s\S]*max-height: 320px/);
   assert.match(adminHtml, /\.task-copy-preview[\s\S]*-webkit-line-clamp: 5/);
   assert.doesNotMatch(adminHtml, /h\("div", \{ className: "task-response" \}, row\.responseText\)/);
+});
+
+test("对话记录显示预计 TOKEN，并忽略旧记录里的占位零值", () => {
+  const chatTaskTokenUsage = loadChatTokenUsageHelper();
+  const usage = localValue(chatTaskTokenUsage({
+    responseJson: {
+      usage: {
+        prompt_tokens: 18,
+        completion_tokens: 7,
+        total_tokens: 25,
+        estimated: true,
+        text_only: true,
+        image_count: 1
+      }
+    }
+  }));
+
+  assert.deepEqual(usage, {
+    input: 18,
+    output: 7,
+    total: 25,
+    imageCount: 1,
+    textOnly: true
+  });
+  assert.equal(chatTaskTokenUsage({
+    responseJson: { usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+  }), null);
+  assert.match(adminHtml, /title: "预计 TOKEN"/);
+  assert.match(adminHtml, /图片 \$\{usage\.imageCount\} 张未计入/);
 });
 
 test("对话摘要会隐藏图片数据并限制长度，完整内容仍可展开", () => {
@@ -249,4 +298,45 @@ test("失败任务会从处理记录中显示实际车位", () => {
   };
 
   assert.equal(taskCarId(row), "failed-car");
+});
+
+test("生图失败会明确区分未完整提交和上游未返回图片", () => {
+  const { taskErrorText, taskReturnJson, taskSubmissionRouteText } = loadTaskFailureHelpers();
+  const notSubmitted = {
+    status: "failed",
+    taskType: "img2img",
+    errorMessage: "旧的模糊错误",
+    upstreamText: "{\"message\":\"车队失效，请重新选择\"}",
+    responseJson: {
+      ok: false,
+      message: "提交失败：图片和生图要求未完整提交到上游，停在“上传原图”。具体原因：车队失效，请重新选择",
+      failureType: "submission_failed",
+      submissionConfirmed: false,
+      failureReason: "车队失效，请重新选择",
+      upstreamText: "{\"message\":\"车队失效，请重新选择\"}"
+    },
+    raw: { submitted: false }
+  };
+  const submitted = {
+    status: "failed",
+    taskType: "img2img",
+    channelName: "聊天生图",
+    accountName: "测试账号",
+    responseJson: {
+      ok: false,
+      message: "上游生成失败：图片和生图要求已完整提交，但上游没有返回图片。上游回复：参数不完整",
+      failureType: "upstream_no_image",
+      submissionConfirmed: true,
+      failureReason: "参数不完整",
+      upstreamText: "参数不完整"
+    },
+    raw: { submitted: true }
+  };
+
+  assert.match(taskErrorText(notSubmitted), /^提交失败：/);
+  assert.equal(taskSubmissionRouteText(notSubmitted), "未提交");
+  assert.match(taskErrorText(submitted), /^上游生成失败：/);
+  assert.equal(taskSubmissionRouteText(submitted), "聊天生图 · 测试账号");
+  assert.match(taskReturnJson(notSubmitted).message, /^提交失败：/);
+  assert.equal(taskReturnJson(notSubmitted).upstreamText, "{\"message\":\"车队失效，请重新选择\"}");
 });

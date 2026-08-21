@@ -325,6 +325,11 @@ function isRetryableImageSubmissionServerFailure(error) {
   return status >= 500 && status < 600;
 }
 
+function isInvalidCarError(error) {
+  const text = `${error?.message || ""} ${error?.body || ""} ${error?.upstreamText || ""}`;
+  return /车队失效|车位失效|请重新选择/.test(text);
+}
+
 function isProCarPlanMismatchError(error) {
   const text = `${error?.message || ""} ${error?.body || ""}`.replace(/\s+/g, " ");
   return /不是\s*Pro\s*用户|not.{0,12}(?:a\s+)?pro\s+user/i.test(text);
@@ -2870,9 +2875,10 @@ export class ChatplusClient {
       }
     });
     if (preflight.status < 200 || preflight.status >= 300) {
-      const error = new Error(`Gemini 鍥剧墖涓婁紶鍓嶇疆璇锋眰澶辫触锛?{preflight.status}`);
+      const error = new Error(`Gemini 图片上传前检查失败：${preflight.status}`);
       error.status = preflight.status;
       error.body = preflight.body;
+      error.upstreamText = String(preflight.body || "").trim();
       error.noRetry = true;
       throw error;
     }
@@ -2908,11 +2914,10 @@ export class ChatplusClient {
       || start.headers["x-goog-upload-control-url"]?.[0]
       || "";
     if (!uploadUrl) {
-      const error = new Error("Gemini 鍥剧墖涓婁紶娌℃湁杩斿洖涓婁紶鍦板潃銆?");
+      const error = new Error("Gemini 图片上传没有返回上传地址。");
       error.noRetry = true;
       throw error;
     }
-    if (!uploadUrl) throw new Error("Gemini 图片上传没有返回上传地址。");
 
     const uploaded = await this.http(uploadUrl, {
       method: "POST",
@@ -2928,6 +2933,7 @@ export class ChatplusClient {
       const error = new Error(`Gemini 图片上传失败：${uploaded.status}`);
       error.status = uploaded.status;
       error.body = uploaded.body;
+      error.upstreamText = String(uploaded.body || "").trim();
       error.noRetry = true;
       throw error;
     }
@@ -2999,6 +3005,7 @@ export class ChatplusClient {
       }
       return upstreamResponse;
     });
+    if (input.imageSubmissionState) input.imageSubmissionState.confirmed = true;
     throwIfImageGenerationLimit(response.body);
     if (isChatUsageLimitMessage(response.body)) {
       const error = chatUsageLimitError("当前 Gemini 账号的使用次数已用完。");
@@ -3041,6 +3048,7 @@ export class ChatplusClient {
       upstreamModel: route.model || "gemini",
       route,
       selected,
+      submissionConfirmed: true,
       directContent,
       imageUrls
     };
@@ -3249,9 +3257,13 @@ export class ChatplusClient {
     }
     if (response.status < 200 || response.status >= 300) {
       const error = new Error(`Grok 提交失败：${response.status}`);
+      error.body = response.body;
+      error.upstreamText = String(response.body || "").trim();
       error.noRetry = true;
       throw error;
     }
+
+    if (input.imageSubmissionState) input.imageSubmissionState.confirmed = true;
 
     const events = parseJsonLines(response.body);
     const directContent = extractGrokAssistantText(events);
@@ -3280,6 +3292,7 @@ export class ChatplusClient {
       upstreamModel,
       route,
       selected,
+      submissionConfirmed: true,
       directContent,
       imageUrls
     };
@@ -3307,6 +3320,8 @@ export class ChatplusClient {
     const errors = [];
     const imageCarQuotaErrors = [];
     let serverFailureRetryUsed = false;
+    let lastError = null;
+    let lastUpstreamText = "";
     const runSubmitStep = input.concurrentSubmit === true
       ? async (work) => work()
       : async (work) => this.sessionLock(work);
@@ -3386,6 +3401,7 @@ export class ChatplusClient {
           error.code = "NO_UPSTREAM_TASK_ID";
           throw error;
         }
+        if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.confirmed = true;
         this.rememberReusableChatSession(requestInput, session, submitClient);
         return {
           events,
@@ -3395,12 +3411,16 @@ export class ChatplusClient {
           upstreamModel: model,
           route,
           selected,
+          submissionConfirmed: true,
           submitSessionSnapshot: submitClient.sessionSnapshot(),
           stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
         };
       } catch (error) {
+        lastError = error;
+        lastUpstreamText = String(error?.upstreamText || error?.body || lastUpstreamText).trim();
         if (imageSubmissionState.started) {
           error.imageSubmissionAttempted = true;
+          if (imageSubmissionState.confirmed) error.imageSubmissionConfirmed = true;
           if (selected) {
             error.selectedCarId ||= selected.carId;
             error.selectedCarType ||= selected.carType;
@@ -3431,6 +3451,12 @@ export class ChatplusClient {
           errors.push(error.message || "上游处理失败，已更换车位重试");
           continue;
         }
+        if (selected && !imageSubmissionState.started && isInvalidCarError(error)) {
+          this.rememberAuthFailedCar(selected);
+          await this.sessionLock(async () => this.resetSession());
+          errors.push(error.message || "当前车位已经失效");
+          continue;
+        }
         if (error.noRetry || error.imageQuotaExhausted || error.imageSubmissionAttempted) {
           if (error.quotaConfirmedByUpstream === true) {
             error.quotaModel = activeRoute?.key || "";
@@ -3455,6 +3481,7 @@ export class ChatplusClient {
     }
     const error = new Error(`自动换车失败：${[...imageCarQuotaErrors, ...errors].join("；")}`);
     if (imageCarQuotaErrors.length) error.imageCarQuotaExhausted = true;
+    error.upstreamText = lastUpstreamText || String(lastError?.upstreamText || lastError?.body || "").trim();
     throw error;
   }
 
@@ -3474,7 +3501,10 @@ export class ChatplusClient {
             quotaErrors.push(error.message || "当前车位图片生成额度已用完。");
             continue;
           }
-          error.imageSubmissionAttempted = true;
+          if (conversation) {
+            error.imageSubmissionAttempted = true;
+            error.imageSubmissionConfirmed = conversation.submissionConfirmed !== false;
+          }
           throw error;
         }
       }

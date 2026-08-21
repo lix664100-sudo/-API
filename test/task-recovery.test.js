@@ -755,11 +755,14 @@ test("wait image task returns upstream policy refusal without wrapping it as tim
         wait: true
       }),
       (error) => {
-        assert.equal(error.message, message);
+        assert.match(error.message, /^上游生成失败：图片和生图要求已完整提交，但上游没有返回图片。/);
         assert.equal(error.status, 400);
         assert.equal(error.code, "content_policy");
         assert.equal(error.task.status, "failed");
-        assert.equal(error.task.responseJson.message, message);
+        assert.equal(error.task.responseJson.failureType, "upstream_no_image");
+        assert.equal(error.task.responseJson.submissionConfirmed, true);
+        assert.equal(error.task.responseJson.failureReason, message);
+        assert.match(error.task.responseJson.message, /^上游生成失败：/);
         assert.equal(error.task.responseJson.upstreamText, message);
         assert.deepEqual(
           error.task.submissionChannels.map((item) => [item.channelId, item.accountId]),
@@ -774,7 +777,7 @@ test("wait image task returns upstream policy refusal without wrapping it as tim
   }
 });
 
-test("提交结果无法确认时不会换账号重发，并保存首次提交渠道", async () => {
+test("提交结果无法确认时不会换账号重发，并准确标记为未完整提交", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -826,15 +829,89 @@ test("提交结果无法确认时不会换账号重发，并保存首次提交�
       }),
       (error) => {
         assert.equal(error.task.status, "failed");
-        assert.equal(error.task.responseJson.code, "IMAGE_SUBMISSION_UNCERTAIN");
-        assert.equal(error.task.raw.submitted, true);
-        assert.equal(error.task.raw.submissionResultUncertain, true);
-        assert.equal(error.task.submissionChannels.length, 1);
+        assert.equal(error.task.responseJson.code, "ECONNRESET");
+        assert.equal(error.task.responseJson.failureType, "submission_failed");
+        assert.equal(error.task.responseJson.submissionConfirmed, false);
+        assert.equal(error.task.responseJson.failureReason, "connection reset");
+        assert.match(error.task.responseJson.message, /^提交失败：图片和生图要求未完整提交到上游/);
+        assert.notEqual(error.task.raw.submitted, true);
+        assert.equal(error.task.submissionChannels.length, 0);
         assert.equal(error.task.generationChannels.length, 0);
         return true;
       }
     );
     assert.equal(submissionCount, 1);
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+    await saveConfig(config);
+  }
+});
+
+test("参考图上传失败会返回准确阶段和上游原始回复", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    imageStorage: { mode: "never", autoCleanup: false, retentionDays: 7 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        chatBaseUrl: "https://chat.example.test",
+        enabledAbilities: { drawing: false, chatplus: true },
+        defaultChatModel: "gemini"
+      }
+    }],
+    accounts: [{
+      id: "upload-failed-account",
+      channelId: "shareai",
+      name: "Upload failed account",
+      username: "upload-failed@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: { abilities: { chatplus: { status: "ok", message: "聊天账号可用" } } }
+    }]
+  });
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  const upstreamText = "{\n  \"error\": \"request_error\",\n  \"message\": \"车队失效，请重新选择\"\n}";
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    await input.onStage?.({
+      id: "source-upload-failed",
+      key: "source_upload",
+      label: "上传原图",
+      status: "failed",
+      durationMs: 1200
+    });
+    const error = new Error("Gemini 图片上传前检查失败：500");
+    error.status = 500;
+    error.body = upstreamText;
+    error.upstreamText = upstreamText;
+    error.noRetry = true;
+    throw error;
+  };
+
+  try {
+    await assert.rejects(
+      () => createImageTask({
+        input: { channel: "chatplus", model: "gemini", prompt: "上传阶段失败测试" },
+        files: [{ filename: "source.png", mimetype: "image/png" }],
+        wait: true
+      }),
+      (error) => {
+        assert.equal(error.task.responseJson.failureType, "submission_failed");
+        assert.equal(error.task.responseJson.submissionConfirmed, false);
+        assert.equal(error.task.responseJson.failureReason, "车队失效，请重新选择");
+        assert.deepEqual(error.task.responseJson.failureStage, { key: "source_upload", label: "上传原图" });
+        assert.equal(error.task.responseJson.upstreamText, upstreamText);
+        assert.match(error.task.responseJson.message, /停在“上传原图”/);
+        assert.equal(error.task.submissionChannels.length, 0);
+        return true;
+      }
+    );
   } finally {
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
     await saveConfig(config);
@@ -1069,7 +1146,10 @@ test("等待上游查询异常会记录原因，连续三十分钟后停止且�
     });
     const retried = await refreshTask(id);
     assert.equal(retried.status, "failed");
-    assert.equal(retried.errorMessage, "上游明确返回任务失败。");
+    assert.match(retried.errorMessage, /^上游生成失败：/);
+    assert.equal(retried.responseJson.failureType, "upstream_no_image");
+    assert.equal(retried.responseJson.submissionConfirmed, true);
+    assert.equal(retried.responseJson.failureReason, "上游明确返回任务失败。");
     assert.equal(retried.raw.upstreamWaitExpired, false);
     assert.equal(retried.raw.interrupted, false);
     assert.equal(retried.raw.refreshError, false);

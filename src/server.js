@@ -183,6 +183,12 @@ async function persistReturnedErrorTask(error, context, payload, status) {
     ...(status ? { status } : {}),
     ...(payload.code ? { code: payload.code } : {}),
     ...(payload.upstreamText ? { upstreamText: payload.upstreamText } : {}),
+    ...(payload.failureType ? {
+      failureType: payload.failureType,
+      submissionConfirmed: payload.submissionConfirmed === true,
+      failureReason: payload.failureReason || "",
+      ...(payload.failureStage ? { failureStage: payload.failureStage } : {})
+    } : {}),
     ...(Array.isArray(attempts) && attempts.length ? { attempts } : {})
   };
   const failedTask = {
@@ -239,13 +245,28 @@ async function sendError(reply, error, context = {}) {
   const sourceTaskId = errorSourceTaskId(error, responseJson, context);
   const upstreamText = errorUpstreamText(error, responseJson);
   const code = error.code || responseJson.code;
+  const failureType = error.failureType || responseJson.failureType || error.task?.responseJson?.failureType || "";
+  const submissionConfirmed = responseJson.submissionConfirmed === true
+    || error.submissionConfirmed === true
+    || error.imageSubmissionConfirmed === true
+    || error.task?.responseJson?.submissionConfirmed === true;
+  const failureReason = error.failureReason || responseJson.failureReason || error.task?.responseJson?.failureReason || "";
+  const failureStage = error.failureStage || responseJson.failureStage || error.task?.responseJson?.failureStage || null;
   const payload = openAIErrorPayload({
     status,
-    message: upstreamText || responseJson.message || error.message || "请求失败",
+    message: failureType
+      ? responseJson.message || error.message || "生图任务失败"
+      : upstreamText || responseJson.message || error.message || "请求失败",
     code,
     param: error.param || null,
     legacy: {
       ...(upstreamText ? { upstreamText } : {}),
+      ...(failureType ? {
+        failureType,
+        submissionConfirmed,
+        failureReason,
+        ...(failureStage ? { failureStage } : {})
+      } : {}),
       ...(sourceTaskId ? { sourceTaskId } : {}),
       ...(Array.isArray(attempts) && attempts.length ? { attempts } : {})
     }

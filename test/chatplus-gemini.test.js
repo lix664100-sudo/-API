@@ -822,6 +822,55 @@ test("Gemini 上游返回 500 后当前任务换车再提交一次", async () =>
   ]);
 });
 
+test("Gemini 参考图上传前发现车位失效时会先换车，不会误记为已经提交", async () => {
+  const testClient = client();
+  const selectedCars = [];
+  let generationCount = 0;
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    const carId = selectedCars.length ? "healthy-upload-car" : "invalid-upload-car";
+    selectedCars.push(carId);
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.sendGeminiConversation = async (_prompt, _input, route, selected) => {
+    if (selected.carId === "invalid-upload-car") {
+      const error = new Error("Gemini 图片上传前检查失败：500");
+      error.status = 500;
+      error.body = JSON.stringify({ error: "request_error", message: "车队失效，请重新选择" });
+      error.upstreamText = error.body;
+      error.noRetry = true;
+      throw error;
+    }
+    generationCount += 1;
+    return {
+      events: [],
+      conversationId: "conversation-after-upload-car-switch",
+      model: "gemini",
+      upstreamModel: "gemini",
+      route,
+      selected,
+      submissionConfirmed: true,
+      directContent: "",
+      imageUrls: ["https://example.test/generated-after-upload-car-switch.png"]
+    };
+  };
+
+  const result = await testClient.createImageTask({
+    prompt: "上传失败后换车",
+    model: "gemini",
+    files: [fakeImageFile()]
+  });
+
+  assert.deepEqual(selectedCars, ["invalid-upload-car", "healthy-upload-car"]);
+  assert.equal(generationCount, 1);
+  assert.equal(result.status, "success");
+  assert.deepEqual(result.imageUrls, ["https://example.test/generated-after-upload-car-switch.png"]);
+});
+
 test("Gemini 上游连续返回 500 时当前任务最多提交两次", async () => {
   const testClient = client();
   const selectedCars = [];
