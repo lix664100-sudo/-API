@@ -24,7 +24,7 @@ test("参考图片允许 6 张，第 7 张会被拒绝", () => {
 test("网页改图链路统一使用同一个图片上限", () => {
   const serverLimitUses = serverSource.match(/maxFiles: MAX_INPUT_IMAGE_COUNT/g) || [];
 
-  assert.equal(serverLimitUses.length, 3);
+  assert.equal(serverLimitUses.length, 5);
   assert.match(channelManagerSource, /assertInputImageCount\(files\.length/);
   assert.match(channelManagerSource, /assertInputImageCount\(\s*chatImageCount\(input\)/);
   assert.match(chatplusSource, /assertInputImageCount\(\s*files\.length/);

@@ -200,6 +200,37 @@ for (const invalidInput of [
   });
 }
 
+for (const effortCase of [
+  { input: { reasoning_effort: "low" }, thinkingLevel: "standard" },
+  { input: { reasoning_effort: "medium" }, thinkingLevel: "standard" },
+  { input: { reasoning_effort: "high" }, thinkingLevel: "extended" },
+  { input: { reasoning: { effort: "xhigh" } }, thinkingLevel: "extended" }
+]) {
+  test(`Gemini 兼容常用 reasoning effort：${effortCase.thinkingLevel}`, () => {
+    const testClient = client();
+    const route = testClient.chatRouteForInput({
+      model: "gemini-3.1-pro",
+      ...effortCase.input
+    });
+
+    assert.equal(route.model, "gemini-3.1-pro");
+    assert.equal(route.thinkingLevel, effortCase.thinkingLevel);
+    assert.equal(route.geminiParameterFallback, false);
+  });
+}
+
+test("Gemini reasoning effort 写错时改用最快模型", () => {
+  const testClient = client();
+  const route = testClient.chatRouteForInput({
+    model: "gemini-3.1-pro",
+    reasoning_effort: "very-strong"
+  });
+
+  assert.equal(route.model, "gemini-3.5-flash-lite");
+  assert.equal(route.thinkingLevel, "standard");
+  assert.equal(route.geminiParameterFallback, true);
+});
+
 test("Gemini 额度用完换车时保持原模型和强度", async () => {
   const testClient = client();
   const selectedCars = [];

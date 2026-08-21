@@ -30,6 +30,18 @@ const GEMINI_WEB_MODELS = Object.freeze({
   "gemini-3.1-pro": Object.freeze({ hash: "e6fa609c3fa255c0", mode: 3 })
 });
 const GEMINI_THINKING_LEVELS = Object.freeze({ standard: 1, extended: 2 });
+const GEMINI_REASONING_EFFORTS = Object.freeze({
+  none: "standard",
+  minimal: "standard",
+  low: "standard",
+  medium: "standard",
+  standard: "standard",
+  high: "extended",
+  xhigh: "extended",
+  max: "extended",
+  ultra: "extended",
+  extended: "extended"
+});
 const GROK_DIRECT_UPLOAD_PATHS = [
   "/grok/http/upload-file-v2/direct",
   "/http/upload-file-v2/direct"
@@ -1749,6 +1761,41 @@ function configuredGeminiModel(value) {
   return "";
 }
 
+function geminiThinkingSelection(input = {}, route = {}) {
+  const hasNativeLevel = Object.prototype.hasOwnProperty.call(input, "thinking_level")
+    || Object.prototype.hasOwnProperty.call(input, "thinkingLevel");
+  if (hasNativeLevel) {
+    return {
+      level: chatModelKey(input.thinking_level ?? input.thinkingLevel),
+      field: "thinking_level"
+    };
+  }
+
+  const hasReasoningEffort = Object.prototype.hasOwnProperty.call(input, "reasoning_effort")
+    || Object.prototype.hasOwnProperty.call(input, "reasoningEffort")
+    || Object.prototype.hasOwnProperty.call(input.reasoning || {}, "effort");
+  if (hasReasoningEffort) {
+    const effort = chatModelKey(
+      input.reasoning_effort
+        ?? input.reasoningEffort
+        ?? input.reasoning?.effort
+    );
+    return {
+      level: GEMINI_REASONING_EFFORTS[effort] || "",
+      field: "reasoning_effort"
+    };
+  }
+
+  return {
+    level: GEMINI_THINKING_LEVELS[chatModelKey(route.thinkingLevel)]
+      ? chatModelKey(route.thinkingLevel)
+      : chatModelKey(route.strategy) === "thinking"
+        ? "extended"
+        : "standard",
+    field: "thinking_level"
+  };
+}
+
 function geminiRequestSelection(input = {}, route = {}) {
   const explicitModelValue = input.model || input.chat_model || input.chatModel || "";
   const explicitModel = chatModelKey(explicitModelValue);
@@ -1758,18 +1805,11 @@ function geminiRequestSelection(input = {}, route = {}) {
     : configuredModel
       ? configuredModel
       : GEMINI_DEFAULT_MODEL;
-  const hasThinkingLevel = Object.prototype.hasOwnProperty.call(input, "thinking_level")
-    || Object.prototype.hasOwnProperty.call(input, "thinkingLevel");
-  const requestedThinkingLevel = hasThinkingLevel
-    ? chatModelKey(input.thinking_level ?? input.thinkingLevel)
-    : GEMINI_THINKING_LEVELS[chatModelKey(route.thinkingLevel)]
-      ? chatModelKey(route.thinkingLevel)
-      : chatModelKey(route.strategy) === "thinking"
-        ? "extended"
-        : "standard";
+  const thinking = geminiThinkingSelection(input, route);
+  const requestedThinkingLevel = thinking.level;
   const invalidFields = [];
   if (!GEMINI_WEB_MODELS[requestedModel]) invalidFields.push("model");
-  if (!GEMINI_THINKING_LEVELS[requestedThinkingLevel]) invalidFields.push("thinking_level");
+  if (!GEMINI_THINKING_LEVELS[requestedThinkingLevel]) invalidFields.push(thinking.field);
   if (invalidFields.length) {
     return {
       model: GEMINI_FASTEST_MODEL,

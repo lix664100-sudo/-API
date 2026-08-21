@@ -3316,6 +3316,13 @@ function inputPreviewUrls(input = {}) {
     .filter(Boolean);
 }
 
+function taskInputPreviewUrls(input = {}, extraUrls = []) {
+  return [...new Set([
+    ...inputPreviewUrls(input),
+    ...(Array.isArray(extraUrls) ? extraUrls : [])
+  ].filter(Boolean))];
+}
+
 function cleanChatPrompt(input = {}) {
   const direct = String(input.message || input.prompt || input.content || "").trim();
   if (direct) return direct;
@@ -4084,7 +4091,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   });
   return task;
 }
-export async function queueChatCompletion(input = {}, requestMeta = {}) {
+export async function queueChatCompletion(input = {}, requestMeta = {}, taskOptions = {}) {
   if (input.stream === true) input = { ...input, stream: false };
   assertChatInput(input);
 
@@ -4108,7 +4115,7 @@ export async function queueChatCompletion(input = {}, requestMeta = {}) {
     taskType: "chat",
     prompt: cleanChatPrompt(input),
     imageCount: chatImageCount(input),
-    inputImageUrls: inputPreviewUrls(input),
+    inputImageUrls: taskInputPreviewUrls(input, taskOptions.inputImageUrls),
     raw: { endpoint: "/v1/chat/completions" },
     requestMeta
   });
@@ -4545,7 +4552,7 @@ function chatCompletionResponse({ result, channel, task, responseJson }) {
   };
 }
 
-export async function createChatCompletion(input = {}, requestMeta = {}) {
+export async function createChatCompletion(input = {}, requestMeta = {}, taskOptions = {}) {
   if (input.stream === true) input = { ...input, stream: false };
   assertChatInput(input);
 
@@ -4570,7 +4577,7 @@ export async function createChatCompletion(input = {}, requestMeta = {}) {
       taskType: "chat",
       prompt: cleanChatPrompt(input),
       imageCount: chatImageCount(input),
-      inputImageUrls: inputPreviewUrls(input),
+      inputImageUrls: taskInputPreviewUrls(input, taskOptions.inputImageUrls),
       raw: { endpoint: "/v1/chat/completions" },
       requestMeta
     });

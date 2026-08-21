@@ -65,6 +65,7 @@ function localValue(value) {
 
 test("任务图片对比会合并已保存原图和请求记录里的原图，并自动去重", () => {
   const { taskInputImageUrls, taskOutputImageUrls } = loadTaskPreviewHelpers();
+  const embeddedImage = "data:image/png;base64,iVBORw0KGgo=";
   const row = {
     inputImageUrls: [" /uploads/previews/source-1.png ", "", "/uploads/previews/source-1.png", 42],
     requestJson: {
@@ -72,6 +73,15 @@ test("任务图片对比会合并已保存原图和请求记录里的原图，�
         { previewUrl: "/uploads/previews/source-1.png" },
         { previewUrl: "/uploads/previews/source-2.png" },
         null
+      ],
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "请看图片" },
+            { type: "image_url", image_url: { url: embeddedImage } }
+          ]
+        }
       ]
     },
     imageUrls: ["https://example.test/result-1.png", "https://example.test/result-1.png", ""]
@@ -79,7 +89,8 @@ test("任务图片对比会合并已保存原图和请求记录里的原图，�
 
   assert.deepEqual(localValue(taskInputImageUrls(row)), [
     "/uploads/previews/source-1.png",
-    "/uploads/previews/source-2.png"
+    "/uploads/previews/source-2.png",
+    embeddedImage
   ]);
   assert.deepEqual(localValue(taskOutputImageUrls(row)), ["https://example.test/result-1.png"]);
 });

@@ -36,6 +36,7 @@ import {
   setRuntimePublicBaseUrl
 } from "./image-store.js";
 import { MAX_INPUT_IMAGE_COUNT } from "./image-limits.js";
+import { chatCompletionSseBody, openAIErrorPayload } from "./openai-compat.js";
 import {
   cleanupMediaStorage,
   getMediaStorageStats,
@@ -237,15 +238,18 @@ async function sendError(reply, error, context = {}) {
   const attempts = error.attempts || responseJson.attempts || error.task?.attempts || [];
   const sourceTaskId = errorSourceTaskId(error, responseJson, context);
   const upstreamText = errorUpstreamText(error, responseJson);
-  const payload = {
-    ok: false,
-    message: upstreamText || responseJson.message || error.message || "请求失败"
-  };
   const code = error.code || responseJson.code;
-  if (code) payload.code = code;
-  if (upstreamText) payload.upstreamText = upstreamText;
-  if (sourceTaskId) payload.sourceTaskId = sourceTaskId;
-  if (Array.isArray(attempts) && attempts.length) payload.attempts = attempts;
+  const payload = openAIErrorPayload({
+    status,
+    message: upstreamText || responseJson.message || error.message || "请求失败",
+    code,
+    param: error.param || null,
+    legacy: {
+      ...(upstreamText ? { upstreamText } : {}),
+      ...(sourceTaskId ? { sourceTaskId } : {}),
+      ...(Array.isArray(attempts) && attempts.length ? { attempts } : {})
+    }
+  });
   try {
     await persistReturnedErrorTask(error, context, payload, status);
   } catch (persistError) {
@@ -253,6 +257,13 @@ async function sendError(reply, error, context = {}) {
   }
   reply.code(status >= 400 && status < 600 ? status : 500).send(payload);
 }
+
+app.setErrorHandler(async (error, request, reply) => {
+  if (String(request.raw?.url || request.url || "").startsWith("/v1/")) {
+    return sendError(reply, error);
+  }
+  return reply.send(error);
+});
 
 function firstHeaderValue(value) {
   return String(Array.isArray(value) ? value[0] : value || "").split(",")[0].trim();
@@ -337,7 +348,11 @@ async function requireApiKey(request, reply) {
   const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
   const apiKey = String(request.headers["x-api-key"] || bearer || "").trim();
   if (!apiKey || apiKey !== config.apiKey) {
-    return reply.code(401).send({ ok: false, message: "API 密钥不正确。" });
+    return reply.code(401).send(openAIErrorPayload({
+      status: 401,
+      message: "API 密钥不正确。",
+      code: "invalid_api_key"
+    }));
   }
 }
 
@@ -618,6 +633,32 @@ async function appendImageFields(input, files, options) {
     if (used) delete nextInput[fieldname];
   }
   return { input: nextInput, files };
+}
+
+function messageImageParts(input = {}) {
+  const messages = Array.isArray(input.messages) ? input.messages : [];
+  return messages.flatMap((message) => Array.isArray(message?.content)
+    ? message.content.filter((part) => part?.image_url || part?.type === "image_url")
+    : []);
+}
+
+async function saveMessageImagePreviews(input = {}, {
+  maxFiles = MAX_INPUT_IMAGE_COUNT,
+  existingFileCount = 0
+} = {}) {
+  const imageParts = messageImageParts(input);
+  if (existingFileCount + imageParts.length > maxFiles) {
+    throw badRequest(`对话最多只能上传 ${maxFiles} 张图片。`);
+  }
+
+  const previewFiles = [];
+  for (const part of imageParts) {
+    await pushBase64Image(previewFiles, part.image_url || part, "messages", {
+      maxFiles,
+      savePreview: true
+    });
+  }
+  return previewFiles.map((file) => file.previewUrl).filter(Boolean);
 }
 
 async function readMultipartInput(request, { maxFiles, savePreview = false }) {
@@ -1157,6 +1198,9 @@ app.get("/v1/models", { preHandler: requireApiKey }, async () => {
       { id: "gpt", object: "model", created, owned_by: "shareai-api" },
       { id: "grok", object: "model", created, owned_by: "shareai-api" },
       { id: "gemini", object: "model", created, owned_by: "shareai-api" },
+      { id: "gemini-3.5-flash-lite", object: "model", created, owned_by: "shareai-api" },
+      { id: "gemini-3.7-flash", object: "model", created, owned_by: "shareai-api" },
+      { id: "gemini-3.1-pro", object: "model", created, owned_by: "shareai-api" },
       { id: "gpt-image-2", object: "model", created, owned_by: "shareai-api" }
     ]
   };
@@ -1170,6 +1214,15 @@ function imageEditResponse(task) {
     data: imageUrls.map((url) => ({ url })),
     task: responseTask
   };
+}
+
+function sendChatCompletionStream(reply, completion) {
+  return reply
+    .code(200)
+    .header("content-type", "text/event-stream; charset=utf-8")
+    .header("cache-control", "no-cache")
+    .header("connection", "keep-alive")
+    .send(chatCompletionSseBody(completion));
 }
 
 async function findImageTask(taskId) {
@@ -1199,20 +1252,29 @@ app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, 
     let requestMeta = apiRequestMeta(request);
     if (isMultipartRequest(request)) {
       const { input, files } = await readMultipartInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
+      const inputImageUrls = await saveMessageImagePreviews(input, {
+        maxFiles: MAX_INPUT_IMAGE_COUNT,
+        existingFileCount: files.length
+      });
       requestMeta = mergeInputSourceTaskId(requestMeta, input);
       if (request.query?.wait === "0") {
-        const task = await queueChatCompletion({ ...input, files }, requestMeta);
+        const task = await queueChatCompletion({ ...input, files }, requestMeta, { inputImageUrls });
         return { created: Math.floor(Date.now() / 1000), task };
       }
-      return await createChatCompletion({ ...input, files }, requestMeta);
+      const completion = await createChatCompletion({ ...input, files }, requestMeta, { inputImageUrls });
+      return input.stream === true ? sendChatCompletionStream(reply, completion) : completion;
     }
     const input = normalizeFields(request.body || {});
+    const inputImageUrls = await saveMessageImagePreviews(input, {
+      maxFiles: MAX_INPUT_IMAGE_COUNT
+    });
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (request.query?.wait === "0") {
-      const task = await queueChatCompletion(input, requestMeta);
+      const task = await queueChatCompletion(input, requestMeta, { inputImageUrls });
       return { created: Math.floor(Date.now() / 1000), task };
     }
-    return await createChatCompletion(input, requestMeta);
+    const completion = await createChatCompletion(input, requestMeta, { inputImageUrls });
+    return input.stream === true ? sendChatCompletionStream(reply, completion) : completion;
   } catch (error) {
     return sendError(reply, error);
   }
