@@ -28,6 +28,7 @@ import {
   refreshTask
 } from "./channel-manager.js";
 import { DrawingClient } from "./channels/drawing.js";
+import { registerCloudlianAccount } from "./cloudlian-registration.js";
 import {
   cleanupResultImages,
   getResultImageStorageStats,
@@ -975,6 +976,37 @@ app.delete("/api/channels/:id", async (request) => {
 app.post("/api/accounts", async (request) => {
   const config = await saveAccount(request.body || {});
   return { ok: true, data: publicConfig(config) };
+});
+
+app.post("/api/channels/:id/cloudlian/register", async (request, reply) => {
+  try {
+    const result = await registerCloudlianAccount({
+      channelId: request.params.id,
+      activationCode: request.body?.activationCode,
+      proxyUrl: request.body?.proxyUrl,
+      resumeAccountId: request.body?.resumeAccountId
+    });
+    let verified = false;
+    let warning = "";
+    if (["ready", "already_bound"].includes(result.status)) {
+      try {
+        const checked = await checkAccount(result.accountId);
+        verified = checked?.status === "ok";
+        if (!verified && checked?.message) warning = checked.message;
+      } catch (error) {
+        warning = error?.message || "账号已绑定，但自动检测暂时失败。";
+      }
+    }
+    return {
+      ok: true,
+      data: {
+        config: publicConfig(await loadConfig()),
+        result: { ...result, verified, warning }
+      }
+    };
+  } catch (error) {
+    return sendError(reply, error);
+  }
 });
 
 app.post("/api/accounts/import", async (request) => {

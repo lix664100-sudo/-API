@@ -2733,6 +2733,26 @@
         return channel?.settings?.baseUrl || "-";
       }
 
+      function cloudlianRegistrationAvailable(channel) {
+        if (!channel) return false;
+        let value = "";
+        if (channel.type === "shareai") {
+          if (!channelAbilityEnabled(channel, "chatplus") || channelAbilityEnabled(channel, "drawing")) return false;
+          value = channel.settings?.chatBaseUrl || "";
+        } else if (channel.type === "chatplus") {
+          value = channel.settings?.baseUrl || "";
+        } else {
+          return false;
+        }
+        try {
+          const url = new URL(value);
+          const host = url.hostname.toLowerCase();
+          return url.protocol === "https:" && (host === "cloudlian.cn" || host.endsWith(".cloudlian.cn"));
+        } catch {
+          return false;
+        }
+      }
+
       function abilityStatus(account, key) {
         return account?.meta?.abilities?.[key] || {};
       }
@@ -4357,6 +4377,9 @@
         const [accountImportRows, setAccountImportRows] = useState([]);
         const [accountImportError, setAccountImportError] = useState("");
         const [accountImporting, setAccountImporting] = useState(false);
+        const [cloudlianRegistrationOpen, setCloudlianRegistrationOpen] = useState(false);
+        const [cloudlianRegistering, setCloudlianRegistering] = useState(false);
+        const [cloudlianRetryAccountId, setCloudlianRetryAccountId] = useState("");
         const [proxyAssignOpen, setProxyAssignOpen] = useState(false);
         const [proxyAssignText, setProxyAssignText] = useState("");
         const [proxyAssignChannelIds, setProxyAssignChannelIds] = useState([]);
@@ -4374,6 +4397,7 @@
         const [editForm] = Form.useForm();
         const [channelForm] = Form.useForm();
         const [accountForm] = Form.useForm();
+        const [cloudlianRegistrationForm] = Form.useForm();
         const [globalForm] = Form.useForm();
         const editingChannelType = Form.useWatch("type", channelForm);
         const editingChannelAbilities = Form.useWatch(["settings", "enabledAbilities"], channelForm) || {};
@@ -5312,6 +5336,46 @@
             message.error(error.message);
           } finally {
             setLoading(false);
+          }
+        }
+
+        function openCloudlianRegistration() {
+          cloudlianRegistrationForm.resetFields();
+          cloudlianRegistrationForm.setFieldsValue({ activationCode: "", proxyUrl: "" });
+          setCloudlianRetryAccountId("");
+          setCloudlianRegistrationOpen(true);
+        }
+
+        async function submitCloudlianRegistration(values) {
+          if (!selectedChannel?.id) return;
+          setCloudlianRegistering(true);
+          try {
+            const response = await api(`/api/channels/${encodeURIComponent(selectedChannel.id)}/cloudlian/register`, {
+              method: "POST",
+              body: {
+                activationCode: values.activationCode,
+                proxyUrl: values.proxyUrl || "",
+                resumeAccountId: cloudlianRetryAccountId
+              }
+            });
+            setConfig(response.config);
+            await refreshRuntimeStatus();
+            const result = response.result || {};
+            if (["ready", "already_bound"].includes(result.status)) {
+              setCloudlianRegistrationOpen(false);
+              setCloudlianRetryAccountId("");
+              cloudlianRegistrationForm.resetFields();
+              if (result.status === "already_bound") message.info(result.message || "这个激活码已经绑定");
+              else message.success(result.message || "账号已注册并绑定");
+              if (result.warning) message.warning(`账号已绑定，自动检测提示：${result.warning}`);
+              return;
+            }
+            if (result.accountId) setCloudlianRetryAccountId(result.accountId);
+            message.warning(result.message || "账号已保留，请检查后重试");
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setCloudlianRegistering(false);
           }
         }
 
@@ -6913,6 +6977,9 @@
                       h("div", { className: "section-title" }, [
                         h("h3", null, "渠道账号"),
                         h(Space, { size: 8, wrap: true }, [
+                          cloudlianRegistrationAvailable(selectedChannel)
+                            ? h(Button, { icon: Icon.UserAddOutlined ? h(Icon.UserAddOutlined) : null, onClick: openCloudlianRegistration }, "激活码注册")
+                            : null,
                           h(Button, { icon: Icon.UploadOutlined ? h(Icon.UploadOutlined) : null, onClick: openAccountImport, disabled: !channels.length }, "批量导入"),
                           h(Button, { icon: Icon.ApartmentOutlined ? h(Icon.ApartmentOutlined) : null, onClick: openProxyAssign, disabled: !accounts.length }, "批量分配代理"),
                           h(Button, { type: "primary", icon: Icon.PlusOutlined ? h(Icon.PlusOutlined) : null, onClick: () => openAccountModal(null), disabled: !channels.length }, "新增账号")
@@ -7452,6 +7519,44 @@
                   ])
                 ])
               : null
+          ])),
+          h(Modal, {
+            title: "激活码注册",
+            open: cloudlianRegistrationOpen,
+            onCancel: () => {
+              if (!cloudlianRegistering) setCloudlianRegistrationOpen(false);
+            },
+            onOk: () => cloudlianRegistrationForm.submit(),
+            okText: cloudlianRetryAccountId ? "继续完成" : "开始注册",
+            cancelText: "取消",
+            confirmLoading: cloudlianRegistering,
+            maskClosable: !cloudlianRegistering,
+            width: 560,
+            destroyOnClose: true
+          }, h(Form, { form: cloudlianRegistrationForm, layout: "vertical", onFinish: submitCloudlianRegistration }, [
+            h(Alert, {
+              type: cloudlianRetryAccountId ? "warning" : "info",
+              showIcon: true,
+              message: cloudlianRetryAccountId ? "继续完成已保留的账号" : `自动注册到“${selectedChannel?.name || ""}”`,
+              description: cloudlianRetryAccountId
+                ? "上次流程没有全部完成。修正激活码或注册 IP 后，系统会继续处理同一个账号。"
+                : "系统会随机生成登录账号，密码固定为 123456；激活成功后自动绑定并检测。",
+              style: { marginBottom: 16 }
+            }),
+            h(Form.Item, {
+              label: "激活码",
+              name: "activationCode",
+              rules: [
+                { required: true, whitespace: true, message: "请输入激活码" },
+                { max: 512, message: "激活码过长，请检查后重试" }
+              ]
+            }, h(Input, { allowClear: true, autoComplete: "off", placeholder: "请输入激活码" })),
+            h(Form.Item, {
+              label: "注册 IP（可选）",
+              name: "proxyUrl",
+              extra: "留空将使用线上服务器网络。支持 IP:端口，或 IP|端口|账号|密码|到期日期。",
+              rules: [{ max: 2048, message: "注册 IP 内容过长，请检查后重试" }]
+            }, h(Input, { allowClear: true, autoComplete: "off", placeholder: "不填则使用线上服务器网络" }))
           ])),
           h(Modal, {
             title: editingAccount ? "编辑账号" : "新增账号",

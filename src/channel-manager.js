@@ -4517,6 +4517,19 @@ function preserveDrawingCooldown(account, status) {
   };
 }
 
+function preserveAccountMetadata(account, status) {
+  const savedMeta = { ...(account.meta || {}) };
+  delete savedMeta.abilities;
+  const checkedMeta = status.meta || {};
+  return {
+    ...status,
+    meta: {
+      ...savedMeta,
+      ...checkedMeta
+    }
+  };
+}
+
 export async function checkAccount(accountId, options = {}) {
   const config = await loadRuntimeConfig();
   const account = config.accounts.find((item) => item.id === accountId);
@@ -4568,10 +4581,10 @@ export async function checkAccount(accountId, options = {}) {
       await checkShareAIAbility(config, channel, account, ability)
     ]));
     const results = Object.fromEntries(checked);
-    const status = preserveDrawingCooldown(
+    const status = preserveAccountMetadata(account, preserveDrawingCooldown(
       account,
       withProxyCheckMeta(combinedEnabledShareAIStatus(results), proxyResult)
-    );
+    ));
     await updateAccountStatus(account.id, status);
     if (status.status !== "ok") throw new Error(status.message || "检测失败");
     return status;
@@ -4584,15 +4597,18 @@ export async function checkAccount(accountId, options = {}) {
     const status = channel.type === "chatplus"
       ? preserveConfirmedChatQuota(account, checked)
       : checked;
-    const nextStatus = withProxyCheckMeta({
+    const nextStatus = preserveAccountMetadata(account, withProxyCheckMeta({
       ...status,
       cooldownUntil: status.status === "ok" ? null : status.cooldownUntil
-    }, proxyResult);
+    }, proxyResult));
     await updateAccountStatus(account.id, nextStatus);
     return nextStatus;
   } catch (error) {
     if (channel.type === "chatplus" && isAccountCheckTimeoutError(error)) {
-      const status = withProxyCheckMeta(accountCheckTimeoutStatus(account, error), proxyResult);
+      const status = preserveAccountMetadata(
+        account,
+        withProxyCheckMeta(accountCheckTimeoutStatus(account, error), proxyResult)
+      );
       await updateAccountStatus(account.id, status);
       if (status.status === "error") throw new Error(status.message);
       return status;
@@ -4609,12 +4625,12 @@ export async function checkAccount(accountId, options = {}) {
       expireAt: "",
       message
     };
-    const status = withProxyCheckMeta(
+    const status = preserveAccountMetadata(account, withProxyCheckMeta(
       channel.type === "chatplus"
         ? preserveConfirmedChatQuota(account, checkedStatus)
         : checkedStatus,
       proxyResult
-    );
+    ));
     await updateAccountStatus(account.id, status);
     throw new Error(message);
   }
