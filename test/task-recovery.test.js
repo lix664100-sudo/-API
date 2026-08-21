@@ -1326,7 +1326,7 @@ test("刷新时拿到无效图片文件会保留任务并继续尝试保存", as
   }
 });
 
-test("synchronous image waits for a temporary proxy mirror failure", async () => {
+test("图片保存失败后交给后台重试，不在同一轮连续下载", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -1390,7 +1390,7 @@ test("synchronous image waits for a temporary proxy mirror failure", async () =>
   ChatplusClient.prototype.downloadResultImage = async (url) => {
     downloadedUrls.push(url);
     downloadAttempt += 1;
-    if (downloadAttempt <= 2) {
+    if (downloadAttempt === 1) {
       const error = new Error("curl: (97) connection to proxy closed");
       error.code = "CURL_PROXY_ERROR";
       error.curlCode = 97;
@@ -1404,7 +1404,7 @@ test("synchronous image waits for a temporary proxy mirror failure", async () =>
 
   let localFilename = "";
   try {
-    const recovered = await createImageTask({
+    const waiting = await createImageTask({
       input: {
         channel: "chatplus",
         model: "gemini",
@@ -1415,11 +1415,16 @@ test("synchronous image waits for a temporary proxy mirror failure", async () =>
       wait: true
     });
 
+    assert.equal(waiting.status, "waiting_upstream");
+    assert.equal(waiting.raw.imageMirrorPending, true);
+    assert.deepEqual(downloadedUrls, [upstreamUrl]);
+
+    const recovered = await refreshTask(waiting.id);
     assert.equal(recovered.status, "success");
     assert.equal(recovered.imageCount, 1);
     assert.match(recovered.imageUrls[0], /^https:\/\/api\.example\.test\/uploads\/results\/.+\.png$/);
     assert.equal(recovered.imageUrls.includes(upstreamUrl), false);
-    assert.deepEqual(downloadedUrls, [upstreamUrl, upstreamUrl, upstreamUrl]);
+    assert.deepEqual(downloadedUrls, [upstreamUrl, upstreamUrl]);
     localFilename = path.basename(new URL(recovered.imageUrls[0]).pathname);
   } finally {
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;

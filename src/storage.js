@@ -1493,6 +1493,17 @@ function taskStatus(value) {
   return String(value?.status || "").trim().toLowerCase();
 }
 
+function taskListStatus(task) {
+  const status = taskStatus(task);
+  if (status !== "failed") return status;
+  const code = String(task?.responseJson?.code || task?.code || "").trim().toUpperCase();
+  const message = String(task?.errorMessage || task?.responseJson?.message || "").trim();
+  const rejectedBeforeSubmission = task?.raw?.submitted !== true;
+  return rejectedBeforeSubmission && (code === "CONCURRENCY_LIMIT" || /^并发上限/.test(message))
+    ? "concurrency_limited"
+    : status;
+}
+
 function taskRecordKind(task = {}) {
   const taskType = String(task?.taskType || "").trim().toLowerCase();
   if (taskType === "chat") return "chat";
@@ -1580,7 +1591,7 @@ export async function listTaskPage({
         if (taskChannelId !== normalizedSourceChannelId && !taskChannelId.startsWith(`${normalizedSourceChannelId}:`)) return false;
       }
       if (normalizedChannel && normalizedChannel !== "all" && taskStatChannelGroup(task) !== normalizedChannel) return false;
-      if (normalizedStatus && normalizedStatus !== "all" && taskStatus(task) !== normalizedStatus) return false;
+      if (normalizedStatus && normalizedStatus !== "all" && taskListStatus(task) !== normalizedStatus) return false;
       return taskMatchesSearch(task, normalizedKeyword, tasksSnapshot.searchTextCache);
     });
     tasksSnapshot.queryCache.set(cacheKey, matched);

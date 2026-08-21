@@ -1344,6 +1344,13 @@
         line-height: 1.45;
       }
 
+      .warning-text {
+        margin-top: 4px;
+        color: #78350f;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
       .task-error-card {
         max-width: 860px;
         margin-top: 8px;
@@ -1393,6 +1400,23 @@
         color: #7f1d1d;
       }
 
+      .task-error-card.task-concurrency-card {
+        border-color: #fde68a;
+        background: #fffbeb;
+        color: #78350f;
+      }
+
+      .task-concurrency-card .task-error-title,
+      .task-concurrency-card .task-error-target,
+      .task-concurrency-card .task-error-reason,
+      .task-concurrency-card .task-error-next {
+        color: #78350f;
+      }
+
+      .task-concurrency-card .task-error-item {
+        border-top-color: #fef3c7;
+      }
+
       .task-error-detail {
         max-width: 980px;
         margin-top: 6px;
@@ -1426,6 +1450,12 @@
         line-height: 1.5;
         overflow-wrap: anywhere;
         white-space: pre-wrap;
+      }
+
+      .task-error-detail.task-warning-detail pre {
+        border-color: #fde68a;
+        background: #fffbeb;
+        color: #78350f;
       }
 
       .task-record-row > td {
@@ -1905,6 +1935,22 @@
         return attempts.filter((item) => item && String(item.message || "").trim());
       }
 
+      function isConcurrencyLimitedTask(row) {
+        if (String(row?.status || "").toLowerCase() !== "failed") return false;
+        const code = String(row?.responseJson?.code || row?.code || "").trim().toUpperCase();
+        if (code === "CONCURRENCY_LIMIT") return true;
+        const attempts = taskAttempts(row);
+        if (attempts.length && attempts.every((item) => item.busy || /正在处理中/.test(String(item.message || "")))) {
+          return true;
+        }
+        const message = String(row?.errorMessage || row?.responseJson?.message || "").trim();
+        return row?.raw?.submitted !== true && /^并发上限/.test(message);
+      }
+
+      function taskPresentationStatus(row) {
+        return isConcurrencyLimitedTask(row) ? "concurrency_limited" : String(row?.status || "");
+      }
+
       function isChatTaskRow(row) {
         const attempts = taskAttempts(row);
         return [
@@ -1949,7 +1995,7 @@
         const text = String(value || "");
         const messages = attempts.map((item) => String(item.message || "")).join("；");
         if (/并发上限/.test(text) || attempts.every((item) => item.busy || /正在处理中/.test(String(item.message || "")))) {
-          return "任务失败：可用账号正在处理其他任务。";
+          return "并发已满：可用账号都在处理其他任务。";
         }
         if (/额度|积分不足|用完|耗尽|暂时没有图片额度/.test(messages)) {
           return "任务失败：可用账号额度不足或暂不可用。";
@@ -2159,8 +2205,9 @@
         const text = taskErrorText(row);
         if (!text) return null;
         const attempts = readableTaskAttempts(row);
-        if (!attempts.length) return h("div", { className: "error-text" }, text);
-        return h("div", { className: "task-error-card" }, [
+        const concurrencyLimited = isConcurrencyLimitedTask(row);
+        if (!attempts.length) return h("div", { className: concurrencyLimited ? "warning-text" : "error-text" }, text);
+        return h("div", { className: concurrencyLimited ? "task-error-card task-concurrency-card" : "task-error-card" }, [
           h("div", { className: "task-error-title", key: "title" }, text),
           h("ul", { className: "task-error-list", key: "list" },
             attempts.map((item, index) => h("li", { className: "task-error-item", key: `${item.target}-${index}` }, [
@@ -2836,6 +2883,7 @@
           error: ["error", "异常"],
           success: ["success", "成功"],
           failed: ["error", "失败"],
+          concurrency_limited: ["warning", "并发已满"],
           cancelled: ["default", "已取消"],
           processing: ["processing", "处理中"],
           waiting_upstream: ["processing", "等待上游"],
@@ -2850,6 +2898,15 @@
       function statusTag(status) {
         const [color, text] = statusInfo(status);
         return h(Tag, { color }, text);
+      }
+
+      function taskStatusTag(row) {
+        const status = taskPresentationStatus(row);
+        const [color, text] = statusInfo(status);
+        const style = status === "concurrency_limited"
+          ? { borderColor: "#fde68a", background: "#fffbeb", color: "#78350f" }
+          : undefined;
+        return h(Tag, { color, style }, text);
       }
 
       function labeledStatusTag(key, label, status) {
@@ -4633,7 +4690,7 @@
           const accountOk = taskAccountFilter === "all" || task.accountId === taskAccountFilter;
           const sourceChannelOk = taskSourceChannelMatches(task, taskSourceChannelFilter, accounts);
           const channelOk = taskChannelFilter === "all" || taskChannelGroup(task) === taskChannelFilter;
-          const statusOk = taskStatusFilter === "all" || task.status === taskStatusFilter;
+          const statusOk = taskStatusFilter === "all" || taskPresentationStatus(task) === taskStatusFilter;
           return accountOk && sourceChannelOk && channelOk && statusOk;
         }
 
@@ -6422,7 +6479,10 @@
               : null,
             taskErrorDisplay(row),
             taskJsonGrid(row),
-            taskRawErrorText(row) ? h("details", { className: "task-error-detail", key: "raw-error" }, [
+            taskRawErrorText(row) ? h("details", {
+              className: isConcurrencyLimitedTask(row) ? "task-error-detail task-warning-detail" : "task-error-detail",
+              key: "raw-error"
+            }, [
               h("summary", null, "查看原始错误"),
               h("pre", null, taskRawErrorText(row))
             ]) : null
@@ -6453,7 +6513,7 @@
                 : h("div", { className: "task-thumb" });
             }
           },
-          { title: "状态", dataIndex: "status", width: 90, render: statusTag },
+          { title: "状态", dataIndex: "status", width: 90, render: (_, row) => taskStatusTag(row) },
           { title: "类型", dataIndex: "taskType", width: 90, render: taskTypeLabel },
           { title: "模型", width: 150, render: (_, row) => taskModelText(row) },
           { title: "渠道", width: 300, render: (_, row) => taskChannelFlow(row) },
@@ -6469,7 +6529,7 @@
         ];
 
         const chatTaskColumns = [
-          { title: "状态", dataIndex: "status", width: 90, render: statusTag },
+          { title: "状态", dataIndex: "status", width: 90, render: (_, row) => taskStatusTag(row) },
           { title: "模型", width: 150, render: (_, row) => taskModelText(row) },
           { title: "渠道", width: 300, render: (_, row) => taskChannelFlow(row) },
           {
@@ -6554,6 +6614,7 @@
                 { label: "全部状态", value: "all" },
                 { label: "成功", value: "success" },
                 { label: "失败", value: "failed" },
+                { label: "并发已满", value: "concurrency_limited" },
                 { label: "处理中", value: "processing" },
                 { label: "等待上游", value: "waiting_upstream" },
                 { label: "结果待确认", value: "interrupted" }

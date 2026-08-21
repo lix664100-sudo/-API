@@ -47,21 +47,34 @@ test("task pages return the newest matching records without returning the full h
       channelId: "channel-shareai:drawing",
       accountId: "account-a",
       createdAt: new Date(now - 60 * 60 * 1000).toISOString()
+    },
+    {
+      id: "task-concurrency-limited",
+      sourceTaskId: "batch_draw_busy_004",
+      status: "failed",
+      taskType: "img2img",
+      channelType: "drawing",
+      channelId: "channel-shareai:drawing",
+      accountId: "account-a",
+      errorMessage: "并发上限：账号正在处理中",
+      responseJson: { code: "CONCURRENCY_LIMIT" },
+      raw: { submitted: false },
+      createdAt: new Date(now - 30 * 60 * 1000).toISOString()
     }
   ];
   for (const task of tasks) await upsertTask(task);
 
   const firstPage = await listTaskPage({ page: 1, pageSize: 2 });
-  assert.equal(firstPage.total, 3);
-  assert.equal(firstPage.allTotal, 3);
-  assert.deepEqual(firstPage.kindTotals, { image: 2, chat: 1 });
+  assert.equal(firstPage.total, 4);
+  assert.equal(firstPage.allTotal, 4);
+  assert.deepEqual(firstPage.kindTotals, { image: 3, chat: 1 });
   assert.equal(firstPage.pageCount, 2);
   assert.equal(firstPage.hasMore, true);
-  assert.deepEqual(firstPage.items.map((task) => task.id), ["task-new-drawing", "task-middle-chat"]);
+  assert.deepEqual(firstPage.items.map((task) => task.id), ["task-concurrency-limited", "task-new-drawing"]);
 
   const secondPage = await listTaskPage({ page: 2, pageSize: 2 });
   assert.equal(secondPage.hasMore, false);
-  assert.deepEqual(secondPage.items.map((task) => task.id), ["task-old-drawing"]);
+  assert.deepEqual(secondPage.items.map((task) => task.id), ["task-middle-chat", "task-old-drawing"]);
 
   const filtered = await listTaskPage({
     keyword: "batch_draw_old",
@@ -73,17 +86,21 @@ test("task pages return the newest matching records without returning the full h
   assert.equal(filtered.total, 1);
   assert.equal(filtered.items[0].id, "task-old-drawing");
 
+  const concurrencyLimited = await listTaskPage({ status: "concurrency_limited" });
+  assert.equal(concurrencyLimited.total, 1);
+  assert.equal(concurrencyLimited.items[0].id, "task-concurrency-limited");
+
   const errorSearch = await listTaskPage({ keyword: "concurrency limit" });
-  assert.equal(errorSearch.total, 1);
-  assert.equal(errorSearch.items[0].id, "task-old-drawing");
+  assert.equal(errorSearch.total, 2);
+  assert.deepEqual(errorSearch.items.map((task) => task.id), ["task-concurrency-limited", "task-old-drawing"]);
 
   const sourceChannel = await listTaskPage({ sourceChannelId: "channel-google" });
   assert.equal(sourceChannel.total, 1);
   assert.equal(sourceChannel.items[0].id, "task-middle-chat");
 
   const imageTasks = await listTaskPage({ kind: "image" });
-  assert.equal(imageTasks.total, 2);
-  assert.deepEqual(imageTasks.items.map((task) => task.id), ["task-new-drawing", "task-old-drawing"]);
+  assert.equal(imageTasks.total, 3);
+  assert.deepEqual(imageTasks.items.map((task) => task.id), ["task-concurrency-limited", "task-new-drawing", "task-old-drawing"]);
 
   const chatTasks = await listTaskPage({ kind: "chat" });
   assert.equal(chatTasks.total, 1);

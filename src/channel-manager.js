@@ -60,8 +60,6 @@ const FAST_TASK_REFRESH_TIMEOUT_SEC = 30;
 const UPSTREAM_RESULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS = 20;
-const WAIT_IMAGE_MIRROR_TIMEOUT_MS = Math.max(1000, Number(process.env.WAIT_IMAGE_MIRROR_TIMEOUT_MS || 90_000));
-const WAIT_IMAGE_MIRROR_RETRY_MS = Math.max(250, Number(process.env.WAIT_IMAGE_MIRROR_RETRY_MS || 1000));
 const PROXY_GUARDED_CLIENT_METHODS = new Set([
   "check",
   "createChatCompletion",
@@ -1605,21 +1603,6 @@ function markTaskSubmissionAttempt(task, channel, account) {
   };
 }
 
-function retryableImageMirrorError(error) {
-  const status = Number(error?.status || error?.statusCode || 0);
-  if ([404, 408, 425, 429].includes(status) || status >= 500) return true;
-  if ([
-    "CURL_PROXY_ERROR",
-    "CURL_TIMEOUT",
-    "IMAGE_DOWNLOAD_TIMEOUT",
-    "ETIMEDOUT",
-    "ECONNRESET",
-    "EAI_AGAIN",
-    "UND_ERR_CONNECT_TIMEOUT"
-  ].includes(String(error?.code || "").toUpperCase())) return true;
-  return /fetch failed|timed? ?out|connection reset|connection to proxy closed|proxy handshake/i.test(String(error?.message || ""));
-}
-
 function mergeTaskStageTimings(...values) {
   const entries = [];
   const seen = new Set();
@@ -1668,29 +1651,21 @@ async function persistTaskStage(task, stage) {
   return nextTask;
 }
 
-async function mirrorTaskImageUrls(imageUrls, config, downloadImage, options = {}) {
-  const waitForReady = options.waitForReady === true;
-  const deadline = waitForReady ? Date.now() + WAIT_IMAGE_MIRROR_TIMEOUT_MS : 0;
+async function mirrorTaskImageUrls(imageUrls, config, downloadImage) {
   const mirroredUrls = [];
 
   for (const imageUrl of imageUrls) {
-    while (true) {
-      try {
-        const [mirroredUrl] = await mirrorImageUrls([imageUrl], config, { downloadImage });
-        mirroredUrls.push(mirroredUrl);
-        break;
-      } catch (error) {
-        const remainingMs = deadline - Date.now();
-        if (!waitForReady || remainingMs <= 0 || !retryableImageMirrorError(error)) throw error;
-        await new Promise((resolve) => setTimeout(resolve, Math.min(WAIT_IMAGE_MIRROR_RETRY_MS, remainingMs)));
-      }
-    }
+    const [mirroredUrl] = await mirrorImageUrls([imageUrl], config, {
+      downloadImage,
+      attempts: 1
+    });
+    mirroredUrls.push(mirroredUrl);
   }
 
   return mirroredUrls;
 }
 
-async function mirrorTaskImages(result, config, client = null, options = {}) {
+async function mirrorTaskImages(result, config, client = null) {
   const imageUrls = usableImageResultUrls(result?.imageUrls);
   if (!imageUrls.length) return result;
   const downloadImage = typeof result?.downloadImage === "function"
@@ -1705,7 +1680,7 @@ async function mirrorTaskImages(result, config, client = null, options = {}) {
   const startedAt = Date.now();
   let mirroredUrls;
   try {
-    mirroredUrls = await mirrorTaskImageUrls(imageUrls, config, downloadImage, options);
+    mirroredUrls = await mirrorTaskImageUrls(imageUrls, config, downloadImage);
   } catch (error) {
     error.taskStageTiming = completedTaskStage("result_save", "保存图片", startedAt, "failed", error);
     throw error;
@@ -3817,9 +3792,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
             result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
           }
-          result = await mirrorTaskImages(result, config, client, {
-            waitForReady: options.waitForChatplusImages === true
-          });
+          result = await mirrorTaskImages(result, config, client);
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
           parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
@@ -3990,9 +3963,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
             result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
           }
-          result = await mirrorTaskImages(result, config, client, {
-            waitForReady: options.waitForChatplusImages === true
-          });
+          result = await mirrorTaskImages(result, config, client);
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
           parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
@@ -4791,7 +4762,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
             waitForImages: wait
           });
           if (wait && channel.type === "drawing") result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
-          result = await mirrorTaskImages(result, config, client, { waitForReady: wait });
+          result = await mirrorTaskImages(result, config, client);
           const task = wrapTask({ result, channel, account, attempts, requestJson: taskRequestJson(input), requestMeta });
           await upsertTask(task);
           if (isFinishedTask(task.status)) await recordTaskStat(task);

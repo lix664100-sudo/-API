@@ -75,7 +75,7 @@ function loadTaskFailureHelpers() {
   assert.ok(start >= 0 && end > start, "任务失败说明辅助逻辑必须存在");
 
   const context = {};
-  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskErrorText, taskReturnJson, taskSubmissionRouteText };`, context);
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { isConcurrencyLimitedTask, taskPresentationStatus, taskErrorText, taskReturnJson, taskSubmissionRouteText };`, context);
   return context.helpers;
 }
 
@@ -339,4 +339,33 @@ test("生图失败会明确区分未完整提交和上游未返回图片", () =>
   assert.equal(taskSubmissionRouteText(submitted), "聊天生图 · 测试账号");
   assert.match(taskReturnJson(notSubmitted).message, /^提交失败：/);
   assert.equal(taskReturnJson(notSubmitted).upstreamText, "{\"message\":\"车队失效，请重新选择\"}");
+});
+
+test("并发已满使用独立的黄色状态，不再显示为任务失败", () => {
+  const { isConcurrencyLimitedTask, taskPresentationStatus, taskErrorText } = loadTaskFailureHelpers();
+  const concurrencyLimited = {
+    status: "failed",
+    taskType: "img2img",
+    errorMessage: "并发上限：账号正在处理中",
+    responseJson: {
+      code: "CONCURRENCY_LIMIT",
+      attempts: [{ busy: true, message: "这个账号还有任务正在处理中" }]
+    },
+    raw: { submitted: false }
+  };
+  const realFailure = {
+    status: "failed",
+    taskType: "img2img",
+    errorMessage: "上游生成失败",
+    responseJson: { code: "UPSTREAM_NO_IMAGE" },
+    raw: { submitted: true }
+  };
+
+  assert.equal(isConcurrencyLimitedTask(concurrencyLimited), true);
+  assert.equal(taskPresentationStatus(concurrencyLimited), "concurrency_limited");
+  assert.match(taskErrorText(concurrencyLimited), /^并发已满：/);
+  assert.equal(isConcurrencyLimitedTask(realFailure), false);
+  assert.equal(taskPresentationStatus(realFailure), "failed");
+  assert.match(adminHtml, /concurrency_limited: \["warning", "并发已满"\]/);
+  assert.match(adminHtml, /task-concurrency-card/);
 });

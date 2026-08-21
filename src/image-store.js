@@ -6,8 +6,8 @@ const rootDir = process.cwd();
 export const resultImageDir = path.resolve(rootDir, process.env.RESULT_IMAGE_DIR || "outputs/results");
 
 const cleanupIntervalMs = Math.max(5, Number(process.env.RESULT_IMAGE_CLEANUP_INTERVAL_MIN || 60)) * 60 * 1000;
-const defaultDownloadTimeoutMs = Math.max(1000, Number(process.env.RESULT_IMAGE_DOWNLOAD_TIMEOUT_MS || 30000));
-const defaultDownloadAttempts = Math.max(1, Number(process.env.RESULT_IMAGE_DOWNLOAD_ATTEMPTS || 2));
+const defaultDownloadTimeoutMs = Math.max(1000, Number(process.env.RESULT_IMAGE_DOWNLOAD_TIMEOUT_MS || 90000));
+const defaultDownloadAttempts = Math.max(1, Number(process.env.RESULT_IMAGE_DOWNLOAD_ATTEMPTS || 1));
 const imageFilePattern = /\.(png|jpe?g|webp|gif)$/i;
 let runtimePublicBaseUrl = "";
 let lastAutoCleanupAt = 0;

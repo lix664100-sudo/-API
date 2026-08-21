@@ -77,7 +77,7 @@ test("required image mirroring fails instead of returning a broken upstream link
     }),
     /500/
   );
-  assert.equal(attempts, 2);
+  assert.equal(attempts, 1);
 });
 
 test("Gemini image mirroring can use an authenticated channel downloader", async () => {
@@ -98,7 +98,7 @@ test("Gemini image mirroring can use an authenticated channel downloader", async
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].source, "https://claude.midjourneye.com/gemini/images/gg-dl/authenticated-image");
-  assert.equal(calls[0].options.timeoutMs, 30000);
+  assert.equal(calls[0].options.timeoutMs, 90000);
   const filename = path.basename(new URL(url).pathname);
   assert.deepEqual(await readFile(path.join(resultImageDir, filename)), imageBytes);
 });
