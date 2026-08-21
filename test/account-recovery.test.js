@@ -815,7 +815,7 @@ test("额度恢复核验会检查指定模型的额度和页面", async () => {
   assert.deepEqual(result.meta.recoveryUsage, geminiUsage);
 });
 
-test("聊天总额度上限返回会立即停止换车并保留刷新时间", async () => {
+test("聊天总额度上限没有创建对话时换一次车并保留刷新时间", async () => {
   const client = new ChatplusClient({
     config: {},
     channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
@@ -823,12 +823,14 @@ test("聊天总额度上限返回会立即停止换车并保留刷新时间", as
     sessionLock: async (work) => work()
   });
   let prepareCount = 0;
-  client.prepareChatSession = async () => {
+  client.prepareChatSession = async (_input, ignoredCarIds) => {
     prepareCount += 1;
+    const carId = `car-limit-${prepareCount}`;
+    ignoredCarIds.add(carId);
     return {
       route: { key: "gpt", model: "gpt-test" },
       init: { default_model_slug: "gpt-test" },
-      selected: { carId: "car-limit", carType: "chatgpt" }
+      selected: { carId, carType: "chatgpt" }
     };
   };
   client.uploadChatImages = async () => [];
@@ -845,7 +847,7 @@ test("聊天总额度上限返回会立即停止换车并保留刷新时间", as
   await assert.rejects(
     client.sendConversation("额度测试", {}),
     (error) => {
-      assert.equal(error.code, "CHAT_USAGE_LIMIT");
+      assert.equal(error.code, "UPSTREAM_CONVERSATION_NOT_CREATED");
       assert.equal(error.quotaEmpty, true);
       assert.equal(error.quota, 220);
       assert.equal(error.balance, 0);
@@ -855,7 +857,7 @@ test("聊天总额度上限返回会立即停止换车并保留刷新时间", as
       return true;
     }
   );
-  assert.equal(prepareCount, 1);
+  assert.equal(prepareCount, 2);
 });
 
 test("GPT 聊天生图会忽略旧模型并使用网页当前模型", async () => {
@@ -912,11 +914,17 @@ test("GPT 聊天生图被 403 拒绝时保留上游原文", async () => {
     account: { id: "account-submit-refused", username: "test@example.com", password: "test" },
     sessionLock: async (work) => work()
   });
-  client.prepareChatSession = async () => ({
+  let prepareCount = 0;
+  client.prepareChatSession = async (_input, ignoredCarIds) => {
+    prepareCount += 1;
+    const carId = `refused-gpt-car-${prepareCount}`;
+    ignoredCarIds.add(carId);
+    return ({
     route: { key: "gpt", model: "" },
     init: { default_model_slug: "gpt-5-6-thinking" },
-    selected: { carId: "refused-gpt-car", carType: "chatgpt" }
-  });
+    selected: { carId, carType: "chatgpt" }
+    });
+  };
   client.uploadChatImages = async () => [];
   client.http = async () => ({
     status: 403,
@@ -930,11 +938,16 @@ test("GPT 聊天生图被 403 拒绝时保留上游原文", async () => {
       requireConversationId: true
     }),
     (error) => {
-      assert.equal(error.message, "当前模型不允许提交图片生成请求。");
-      assert.equal(error.code, "UPSTREAM_HTTP_403");
+      assert.match(error.message, /车位失效：连续两个车位都没有创建对话/);
+      assert.match(error.message, /当前模型不允许提交图片生成请求/);
+      assert.equal(error.code, "UPSTREAM_CONVERSATION_NOT_CREATED");
       assert.equal(error.upstreamText, "当前模型不允许提交图片生成请求。");
       assert.equal(error.upstreamExplicitFailure, true);
       assert.equal(error.imageSubmissionAttempted, true);
+      assert.deepEqual(error.carAttempts.map((item) => item.carId), [
+        "refused-gpt-car-1",
+        "refused-gpt-car-2"
+      ]);
       return true;
     }
   );

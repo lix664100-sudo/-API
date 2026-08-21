@@ -14,6 +14,8 @@ const CONVERSATION_READ_HEADERS = Object.freeze({
 });
 const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
+const UNCONFIRMED_CAR_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_UNCONFIRMED_CAR_ATTEMPTS = 2;
 const IMAGE_CAR_RECHECK_MS = 5 * 60 * 1000;
 const RECENT_IMAGE_SUCCESS_TTL_MS = 6 * 60 * 60 * 1000;
 const GEMINI_REQUEST_PATH = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
@@ -319,15 +321,11 @@ function shouldQuarantineImageSubmissionCar(error) {
   return status >= 500 || error?.code === "INVALID_UPSTREAM_RESPONSE";
 }
 
-function isRetryableImageSubmissionServerFailure(error) {
-  if (error?.imageSubmissionAttempted !== true || error?.upstreamExplicitFailure !== true) return false;
-  const status = Number(error?.status || error?.statusCode || 0);
-  return status >= 500 && status < 600;
-}
-
 function isInvalidCarError(error) {
   const text = `${error?.message || ""} ${error?.body || ""} ${error?.upstreamText || ""}`;
-  return /车队失效|车位失效|请重新选择/.test(text);
+  return error?.conversationNotCreated === true
+    || error?.code === "UPSTREAM_CONVERSATION_NOT_CREATED"
+    || /车队失效|车位失效|请重新选择|BardErrorInfo/.test(text);
 }
 
 function isProCarPlanMismatchError(error) {
@@ -1302,6 +1300,23 @@ function conversationSubmitError(response) {
     error.upstreamExplicitFailure = true;
     error.upstreamStatus = "failed";
   }
+  return error;
+}
+
+function conversationNotCreatedError(selected, detail = "", upstreamText = "") {
+  const carId = String(selected?.carId || "").trim();
+  const reason = String(detail || "").replace(/\s+/g, " ").trim();
+  const error = new Error(
+    `车位${carId ? ` ${carId}` : ""}失效：上游没有创建对话${reason ? `。上游回复：${reason}` : "。"}`
+  );
+  error.status = 502;
+  error.code = "UPSTREAM_CONVERSATION_NOT_CREATED";
+  error.conversationNotCreated = true;
+  error.upstreamExplicitFailure = true;
+  error.upstreamStatus = "failed";
+  error.upstreamText = String(upstreamText || detail || "").trim();
+  error.selectedCarId = carId;
+  error.selectedCarType = String(selected?.carType || "").trim();
   return error;
 }
 
@@ -2541,6 +2556,26 @@ export class ChatplusClient {
     rememberBadCar(this.account?.id, selected?.carType, selected?.carId);
   }
 
+  async rememberUnconfirmedCar(selected, error = null) {
+    if (!String(selected?.carId || "").trim()) return 0;
+    const retryAt = Date.now() + UNCONFIRMED_CAR_TTL_MS;
+    rememberBadCar(this.account?.id, selected?.carType, selected?.carId, retryAt);
+    if (this.onImageCarCooldown) {
+      try {
+        await this.onImageCarCooldown({
+          carId: String(selected.carId),
+          carType: String(selected.carType || "chatgpt"),
+          cooldownUntil: new Date(retryAt).toISOString(),
+          reason: "conversation_not_created",
+          message: String(error?.message || "上游没有创建对话")
+        });
+      } catch (persistError) {
+        console.error("保存失效车位失败：", persistError);
+      }
+    }
+    return retryAt;
+  }
+
   async rememberImageFailedCar(selected, error = null) {
     if (!String(selected?.carId || "").trim()) return 0;
     const parsedResetAt = Date.parse(error?.quotaResetAt || "");
@@ -3005,6 +3040,18 @@ export class ChatplusClient {
       }
       return upstreamResponse;
     });
+    const events = parseGeminiJsonLines(response.body);
+    const directContent = extractGeminiText(events);
+    const imageUrls = extractGeminiImageUrls(events, this.baseUrl);
+    const upstreamError = extractGeminiErrorText(events);
+    const conversationId = extractGeminiConversationId(events);
+    if (!conversationId) {
+      throw conversationNotCreatedError(
+        selected,
+        upstreamError || "谷歌没有返回对话编号",
+        response.body
+      );
+    }
     if (input.imageSubmissionState) input.imageSubmissionState.confirmed = true;
     throwIfImageGenerationLimit(response.body);
     if (isChatUsageLimitMessage(response.body)) {
@@ -3012,11 +3059,7 @@ export class ChatplusClient {
       error.imageQuotaExhausted = true;
       throw error;
     }
-    const events = parseGeminiJsonLines(response.body);
-    const directContent = extractGeminiText(events);
-    const imageUrls = extractGeminiImageUrls(events, this.baseUrl);
     throwIfImageGenerationLimit(directContent);
-    const upstreamError = extractGeminiErrorText(events);
     if (isImageGenerationLimitMessage(upstreamError)) {
       throw imageQuotaError("当前 Gemini 账号的图片生成额度已用完。");
     }
@@ -3029,6 +3072,7 @@ export class ChatplusClient {
       const error = new Error(upstreamError);
       error.status = 400;
       error.upstreamExplicitFailure = true;
+      error.upstreamText = String(response.body || upstreamError).trim();
       throw error;
     }
     if (!directContent && !imageUrls.length) {
@@ -3040,7 +3084,7 @@ export class ChatplusClient {
     const messageId = randomUUID();
     return {
       events,
-      conversationId: extractGeminiConversationId(events),
+      conversationId,
       messageId,
       model: route.geminiRequestedModel && route.geminiRequestedModel !== "gemini"
         ? route.model
@@ -3263,14 +3307,21 @@ export class ChatplusClient {
       throw error;
     }
 
-    if (input.imageSubmissionState) input.imageSubmissionState.confirmed = true;
-
     const events = parseJsonLines(response.body);
     const directContent = extractGrokAssistantText(events);
     const imageUrls = imageGeneration
       ? extractGrokImageUrls(events, this.baseUrl).slice(0, imageCount)
       : [];
     const upstreamError = grokUpstreamError(events);
+    const conversationId = extractGrokConversationId(events);
+    if (!conversationId) {
+      throw conversationNotCreatedError(
+        selected,
+        upstreamError || directContent || "Grok 没有返回对话编号",
+        response.body
+      );
+    }
+    if (input.imageSubmissionState) input.imageSubmissionState.confirmed = true;
     if (imageGeneration && isImageGenerationLimitMessage(upstreamError)) {
       throw imageQuotaError("当前 Grok 账号的图片生成额度已用完。");
     }
@@ -3286,7 +3337,7 @@ export class ChatplusClient {
     }
     return {
       events,
-      conversationId: extractGrokConversationId(events),
+      conversationId,
       messageId,
       model: route.key,
       upstreamModel,
@@ -3319,7 +3370,7 @@ export class ChatplusClient {
   async sendConversation(prompt, input = {}, ignoredCarIds = new Set()) {
     const errors = [];
     const imageCarQuotaErrors = [];
-    let serverFailureRetryUsed = false;
+    const unconfirmedCars = [];
     let lastError = null;
     let lastUpstreamText = "";
     const runSubmitStep = input.concurrentSubmit === true
@@ -3329,9 +3380,7 @@ export class ChatplusClient {
       let selected = null;
       let activeRoute = null;
       const imageSubmissionState = { started: false };
-      const requestInput = input.imageGeneration === true
-        ? { ...input, imageSubmissionState }
-        : input;
+      const requestInput = { ...input, imageSubmissionState };
       try {
         const session = input.concurrentSubmit === true
           ? await this.prepareReusableChatSession(requestInput, ignoredCarIds, 1)
@@ -3395,11 +3444,12 @@ export class ChatplusClient {
         for (const event of events) {
           if (event.conversation_id) conversationId = event.conversation_id;
         }
-        if (input.requireConversationId && !conversationId) {
-          const error = new Error("聊天站没有返回上游任务编号，不能算真正提交。");
-          error.status = 502;
-          error.code = "NO_UPSTREAM_TASK_ID";
-          throw error;
+        if (!conversationId) {
+          throw conversationNotCreatedError(
+            selected,
+            "GPT 没有返回对话编号",
+            response.body
+          );
         }
         if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.confirmed = true;
         this.rememberReusableChatSession(requestInput, session, submitClient);
@@ -3429,6 +3479,63 @@ export class ChatplusClient {
             await this.rememberImageFailedCar(selected);
           }
         }
+        if (
+          selected
+          && !imageSubmissionState.confirmed
+          && (imageSubmissionState.started || isInvalidCarError(error))
+        ) {
+          const carId = String(selected.carId || "").trim();
+          const reason = String(error?.message || "上游没有创建对话").replace(/\s+/g, " ").trim();
+          const message = error?.conversationNotCreated === true
+            ? reason
+            : `车位 ${carId} 失效：上游没有创建对话。具体原因：${reason}`;
+          const carAttempt = {
+            carId,
+            carType: String(selected.carType || "").trim(),
+            message,
+            upstreamText: String(error?.upstreamText || error?.body || "").trim()
+          };
+          unconfirmedCars.push(carAttempt);
+          errors.push(message);
+          await this.rememberUnconfirmedCar(selected, error);
+          await this.sessionLock(async () => this.resetSession());
+          if (unconfirmedCars.length >= MAX_UNCONFIRMED_CAR_ATTEMPTS) {
+            const failedCars = unconfirmedCars.map((item) => item.carId).filter(Boolean).join("、");
+            const finalError = new Error(
+              `车位失效：连续两个车位都没有创建对话${failedCars ? `（${failedCars}）` : ""}，当前任务失败。最后原因：${reason}`
+            );
+            finalError.status = 502;
+            finalError.code = "UPSTREAM_CONVERSATION_NOT_CREATED";
+            finalError.conversationNotCreated = true;
+            finalError.noRetry = true;
+            finalError.upstreamExplicitFailure = true;
+            finalError.upstreamStatus = "failed";
+            finalError.upstreamText = carAttempt.upstreamText || lastUpstreamText;
+            finalError.selectedCarId = carId;
+            finalError.selectedCarType = String(selected.carType || "").trim();
+            finalError.carAttempts = unconfirmedCars;
+            for (const key of [
+              "quotaEmpty",
+              "imageQuotaExhausted",
+              "quotaReason",
+              "quotaConfirmedByUpstream",
+              "quota",
+              "used",
+              "balance",
+              "quotaResetAt",
+              "cooldownUntil",
+              "period"
+            ]) {
+              if (error?.[key] !== undefined) finalError[key] = error[key];
+            }
+            if (input.imageGeneration === true) {
+              finalError.imageSubmissionAttempted = true;
+              finalError.imageSubmissionConfirmed = false;
+            }
+            throw finalError;
+          }
+          continue;
+        }
         if (selected && error.imageCarQuotaExhausted === true) {
           await this.rememberImageFailedCar(selected, error);
           await this.sessionLock(async () => this.resetSession());
@@ -3439,22 +3546,6 @@ export class ChatplusClient {
           this.rememberAuthFailedCar(selected);
           await this.sessionLock(async () => this.resetSession());
           errors.push(error.message || "上游拒绝了当前聊天车位");
-          continue;
-        }
-        if (
-          selected
-          && !serverFailureRetryUsed
-          && isRetryableImageSubmissionServerFailure(error)
-        ) {
-          serverFailureRetryUsed = true;
-          await this.sessionLock(async () => this.resetSession());
-          errors.push(error.message || "上游处理失败，已更换车位重试");
-          continue;
-        }
-        if (selected && !imageSubmissionState.started && isInvalidCarError(error)) {
-          this.rememberAuthFailedCar(selected);
-          await this.sessionLock(async () => this.resetSession());
-          errors.push(error.message || "当前车位已经失效");
           continue;
         }
         if (error.noRetry || error.imageQuotaExhausted || error.imageSubmissionAttempted) {
@@ -3756,12 +3847,12 @@ export class ChatplusClient {
         }, async () => waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec));
         return { ...conversation, imageUrls };
       });
-      const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
+      const { events, conversationId, model, upstreamModel, route, selected, imageUrls } = result;
       const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
       if (imageUrls.length) await this.rememberImageSuccessfulCar(selected);
 
       return {
-        externalId: conversationId || messageId,
+        externalId: conversationId,
         status: imageUrls.length ? "success" : "waiting_upstream",
         prompt,
         taskType: "text2img",
@@ -3818,12 +3909,12 @@ export class ChatplusClient {
         }, async () => waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true }));
         return { ...conversation, imageUrls };
       });
-      const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
+      const { events, conversationId, model, upstreamModel, route, selected, imageUrls } = result;
       const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
       if (imageUrls.length) await this.rememberImageSuccessfulCar(selected);
 
       return {
-        externalId: conversationId || messageId,
+        externalId: conversationId,
         status: imageUrls.length ? "success" : "waiting_upstream",
         prompt,
         taskType: "img2img",
@@ -3882,9 +3973,9 @@ export class ChatplusClient {
           if (!content) throw new Error("聊天渠道没有返回文字内容，已尝试切换备用渠道。");
           return { ...conversation, content, detailContent, imageUrls };
         });
-        const { events, conversationId, messageId, model, upstreamModel, route, selected, content, detailContent, imageUrls } = result;
+        const { events, conversationId, model, upstreamModel, route, selected, content, detailContent, imageUrls } = result;
         return {
-          externalId: conversationId || messageId,
+          externalId: conversationId,
           model,
           content,
           imageUrls,

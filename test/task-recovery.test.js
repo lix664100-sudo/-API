@@ -2218,12 +2218,16 @@ test("聊天生图没有上游编号时不能算已提交", async () => {
     sessionLock: async (work) => work()
   });
   let submittedCount = 0;
-  client.prepareChatSession = async () => {
+  let prepareCount = 0;
+  client.prepareChatSession = async (_input, ignoredCarIds) => {
+    prepareCount += 1;
+    const carId = `car-no-upstream-id-${prepareCount}`;
+    ignoredCarIds.add(carId);
     client.portalLoggedIn = true;
-    client.cookies = ["portal=ok", "car=car-no-upstream-id"];
+    client.cookies = ["portal=ok", `car=${carId}`];
     return {
       route: { key: "gpt", strategy: "image" },
-      selected: { carId: "car-no-upstream-id", carType: "chatgpt", strategy: "image" },
+      selected: { carId, carType: "chatgpt", strategy: "image" },
       init: { default_model_slug: "gpt-test" }
     };
   };
@@ -2247,9 +2251,10 @@ test("聊天生图没有上游编号时不能算已提交", async () => {
           submittedCount += 1;
         }
       }),
-      /上游任务编号/
+      /连续两个车位都没有创建对话/
     );
     assert.equal(submittedCount, 0);
+    assert.equal(prepareCount, 2);
   } finally {
     ChatplusClient.prototype.http = originalHttp;
   }

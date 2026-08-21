@@ -202,7 +202,7 @@ test("Plus image limit switches to the best remaining image car without saving a
   }
 });
 
-test("Free image limit switches cars and records the complete upstream recovery time", async () => {
+test("Free image limit without a conversation id switches cars and pauses the car for 24 hours", async () => {
   const cooldowns = [];
   const enteredCars = [];
   let requestCount = 0;
@@ -241,7 +241,7 @@ test("Free image limit switches cars and records the complete upstream recovery 
   assert.deepEqual(enteredCars, ["free-limit-car", "free-limit-fallback"]);
   assert.equal(cooldowns.length, 1);
   assert.equal(cooldowns[0].carId, "free-limit-car");
-  const expectedDelay = (17 * 60 + 34) * 60 * 1000;
+  const expectedDelay = 24 * 60 * 60 * 1000;
   const actualDelay = Date.parse(cooldowns[0].cooldownUntil) - startedAt;
   assert.ok(Math.abs(actualDelay - expectedDelay) < 2000);
 });
@@ -411,7 +411,7 @@ test("legacy image-limit restriction is rechecked instead of permanently skippin
   assert.equal(selected.carId, "pro-car");
 });
 
-test("image car becomes eligible again after the upstream recovery hint", async () => {
+test("a car without a conversation id stays paused even after a shorter upstream recovery hint", async () => {
   let requestCount = 0;
   const server = createServer((_request, response) => {
     requestCount += 1;
@@ -451,7 +451,7 @@ test("image car becomes eligible again after the upstream recovery hint", async 
       requireConversationId: true
     });
 
-    assert.deepEqual(selectedCars, ["recovering-car", "fallback-car", "recovering-car"]);
+    assert.deepEqual(selectedCars, ["recovering-car", "fallback-car", "fallback-car"]);
     assert.equal(requestCount, 3);
   } finally {
     await new Promise((resolve) => server.close(resolve));

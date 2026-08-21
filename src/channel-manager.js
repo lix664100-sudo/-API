@@ -735,6 +735,7 @@ async function persistImageCarCooldown(channel, account, cooldown = {}) {
           carType,
           cooldownUntil,
           reason: String(cooldown.reason || "image_failure"),
+          message: String(cooldown.message || "").replace(/\s+/g, " ").trim().slice(0, 300),
           updatedAt: new Date().toISOString()
         };
       } else {
@@ -752,6 +753,7 @@ async function persistImageCarCooldown(channel, account, cooldown = {}) {
         carType,
         cooldownUntil,
         reason: String(cooldown.reason || "image_failure"),
+        message: String(cooldown.message || "").replace(/\s+/g, " ").trim().slice(0, 300),
         updatedAt: new Date().toISOString()
       };
     } else {
@@ -980,6 +982,7 @@ function imageSubmissionFailure(error) {
   failure.upstreamExplicitFailure = error?.upstreamExplicitFailure === true;
   failure.selectedCarId = error?.selectedCarId || "";
   failure.selectedCarType = error?.selectedCarType || "";
+  failure.carAttempts = Array.isArray(error?.carAttempts) ? error.carAttempts : [];
   return failure;
 }
 
@@ -3578,12 +3581,18 @@ async function failQueuedTask(task, error, attempts = []) {
       ...(statusCode ? { status: statusCode } : {}),
       ...(code ? { code } : {}),
       ...(failure ? imageFailureResponseFields(failure) : upstreamText ? { upstreamText } : {}),
+      ...(Array.isArray(error?.carAttempts) && error.carAttempts.length
+        ? { carAttempts: taskResponseJson(error.carAttempts) }
+        : {}),
       attempts: taskResponseJson(attempts)
     },
     completedAt: new Date().toISOString(),
     raw: mergeTaskRaw(task.raw, {
       ...(error?.selectedCarId ? { selectedCarId: error.selectedCarId } : {}),
       ...(error?.selectedCarType ? { selectedCarType: error.selectedCarType } : {}),
+      ...(Array.isArray(error?.carAttempts) && error.carAttempts.length
+        ? { carAttempts: taskResponseJson(error.carAttempts) }
+        : {}),
       ...(failure ? imageFailureRawFields(failure) : {}),
       stageTimings: error?.taskStageTiming ? [error.taskStageTiming] : []
     })
@@ -4120,7 +4129,11 @@ async function runChatCompletionTask(task, input) {
         channelName: channel.name,
         accountId: account.id,
         accountName: account.name,
-        message: error.message || "调用失败"
+        message: error.message || "调用失败",
+        ...(error?.selectedCarId ? { carId: error.selectedCarId } : {}),
+        ...(Array.isArray(error?.carAttempts) && error.carAttempts.length
+          ? { carAttempts: taskResponseJson(error.carAttempts) }
+          : {})
       });
       if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
         await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error, {
@@ -4132,6 +4145,10 @@ async function runChatCompletionTask(task, input) {
         await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error, {
           explicitChatQuotaOnly: channel.type === "chatplus"
         }));
+      }
+      if (error?.code === "UPSTREAM_CONVERSATION_NOT_CREATED") {
+        error.task = await failQueuedTask(task, error, attempts);
+        throw error;
       }
       if (status === 400 && !isChatBlockedError(error)) {
         error.task = await failQueuedTask(task, error, attempts);

@@ -692,7 +692,7 @@ test("Gemini 返回文字失败时只消耗一次提交并保留回复", async (
   assert.equal(submitted.length, 1);
 });
 
-test("Gemini 提交结果无法确认时不会换车重发", async () => {
+test("Gemini 提交结果无法确认时最多换一个车位重试", async () => {
   const testClient = client();
   testClient.geminiSession = {
     at: "token-at",
@@ -728,11 +728,12 @@ test("Gemini 提交结果无法确认时不会换车重发", async () => {
       model: "gemini",
       files: [fakeImageFile()]
     }),
-    (error) => error.imageSubmissionAttempted === true
+    (error) => error.code === "UPSTREAM_CONVERSATION_NOT_CREATED"
+      && error.imageSubmissionAttempted === true
   );
 
-  assert.equal(selectedCount, 1);
-  assert.equal(submissionCount, 1);
+  assert.equal(selectedCount, 2);
+  assert.equal(submissionCount, 2);
 });
 
 test("Gemini 上游返回 500 后当前任务换车再提交一次", async () => {
@@ -871,6 +872,101 @@ test("Gemini 参考图上传前发现车位失效时会先换车，不会误记�
   assert.deepEqual(result.imageUrls, ["https://example.test/generated-after-upload-car-switch.png"]);
 });
 
+test("普通对话没有创建对话时会停用当前车位并换一个车位", async () => {
+  const testClient = client();
+  const selectedCars = [];
+  const cooldowns = [];
+  testClient.onImageCarCooldown = async (cooldown) => cooldowns.push(cooldown);
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    const carId = selectedCars.length ? "healthy-chat-car" : "invalid-chat-car";
+    selectedCars.push(carId);
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.sendGeminiConversation = async (_prompt, input, route, selected) => {
+    input.imageSubmissionState.started = true;
+    if (selected.carId === "invalid-chat-car") {
+      const error = new Error("type.googleapis.com/assistant.boq.bard.application.BardErrorInfo");
+      error.status = 400;
+      error.upstreamText = error.message;
+      throw error;
+    }
+    input.imageSubmissionState.confirmed = true;
+    return {
+      events: [],
+      conversationId: "conversation-after-chat-car-switch",
+      model: "gemini",
+      upstreamModel: "gemini",
+      route,
+      selected,
+      submissionConfirmed: true,
+      directContent: "这是测试商品。",
+      imageUrls: []
+    };
+  };
+
+  const result = await testClient.createChatCompletion({
+    model: "gemini",
+    messages: [{ role: "user", content: "请说明这是什么商品。" }]
+  });
+
+  assert.deepEqual(selectedCars, ["invalid-chat-car", "healthy-chat-car"]);
+  assert.equal(result.content, "这是测试商品。");
+  assert.equal(result.externalId, "conversation-after-chat-car-switch");
+  assert.equal(result.raw.selectedCarId, "healthy-chat-car");
+  assert.equal(cooldowns.length, 1);
+  assert.equal(cooldowns[0].carId, "invalid-chat-car");
+  assert.equal(cooldowns[0].reason, "conversation_not_created");
+  assert.ok(Date.parse(cooldowns[0].cooldownUntil) > Date.now() + 23 * 60 * 60 * 1000);
+});
+
+test("连续两个车位都没有创建对话时任务失败并保存两个车位", async () => {
+  const testClient = client();
+  const selectedCars = [];
+  const cooldowns = [];
+  testClient.onImageCarCooldown = async (cooldown) => cooldowns.push(cooldown);
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    const carId = `invalid-chat-car-${selectedCars.length + 1}`;
+    selectedCars.push(carId);
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.sendGeminiConversation = async (_prompt, input) => {
+    input.imageSubmissionState.started = true;
+    const error = new Error("type.googleapis.com/assistant.boq.bard.application.BardErrorInfo");
+    error.status = 400;
+    error.upstreamText = error.message;
+    throw error;
+  };
+
+  await assert.rejects(
+    () => testClient.createChatCompletion({
+      model: "gemini",
+      messages: [{ role: "user", content: "测试连续失效车位" }]
+    }),
+    (error) => {
+      assert.equal(error.code, "UPSTREAM_CONVERSATION_NOT_CREATED");
+      assert.deepEqual(error.carAttempts.map((item) => item.carId), [
+        "invalid-chat-car-1",
+        "invalid-chat-car-2"
+      ]);
+      assert.match(error.message, /连续两个车位都没有创建对话/);
+      return true;
+    }
+  );
+
+  assert.deepEqual(selectedCars, ["invalid-chat-car-1", "invalid-chat-car-2"]);
+  assert.deepEqual(cooldowns.map((item) => item.carId), selectedCars);
+});
+
 test("Gemini 上游连续返回 500 时当前任务最多提交两次", async () => {
   const testClient = client();
   const selectedCars = [];
@@ -901,7 +997,9 @@ test("Gemini 上游连续返回 500 时当前任务最多提交两次", async ()
       model: "gemini",
       files: [fakeImageFile()]
     }),
-    (error) => error.status === 500 && error.imageSubmissionAttempted === true
+    (error) => error.code === "UPSTREAM_CONVERSATION_NOT_CREATED"
+      && error.status === 502
+      && error.imageSubmissionAttempted === true
   );
 
   assert.equal(submissionCount, 2);
@@ -1060,8 +1158,44 @@ test("Gemini 没有返回文字或图片时不能误判成功", async () => {
       { key: "gemini", strategy: "thinking", model: "" },
       { carId: "car-test", carType: "gemini" }
     ),
-    (error) => error.code === "INVALID_UPSTREAM_RESPONSE" && error.status === 502
+    (error) => error.code === "UPSTREAM_CONVERSATION_NOT_CREATED"
+      && error.status === 502
+      && error.conversationNotCreated === true
   );
+});
+
+test("Gemini 返回 BardErrorInfo 且没有对话编号时明确标记车位失效", async () => {
+  const testClient = client();
+  const state = { started: false };
+  const body = JSON.stringify([["wrb.fr", "StreamGenerate", JSON.stringify([
+    null,
+    null,
+    null,
+    null,
+    [[null, "type.googleapis.com/assistant.boq.bard.application.BardErrorInfo"]]
+  ]), null, null]]);
+  testClient.geminiSession.bl = "boq_assistant-bard-web-server_test";
+  testClient.uploadGeminiImages = async () => [];
+  testClient.http = async () => ({ status: 200, headers: {}, body });
+
+  await assert.rejects(
+    () => testClient.sendGeminiConversation(
+      "车位失效测试",
+      { files: [], imageSubmissionState: state },
+      { key: "gemini", strategy: "thinking", model: "" },
+      { carId: "expired-car", carType: "gemini" }
+    ),
+    (error) => {
+      assert.equal(error.code, "UPSTREAM_CONVERSATION_NOT_CREATED");
+      assert.equal(error.conversationNotCreated, true);
+      assert.equal(error.selectedCarId, "expired-car");
+      assert.equal(error.upstreamText, body);
+      return true;
+    }
+  );
+
+  assert.equal(state.started, true);
+  assert.equal(state.confirmed, undefined);
 });
 
 test("Gemini 上游明确返回用量上限时标记为额度不足", async () => {

@@ -220,6 +220,17 @@ export function normalizeDrawingTask(task, drawingBaseUrl = "") {
   };
 }
 
+function confirmedDrawingTask(task, drawingBaseUrl = "") {
+  const result = normalizeDrawingTask(task, drawingBaseUrl);
+  if (String(result.externalId || "").trim()) return result;
+  const error = new Error("绘图渠道没有创建任务，已自动尝试备用渠道。");
+  error.status = 502;
+  error.code = "UPSTREAM_TASK_NOT_CREATED";
+  error.upstreamText = returnedTextValue(task);
+  error.payload = task;
+  throw error;
+}
+
 export class DrawingClient {
   constructor({ config, channel, account, sessionLock }) {
     this.config = config;
@@ -436,7 +447,7 @@ export class DrawingClient {
     };
     if (!payload.prompt) throw new Error("请输入生图描述。");
     const task = await this.request("/api/v1/draw/tasks", { method: "POST", body: payload });
-    return normalizeDrawingTask(task, this.drawingBaseUrl);
+    return confirmedDrawingTask(task, this.drawingBaseUrl);
   }
 
   async uploadImage(file) {
@@ -464,7 +475,7 @@ export class DrawingClient {
     if (!payload.prompt) throw new Error("请输入改图要求。");
     if (!payload.source_upload_ids.length) throw new Error("请上传源图。");
     const task = await this.request("/api/v1/draw/tasks", { method: "POST", body: payload });
-    return normalizeDrawingTask(task, this.drawingBaseUrl);
+    return confirmedDrawingTask(task, this.drawingBaseUrl);
   }
 
   async getTask(externalId) {
