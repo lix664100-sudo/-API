@@ -51,7 +51,8 @@ function clientForGpt(options = {}) {
       ...(options.account || {})
     },
     sessionLock: async (work) => work(),
-    onProCarsUnavailable: options.onProCarsUnavailable
+    onProCarsUnavailable: options.onProCarsUnavailable,
+    onImageCarCooldown: options.onImageCarCooldown
   });
 }
 
@@ -199,6 +200,149 @@ test("Plus image limit switches to the best remaining image car without saving a
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("Free image limit switches cars and records the complete upstream recovery time", async () => {
+  const cooldowns = [];
+  const enteredCars = [];
+  let requestCount = 0;
+  const client = clientForGpt({
+    accountId: "account-free-image-limit",
+    onImageCarCooldown: async (cooldown) => cooldowns.push(cooldown)
+  });
+  client.portalLoggedIn = true;
+  client.fetchCars = async () => [
+    car({ id: "free-limit-car", imageRemaining: 100 }),
+    car({ id: "free-limit-fallback", imageRemaining: 1 })
+  ];
+  client.enterCar = async (carId) => {
+    enteredCars.push(carId);
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.uploadChatImages = async () => [];
+  client.http = async () => {
+    requestCount += 1;
+    return {
+      status: 200,
+      headers: {},
+      body: requestCount === 1
+        ? "data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"parts\":[\"You've hit the Free plan limit for image generations requests. You can create more images when the limit resets in 17 hours and 34 minutes.\"]}}}\n\ndata: [DONE]\n\n"
+        : "data: {\"conversation_id\":\"conversation-free-fallback\"}\n\ndata: [DONE]\n\n"
+    };
+  };
+
+  const startedAt = Date.now();
+  const result = await client.sendConversation("生成图片", {
+    imageGeneration: true,
+    requireConversationId: true
+  });
+
+  assert.equal(result.conversationId, "conversation-free-fallback");
+  assert.deepEqual(enteredCars, ["free-limit-car", "free-limit-fallback"]);
+  assert.equal(cooldowns.length, 1);
+  assert.equal(cooldowns[0].carId, "free-limit-car");
+  const expectedDelay = (17 * 60 + 34) * 60 * 1000;
+  const actualDelay = Date.parse(cooldowns[0].cooldownUntil) - startedAt;
+  assert.ok(Math.abs(actualDelay - expectedDelay) < 2000);
+});
+
+test("an image limit discovered while waiting switches the current task to another car", async () => {
+  const enteredCars = [];
+  let requestCount = 0;
+  const client = clientForGpt({ accountId: "account-late-image-limit" });
+  client.portalLoggedIn = true;
+  client.fetchCars = async () => [
+    car({ id: "late-limit-car", imageRemaining: 100 }),
+    car({ id: "late-limit-fallback", imageRemaining: 1 })
+  ];
+  client.enterCar = async (carId) => {
+    enteredCars.push(carId);
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.uploadChatImages = async () => [];
+  client.createSubmitClient = () => client;
+  client.http = async () => {
+    requestCount += 1;
+    return {
+      status: 200,
+      headers: {},
+      body: requestCount === 1
+        ? "data: {\"conversation_id\":\"conversation-late-limit\"}\n\ndata: [DONE]\n\n"
+        : "data: {\"conversation_id\":\"conversation-late-fallback\"}\n\ndata: [DONE]\n\n"
+    };
+  };
+  client.conversationDetail = async () => ({
+    messages: [
+      {
+        author: { role: "assistant" },
+        content: {
+          parts: [JSON.stringify({
+            prompt: "一段比额度提示更长的图片参数内容，用来模拟上游先返回绘图参数、稍后再返回额度不足的真实情况。".repeat(4),
+            size: "1024x1365",
+            n: 1,
+            referenced_image_ids: ["file_test"]
+          })]
+        }
+      },
+      {
+        author: { role: "assistant" },
+        content: {
+          parts: ["You've hit the Free plan limit for image generations requests. You can create more images when the limit resets in 2 hours and 15 minutes."]
+        }
+      }
+    ]
+  });
+  client.imageUrlsFrom = async (value) => (
+    JSON.stringify(value).includes("conversation-late-fallback")
+      ? ["https://example.test/generated-after-late-switch.png"]
+      : []
+  );
+
+  const result = await client.createTextTask({
+    prompt: "等待后换车",
+    waitForImages: true
+  });
+
+  assert.deepEqual(enteredCars, ["late-limit-car", "late-limit-fallback"]);
+  assert.deepEqual(result.imageUrls, ["https://example.test/generated-after-late-switch.png"]);
+});
+
+test("saved image car cooldowns are restored after a client restart", async () => {
+  const cooldownUntil = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const client = clientForGpt({
+    accountId: "account-restored-image-cooldown",
+    account: {
+      meta: {
+        abilities: {
+          chatplus: {
+            meta: {
+              imageCarCooldowns: {
+                "chatgpt:persisted-limit-car": {
+                  carId: "persisted-limit-car",
+                  carType: "chatgpt",
+                  cooldownUntil
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+  client.fetchCars = async () => [
+    car({ id: "persisted-limit-car", imageRemaining: 100 }),
+    car({ id: "restored-fallback-car", imageRemaining: 1 })
+  ];
+
+  const selected = await client.selectCar({
+    key: "gpt",
+    name: "GPT",
+    carType: "chatgpt",
+    strategy: "image",
+    carTier: "auto"
+  });
+
+  assert.equal(selected.carId, "restored-fallback-car");
 });
 
 test("saved plan mismatch restriction continues to skip PRO cars", async () => {
@@ -362,4 +506,110 @@ test("a car that recently produced an image is preferred when switching", async 
   });
 
   assert.equal(selected.carId, "recent-success-car");
+});
+
+test("image tasks record each processing stage and car attempt", async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end("data: {\"conversation_id\":\"conversation-timing\"}\n\ndata: [DONE]\n\n");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const client = clientForGpt({
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    accountId: "account-stage-timing"
+  });
+  const reported = [];
+  client.portalLoggedIn = true;
+  client.fetchCars = async () => [car({ id: "timed-car", imageRemaining: 10 })];
+  client.enterCar = async () => {};
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.uploadChatImages = async () => [];
+
+  try {
+    const result = await client.createImageTask({
+      prompt: "记录耗时",
+      files: [{ filename: "source.png" }],
+      waitForImages: false,
+      onStage: async (stage) => reported.push(stage)
+    });
+
+    const keys = result.raw.stageTimings.map((stage) => stage.key);
+    assert.deepEqual(keys, ["car_enter", "car_init", "source_upload", "upstream_generation"]);
+    assert.deepEqual(reported.map((stage) => stage.id), result.raw.stageTimings.map((stage) => stage.id));
+    assert.equal(result.raw.stageTimings[0].carId, "timed-car");
+    assert.equal(result.status, "waiting_upstream");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a successful concurrent submission refreshes the reusable login session", async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, {
+      "content-type": "text/event-stream",
+      "set-cookie": "session=fresh; Path=/"
+    });
+    response.end("data: {\"conversation_id\":\"conversation-fresh-session\"}\n\ndata: [DONE]\n\n");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const client = clientForGpt({
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    accountId: "account-fresh-session"
+  });
+  let carListReads = 0;
+  let carEntries = 0;
+  client.fetchCars = async () => {
+    carListReads += 1;
+    return [car({ id: "fresh-session-car", imageRemaining: 10 })];
+  };
+  client.enterCar = async (carId, carType) => {
+    carEntries += 1;
+    client.portalLoggedIn = true;
+    client.carId = carId;
+    client.carType = carType;
+    client.cookies = ["session=initial"];
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+
+  try {
+    await client.createTextTask({
+      prompt: "刷新登录状态",
+      concurrentSubmit: true,
+      waitForImages: false
+    });
+    const reused = await client.prepareReusableChatSession({ preferImageCar: true }, new Set(), 1);
+
+    assert.equal(carListReads, 1);
+    assert.equal(carEntries, 1);
+    assert.equal(reused.snapshot.cookies.includes("session=fresh"), true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("an in-flight task keeps its original car when the next task switches cars", async () => {
+  const client = clientForGemini();
+  client.fetchCars = async () => [
+    car({ id: "car-a", count: 0, imageRemaining: 10 }),
+    car({ id: "car-b", count: 1, imageRemaining: 9 })
+  ];
+  client.enterCar = async (carId, carType) => {
+    client.portalLoggedIn = true;
+    client.carId = carId;
+    client.carType = carType;
+    client.cookies = [`car=${carId}`];
+  };
+
+  const taskASession = await client.prepareReusableChatSession({ preferImageCar: true }, new Set(), 1);
+  const taskAClient = client.createSubmitClient(taskASession);
+  client.rememberImageFailedCar(taskASession.selected);
+  const taskBSession = await client.prepareReusableChatSession({ preferImageCar: true }, new Set(), 1);
+  const taskBClient = client.createSubmitClient(taskBSession);
+
+  assert.equal(taskAClient.carId, "car-a");
+  assert.deepEqual(taskAClient.cookies, ["car=car-a"]);
+  assert.equal(taskBClient.carId, "car-b");
+  assert.deepEqual(taskBClient.cookies, ["car=car-b"]);
 });

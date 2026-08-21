@@ -1950,6 +1950,81 @@ test("后台可以用服务器账号读取上游聊天详情", async () => {
   }
 });
 
+test("Gemini 本地备用编号不会被当成真实上游对话", async () => {
+  const originalConfig = await loadConfig();
+  const shareAIChannel = {
+    id: "shareai",
+    name: "ShareAI账号",
+    type: "shareai",
+    enabled: true,
+    settings: {
+      baseUrl: "https://one.aishare.icu",
+      defaultChatModel: "gemini",
+      chatModels: [{
+        key: "gemini",
+        name: "Gemini",
+        carType: "gemini",
+        strategy: "thinking",
+        enabled: true,
+        default: true
+      }]
+    }
+  };
+  await saveConfig({
+    ...originalConfig,
+    defaultChannel: "shareai",
+    channels: [
+      shareAIChannel,
+      ...originalConfig.channels.filter((item) => item.id !== "shareai")
+    ],
+    accounts: [
+      ...originalConfig.accounts.filter((item) => item.id !== "account-gemini-local-id"),
+      {
+        id: "account-gemini-local-id",
+        channelId: "shareai",
+        name: "Gemini编号测试账号",
+        username: "gemini-local-id@example.com",
+        password: "test",
+        enabled: true,
+        status: "ok"
+      }
+    ]
+  });
+  await upsertTask({
+    id: "task-gemini-local-id",
+    externalId: "6a881587-cb5e-4f00-9c74-e5ac904bf377",
+    status: "failed",
+    taskType: "img2img",
+    modelId: "gemini",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-gemini-local-id",
+    accountName: "Gemini编号测试账号",
+    raw: { chatModel: "gemini" },
+    createdAt: new Date().toISOString(),
+    completedAt: new Date().toISOString()
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  let queriedUpstream = false;
+  ChatplusClient.prototype.getTask = async function getTask() {
+    queriedUpstream = true;
+    return {};
+  };
+
+  try {
+    await assert.rejects(
+      () => inspectUpstreamTask("task-gemini-local-id"),
+      /还没有保存上游对话编号/
+    );
+    assert.equal(queriedUpstream, false);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    await saveConfig(originalConfig);
+  }
+});
+
 test("已提交但被中间 JSON 误判失败的聊天生图会自动恢复", async () => {
   const originalConfig = await loadConfig();
   await saveConfig({
@@ -2239,6 +2314,16 @@ test("聊天生图等待上游任务会继续占用并发名额", async () => {
   ChatplusClient.prototype.createImageTask = async (input) => {
     const job = String(input.prompt || "");
     submittedJobs.push(job);
+    await input.onStage?.({
+      id: `stage-${job}`,
+      key: "car_enter",
+      label: "进入车位",
+      status: "success",
+      carId: `car-${job}`,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      durationMs: 1200
+    });
     await input.onSubmitted?.({
       externalId: `conversation-${job}`,
       status: "processing",
@@ -2287,6 +2372,10 @@ test("聊天生图等待上游任务会继续占用并发名额", async () => {
     assert.deepEqual(
       tasks.find((task) => task.prompt === "job-1")?.inputImageUrls,
       ["/uploads/previews/source-1.png"]
+    );
+    assert.deepEqual(
+      tasks.find((task) => task.prompt === "job-1")?.raw?.stageTimings?.map((stage) => stage.id),
+      ["stage-job-1"]
     );
     await assert.rejects(
       () => queueImageTask({

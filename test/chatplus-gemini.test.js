@@ -61,6 +61,10 @@ function fakeImageFile() {
   };
 }
 
+function geminiModelHeader(request) {
+  return JSON.parse(request.options.headers["x-goog-ext-525001261-jspb"]);
+}
+
 test("Gemini 进页时会顺手拿到镜像站上传参数", async () => {
   const testClient = client();
   testClient.portalLoggedIn = true;
@@ -119,6 +123,174 @@ test("Gemini 文字请求会提交网页协议并返回文字", async () => {
   assert.match(decodedBody, /token-at/);
   assert.match(decodedBody, /请回复测试成功/);
   assert.equal(request.options.headers["content-type"], "application/x-www-form-urlencoded;charset=UTF-8");
+});
+
+for (const modelCase of [
+  {
+    model: "gemini-3.5-flash-lite",
+    thinkingLevel: "standard",
+    modelHash: "8c46e95b1a07cecc",
+    mode: 6,
+    nativeThinkingLevel: 1
+  },
+  {
+    model: "gemini-3.7-flash",
+    thinkingLevel: "standard",
+    modelHash: "56fdd199312815e2",
+    mode: 1,
+    nativeThinkingLevel: 1
+  },
+  {
+    model: "gemini-3.1-pro",
+    thinkingLevel: "extended",
+    modelHash: "e6fa609c3fa255c0",
+    mode: 3,
+    nativeThinkingLevel: 2
+  }
+]) {
+  test(`Gemini 参数会选择 ${modelCase.model} / ${modelCase.thinkingLevel}`, async () => {
+    const testClient = client();
+    testClient.geminiSession.bl = "boq_assistant-bard-web-server_test";
+    testClient.uploadGeminiImages = async () => [];
+    let request = null;
+    testClient.http = async (path, options) => {
+      request = { path, options };
+      return { status: 200, headers: {}, body: geminiResponse({ text: "模型选择成功" }) };
+    };
+    const input = {
+      model: modelCase.model,
+      thinking_level: modelCase.thinkingLevel,
+      files: []
+    };
+    const route = testClient.chatRouteForInput(input);
+
+    const result = await testClient.sendGeminiConversation(
+      "模型选择测试",
+      input,
+      route,
+      { carId: "car-test", carType: "gemini" }
+    );
+
+    const selector = geminiModelHeader(request);
+    assert.equal(route.key, "gemini");
+    assert.equal(route.model, modelCase.model);
+    assert.equal(route.thinkingLevel, modelCase.thinkingLevel);
+    assert.equal(route.geminiParameterFallback, false);
+    assert.equal(selector[4], modelCase.modelHash);
+    assert.equal(selector[11], modelCase.mode);
+    assert.equal(selector[14], modelCase.mode);
+    assert.equal(selector[15], modelCase.nativeThinkingLevel);
+    assert.equal(result.model, modelCase.model);
+    assert.equal(result.upstreamModel, modelCase.model);
+  });
+}
+
+for (const invalidInput of [
+  { model: "gemini-model-written-wrong", thinking_level: "extended" },
+  { model: "gemini-3.1-pro", thinking_level: "very-strong" }
+]) {
+  test("Gemini 模型或强度写错时才改用最快模型", async () => {
+    const testClient = client();
+    const route = testClient.chatRouteForInput(invalidInput);
+
+    assert.equal(route.key, "gemini");
+    assert.equal(route.model, "gemini-3.5-flash-lite");
+    assert.equal(route.thinkingLevel, "standard");
+    assert.equal(route.geminiParameterFallback, true);
+  });
+}
+
+test("Gemini 额度用完换车时保持原模型和强度", async () => {
+  const testClient = client();
+  const selectedCars = [];
+  const selectedRoutes = [];
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    const carId = `quota-car-${ignoredCarIds.size + 1}`;
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.sendGeminiConversation = async (_prompt, _input, route, selected) => {
+    selectedCars.push(selected.carId);
+    selectedRoutes.push([route.model, route.thinkingLevel]);
+    if (selectedCars.length === 1) {
+      const error = new Error("当前 Gemini 账号的使用次数已用完。");
+      error.imageQuotaExhausted = true;
+      error.quotaConfirmedByUpstream = true;
+      error.quotaReason = "chat_usage_limit";
+      throw error;
+    }
+    return {
+      events: [],
+      conversationId: "conversation-after-switch",
+      model: route.model,
+      upstreamModel: route.model,
+      route,
+      selected,
+      directContent: "换车成功",
+      imageUrls: []
+    };
+  };
+
+  const result = await testClient.withImageQuotaFallback(
+    "额度换车测试",
+    {
+      model: "gemini-3.1-pro",
+      thinking_level: "extended",
+      files: []
+    },
+    async (conversation) => conversation
+  );
+
+  assert.deepEqual(selectedCars, ["quota-car-1", "quota-car-2"]);
+  assert.deepEqual(selectedRoutes, [
+    ["gemini-3.1-pro", "extended"],
+    ["gemini-3.1-pro", "extended"]
+  ]);
+  assert.equal(result.directContent, "换车成功");
+});
+
+test("Gemini 所有车都用完时保留聊天次数错误而不是误报图片额度", async () => {
+  const testClient = client();
+  let attempts = 0;
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    const carId = `empty-car-${ignoredCarIds.size + 1}`;
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.sendGeminiConversation = async () => {
+    attempts += 1;
+    const error = new Error("当前 Gemini 账号的使用次数已用完。");
+    error.status = 429;
+    error.code = "CHAT_USAGE_LIMIT";
+    error.imageQuotaExhausted = true;
+    error.quotaEmpty = true;
+    error.quotaConfirmedByUpstream = true;
+    error.quotaReason = "chat_usage_limit";
+    throw error;
+  };
+
+  await assert.rejects(
+    () => testClient.withImageQuotaFallback(
+      "全部车位额度测试",
+      {
+        model: "gemini-3.1-pro",
+        thinking_level: "extended",
+        files: []
+      },
+      async (conversation) => conversation
+    ),
+    (error) => error.code === "CHAT_USAGE_LIMIT" && error.quotaReason === "chat_usage_limit"
+  );
+
+  assert.equal(attempts, 5);
 });
 
 test("GPT 图生图模型不会因为渠道默认值而转到 Gemini", async () => {
@@ -530,6 +702,130 @@ test("Gemini 提交结果无法确认时不会换车重发", async () => {
 
   assert.equal(selectedCount, 1);
   assert.equal(submissionCount, 1);
+});
+
+test("Gemini 上游返回 500 后当前任务换车再提交一次", async () => {
+  const testClient = client();
+  const enteredCars = [];
+  let submissionCount = 0;
+  testClient.fetchCars = async () => [
+    {
+      id: "server-500-car",
+      status: 1,
+      count: 0,
+      cooldown: 0,
+      desc: "ok",
+      label: "first",
+      imageRemaining: 10,
+      imageRemainingKnown: true,
+      isIQ: false,
+      isPro: false,
+      isUltra: false,
+      isSuper: false,
+      isVirtual: false,
+      realCarIDs: []
+    },
+    {
+      id: "healthy-car-after-500",
+      status: 1,
+      count: 1,
+      cooldown: 0,
+      desc: "ok",
+      label: "second",
+      imageRemaining: 9,
+      imageRemainingKnown: true,
+      isIQ: false,
+      isPro: false,
+      isUltra: false,
+      isSuper: false,
+      isVirtual: false,
+      realCarIDs: []
+    }
+  ];
+  testClient.enterCar = async (carId, carType) => {
+    enteredCars.push(carId);
+    testClient.portalLoggedIn = true;
+    testClient.carId = carId;
+    testClient.carType = carType;
+    testClient.cookies = [`car=${carId}`];
+    testClient.geminiSession = {
+      at: "token-at",
+      sid: "123456",
+      bl: "boq_assistant-bard-web-server_test",
+      pushId: "feeds/test",
+      uploadClientPctx: "CgcSBWjK7pYx",
+      sourcePath: "/app"
+    };
+  };
+  testClient.uploadGeminiImages = async () => [["uploaded-image", "source.png"]];
+  testClient.http = async () => {
+    submissionCount += 1;
+    if (submissionCount === 1) {
+      return {
+        status: 500,
+        headers: {},
+        body: JSON.stringify({ error: "请求失败，请重试" })
+      };
+    }
+    return {
+      status: 200,
+      headers: {},
+      body: geminiResponse({ imageUrl: "/gemini/images/gg-dl/generated-after-switch.png" })
+    };
+  };
+
+  const result = await testClient.createImageTask({
+    prompt: "当前任务换车重试",
+    model: "gemini",
+    files: [fakeImageFile()]
+  });
+
+  assert.equal(submissionCount, 2);
+  assert.deepEqual(enteredCars, ["server-500-car", "healthy-car-after-500"]);
+  assert.equal(result.status, "success");
+  assert.deepEqual(result.imageUrls, ["https://claude.midjourneye.com/gemini/images/gg-dl/generated-after-switch.png"]);
+  const generationStages = result.raw.stageTimings.filter((stage) => stage.key === "upstream_generation");
+  assert.deepEqual(generationStages.map((stage) => [stage.carId, stage.status]), [
+    ["server-500-car", "failed"],
+    ["healthy-car-after-500", "success"]
+  ]);
+});
+
+test("Gemini 上游连续返回 500 时当前任务最多提交两次", async () => {
+  const testClient = client();
+  const selectedCars = [];
+  let submissionCount = 0;
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    const carId = `repeated-500-car-${selectedCars.length + 1}`;
+    selectedCars.push(carId);
+    ignoredCarIds.add(carId);
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId, carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.sendGeminiConversation = async (_prompt, input) => {
+    input.imageSubmissionState.started = true;
+    submissionCount += 1;
+    const error = new Error("请求失败，请重试");
+    error.status = 500;
+    error.upstreamExplicitFailure = true;
+    error.upstreamStatus = "failed";
+    throw error;
+  };
+
+  await assert.rejects(
+    () => testClient.createImageTask({
+      prompt: "连续失败测试",
+      model: "gemini",
+      files: [fakeImageFile()]
+    }),
+    (error) => error.status === 500 && error.imageSubmissionAttempted === true
+  );
+
+  assert.equal(submissionCount, 2);
+  assert.deepEqual(selectedCars, ["repeated-500-car-1", "repeated-500-car-2"]);
 });
 
 test("Gemini 明确触发内容安全限制时不会重复换车", async () => {

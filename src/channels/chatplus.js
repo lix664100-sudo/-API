@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { performance } from "node:perf_hooks";
 import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "../image-limits.js";
 import { normalizeProxyUrl } from "../proxy.js";
 
@@ -21,6 +22,14 @@ const GEMINI_UPLOAD_PREFLIGHT_RPC_ID = "ESY5D";
 const GEMINI_UPLOAD_START_PATH = "/gemini/push/upload/";
 const GEMINI_DEFAULT_BUILD_LABEL = "boq_assistant-bard-web-server_20260525.09_p0";
 const GEMINI_DEFAULT_PUSH_ID = "feeds/mcudyrk2a4khkz";
+const GEMINI_FASTEST_MODEL = "gemini-3.5-flash-lite";
+const GEMINI_DEFAULT_MODEL = "gemini-3.7-flash";
+const GEMINI_WEB_MODELS = Object.freeze({
+  "gemini-3.5-flash-lite": Object.freeze({ hash: "8c46e95b1a07cecc", mode: 6 }),
+  "gemini-3.7-flash": Object.freeze({ hash: "56fdd199312815e2", mode: 1 }),
+  "gemini-3.1-pro": Object.freeze({ hash: "e6fa609c3fa255c0", mode: 3 })
+});
+const GEMINI_THINKING_LEVELS = Object.freeze({ standard: 1, extended: 2 });
 const GROK_DIRECT_UPLOAD_PATHS = [
   "/grok/http/upload-file-v2/direct",
   "/http/upload-file-v2/direct"
@@ -260,10 +269,12 @@ function rememberBadCar(accountId, carType, carId, until = Date.now() + BAD_CAR_
 }
 
 function rememberImageCarSuccess(accountId, carType, carId) {
-  if (!carId) return;
+  if (!carId) return false;
   const key = badCarKey(accountId, carType, carId);
+  const hadCooldown = badCarUntil.has(key);
   badCarUntil.delete(key);
   recentImageCarSuccessAt.set(key, Date.now());
+  return hadCooldown;
 }
 
 function recentImageCarSuccess(accountId, carType, carId) {
@@ -288,6 +299,18 @@ function isRetryableImageSubmissionRejection(error) {
   if (error?.imageSubmissionAttempted !== true || error?.upstreamExplicitFailure !== true) return false;
   const status = Number(error?.status || error?.statusCode || 0);
   return status === 401 || (status === 403 && isExplicitAuthSessionError(error));
+}
+
+function shouldQuarantineImageSubmissionCar(error) {
+  if (error?.imageSubmissionAttempted !== true) return false;
+  const status = Number(error?.status || error?.statusCode || 0);
+  return status >= 500 || error?.code === "INVALID_UPSTREAM_RESPONSE";
+}
+
+function isRetryableImageSubmissionServerFailure(error) {
+  if (error?.imageSubmissionAttempted !== true || error?.upstreamExplicitFailure !== true) return false;
+  const status = Number(error?.status || error?.statusCode || 0);
+  return status >= 500 && status < 600;
 }
 
 function isProCarPlanMismatchError(error) {
@@ -879,6 +902,16 @@ function normalizeChatFiles(input, messages) {
   return files;
 }
 
+function geminiRouteMetadata(route = {}) {
+  if (route.key !== "gemini") return {};
+  return {
+    requestedModel: route.geminiRequestedModel || "gemini",
+    thinkingLevel: route.thinkingLevel || "standard",
+    parameterFallback: route.geminiParameterFallback === true,
+    ...(route.geminiFallbackReason ? { parameterFallbackReason: route.geminiFallbackReason } : {})
+  };
+}
+
 function submittedImageTask(conversation, input, prompt, taskType, sourceImageCount = 0) {
   const { events = [], conversationId, model, upstreamModel, route, selected } = conversation;
   const imageUrls = Array.isArray(conversation.imageUrls) ? conversation.imageUrls.filter(Boolean) : [];
@@ -902,6 +935,8 @@ function submittedImageTask(conversation, input, prompt, taskType, sourceImageCo
       selectedCarId: selected?.carId,
       selectedCarType: selected?.carType,
       strategy: selected?.strategy,
+      ...geminiRouteMetadata(route),
+      stageTimings: Array.isArray(conversation.stageTimings) ? conversation.stageTimings : [],
       ...(imageUrls.length ? {
         upstreamCompleted: true,
         upstreamStatus: "success",
@@ -946,9 +981,37 @@ function textFromAssistantContent(content) {
 
 function isImageGenerationLimitMessage(content) {
   const text = String(content || "").replace(/\s+/g, " ").trim();
-  return /(?:you(?:'|’)ve|you have) hit (?:the )?(?:plus )?plan limit for image generation(?:s| requests)?/i.test(text)
+  return /(?:(?:you(?:'|’)ve|you have) hit )?(?:the )?(?:[a-z][\w-]* ){0,3}plan limit for image generations?(?: requests?)?/i.test(text)
     || /image generation (?:request )?(?:limit|quota).*(?:reset|exhausted|reached)/i.test(text)
     || /(?:图片|图像).{0,12}(?:生成).{0,24}(?:额度|配额|上限|限制).{0,16}(?:用完|耗尽|达到|已满)/.test(text);
+}
+
+function relativeImageCarQuotaDelay(text) {
+  const anchored = String(text || "").match(
+    /(?:reset(?:s|ting)?|refresh(?:es|ing)?|available|try again|恢复|重置|刷新|再试).{0,160}/i
+  )?.[0] || String(text || "").match(
+    /(?:\d+(?:\.\d+)?\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|秒钟?|分钟|小时|天)\s*(?:and|和)?\s*){1,4}.{0,40}?(?:后|later)/i
+  )?.[0] || "";
+  if (!anchored) return 0;
+
+  let totalMs = 0;
+  const durations = anchored.matchAll(
+    /(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|秒钟?|分钟|小时|天)/gi
+  );
+  for (const duration of durations) {
+    const amount = Number(duration[1]);
+    if (!Number.isFinite(amount) || amount <= 0) continue;
+    const unit = String(duration[2] || "").toLowerCase();
+    const unitMs = /天|day/.test(unit)
+      ? 24 * 60 * 60 * 1000
+      : /小时|hour|hr/.test(unit)
+        ? 60 * 60 * 1000
+        : /分钟|minute|min/.test(unit)
+          ? 60 * 1000
+          : 1000;
+    totalMs += amount * unitMs;
+  }
+  return totalMs;
 }
 
 function imageCarQuotaRetryAt(content, now = Date.now()) {
@@ -959,21 +1022,8 @@ function imageCarQuotaRetryAt(content, now = Date.now()) {
     if (Number.isFinite(parsed) && parsed > now) return parsed;
   }
 
-  const relative = text.match(/(?:reset(?:s|ting)?|refresh(?:es|ing)?|available|try again|恢复|重置|刷新|再试).{0,80}?(?:\bin\b|\bafter\b|后)\s*(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|秒钟?|分钟|小时|天)/i)
-    || text.match(/(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|秒钟?|分钟|小时|天)\s*(?:后|later).{0,40}?(?:reset|refresh|available|try again|恢复|重置|刷新|再试)/i);
-  if (!relative) return 0;
-
-  const amount = Number(relative[1]);
-  if (!Number.isFinite(amount) || amount <= 0) return 0;
-  const unit = String(relative[2] || "").toLowerCase();
-  const unitMs = /天|day/.test(unit)
-    ? 24 * 60 * 60 * 1000
-    : /小时|hour|hr/.test(unit)
-      ? 60 * 60 * 1000
-      : /分钟|minute|min/.test(unit)
-        ? 60 * 1000
-        : 1000;
-  return now + amount * unitMs;
+  const delayMs = relativeImageCarQuotaDelay(text);
+  return delayMs > 0 ? now + delayMs : 0;
 }
 
 function imageCarQuotaError(content = "") {
@@ -986,12 +1036,6 @@ function imageCarQuotaError(content = "") {
   error.quotaResetAt = retryAt ? new Date(retryAt).toISOString() : "";
   error.status = 429;
   return error;
-}
-
-function throwIfImageGenerationLimit(content, options = {}) {
-  if (!isImageGenerationLimitMessage(content)) return;
-  const error = options.car ? imageCarQuotaError(content) : imageQuotaError();
-  throw error;
 }
 
 function imageQuotaError(message = "图片生成额度已用完。") {
@@ -1223,7 +1267,8 @@ function conversationSubmitError(response) {
     payload = null;
   }
   const payloadDetail = typeof payload?.detail === "string" ? payload.detail : payload?.detail?.message;
-  const detail = String(payloadDetail || payload?.message || "").trim();
+  const payloadError = typeof payload?.error === "string" ? payload.error : payload?.error?.message;
+  const detail = String(payloadDetail || payload?.message || payloadError || "").trim();
   const upstreamText = detail || String(response.body || "").trim();
   const usage = chatUsageLimitFromText(detail || response.body);
   const error = usage
@@ -1241,6 +1286,21 @@ function conversationSubmitError(response) {
     error.upstreamStatus = "failed";
   }
   return error;
+}
+
+function imageGenerationLimitContent(content) {
+  if (typeof content === "string") return isImageGenerationLimitMessage(content) ? content : "";
+  if (!content || typeof content !== "object") return "";
+  const patchText = collectPatchText(content).join("").trim();
+  const candidates = [patchText, ...collectAssistantText(content)].filter(Boolean);
+  return candidates.find((candidate) => isImageGenerationLimitMessage(candidate)) || "";
+}
+
+function throwIfImageGenerationLimit(content, options = {}) {
+  const limitContent = imageGenerationLimitContent(content);
+  if (!limitContent) return;
+  const error = options.car ? imageCarQuotaError(limitContent) : imageQuotaError();
+  throw error;
 }
 
 function imageQuotaResetAt(imageLimit = {}) {
@@ -1401,6 +1461,11 @@ function chatModelKey(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function isGeminiModelRequest(value) {
+  const key = chatModelKey(value);
+  return key === "gemini" || key.startsWith("gemini-");
+}
+
 function configuredChatModel(value, modelKey = "") {
   const model = String(value || "").trim();
   if (chatModelKey(modelKey) === "gpt" && chatModelKey(model) === "gpt-5-5-instant") return "";
@@ -1428,6 +1493,7 @@ function requestedChatModel(input = {}) {
   const requested = input.model || input.chat_model || input.chatModel || "";
   const requestedKey = chatModelKey(requested);
   if (gptImageModelRequestKeys.has(requestedKey)) return "gpt";
+  if (isGeminiModelRequest(requestedKey)) return "gemini";
   if (requested) return drawingModelRequestKeys.has(requestedKey) ? "" : requested;
 
   const imageModel = input.model_id ?? input.modelId ?? "";
@@ -1674,19 +1740,88 @@ function geminiSessionFromPage(body, previous = {}) {
   };
 }
 
-function geminiModeForRoute(route = {}) {
-  const requested = String(route.model || "").trim().toLowerCase();
-  if (/^\d+$/.test(requested)) {
-    const mode = Number(requested);
-    if (mode >= 1 && mode <= 6) return mode;
+function configuredGeminiModel(value) {
+  const key = chatModelKey(value);
+  if (GEMINI_WEB_MODELS[key]) return key;
+  if (key === "3" || key.includes("pro")) return "gemini-3.1-pro";
+  if (["5", "6"].includes(key) || key.includes("lite")) return GEMINI_FASTEST_MODEL;
+  if (key === "1" || key.includes("flash")) return GEMINI_DEFAULT_MODEL;
+  return "";
+}
+
+function geminiRequestSelection(input = {}, route = {}) {
+  const explicitModelValue = input.model || input.chat_model || input.chatModel || "";
+  const explicitModel = chatModelKey(explicitModelValue);
+  const configuredModel = configuredGeminiModel(route.model);
+  const requestedModel = explicitModel && explicitModel !== "gemini"
+    ? explicitModel
+    : configuredModel
+      ? configuredModel
+      : GEMINI_DEFAULT_MODEL;
+  const hasThinkingLevel = Object.prototype.hasOwnProperty.call(input, "thinking_level")
+    || Object.prototype.hasOwnProperty.call(input, "thinkingLevel");
+  const requestedThinkingLevel = hasThinkingLevel
+    ? chatModelKey(input.thinking_level ?? input.thinkingLevel)
+    : GEMINI_THINKING_LEVELS[chatModelKey(route.thinkingLevel)]
+      ? chatModelKey(route.thinkingLevel)
+      : chatModelKey(route.strategy) === "thinking"
+        ? "extended"
+        : "standard";
+  const invalidFields = [];
+  if (!GEMINI_WEB_MODELS[requestedModel]) invalidFields.push("model");
+  if (!GEMINI_THINKING_LEVELS[requestedThinkingLevel]) invalidFields.push("thinking_level");
+  if (invalidFields.length) {
+    return {
+      model: GEMINI_FASTEST_MODEL,
+      thinkingLevel: "standard",
+      requestedModel: explicitModel || "gemini",
+      parameterFallback: true,
+      fallbackReason: invalidFields.join(",")
+    };
   }
-  if (requested.includes("pro")) return 3;
-  if (requested.includes("lite")) return 5;
-  return 1;
+  return {
+    model: requestedModel,
+    thinkingLevel: requestedThinkingLevel,
+    requestedModel: explicitModel || "gemini",
+    parameterFallback: false,
+    fallbackReason: ""
+  };
 }
 
 function geminiThinkingModeForRoute(route = {}) {
-  return String(route.strategy || "").toLowerCase() === "thinking" ? 0 : 4;
+  const thinkingLevel = GEMINI_THINKING_LEVELS[chatModelKey(route.thinkingLevel)]
+    ? chatModelKey(route.thinkingLevel)
+    : chatModelKey(route.strategy) === "thinking"
+      ? "extended"
+      : "standard";
+  return thinkingLevel === "extended" ? 0 : 4;
+}
+
+function geminiModelForRoute(route = {}) {
+  return configuredGeminiModel(route.model) || GEMINI_DEFAULT_MODEL;
+}
+
+function geminiModelHeaders(route = {}) {
+  const model = GEMINI_WEB_MODELS[geminiModelForRoute(route)];
+  const thinkingLevel = geminiThinkingModeForRoute(route) === 0
+    ? GEMINI_THINKING_LEVELS.extended
+    : GEMINI_THINKING_LEVELS.standard;
+  const requestId = randomUUID();
+  const selector = [];
+  selector[0] = 1;
+  selector[4] = model.hash;
+  selector[7] = 0;
+  selector[8] = [4, 5, 6, 8];
+  selector[11] = model.mode;
+  selector[14] = model.mode;
+  selector[15] = thinkingLevel;
+  selector[16] = requestId;
+  return {
+    "x-goog-ext-525001261-jspb": JSON.stringify(selector),
+    "x-goog-ext-525005358-jspb": JSON.stringify([requestId, 1]),
+    "x-goog-ext-73010989-jspb": JSON.stringify([0]),
+    "x-goog-ext-73010990-jspb": JSON.stringify([0, 0, 0])
+  };
 }
 
 function savedProCarRestriction(account = {}, channel = {}) {
@@ -1701,8 +1836,96 @@ function savedProCarRestriction(account = {}, channel = {}) {
   );
 }
 
+function savedImageCarCooldowns(account = {}, channel = {}) {
+  const ability = String(channel?.ability || "");
+  const abilityCooldowns = ability
+    ? account.meta?.abilities?.[ability]?.meta?.imageCarCooldowns
+    : null;
+  const stored = abilityCooldowns || account.meta?.chatplusImageCarCooldowns || {};
+  return stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+}
+
+function restoreSavedImageCarCooldowns(account = {}, channel = {}) {
+  const accountId = account?.id;
+  if (!accountId) return;
+  for (const cooldown of Object.values(savedImageCarCooldowns(account, channel))) {
+    const carId = String(cooldown?.carId || "").trim();
+    const carType = String(cooldown?.carType || "chatgpt").trim();
+    const until = Date.parse(cooldown?.cooldownUntil || "");
+    if (!carId || !Number.isFinite(until) || until <= Date.now()) continue;
+    rememberBadCar(accountId, carType, carId, until);
+  }
+}
+
+function createTaskStageRecorder(input = {}) {
+  if (input.taskStageRecorder?.entries && typeof input.taskStageRecorder.record === "function") {
+    return input.taskStageRecorder;
+  }
+  const entries = [];
+  const onStage = typeof input.onStage === "function" ? input.onStage : null;
+  return {
+    entries,
+    async record(entry) {
+      const saved = {
+        id: entry.id || `stage-${randomUUID()}`,
+        key: String(entry.key || "").trim(),
+        label: String(entry.label || "").trim(),
+        status: entry.status === "failed" ? "failed" : "success",
+        startedAt: entry.startedAt,
+        finishedAt: entry.finishedAt,
+        durationMs: Math.max(0, Math.round(Number(entry.durationMs || 0))),
+        ...(entry.carId ? { carId: String(entry.carId) } : {}),
+        ...(entry.carType ? { carType: String(entry.carType) } : {}),
+        ...(entry.message ? { message: String(entry.message).replace(/\s+/g, " ").trim().slice(0, 300) } : {})
+      };
+      entries.push(saved);
+      if (onStage) {
+        try {
+          await onStage(saved);
+        } catch (error) {
+          console.error("保存任务耗时失败：", error);
+        }
+      }
+      return saved;
+    }
+  };
+}
+
+function taskStageSnapshot(recorder) {
+  return Array.isArray(recorder?.entries) ? recorder.entries.map((entry) => ({ ...entry })) : [];
+}
+
+async function measureTaskStage(recorder, stage, work) {
+  if (!recorder) return work();
+  const startedAt = new Date().toISOString();
+  const started = performance.now();
+  try {
+    const result = await work();
+    const completedStage = typeof stage === "function" ? stage(result) : stage;
+    await recorder.record({
+      ...completedStage,
+      status: "success",
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: performance.now() - started
+    });
+    return result;
+  } catch (error) {
+    const failedStage = typeof stage === "function" ? stage(null) : stage;
+    await recorder.record({
+      ...failedStage,
+      status: "failed",
+      message: error?.message || "处理失败",
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: performance.now() - started
+    });
+    throw error;
+  }
+}
+
 export class ChatplusClient {
-  constructor({ config, channel, account, sessionLock, onProCarsUnavailable }) {
+  constructor({ config, channel, account, sessionLock, onProCarsUnavailable, onImageCarCooldown }) {
     this.config = config;
     this.channel = channel;
     this.account = account;
@@ -1722,10 +1945,12 @@ export class ChatplusClient {
     };
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     this.onProCarsUnavailable = typeof onProCarsUnavailable === "function" ? onProCarsUnavailable : null;
+    this.onImageCarCooldown = typeof onImageCarCooldown === "function" ? onImageCarCooldown : null;
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWorks = new Map();
     this.concurrentChatSessions = new Map();
     this.proCarsUnavailableUntil = savedProCarRestriction(account, channel) ? Infinity : 0;
+    restoreSavedImageCarCooldowns(account, channel);
   }
 
   makeContextSignature({ channel, account }) {
@@ -1737,7 +1962,7 @@ export class ChatplusClient {
     ].join("::");
   }
 
-  updateContext({ config, channel, account, sessionLock, onProCarsUnavailable }) {
+  updateContext({ config, channel, account, sessionLock, onProCarsUnavailable, onImageCarCooldown }) {
     const nextSignature = this.makeContextSignature({ channel, account });
     const changed = nextSignature !== this.contextSignature;
     this.config = config;
@@ -1746,6 +1971,8 @@ export class ChatplusClient {
     this.baseUrl = trimSlash(channel?.settings?.baseUrl || "https://www.chatplus.cc");
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     this.onProCarsUnavailable = typeof onProCarsUnavailable === "function" ? onProCarsUnavailable : null;
+    this.onImageCarCooldown = typeof onImageCarCooldown === "function" ? onImageCarCooldown : null;
+    restoreSavedImageCarCooldowns(account, channel);
     if (changed) {
       this.contextSignature = nextSignature;
       this.proCarsUnavailableUntil = savedProCarRestriction(account, channel) ? Infinity : 0;
@@ -2027,7 +2254,18 @@ export class ChatplusClient {
   }
 
   chatRouteForInput(input = {}) {
-    const resolvedRoute = resolveChatModelRoute(this.channel?.settings || {}, requestedChatModel(input));
+    let resolvedRoute = resolveChatModelRoute(this.channel?.settings || {}, requestedChatModel(input));
+    if (resolvedRoute.key === "gemini") {
+      const selection = geminiRequestSelection(input, resolvedRoute);
+      resolvedRoute = {
+        ...resolvedRoute,
+        model: selection.model,
+        thinkingLevel: selection.thinkingLevel,
+        geminiRequestedModel: selection.requestedModel,
+        geminiParameterFallback: selection.parameterFallback,
+        geminiFallbackReason: selection.fallbackReason
+      };
+    }
     if (!input.preferImageCar) return resolvedRoute;
     if (resolvedRoute.key === "gpt") return { ...resolvedRoute, strategy: "image" };
     if (resolvedRoute.key === "gemini") return { ...resolvedRoute, selectionStrategy: "image" };
@@ -2040,6 +2278,7 @@ export class ChatplusClient {
       route.carType || "",
       route.model || "",
       route.strategy || "",
+      route.thinkingLevel || "",
       route.selectionStrategy || "",
       route.carTier || ""
     ].join("::");
@@ -2056,12 +2295,22 @@ export class ChatplusClient {
         && !isBadCar(this.account?.id, cached.session.selected?.carType, cachedCarId)
       ) {
         if (cachedCarId) ignoredCarIds.add(cachedCarId);
-        return this.cloneChatSession(cached.session);
+        return measureTaskStage(input.taskStageRecorder, {
+          key: "session_reuse",
+          label: "复用已登录车位",
+          carId: cachedCarId,
+          carType: cached.session.selected?.carType
+        }, async () => this.cloneChatSession(cached.session));
       }
       this.concurrentChatSessions.delete(key);
     }
     if (cached?.promise) {
-      const session = await cached.promise;
+      const session = await measureTaskStage(input.taskStageRecorder, (prepared) => ({
+        key: "session_reuse",
+        label: "等待可复用车位",
+        carId: prepared?.selected?.carId,
+        carType: prepared?.selected?.carType
+      }), async () => cached.promise);
       const cachedCarId = session.selected?.carId;
       if (
         !ignoredCarIds.has(cachedCarId)
@@ -2086,19 +2335,33 @@ export class ChatplusClient {
     }
   }
 
-  async performPortalLogin(options = {}) {
-    this.assertConfigured();
-    const login = await this.json("/frontend-api/login", {
-      method: "POST",
-      timeoutSec: options.timeoutSec,
-      body: {
-        userToken: this.account.username,
-        password: this.account.password,
-        token: ""
-      }
+  rememberReusableChatSession(input = {}, session = {}, submitClient = this) {
+    if (input.concurrentSubmit !== true || !session?.route || !session?.selected) return;
+    const refreshed = this.cloneChatSession({
+      ...session,
+      snapshot: submitClient.sessionSnapshot()
     });
-    if (login?.code !== 1) throw new Error(login?.msg || "聊天站登录失败。");
-    this.portalLoggedIn = true;
+    this.concurrentChatSessions.set(this.chatSessionKey(session.route), { session: refreshed });
+  }
+
+  async performPortalLogin(options = {}) {
+    return measureTaskStage(options.taskStageRecorder, {
+      key: "account_login",
+      label: "登录账号"
+    }, async () => {
+      this.assertConfigured();
+      const login = await this.json("/frontend-api/login", {
+        method: "POST",
+        timeoutSec: options.timeoutSec,
+        body: {
+          userToken: this.account.username,
+          password: this.account.password,
+          token: ""
+        }
+      });
+      if (login?.code !== 1) throw new Error(login?.msg || "聊天站登录失败。");
+      this.portalLoggedIn = true;
+    });
   }
 
   async loginPortal(options = {}) {
@@ -2180,11 +2443,14 @@ export class ChatplusClient {
   async fetchCars(carType, options = {}) {
     await this.loginPortal(options);
     const endpoint = carListEndpoints[carType] || carListEndpoints.chatgpt;
-    const payload = await this.json(endpoint, {
+    const payload = await measureTaskStage(options.taskStageRecorder, {
+      key: "car_list",
+      label: "读取车位"
+    }, async () => this.json(endpoint, {
       method: "POST",
       timeoutSec: options.timeoutSec,
       body: { page: 1, pageSize: 100, limit: 100 }
-    });
+    }));
     if (payload?.code !== undefined && payload.code !== 1) {
       throw new Error(payload?.msg || `读取 ${carType} 车队失败。`);
     }
@@ -2230,17 +2496,42 @@ export class ChatplusClient {
     rememberBadCar(this.account?.id, selected?.carType, selected?.carId);
   }
 
-  rememberImageFailedCar(selected, error = null) {
+  async rememberImageFailedCar(selected, error = null) {
+    if (!String(selected?.carId || "").trim()) return 0;
     const parsedResetAt = Date.parse(error?.quotaResetAt || "");
     const cooldownMs = Math.max(0, Number(selected?.car?.cooldown || 0)) * 1000;
     const retryAt = Number.isFinite(parsedResetAt) && parsedResetAt > Date.now()
       ? parsedResetAt
       : Date.now() + (cooldownMs || IMAGE_CAR_RECHECK_MS);
     rememberBadCar(this.account?.id, selected?.carType, selected?.carId, retryAt);
+    if (this.onImageCarCooldown) {
+      try {
+        await this.onImageCarCooldown({
+          carId: String(selected?.carId || ""),
+          carType: String(selected?.carType || "chatgpt"),
+          cooldownUntil: new Date(retryAt).toISOString(),
+          reason: error?.imageCarQuotaExhausted === true ? "image_quota" : "image_failure"
+        });
+      } catch (persistError) {
+        console.error("保存车位暂停时间失败：", persistError);
+      }
+    }
+    return retryAt;
   }
 
-  rememberImageSuccessfulCar(selected) {
-    rememberImageCarSuccess(this.account?.id, selected?.carType, selected?.carId);
+  async rememberImageSuccessfulCar(selected) {
+    const cleared = rememberImageCarSuccess(this.account?.id, selected?.carType, selected?.carId);
+    if (!cleared || !this.onImageCarCooldown) return;
+    try {
+      await this.onImageCarCooldown({
+        carId: String(selected?.carId || ""),
+        carType: String(selected?.carType || "chatgpt"),
+        cooldownUntil: "",
+        reason: "recovered"
+      });
+    } catch (persistError) {
+      console.error("清除车位暂停时间失败：", persistError);
+    }
   }
 
   rememberProCarsUnavailable(error) {
@@ -2255,7 +2546,10 @@ export class ChatplusClient {
   async prepareChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
     const route = this.chatRouteForInput(input);
     const timeoutSec = Number(input.checkTimeoutSec || 0);
-    const requestOptions = timeoutSec > 0 ? { timeoutSec } : {};
+    const requestOptions = {
+      ...(timeoutSec > 0 ? { timeoutSec } : {}),
+      ...(input.taskStageRecorder ? { taskStageRecorder: input.taskStageRecorder } : {})
+    };
     const errors = [];
     let subscriptionExpiredAttempts = 0;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
@@ -2264,8 +2558,20 @@ export class ChatplusClient {
       this.carId = selected.carId;
       this.carType = selected.carType;
       try {
-        await this.enterCar(selected.carId, selected.carType, requestOptions);
-        const init = route.key === "gpt" ? await this.loadInit(requestOptions) : {};
+        await measureTaskStage(input.taskStageRecorder, {
+          key: "car_enter",
+          label: "进入车位",
+          carId: selected.carId,
+          carType: selected.carType
+        }, async () => this.enterCar(selected.carId, selected.carType, requestOptions));
+        const init = route.key === "gpt"
+          ? await measureTaskStage(input.taskStageRecorder, {
+              key: "car_init",
+              label: "初始化车位",
+              carId: selected.carId,
+              carType: selected.carType
+            }, async () => this.loadInit(requestOptions))
+          : {};
         return { route, selected, init };
       } catch (error) {
         if (route.key === "gpt" && isChatSubscriptionExpiredText(`${error?.message || ""} ${error?.body || ""}`)) {
@@ -2482,7 +2788,7 @@ export class ChatplusClient {
     request[59] = randomUUID().toUpperCase();
     request[61] = [];
     request[68] = 1;
-    request[79] = geminiModeForRoute(route);
+    request[79] = GEMINI_WEB_MODELS[geminiModelForRoute(route)].mode;
     return request;
   }
 
@@ -2596,8 +2902,12 @@ export class ChatplusClient {
     return [identifier, filename];
   }
 
-  async uploadGeminiImages(files = []) {
-    return Promise.all(files.map((file) => this.uploadGeminiImage(file)));
+  async uploadGeminiImages(files = [], recorder = null) {
+    if (!files.length) return [];
+    return measureTaskStage(recorder, {
+      key: "source_upload",
+      label: "上传原图"
+    }, async () => Promise.all(files.map((file) => this.uploadGeminiImage(file))));
   }
 
   async sendGeminiConversation(prompt, input, route, selected) {
@@ -2606,7 +2916,7 @@ export class ChatplusClient {
       error.noRetry = true;
       throw error;
     }
-    const uploads = await this.uploadGeminiImages(input.files || []);
+    const uploads = await this.uploadGeminiImages(input.files || [], input.taskStageRecorder);
     const request = this.buildGeminiRequest(prompt, route, uploads);
     const params = new URLSearchParams({
       bl: this.geminiSession.bl,
@@ -2620,16 +2930,34 @@ export class ChatplusClient {
     });
     if (this.geminiSession.at) form.set("at", this.geminiSession.at);
     if (input.imageSubmissionState) input.imageSubmissionState.started = true;
-    const response = await this.http(`${GEMINI_REQUEST_PATH}?${params.toString()}`, {
-      method: "POST",
-      body: form.toString(),
-      rawBody: true,
-      headers: {
-        accept: "*/*",
-        "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
-        "x-same-domain": "1",
-        referer: `${this.baseUrl}/app`
+    const response = await measureTaskStage(input.taskStageRecorder, {
+      key: "upstream_generation",
+      label: "等待上游处理",
+      carId: selected?.carId,
+      carType: selected?.carType
+    }, async () => {
+      const upstreamResponse = await this.http(`${GEMINI_REQUEST_PATH}?${params.toString()}`, {
+        method: "POST",
+        body: form.toString(),
+        rawBody: true,
+        headers: {
+          accept: "*/*",
+          "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+          "x-same-domain": "1",
+          referer: `${this.baseUrl}/app`,
+          ...geminiModelHeaders(route)
+        }
+      });
+      if (upstreamResponse.status < 200 || upstreamResponse.status >= 300) {
+        const error = conversationSubmitError(upstreamResponse);
+        if ([401, 403].includes(upstreamResponse.status)) {
+          error.message = "Gemini 上游拒绝了当前登录会话，请重新检测账号。";
+        }
+        error.upstreamExplicitFailure = true;
+        error.upstreamStatus = "failed";
+        throw error;
       }
+      return upstreamResponse;
     });
     throwIfImageGenerationLimit(response.body);
     if (isChatUsageLimitMessage(response.body)) {
@@ -2637,19 +2965,6 @@ export class ChatplusClient {
       error.imageQuotaExhausted = true;
       throw error;
     }
-    if ([401, 403].includes(response.status)) {
-      const error = new Error("Gemini 上游拒绝了当前登录会话，请重新检测账号。");
-      error.status = response.status;
-      error.body = response.body;
-      throw error;
-    }
-    if (response.status < 200 || response.status >= 300) {
-      const error = new Error(`Gemini 提交失败：${response.status}`);
-      error.status = response.status;
-      error.body = response.body;
-      throw error;
-    }
-
     const events = parseGeminiJsonLines(response.body);
     const directContent = extractGeminiText(events);
     const imageUrls = extractGeminiImageUrls(events, this.baseUrl);
@@ -2680,7 +2995,9 @@ export class ChatplusClient {
       events,
       conversationId: extractGeminiConversationId(events),
       messageId,
-      model: route.key,
+      model: route.geminiRequestedModel && route.geminiRequestedModel !== "gemini"
+        ? route.model
+        : route.key,
       upstreamModel: route.model || "gemini",
       route,
       selected,
@@ -2756,10 +3073,16 @@ export class ChatplusClient {
     return grokUploadedFile(legacy.body);
   }
 
-  async uploadGrokImages(files = []) {
-    const uploads = [];
-    for (const file of files) uploads.push(await this.uploadGrokImage(file));
-    return uploads;
+  async uploadGrokImages(files = [], recorder = null) {
+    if (!files.length) return [];
+    return measureTaskStage(recorder, {
+      key: "source_upload",
+      label: "上传原图"
+    }, async () => {
+      const uploads = [];
+      for (const file of files) uploads.push(await this.uploadGrokImage(file));
+      return uploads;
+    });
   }
 
   grokImageEditBody(prompt, input, uploads) {
@@ -2808,7 +3131,9 @@ export class ChatplusClient {
     }
 
     const messageId = randomUUID();
-    const uploads = imageGeneration && files.length ? await this.uploadGrokImages(files) : [];
+    const uploads = imageGeneration && files.length
+      ? await this.uploadGrokImages(files, input.taskStageRecorder)
+      : [];
     const upstreamModel = uploads.length ? GROK_IMAGE_EDIT_MODEL : route.model || "grok-4";
     const imageCount = requestedGrokImageCount(input);
     const body = uploads.length
@@ -2838,7 +3163,12 @@ export class ChatplusClient {
     let response = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       if (input.imageSubmissionState) input.imageSubmissionState.started = true;
-      response = await this.http(conversationPath, {
+      response = await measureTaskStage(input.taskStageRecorder, {
+        key: "upstream_generation",
+        label: "等待上游处理",
+        carId: selected?.carId,
+        carType: selected?.carType
+      }, async () => this.http(conversationPath, {
         method: "POST",
         body,
         headers: {
@@ -2854,7 +3184,7 @@ export class ChatplusClient {
           "x-xai-request-id": randomUUID(),
           ...(statsigId ? { "x-statsig-id": statsigId } : {})
         }
-      });
+      }));
       if (response.status !== 403
         || !imageGeneration
         || isChatUsageLimitMessage(response.body)
@@ -2936,6 +3266,7 @@ export class ChatplusClient {
   async sendConversation(prompt, input = {}, ignoredCarIds = new Set()) {
     const errors = [];
     const imageCarQuotaErrors = [];
+    let serverFailureRetryUsed = false;
     const runSubmitStep = input.concurrentSubmit === true
       ? async (work) => work()
       : async (work) => this.sessionLock(work);
@@ -2956,18 +3287,39 @@ export class ChatplusClient {
         selected = session.selected;
         if (route.key === "grok") {
           const conversation = await runSubmitStep(() => submitClient.sendGrokConversation(prompt, requestInput, route, selected));
-          return { ...conversation, submitSessionSnapshot: submitClient.sessionSnapshot() };
+          this.rememberReusableChatSession(requestInput, session, submitClient);
+          return {
+            ...conversation,
+            submitSessionSnapshot: submitClient.sessionSnapshot(),
+            stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
+          };
         }
         if (route.key === "gemini") {
           const conversation = await runSubmitStep(() => submitClient.sendGeminiConversation(prompt, requestInput, route, selected));
-          return { ...conversation, submitSessionSnapshot: submitClient.sessionSnapshot() };
+          this.rememberReusableChatSession(requestInput, session, submitClient);
+          return {
+            ...conversation,
+            submitSessionSnapshot: submitClient.sessionSnapshot(),
+            stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
+          };
         }
         const model = route.model || init?.default_model_slug || submitClient.defaultModel || this.defaultModel;
-        const imageAssets = await runSubmitStep(() => submitClient.uploadChatImages(requestInput.files || []));
+        const sourceFiles = requestInput.files || [];
+        const imageAssets = sourceFiles.length
+          ? await measureTaskStage(requestInput.taskStageRecorder, {
+              key: "source_upload",
+              label: "上传原图"
+            }, async () => runSubmitStep(() => submitClient.uploadChatImages(sourceFiles)))
+          : [];
         const { body, messageId } = submitClient.buildConversationBody(prompt, model, imageAssets);
 
         if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.started = true;
-        const response = await runSubmitStep(() => submitClient.http("/backend-api/conversation", {
+        const response = await measureTaskStage(requestInput.taskStageRecorder, {
+          key: "upstream_generation",
+          label: "等待上游处理",
+          carId: selected?.carId,
+          carType: selected?.carType
+        }, async () => runSubmitStep(() => submitClient.http("/backend-api/conversation", {
           method: "POST",
           body,
           abortWhen: requestInput.imageGeneration === true
@@ -2977,13 +3329,13 @@ export class ChatplusClient {
             accept: "text/event-stream",
             referer: `${this.baseUrl}/`
           }
-        }));
+        })));
         if (response.status < 200 || response.status >= 300) {
           throw conversationSubmitError(response);
         }
 
         const events = parseSse(response.body);
-        throwIfImageGenerationLimit(extractAssistantText(events), { car: requestInput.imageGeneration === true });
+        throwIfImageGenerationLimit(events, { car: requestInput.imageGeneration === true });
         let conversationId = "";
         for (const event of events) {
           if (event.conversation_id) conversationId = event.conversation_id;
@@ -2994,6 +3346,7 @@ export class ChatplusClient {
           error.code = "NO_UPSTREAM_TASK_ID";
           throw error;
         }
+        this.rememberReusableChatSession(requestInput, session, submitClient);
         return {
           events,
           conversationId,
@@ -3002,17 +3355,22 @@ export class ChatplusClient {
           upstreamModel: model,
           route,
           selected,
-          submitSessionSnapshot: submitClient.sessionSnapshot()
+          submitSessionSnapshot: submitClient.sessionSnapshot(),
+          stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
         };
       } catch (error) {
         if (imageSubmissionState.started) {
           error.imageSubmissionAttempted = true;
-          if (selected && error.code === "INVALID_UPSTREAM_RESPONSE") {
-            this.rememberImageFailedCar(selected);
+          if (selected) {
+            error.selectedCarId ||= selected.carId;
+            error.selectedCarType ||= selected.carType;
+          }
+          if (selected && shouldQuarantineImageSubmissionCar(error)) {
+            await this.rememberImageFailedCar(selected);
           }
         }
         if (selected && error.imageCarQuotaExhausted === true) {
-          this.rememberImageFailedCar(selected, error);
+          await this.rememberImageFailedCar(selected, error);
           await this.sessionLock(async () => this.resetSession());
           imageCarQuotaErrors.push(error.message || "当前车位不能继续生图");
           continue;
@@ -3021,6 +3379,16 @@ export class ChatplusClient {
           this.rememberAuthFailedCar(selected);
           await this.sessionLock(async () => this.resetSession());
           errors.push(error.message || "上游拒绝了当前聊天车位");
+          continue;
+        }
+        if (
+          selected
+          && !serverFailureRetryUsed
+          && isRetryableImageSubmissionServerFailure(error)
+        ) {
+          serverFailureRetryUsed = true;
+          await this.sessionLock(async () => this.resetSession());
+          errors.push(error.message || "上游处理失败，已更换车位重试");
           continue;
         }
         if (error.noRetry || error.imageQuotaExhausted || error.imageSubmissionAttempted) {
@@ -3052,13 +3420,29 @@ export class ChatplusClient {
 
   async withImageQuotaFallback(prompt, input, work) {
     if (input.imageGeneration === true) {
-      const conversation = await this.sendConversation(prompt, input, new Set());
-      try {
-        return await work(conversation);
-      } catch (error) {
-        error.imageSubmissionAttempted = true;
-        throw error;
+      const ignoredCarIds = new Set();
+      const quotaErrors = [];
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        let conversation = null;
+        try {
+          conversation = await this.sendConversation(prompt, input, ignoredCarIds);
+          return await work(conversation);
+        } catch (error) {
+          if (conversation?.selected && error.imageCarQuotaExhausted === true) {
+            ignoredCarIds.add(conversation.selected.carId);
+            await this.rememberImageFailedCar(conversation.selected, error);
+            quotaErrors.push(error.message || "当前车位图片生成额度已用完。");
+            continue;
+          }
+          error.imageSubmissionAttempted = true;
+          throw error;
+        }
       }
+      const error = new Error(`已自动尝试 ${quotaErrors.length} 个生图车位，但图片生成额度都已用完。`);
+      error.imageCarQuotaExhausted = true;
+      error.imageSubmissionAttempted = true;
+      error.status = 429;
+      throw error;
     }
     const ignoredCarIds = new Set();
     const quotaErrors = [];
@@ -3073,7 +3457,7 @@ export class ChatplusClient {
           continue;
         }
         if (error.imageQuotaExhausted) {
-          quotaErrors.push(error.message || "图片生成额度已用完。");
+          quotaErrors.push(error);
           continue;
         }
         throw error;
@@ -3092,13 +3476,17 @@ export class ChatplusClient {
       error.code = "upstream_text_response";
       throw error;
     }
+    const lastQuotaError = quotaErrors[quotaErrors.length - 1];
+    if (lastQuotaError?.quotaReason === "chat_usage_limit") throw lastQuotaError;
     throw imageQuotaError(`已自动尝试 ${quotaErrors.length} 个生图车位，但图片生成额度都已用完。`);
   }
 
   async waitForConversationImages(events, conversationId, timeoutSec, options = {}) {
     const initialContent = extractAssistantText(events);
     const initialPromptEnvelope = isImagePromptEnvelope(initialContent);
-    if (!initialPromptEnvelope) throwIfImageGenerationLimit(initialContent);
+    if (!initialPromptEnvelope || imageGenerationLimitContent(events)) {
+      throwIfImageGenerationLimit(events, { car: true });
+    }
     let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: options.generatedOnly });
     if (imageUrls.length || !conversationId) return imageUrls;
     if (!initialPromptEnvelope) {
@@ -3113,7 +3501,9 @@ export class ChatplusClient {
         const detail = await this.conversationDetail(conversationId);
         const content = extractAssistantText(detail);
         const promptEnvelope = isImagePromptEnvelope(content);
-        if (!promptEnvelope) throwIfImageGenerationLimit(content);
+        if (!promptEnvelope || imageGenerationLimitContent(detail)) {
+          throwIfImageGenerationLimit(detail, { car: true });
+        }
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
         if (!promptEnvelope) {
@@ -3128,7 +3518,7 @@ export class ChatplusClient {
           throw error;
         }
       } catch (error) {
-        if (error.imageQuotaExhausted || error.upstreamExplicitFailure) throw error;
+        if (error.imageCarQuotaExhausted || error.imageQuotaExhausted || error.upstreamExplicitFailure) throw error;
         // Images can appear shortly after the streamed response finishes.
       }
       await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -3184,7 +3574,7 @@ export class ChatplusClient {
     }
     const imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
     if (imageUrls.length) {
-      this.rememberImageSuccessfulCar({
+      await this.rememberImageSuccessfulCar({
         carId: context.carId || this.carId,
         carType: context.carType || this.carType
       });
@@ -3200,14 +3590,24 @@ export class ChatplusClient {
     const content = extractAssistantText(detail);
     const promptEnvelope = isImagePromptEnvelope(content);
     const intermediateResponse = promptEnvelope || isSkippedMainlineContent(content);
-    if (!intermediateResponse && isImageGenerationLimitMessage(content)) {
+    const quotaContent = imageGenerationLimitContent(detail);
+    if (quotaContent) {
+      const quotaError = imageCarQuotaError(quotaContent);
+      await this.rememberImageFailedCar({
+        carId: context.carId || this.carId,
+        carType: context.carType || this.carType
+      }, quotaError);
       return {
         externalId,
         status: "failed",
         imageCount: 0,
         imageUrls: [],
-        errorMessage: "上游明确返回图片生成额度不足。",
-        raw: detail
+        errorMessage: "当前车位图片生成次数已用完，系统已暂停使用该车位。",
+        raw: {
+          ...detail,
+          imageCarQuotaExhausted: true,
+          imageCarCooldownUntil: quotaError.quotaResetAt || ""
+        }
       };
     }
     if (!intermediateResponse && isTerminalImageFailureMessage(content)) {
@@ -3253,22 +3653,24 @@ export class ChatplusClient {
 
   async createTextTask(input) {
     return this.runTaskWork(input, async () => {
+      const taskStageRecorder = createTaskStageRecorder(input);
+      const trackedInput = { ...input, taskStageRecorder };
       const prompt = String(input.prompt || "").trim();
       if (!prompt) throw new Error("请输入生图描述。");
       const result = await this.withImageQuotaFallback(prompt, {
-        ...input,
+        ...trackedInput,
         imageGeneration: true,
         preferImageCar: true,
         requireConversationId: true
       }, async (conversation) => {
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
-        throwIfImageGenerationLimit(extractAssistantText(conversation.events));
+        throwIfImageGenerationLimit(conversation.events, { car: true });
         if (["gemini", "grok"].includes(conversation.route?.key)) {
           const imageUrls = conversation.imageUrls || [];
           if (!imageUrls.length) {
             if (conversation.route?.key === "gemini") {
               throwIfTerminalImageFailure(conversation.directContent, { policyOnly: true });
-              this.rememberImageFailedCar(conversation.selected);
+              await this.rememberImageFailedCar(conversation.selected);
             }
             throwIfTextImageResponse(conversation.directContent, { requireResult: true });
           }
@@ -3276,12 +3678,17 @@ export class ChatplusClient {
         }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
         const waitClient = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
-        const imageUrls = await waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec);
+        const imageUrls = await measureTaskStage(taskStageRecorder, {
+          key: "result_wait",
+          label: "等待图片完成",
+          carId: conversation.selected?.carId,
+          carType: conversation.selected?.carType
+        }, async () => waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec));
         return { ...conversation, imageUrls };
       });
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
       const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
-      if (imageUrls.length) this.rememberImageSuccessfulCar(selected);
+      if (imageUrls.length) await this.rememberImageSuccessfulCar(selected);
 
       return {
         externalId: conversationId || messageId,
@@ -3297,33 +3704,35 @@ export class ChatplusClient {
           carId: selected?.carId,
           carType: selected?.carType
         }),
-        raw: { conversationId, eventCount: events.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy }
+        raw: { conversationId, eventCount: events.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy, ...geminiRouteMetadata(route), stageTimings: taskStageSnapshot(taskStageRecorder) }
       };
     });
   }
 
   async createImageTask(input = {}) {
     return this.runTaskWork(input, async () => {
+      const taskStageRecorder = createTaskStageRecorder(input);
+      const trackedInput = { ...input, taskStageRecorder };
       const files = normalizeChatFiles(input, []);
       const prompt = String(input.prompt || "").trim();
       if (!prompt) throw new Error("Please enter an image edit prompt.");
       if (!files.length) throw new Error("Please upload a source image.");
 
       const result = await this.withImageQuotaFallback(prompt, {
-        ...input,
+        ...trackedInput,
         files,
         imageGeneration: true,
         preferImageCar: true,
         requireConversationId: true
       }, async (conversation) => {
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
-        throwIfImageGenerationLimit(extractAssistantText(conversation.events));
+        throwIfImageGenerationLimit(conversation.events, { car: true });
         if (["gemini", "grok"].includes(conversation.route?.key)) {
           const imageUrls = conversation.imageUrls || [];
           if (!imageUrls.length) {
             if (conversation.route?.key === "gemini") {
               throwIfTerminalImageFailure(conversation.directContent, { policyOnly: true });
-              this.rememberImageFailedCar(conversation.selected);
+              await this.rememberImageFailedCar(conversation.selected);
             }
             throwIfTextImageResponse(conversation.directContent, { requireResult: true });
           }
@@ -3331,12 +3740,17 @@ export class ChatplusClient {
         }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
         const waitClient = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
-        const imageUrls = await waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true });
+        const imageUrls = await measureTaskStage(taskStageRecorder, {
+          key: "result_wait",
+          label: "等待图片完成",
+          carId: conversation.selected?.carId,
+          carType: conversation.selected?.carType
+        }, async () => waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true }));
         return { ...conversation, imageUrls };
       });
       const { events, conversationId, messageId, model, upstreamModel, route, selected, imageUrls } = result;
       const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
-      if (imageUrls.length) this.rememberImageSuccessfulCar(selected);
+      if (imageUrls.length) await this.rememberImageSuccessfulCar(selected);
 
       return {
         externalId: conversationId || messageId,
@@ -3352,7 +3766,7 @@ export class ChatplusClient {
           carId: selected?.carId,
           carType: selected?.carType
         }),
-        raw: { conversationId, eventCount: events.length, sourceImageCount: files.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy }
+        raw: { conversationId, eventCount: events.length, sourceImageCount: files.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy, ...geminiRouteMetadata(route), stageTimings: taskStageSnapshot(taskStageRecorder) }
       };
     });
   }
@@ -3404,7 +3818,7 @@ export class ChatplusClient {
           model,
           content,
           imageUrls,
-          raw: { conversationId, eventCount: events.length, imageCount: files.length, outputImageCount: imageUrls.length, detailTextLength: detailContent.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy }
+          raw: { conversationId, eventCount: events.length, imageCount: files.length, outputImageCount: imageUrls.length, detailTextLength: detailContent.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy, ...geminiRouteMetadata(route) }
         };
       } finally {
         if (conversationToDelete?.conversationId) {

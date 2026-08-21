@@ -26,6 +26,7 @@ import {
   listTodayAccountRoutingUsage,
   loadConfig,
   recordTaskStat,
+  updateAccountMeta,
   updateAccountStatus,
   upsertTask
 } from "./storage.js";
@@ -249,7 +250,7 @@ function targetRuntimeAvailable(target, taskType) {
 
 function targetSupportsChatModel(target, modelKey) {
   if (target?.channel?.type !== "chatplus") return false;
-  const requestedKey = modelRequestKey(modelKey);
+  const requestedKey = geminiModelFamily(modelKey) || modelRequestKey(modelKey);
   if (!requestedKey) return true;
   const settings = target.channel.settings || {};
   const routes = Array.isArray(settings.chatModels) ? settings.chatModels : [];
@@ -699,13 +700,74 @@ async function persistProCarRestriction(channel, account) {
   });
 }
 
+function activeImageCarCooldowns(value = {}, now = Date.now()) {
+  const entries = Object.values(value && typeof value === "object" && !Array.isArray(value) ? value : {})
+    .filter((item) => {
+      const until = Date.parse(item?.cooldownUntil || "");
+      return String(item?.carId || "").trim() && Number.isFinite(until) && until > now;
+    })
+    .sort((a, b) => Date.parse(b.cooldownUntil) - Date.parse(a.cooldownUntil))
+    .slice(0, 300);
+  return Object.fromEntries(entries.map((item) => [
+    `${String(item.carType || "chatgpt").trim()}:${String(item.carId).trim()}`,
+    item
+  ]));
+}
+
+async function persistImageCarCooldown(channel, account, cooldown = {}) {
+  const carId = String(cooldown.carId || "").trim();
+  const carType = String(cooldown.carType || "chatgpt").trim();
+  if (!account?.id || !carId) return;
+  const key = `${carType}:${carId}`;
+  const cooldownUntil = String(cooldown.cooldownUntil || "").trim();
+  const ability = channelAbilityKey(channel);
+
+  await updateAccountMeta(account.id, (accountMeta) => {
+    if (ability) {
+      const abilities = { ...(accountMeta.abilities || {}) };
+      const abilityStatus = { ...(abilities[ability] || {}) };
+      const abilityMeta = { ...(abilityStatus.meta || {}) };
+      const cooldowns = activeImageCarCooldowns(abilityMeta.imageCarCooldowns);
+      if (Date.parse(cooldownUntil) > Date.now()) {
+        cooldowns[key] = {
+          carId,
+          carType,
+          cooldownUntil,
+          reason: String(cooldown.reason || "image_failure"),
+          updatedAt: new Date().toISOString()
+        };
+      } else {
+        delete cooldowns[key];
+      }
+      abilityMeta.imageCarCooldowns = activeImageCarCooldowns(cooldowns);
+      abilities[ability] = { ...abilityStatus, meta: abilityMeta };
+      return { ...accountMeta, abilities };
+    }
+
+    const cooldowns = activeImageCarCooldowns(accountMeta.chatplusImageCarCooldowns);
+    if (Date.parse(cooldownUntil) > Date.now()) {
+      cooldowns[key] = {
+        carId,
+        carType,
+        cooldownUntil,
+        reason: String(cooldown.reason || "image_failure"),
+        updatedAt: new Date().toISOString()
+      };
+    } else {
+      delete cooldowns[key];
+    }
+    return { ...accountMeta, chatplusImageCarCooldowns: activeImageCarCooldowns(cooldowns) };
+  });
+}
+
 function clientContext(config, channel, account) {
   return {
     config,
     channel,
     account,
     sessionLock: (work) => withAccountAuthLock(account, work),
-    onProCarsUnavailable: () => persistProCarRestriction(channel, account)
+    onProCarsUnavailable: () => persistProCarRestriction(channel, account),
+    onImageCarCooldown: (cooldown) => persistImageCarCooldown(channel, account, cooldown)
   };
 }
 
@@ -913,6 +975,8 @@ function imageSubmissionFailure(error) {
   failure.imageSubmissionAttempted = true;
   failure.upstreamText = String(error?.upstreamText || error?.body || "").trim();
   failure.upstreamStatus = error?.upstreamStatus || "";
+  failure.selectedCarId = error?.selectedCarId || "";
+  failure.selectedCarType = error?.selectedCarType || "";
   return failure;
 }
 
@@ -1153,12 +1217,22 @@ function taskExternalId(task) {
 }
 
 function taskConversationId(task) {
-  return task.raw?.conversationId
+  const confirmedId = task.raw?.conversationId
     || task.raw?.conversation_id
     || task.responseJson?.conversationId
     || task.responseJson?.conversation_id
-    || task.externalId
     || "";
+  if (confirmedId) return confirmedId;
+  const externalId = String(task.externalId || "").trim();
+  const chatModel = String(
+    task.raw?.chatModel
+      || task.responseJson?.raw?.chatModel
+      || task.responseJson?.chatModel
+      || task.modelId
+      || ""
+  ).trim().toLowerCase();
+  if (chatModel === "gemini" && !externalId.startsWith("c_")) return "";
+  return externalId;
 }
 
 function upstreamConversationUrl(channel, conversationId) {
@@ -1182,7 +1256,7 @@ export async function inspectUpstreamTask(taskId) {
     throw error;
   }
 
-  const externalId = taskConversationId(task) || taskExternalId(task);
+  const externalId = taskConversationId(task);
   if (!externalId || (task.raw?.queued && String(externalId).startsWith("task-"))) {
     const error = new Error("这个任务还没有保存上游对话编号。");
     error.status = 400;
@@ -1541,6 +1615,54 @@ function retryableImageMirrorError(error) {
   return /fetch failed|timed? ?out|connection reset|connection to proxy closed|proxy handshake/i.test(String(error?.message || ""));
 }
 
+function mergeTaskStageTimings(...values) {
+  const entries = [];
+  const seen = new Set();
+  for (const value of values) {
+    for (const entry of Array.isArray(value) ? value : []) {
+      if (!entry || typeof entry !== "object") continue;
+      const durationMs = Number(entry.durationMs);
+      if (!String(entry.key || "").trim() || !Number.isFinite(durationMs) || durationMs < 0) continue;
+      const key = String(entry.id || [entry.key, entry.startedAt, entry.finishedAt, entry.carId].join("::"));
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push({ ...entry, durationMs: Math.round(durationMs) });
+    }
+  }
+  return entries.slice(-100);
+}
+
+function mergeTaskRaw(current = {}, incoming = {}) {
+  const stageTimings = mergeTaskStageTimings(current?.stageTimings, incoming?.stageTimings);
+  return {
+    ...(current || {}),
+    ...(incoming || {}),
+    ...(stageTimings.length ? { stageTimings } : {})
+  };
+}
+
+function completedTaskStage(key, label, startedAtMs, status = "success", error = null) {
+  return {
+    id: `stage-${randomUUID()}`,
+    key,
+    label,
+    status,
+    startedAt: new Date(startedAtMs).toISOString(),
+    finishedAt: new Date().toISOString(),
+    durationMs: Math.max(0, Date.now() - startedAtMs),
+    ...(error?.message ? { message: String(error.message).replace(/\s+/g, " ").trim().slice(0, 300) } : {})
+  };
+}
+
+async function persistTaskStage(task, stage) {
+  const nextTask = {
+    ...task,
+    raw: mergeTaskRaw(task.raw, { stageTimings: [stage] })
+  };
+  await upsertTask(nextTask);
+  return nextTask;
+}
+
 async function mirrorTaskImageUrls(imageUrls, config, downloadImage, options = {}) {
   const waitForReady = options.waitForReady === true;
   const deadline = waitForReady ? Date.now() + WAIT_IMAGE_MIRROR_TIMEOUT_MS : 0;
@@ -1575,19 +1697,27 @@ async function mirrorTaskImages(result, config, client = null, options = {}) {
           carType: result?.raw?.selectedCarType
         })
       : undefined;
-  const mirroredUrls = await mirrorTaskImageUrls(imageUrls, config, downloadImage, options);
+  const startedAt = Date.now();
+  let mirroredUrls;
+  try {
+    mirroredUrls = await mirrorTaskImageUrls(imageUrls, config, downloadImage, options);
+  } catch (error) {
+    error.taskStageTiming = completedTaskStage("result_save", "保存图片", startedAt, "failed", error);
+    throw error;
+  }
+  const saveTiming = completedTaskStage("result_save", "保存图片", startedAt);
   return {
     ...result,
     imageCount: mirroredUrls.length,
     imageUrls: mirroredUrls,
-    raw: {
-      ...(result.raw || {}),
+    raw: mergeTaskRaw(result.raw, {
       originalImageUrls: imageUrls,
       imageMirrorPending: false,
       imageMirrorRecoveredAt: new Date().toISOString(),
       resultSaveError: "",
-      resultSaveErrorCode: ""
-    }
+      resultSaveErrorCode: "",
+      stageTimings: [saveTiming]
+    })
   };
 }
 
@@ -1758,6 +1888,15 @@ function mergeRefreshedTask(task, result, channel, account) {
   const status = result.status || task.status;
   const route = taskRouteEntry(channel, account);
   const wasSubmitted = Boolean(task.raw?.submitted || savedTaskExternalId(task) || savedTaskExternalId(result));
+  const mergedRaw = mergeTaskRaw(task.raw, result.raw);
+  const submittedAtMs = Date.parse(task.raw?.submittedAt || "");
+  const hasResultWaitTiming = (mergedRaw.stageTimings || []).some((entry) => entry.key === "result_wait");
+  const resultWaitTiming = status === "success"
+    && task.status !== "success"
+    && !hasResultWaitTiming
+    && Number.isFinite(submittedAtMs)
+      ? completedTaskStage("result_wait", "等待图片完成", submittedAtMs)
+      : null;
   return {
     ...task,
     externalId: result.externalId || task.externalId,
@@ -1784,10 +1923,9 @@ function mergeRefreshedTask(task, result, channel, account) {
     completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : task.completedAt || null,
     requestJson: task.requestJson || null,
     responseJson: attachResponseSourceTaskId(taskResponseJson(result), task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson)),
-    raw: {
-      ...(task.raw || {}),
-      ...(result.raw || {})
-    }
+    raw: mergeTaskRaw(mergedRaw, {
+      stageTimings: resultWaitTiming ? [resultWaitTiming] : []
+    })
   };
 }
 
@@ -2136,6 +2274,11 @@ function modelRequestKey(value) {
   return String(value ?? "").trim().toLowerCase();
 }
 
+function geminiModelFamily(value) {
+  const key = modelRequestKey(value);
+  return key === "gemini" || key.startsWith("gemini-") ? "gemini" : "";
+}
+
 const chatModelRequestKeys = new Set(["gpt", "grok", "gemini"]);
 const gptImageModelRequestKeys = new Set(["1", "gpt-image-2", "chatgpt-image-2"]);
 const geminiImageModelRequestKeys = new Set([
@@ -2160,6 +2303,7 @@ function requestedModelLock(input = {}) {
   const explicitModel = input.model || input.chat_model || input.chatModel || "";
   const explicitKey = modelRequestKey(explicitModel);
   if (explicitKey && explicitKey !== "auto") {
+    if (geminiModelFamily(explicitKey)) return { type: "chat", key: "gemini" };
     if (chatModelRequestKeys.has(explicitKey)) return { type: "chat", key: explicitKey };
     if (gptImageModelRequestKeys.has(explicitKey)) return { type: "gpt-image", key: "gpt" };
     if (geminiImageModelRequestKeys.has(explicitKey)) return { type: "gemini-image", key: "gemini" };
@@ -3302,7 +3446,12 @@ async function failQueuedTask(task, error, attempts = []) {
       ...(upstreamText ? { upstreamText } : {}),
       attempts: taskResponseJson(attempts)
     },
-    completedAt: new Date().toISOString()
+    completedAt: new Date().toISOString(),
+    raw: mergeTaskRaw(task.raw, {
+      ...(error?.selectedCarId ? { selectedCarId: error.selectedCarId } : {}),
+      ...(error?.selectedCarType ? { selectedCarType: error.selectedCarType } : {}),
+      stageTimings: error?.taskStageTiming ? [error.taskStageTiming] : []
+    })
   };
   await upsertTask(failedTask);
   await recordTaskStat(failedTask);
@@ -3319,7 +3468,8 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
     createdAt: task.createdAt,
     submissionChannels: mergeTaskRoutes(task.submissionChannels, wrapped.submissionChannels),
     generationChannels: mergeTaskRoutes(task.generationChannels, wrapped.generationChannels),
-    completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : null
+    completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : null,
+    raw: mergeTaskRaw(task.raw, wrapped.raw)
   };
   if (!isFinishedTask(status) && task.raw?.submitted === true && savedTaskExternalId(nextTask)) {
     nextTask.raw = {
@@ -3405,8 +3555,7 @@ async function interruptExpiredImageMirror(task, error, retryCount, firstFailedA
       task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson)
     ),
     completedAt: now,
-    raw: {
-      ...(task.raw || {}),
+    raw: mergeTaskRaw(task.raw, {
       waitingUpstream: false,
       imageMirrorPending: false,
       imageMirrorGaveUp: true,
@@ -3417,8 +3566,9 @@ async function interruptExpiredImageMirror(task, error, retryCount, firstFailedA
       resultSaveErrorAt: now,
       interrupted: true,
       interruptedAt: now,
-      interruptedReason: message
-    }
+      interruptedReason: message,
+      stageTimings: error?.taskStageTiming ? [error.taskStageTiming] : []
+    })
   };
   await upsertTask(nextTask);
   return nextTask;
@@ -3454,8 +3604,7 @@ async function keepSubmittedTaskRecoverable(task, error, attempts = []) {
       task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson)
     ),
     completedAt: null,
-    raw: {
-      ...(task.raw || {}),
+    raw: mergeTaskRaw(task.raw, {
       queued: false,
       submitted: true,
       waitingUpstream: true,
@@ -3466,8 +3615,9 @@ async function keepSubmittedTaskRecoverable(task, error, attempts = []) {
       ...(originalImageUrls.length ? { originalImageUrls } : {}),
       resultSaveError: error?.message || "结果保存中断。",
       resultSaveErrorCode: error?.code || "",
-      resultSaveErrorAt: now
-    }
+      resultSaveErrorAt: now,
+      stageTimings: error?.taskStageTiming ? [error.taskStageTiming] : []
+    })
   };
   await upsertTask(nextTask);
   scheduleFastTaskRefresh(nextTask);
@@ -3479,6 +3629,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
   const requestedChannel = requestedChannelForInput(config, input);
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { input });
   const attempts = [...(reserved?.attempts || [])];
+  let latestTask = task;
   let reservedRelease = reserved?.release || null;
   try {
     for (const target of orderedTargets(targets, reserved)) {
@@ -3495,22 +3646,29 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           continue;
         }
       }
-      let taskState = task;
+      let taskState = latestTask;
       try {
         const finishedTask = await runChatplusAccountWork(channel, account, async () => {
           if (!(await ensureTargetReady(config, target, "text2img", attempts))) return null;
           const client = getWorkClient(config, channel, account);
           const onSubmitted = async (submittedResult) => {
             taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
+            latestTask = taskState;
+          };
+          const onStage = async (stage) => {
+            taskState = await persistTaskStage(taskState, stage);
+            latestTask = taskState;
           };
           const chatplusConcurrentSubmit = channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false;
           let result = await client.createTextTask({
             ...imageInputForTarget(target, input),
             onSubmitted,
+            onStage,
             ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
             waitForImages: options.waitForChatplusImages === true
           });
           taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
+          latestTask = taskState;
           scheduleDrawingQuotaRefresh(account, channel);
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
             result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
@@ -3529,6 +3687,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
+        latestTask = taskState;
         if (savedTaskExternalId(taskState)) {
           if (isTerminalTaskFailureError(error)) {
             pushAttempt(attempts, target, error.message || "调用失败");
@@ -3566,7 +3725,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
   } finally {
     if (reservedRelease) reservedRelease();
   }
-  return failQueuedTask(task, targetsFailedError(attempts), attempts);
+  return failQueuedTask(latestTask, targetsFailedError(attempts), attempts);
 }
 
 async function submitImageTask(client, input, files) {
@@ -3634,6 +3793,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, input });
   const attempts = [...(reserved?.attempts || [])];
+  let latestTask = task;
   let reservedRelease = reserved?.release || null;
   try {
     const executionTargets = Array.isArray(options.orderedTargets)
@@ -3647,7 +3807,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         release = reservedRelease;
         reservedRelease = null;
       }
-      let taskState = task;
+      let taskState = latestTask;
       try {
         if (!(await ensureTargetReady(config, target, "img2img", attempts, {
           skipQuotaRefresh: options.fastQuotaRefresh || options.noChatplusQueue
@@ -3663,15 +3823,22 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           const client = getWorkClient(config, channel, account);
           const onSubmitted = async (submittedResult) => {
             taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
+            latestTask = taskState;
+          };
+          const onStage = async (stage) => {
+            taskState = await persistTaskStage(taskState, stage);
+            latestTask = taskState;
           };
           const chatplusConcurrentSubmit = channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false;
           let result = await submitImageTask(client, {
             ...imageInputForTarget(target, input),
             onSubmitted,
+            onStage,
             ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
             waitForImages: options.waitForChatplusImages === true
           }, files);
           taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
+          latestTask = taskState;
           scheduleDrawingQuotaRefresh(account, channel);
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
             result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
@@ -3690,6 +3857,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         });
         if (finishedTask) return finishedTask;
       } catch (error) {
+        latestTask = taskState;
         if (savedTaskExternalId(taskState)) {
           if (isTerminalTaskFailureError(error)) {
             pushAttempt(attempts, target, error.message || "调用失败");
@@ -3727,7 +3895,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
   } finally {
     if (reservedRelease) reservedRelease();
   }
-  return failQueuedTask(task, targetsFailedError(attempts), attempts);
+  return failQueuedTask(latestTask, targetsFailedError(attempts), attempts);
 }
 
 async function finishChatTask(task, result, channel, account, attempts, responseJson = null) {
@@ -3862,7 +4030,7 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   scheduledImageTasks.add(task.id);
   runInBackground(async () => {
     try {
-      await runQueuedTextTask(task, input, reserved);
+      await runQueuedTextTask(task, input, reserved, { waitForChatplusImages: true });
     } finally {
       scheduledImageTasks.delete(task.id);
     }
@@ -3909,7 +4077,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   scheduledImageTasks.add(task.id);
   runInBackground(async () => {
     try {
-      await runQueuedImageTask(task, input, files, reserved);
+      await runQueuedImageTask(task, input, files, reserved, { waitForChatplusImages: true });
     } finally {
       scheduledImageTasks.delete(task.id);
     }

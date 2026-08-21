@@ -1398,6 +1398,17 @@ export async function updateAccountStatus(accountId, statusPatch) {
   }));
 }
 
+export async function updateAccountMeta(accountId, buildMeta) {
+  if (typeof buildMeta !== "function") throw new TypeError("buildMeta must be a function");
+  return updateConfig((config) => ({
+    accounts: config.accounts.map((account) => {
+      if (account.id !== accountId) return account;
+      const meta = buildMeta({ ...(account.meta || {}) });
+      return { ...account, meta: meta && typeof meta === "object" ? meta : account.meta || {} };
+    })
+  }));
+}
+
 function sortTasks(tasks) {
   return [...tasks].sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
 }
@@ -1482,6 +1493,14 @@ function taskStatus(value) {
   return String(value?.status || "").trim().toLowerCase();
 }
 
+function taskRecordKind(task = {}) {
+  const taskType = String(task?.taskType || "").trim().toLowerCase();
+  if (taskType === "chat") return "chat";
+  if (["text2img", "img2img"].includes(taskType)) return "image";
+  const endpoint = String(task?.raw?.endpoint || "").trim().toLowerCase();
+  return endpoint.includes("/chat/completions") ? "chat" : "image";
+}
+
 function normalizeTaskSearchKeyword(value) {
   return String(value || "")
     .trim()
@@ -1530,7 +1549,8 @@ export async function listTaskPage({
   accountId = "",
   sourceChannelId = "",
   channel = "",
-  status = ""
+  status = "",
+  kind = ""
 } = {}) {
   const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
   const normalizedPageSize = Math.min(500, Math.max(1, Math.floor(Number(pageSize) || 100)));
@@ -1539,6 +1559,9 @@ export async function listTaskPage({
   const normalizedSourceChannelId = String(sourceChannelId || "").trim();
   const normalizedChannel = String(channel || "").trim().toLowerCase();
   const normalizedStatus = String(status || "").trim().toLowerCase();
+  const normalizedKind = ["image", "chat"].includes(String(kind || "").trim().toLowerCase())
+    ? String(kind).trim().toLowerCase()
+    : "";
 
   const tasks = await loadTasks({ waitForWrites: false });
   const cacheKey = [
@@ -1548,9 +1571,9 @@ export async function listTaskPage({
     normalizedChannel,
     normalizedStatus
   ].join("\u0000");
-  let filtered = tasksSnapshot.queryCache.get(cacheKey);
-  if (!filtered) {
-    filtered = tasks.filter((task) => {
+  let matched = tasksSnapshot.queryCache.get(cacheKey);
+  if (!matched) {
+    matched = tasks.filter((task) => {
       if (normalizedAccountId && normalizedAccountId !== "all" && String(task.accountId || "") !== normalizedAccountId) return false;
       if (normalizedSourceChannelId && normalizedSourceChannelId !== "all") {
         const taskChannelId = String(task.channelId || "").trim();
@@ -1560,8 +1583,15 @@ export async function listTaskPage({
       if (normalizedStatus && normalizedStatus !== "all" && taskStatus(task) !== normalizedStatus) return false;
       return taskMatchesSearch(task, normalizedKeyword, tasksSnapshot.searchTextCache);
     });
-    tasksSnapshot.queryCache.set(cacheKey, filtered);
+    tasksSnapshot.queryCache.set(cacheKey, matched);
   }
+  const kindTotals = matched.reduce((totals, task) => {
+    totals[taskRecordKind(task)] += 1;
+    return totals;
+  }, { image: 0, chat: 0 });
+  const filtered = normalizedKind
+    ? matched.filter((task) => taskRecordKind(task) === normalizedKind)
+    : matched;
   const total = filtered.length;
   const pageCount = Math.ceil(total / normalizedPageSize);
   const normalizedPage = Math.min(requestedPage, Math.max(1, pageCount));
@@ -1573,7 +1603,9 @@ export async function listTaskPage({
     page: normalizedPage,
     pageSize: normalizedPageSize,
     pageCount,
-    hasMore: start + normalizedPageSize < total
+    hasMore: start + normalizedPageSize < total,
+    allTotal: tasks.length,
+    kindTotals
   };
 }
 

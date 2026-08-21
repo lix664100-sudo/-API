@@ -1092,7 +1092,8 @@ app.get("/api/tasks/page", async (request) => ({
     accountId: request.query?.accountId,
     sourceChannelId: request.query?.sourceChannelId,
     channel: request.query?.channel,
-    status: request.query?.status
+    status: request.query?.status,
+    kind: request.query?.kind
   })
 }));
 

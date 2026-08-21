@@ -21,6 +21,7 @@ test("task pages return the newest matching records without returning the full h
       id: "task-old-drawing",
       sourceTaskId: "batch_draw_old_001",
       status: "failed",
+      taskType: "text2img",
       channelType: "drawing",
       channelId: "channel-shareai:drawing",
       accountId: "account-a",
@@ -31,6 +32,7 @@ test("task pages return the newest matching records without returning the full h
       id: "task-middle-chat",
       sourceTaskId: "batch_draw_middle_002",
       status: "success",
+      taskType: "chat",
       channelType: "chatplus",
       channelId: "channel-google:chatplus",
       accountId: "account-b",
@@ -40,6 +42,7 @@ test("task pages return the newest matching records without returning the full h
       id: "task-new-drawing",
       sourceTaskId: "batch_draw_new_003",
       status: "processing",
+      taskType: "img2img",
       channelType: "drawing",
       channelId: "channel-shareai:drawing",
       accountId: "account-a",
@@ -50,6 +53,8 @@ test("task pages return the newest matching records without returning the full h
 
   const firstPage = await listTaskPage({ page: 1, pageSize: 2 });
   assert.equal(firstPage.total, 3);
+  assert.equal(firstPage.allTotal, 3);
+  assert.deepEqual(firstPage.kindTotals, { image: 2, chat: 1 });
   assert.equal(firstPage.pageCount, 2);
   assert.equal(firstPage.hasMore, true);
   assert.deepEqual(firstPage.items.map((task) => task.id), ["task-new-drawing", "task-middle-chat"]);
@@ -75,4 +80,12 @@ test("task pages return the newest matching records without returning the full h
   const sourceChannel = await listTaskPage({ sourceChannelId: "channel-google" });
   assert.equal(sourceChannel.total, 1);
   assert.equal(sourceChannel.items[0].id, "task-middle-chat");
+
+  const imageTasks = await listTaskPage({ kind: "image" });
+  assert.equal(imageTasks.total, 2);
+  assert.deepEqual(imageTasks.items.map((task) => task.id), ["task-new-drawing", "task-old-drawing"]);
+
+  const chatTasks = await listTaskPage({ kind: "chat" });
+  assert.equal(chatTasks.total, 1);
+  assert.deepEqual(chatTasks.items.map((task) => task.id), ["task-middle-chat"]);
 });

@@ -29,6 +29,36 @@ function loadTaskRouteHelpers() {
   return context.helpers;
 }
 
+function loadTaskTimingHelpers() {
+  const start = adminHtml.indexOf("function taskStageTimings");
+  const end = adminHtml.indexOf("function formatTaskStageDuration", start);
+  assert.ok(start >= 0 && end > start, "任务耗时辅助逻辑必须存在");
+
+  const context = {};
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskStageTimings, taskStageSummary };`, context);
+  return context.helpers;
+}
+
+function loadTaskIdentityHelpers() {
+  const start = adminHtml.indexOf("function taskConversationId");
+  const end = adminHtml.indexOf("function taskUpstreamTitle", start);
+  assert.ok(start >= 0 && end > start, "任务上游编号辅助逻辑必须存在");
+
+  const context = {};
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskConversationId, taskCarId };`, context);
+  return context.helpers;
+}
+
+function loadTaskRecordHelpers() {
+  const start = adminHtml.indexOf("function taskRecordKind");
+  const end = adminHtml.indexOf("function taskTypeLabel", start);
+  assert.ok(start >= 0 && end > start, "任务分类与摘要辅助逻辑必须存在");
+
+  const context = {};
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskRecordKind, compactTaskText, taskTextLengthLabel };`, context);
+  return context.helpers;
+}
+
 function localValue(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -64,10 +94,33 @@ test("历史任务没有原图时返回空列表，界面显示明确提示", ()
 
 test("任务缩略图打开原图与生成结果弹窗，并支持多图放大和窄屏排列", () => {
   assert.match(adminHtml, /aria-label": "查看原图和生成结果"/);
-  assert.match(adminHtml, /title: "原图与生成结果"/);
+  assert.match(adminHtml, /\? "对话图片" : "原图与生成结果"/);
   assert.match(adminHtml, /Image\.PreviewGroup/);
   assert.match(adminHtml, /\.task-compare-grid[\s\S]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
   assert.match(adminHtml, /@media \(max-width: 780px\)[\s\S]*\.task-compare-grid[\s\S]*grid-template-columns: 1fr/);
+});
+
+test("生图和对话记录独立展示，表格固定列宽避免长内容撑坏页面", () => {
+  assert.match(adminHtml, /taskRecordTabLabel\("image", "生图记录"/);
+  assert.match(adminHtml, /taskRecordTabLabel\("chat", "对话记录"/);
+  assert.match(adminHtml, /tableLayout: "fixed"/);
+  assert.match(adminHtml, /scroll: \{ x: isChat \? 1420 : 1620 \}/);
+  assert.match(adminHtml, /\.task-copy-full[\s\S]*max-height: 320px/);
+  assert.match(adminHtml, /\.task-copy-preview[\s\S]*-webkit-line-clamp: 5/);
+  assert.doesNotMatch(adminHtml, /h\("div", \{ className: "task-response" \}, row\.responseText\)/);
+});
+
+test("对话摘要会隐藏图片数据并限制长度，完整内容仍可展开", () => {
+  const { taskRecordKind, compactTaskText, taskTextLengthLabel } = loadTaskRecordHelpers();
+  const withImage = `请看图片 data:image/jpeg;base64,${"A".repeat(240)} 并说明内容`;
+
+  assert.equal(taskRecordKind({ taskType: "chat" }), "chat");
+  assert.equal(taskRecordKind({ raw: { endpoint: "/v1/chat/completions" } }), "chat");
+  assert.equal(taskRecordKind({ taskType: "img2img" }), "image");
+  assert.equal(compactTaskText(withImage, 120), "请看图片 [图片] 并说明内容");
+  assert.equal(compactTaskText("A".repeat(200), 80).length, 81);
+  assert.equal(taskTextLengthLabel("A".repeat(32000)), "3.2 万字");
+  assert.match(adminHtml, /查看完整\$\{label\}/);
 });
 
 test("两个改图入口都会保存原图预览，并纳入现有图片清理目录", () => {
@@ -121,4 +174,68 @@ test("旧任务和未提交任务也有明确的渠道状态", () => {
   assert.equal(taskSubmissionRouteText({ taskType: "img2img" }), "未提交");
   assert.equal(taskGenerationRouteText({ taskType: "img2img", status: "failed" }), "未成功");
   assert.equal(taskGenerationRouteText({ taskType: "chat", status: "success" }), "不适用");
+});
+
+test("任务耗时会合并重复记录并准确计算换车次数", () => {
+  const { taskStageSummary } = loadTaskTimingHelpers();
+  const row = {
+    raw: {
+      stageTimings: [
+        { id: "enter-a", key: "car_enter", label: "进入车位", carId: "car-a", durationMs: 1500, status: "failed" },
+        { id: "enter-b", key: "car_enter", label: "进入车位", carId: "car-b", durationMs: 2500, status: "success" },
+        { id: "upload", key: "source_upload", label: "上传原图", durationMs: 8000, status: "success" }
+      ]
+    },
+    responseJson: {
+      raw: {
+        stageTimings: [
+          { id: "upload", key: "source_upload", label: "上传原图", durationMs: 8000, status: "success" }
+        ]
+      }
+    }
+  };
+
+  const summary = localValue(taskStageSummary(row));
+  assert.equal(summary.carAttempts, 2);
+  assert.deepEqual(summary.stages, [
+    { key: "car_enter", label: "进入车位", durationMs: 4000, count: 2, failedCount: 1 },
+    { key: "source_upload", label: "上传原图", durationMs: 8000, count: 1, failedCount: 0 }
+  ]);
+  assert.match(adminHtml, /换车 \$\{summary\.carAttempts - 1\} 次/);
+  assert.match(adminHtml, /aria-label": "任务耗时明细"/);
+});
+
+test("Gemini 只有真实上游编号才显示为上游对话", () => {
+  const { taskConversationId } = loadTaskIdentityHelpers();
+
+  assert.equal(taskConversationId({
+    channelType: "chatplus",
+    modelId: "gemini",
+    externalId: "6a881587-cb5e-4f00-9c74-e5ac904bf377"
+  }), "");
+  assert.equal(taskConversationId({
+    channelType: "chatplus",
+    modelId: "gemini",
+    externalId: "c_f182cceb2592f88e"
+  }), "c_f182cceb2592f88e");
+  assert.equal(taskConversationId({
+    channelType: "chatplus",
+    modelId: "gemini",
+    externalId: "local-fallback",
+    raw: { conversationId: "confirmed-upstream-id" }
+  }), "confirmed-upstream-id");
+});
+
+test("失败任务会从处理记录中显示实际车位", () => {
+  const { taskCarId } = loadTaskIdentityHelpers();
+  const row = {
+    raw: {
+      stageTimings: [
+        { id: "upload", key: "source_upload", durationMs: 10 },
+        { id: "submit", key: "upstream_generation", carId: "failed-car", durationMs: 20, status: "failed" }
+      ]
+    }
+  };
+
+  assert.equal(taskCarId(row), "failed-car");
 });

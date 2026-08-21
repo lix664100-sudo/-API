@@ -419,6 +419,43 @@
         color: var(--muted);
       }
 
+      .task-timing {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+        margin-top: 8px;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .task-timing-title {
+        color: var(--muted);
+        font-weight: 650;
+      }
+
+      .task-timing-item {
+        display: inline-flex;
+        align-items: center;
+        padding: 2px 7px;
+        border: 1px solid #d7e3f5;
+        border-radius: 6px;
+        background: #fff;
+        color: #344054;
+      }
+
+      .task-timing-item.is-count {
+        border-color: #b8d5ff;
+        background: #f3f8ff;
+        color: #175cd3;
+      }
+
+      .task-timing-item.is-failed {
+        border-color: #fecdca;
+        background: #fff6f5;
+        color: #b42318;
+      }
+
       .task-upstream-action {
         display: inline-flex;
         align-items: center;
@@ -679,6 +716,52 @@
         min-width: 0;
         overflow: visible;
         padding: 14px 18px 18px;
+      }
+
+      .task-record-tabs {
+        min-width: 0;
+      }
+
+      .task-record-tab-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        font-weight: 700;
+      }
+
+      .task-record-tab-count {
+        min-width: 24px;
+        padding: 1px 7px;
+        border-radius: 999px;
+        background: #eef4ff;
+        color: #175cd3;
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        line-height: 20px;
+        text-align: center;
+      }
+
+      .task-record-context {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 12px;
+        padding: 0 2px 12px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .task-record-context-title {
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 760;
+      }
+
+      .task-record-context-desc {
+        margin-top: 3px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
       }
 
       .task-toolbar {
@@ -1097,6 +1180,10 @@
         gap: 24px;
       }
 
+      .task-compare-grid.is-single {
+        grid-template-columns: 1fr;
+      }
+
       .task-compare-section {
         min-width: 0;
       }
@@ -1242,6 +1329,76 @@
         color: var(--muted);
         font-size: 12px;
         line-height: 1.5;
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+      }
+
+      .task-record-row > td {
+        vertical-align: top;
+      }
+
+      .task-copy-cell {
+        min-width: 0;
+      }
+
+      .task-copy-block + .task-copy-block {
+        margin-top: 10px;
+        padding-top: 9px;
+        border-top: 1px solid #eef2f6;
+      }
+
+      .task-copy-label {
+        margin-bottom: 4px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+      }
+
+      .task-copy-preview {
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 620;
+        line-height: 1.6;
+        overflow-wrap: anywhere;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 5;
+        overflow: hidden;
+      }
+
+      .task-copy-preview.is-answer {
+        color: #475467;
+        font-weight: 500;
+      }
+
+      .task-copy-detail {
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .task-copy-detail summary {
+        width: fit-content;
+        cursor: pointer;
+        color: #175cd3;
+        font-weight: 650;
+        user-select: none;
+      }
+
+      .task-copy-full {
+        max-height: 320px;
+        margin: 8px 0 0;
+        overflow: auto;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel-soft);
+        color: #344054;
+        font-family: inherit;
+        font-size: 12px;
+        line-height: 1.6;
+        overflow-wrap: anywhere;
         white-space: pre-wrap;
       }
 
@@ -1378,6 +1535,11 @@
         }
 
         .task-trend-header {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .task-record-context {
           align-items: stretch;
           flex-direction: column;
         }
@@ -2087,7 +2249,16 @@
         if (rawId) return String(rawId).trim();
         const channelText = `${row?.channelId || ""} ${row?.channelType || ""} ${row?.channelName || ""}`;
         if (!/chatplus|聊天生图/.test(channelText)) return "";
-        return String(row?.externalId || row?.responseJson?.externalId || "").trim();
+        const externalId = String(row?.externalId || row?.responseJson?.externalId || "").trim();
+        const chatModel = String(
+          row?.raw?.chatModel
+            || row?.responseJson?.raw?.chatModel
+            || row?.responseJson?.chatModel
+            || row?.modelId
+            || ""
+        ).trim().toLowerCase();
+        if (chatModel === "gemini" && !externalId.startsWith("c_")) return "";
+        return externalId;
       }
 
       function taskChatBaseUrl(row, config) {
@@ -2110,7 +2281,80 @@
       }
 
       function taskCarId(row) {
-        return String(row?.raw?.selectedCarId || row?.responseJson?.selectedCarId || "").trim();
+        const savedCarId = String(row?.raw?.selectedCarId || row?.responseJson?.selectedCarId || "").trim();
+        if (savedCarId) return savedCarId;
+        const stage = [...taskStageTimings(row)].reverse().find((entry) => entry?.carId);
+        return String(stage?.carId || "").trim();
+      }
+
+      function taskStageTimings(row) {
+        const sources = [
+          row?.raw?.stageTimings,
+          row?.responseJson?.raw?.stageTimings,
+          row?.responseJson?.stageTimings
+        ];
+        const entries = [];
+        const seen = new Set();
+        for (const source of sources) {
+          for (const entry of Array.isArray(source) ? source : []) {
+            const durationMs = Number(entry?.durationMs);
+            const key = String(entry?.id || [entry?.key, entry?.startedAt, entry?.finishedAt, entry?.carId].join("::"));
+            if (!entry?.key || !Number.isFinite(durationMs) || durationMs < 0 || seen.has(key)) continue;
+            seen.add(key);
+            entries.push({ ...entry, durationMs });
+          }
+        }
+        return entries;
+      }
+
+      function taskStageSummary(row) {
+        const entries = taskStageTimings(row);
+        const grouped = new Map();
+        for (const entry of entries) {
+          const key = String(entry.key);
+          const current = grouped.get(key) || {
+            key,
+            label: String(entry.label || key),
+            durationMs: 0,
+            count: 0,
+            failedCount: 0
+          };
+          current.durationMs += entry.durationMs;
+          current.count += 1;
+          if (entry.status === "failed") current.failedCount += 1;
+          grouped.set(key, current);
+        }
+        const carAttempts = entries.filter((entry) => (
+          ["car_enter", "session_reuse"].includes(entry.key) && entry.carId
+        )).length;
+        return { stages: [...grouped.values()], carAttempts };
+      }
+
+      function formatTaskStageDuration(ms) {
+        if (!Number.isFinite(ms) || ms < 0) return "-";
+        if (ms < 1000) return ms < 100 ? "少于0.1秒" : `${(ms / 1000).toFixed(1)}秒`;
+        return formatDuration(ms);
+      }
+
+      function taskTimingLine(row) {
+        const summary = taskStageSummary(row);
+        if (!summary.stages.length) return null;
+        const carText = summary.carAttempts > 0
+          ? `车位尝试 ${summary.carAttempts} 次${summary.carAttempts > 1 ? `，换车 ${summary.carAttempts - 1} 次` : ""}`
+          : "";
+        return h("div", {
+          className: "task-timing",
+          role: "group",
+          "aria-label": "任务耗时明细"
+        }, [
+          h("span", { className: "task-timing-title", key: "title" }, "耗时明细："),
+          carText ? h("span", { className: "task-timing-item is-count", key: "cars" }, carText) : null,
+          ...summary.stages.map((stage) => h("span", {
+            className: `task-timing-item${stage.failedCount ? " is-failed" : ""}`,
+            key: stage.key,
+            title: stage.failedCount ? `${stage.failedCount} 次未完成` : undefined
+          }, `${stage.label}${stage.count > 1 ? `（${stage.count}次）` : ""} ${formatTaskStageDuration(stage.durationMs)}`))
+        ].filter(Boolean));
       }
 
       function taskUpstreamTitle(row) {
@@ -2810,6 +3054,52 @@
         ]);
       }
 
+      function taskRecordKind(row) {
+        const taskType = String(row?.taskType || "").trim().toLowerCase();
+        if (taskType === "chat") return "chat";
+        if (["text2img", "img2img"].includes(taskType)) return "image";
+        const endpoint = String(row?.raw?.endpoint || "").trim().toLowerCase();
+        return endpoint.includes("/chat/completions") ? "chat" : "image";
+      }
+
+      function compactTaskText(value, limit = 360) {
+        const normalized = String(value || "")
+          .replace(/data:image\/[a-z0-9.+-]+;base64,(?:[a-z0-9+/=]+|\[omitted[^\]]*\])/gi, "[图片]")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (!normalized) return "";
+        const maxLength = Math.max(20, Number(limit) || 360);
+        return normalized.length > maxLength
+          ? `${normalized.slice(0, maxLength).trimEnd()}…`
+          : normalized;
+      }
+
+      function taskTextLengthLabel(value) {
+        const length = String(value || "").trim().length;
+        if (length < 1000) return `${length} 字`;
+        if (length < 10000) return `${(length / 1000).toFixed(1)} 千字`;
+        return `${(length / 10000).toFixed(1)} 万字`;
+      }
+
+      function taskCopyBlock(label, value, options = {}) {
+        const fullText = String(value || "").trim();
+        if (!fullText) return null;
+        const limit = Number(options.limit) || 360;
+        const preview = compactTaskText(fullText, limit);
+        const hasMore = fullText.length > limit || fullText.includes("\n") || /data:image\//i.test(fullText);
+        return h("div", { className: "task-copy-block", key: options.key || label }, [
+          h("div", { className: "task-copy-label", key: "label" }, label),
+          h("div", {
+            className: `task-copy-preview${options.answer ? " is-answer" : ""}`,
+            key: "preview"
+          }, preview),
+          hasMore ? h("details", { className: "task-copy-detail", key: "detail" }, [
+            h("summary", { key: "summary" }, `查看完整${label}（${taskTextLengthLabel(fullText)}）`),
+            h("pre", { className: "task-copy-full", key: "content" }, fullText)
+          ]) : null
+        ]);
+      }
+
       function taskTypeLabel(type) {
         const map = {
           chat: "对话",
@@ -2912,6 +3202,7 @@
         const records = Array.isArray(daily?.records) ? daily.records : [];
         records.forEach((record) => {
           if (!visibleDays.has(record.day)) return;
+          if (taskRecordKind(record) !== "image") return;
           if (accountFilter !== "all" && record.accountId !== accountFilter) return;
           if (!taskSourceChannelMatches(record, sourceChannelFilter, accounts)) return;
           if (channelFilter !== "all" && record.channelGroup !== channelFilter) return;
@@ -3812,6 +4103,7 @@
         const [tasks, setTasks] = useState([]);
         const [taskTotal, setTaskTotal] = useState(0);
         const [allTaskTotal, setAllTaskTotal] = useState(0);
+        const [taskKindTotals, setTaskKindTotals] = useState({ image: 0, chat: 0 });
         const [taskPage, setTaskPage] = useState(1);
         const [taskListLoading, setTaskListLoading] = useState(false);
         const [statRecords, setStatRecords] = useState([]);
@@ -3846,6 +4138,7 @@
         const [taskSourceChannelFilter, setTaskSourceChannelFilter] = useState("all");
         const [taskChannelFilter, setTaskChannelFilter] = useState("all");
         const [taskStatusFilter, setTaskStatusFilter] = useState("all");
+        const [taskKind, setTaskKind] = useState("image");
         const [taskKeyword, setTaskKeyword] = useState("");
         const [taskSearchLoading, setTaskSearchLoading] = useState(false);
         const taskRequestIdRef = useRef(0);
@@ -4191,7 +4484,7 @@
           }))
         ]), [channels]);
 
-        function taskMatchesCurrentFilters(task) {
+        function taskMatchesListFilters(task) {
           const accountOk = taskAccountFilter === "all" || task.accountId === taskAccountFilter;
           const sourceChannelOk = taskSourceChannelMatches(task, taskSourceChannelFilter, accounts);
           const channelOk = taskChannelFilter === "all" || taskChannelGroup(task) === taskChannelFilter;
@@ -4199,21 +4492,31 @@
           return accountOk && sourceChannelOk && channelOk && statusOk;
         }
 
+        function taskMatchesCurrentFilters(task) {
+          return taskRecordKind(task) === taskKind && taskMatchesListFilters(task);
+        }
+
         const filteredTasks = useMemo(() => {
           return tasks.filter((task) => {
             return taskMatchesCurrentFilters(task) && taskMatchesKeyword(task, taskKeyword);
           });
-        }, [tasks, accounts, taskAccountFilter, taskSourceChannelFilter, taskChannelFilter, taskStatusFilter, taskKeyword]);
+        }, [tasks, accounts, taskKind, taskAccountFilter, taskSourceChannelFilter, taskChannelFilter, taskStatusFilter, taskKeyword]);
 
         function addSubmittedTask(task) {
           setAllTaskTotal((current) => current + 1);
-          if (!taskMatchesCurrentFilters(task) || !taskMatchesKeyword(task, taskKeyword)) return;
+          const kind = taskRecordKind(task);
+          const matches = taskMatchesListFilters(task) && taskMatchesKeyword(task, taskKeyword);
+          if (matches) {
+            setTaskKindTotals((current) => ({ ...current, [kind]: numberValue(current[kind]) + 1 }));
+          }
+          if (kind !== taskKind || !matches) return;
           setTasks((current) => [task, ...current.filter((item) => String(item.id) !== String(task.id))]);
           setTaskTotal((current) => current + 1);
         }
 
         const filteredStatRecords = useMemo(() => {
           return statRecords.filter((record) => {
+            if (taskRecordKind(record) !== "image") return false;
             const accountOk = taskAccountFilter === "all" || record.accountId === taskAccountFilter;
             const sourceChannelOk = taskSourceChannelMatches(record, taskSourceChannelFilter, accounts);
             const channelOk = taskChannelFilter === "all" || record.channelGroup === taskChannelFilter;
@@ -4316,6 +4619,7 @@
           sourceChannelId = taskSourceChannelFilter,
           channel = taskChannelFilter,
           status = taskStatusFilter,
+          kind = taskKind,
           showLoading = true,
           background = false
         } = {}) {
@@ -4330,6 +4634,7 @@
           if (sourceChannelId && sourceChannelId !== "all") params.set("sourceChannelId", sourceChannelId);
           if (channel && channel !== "all") params.set("channel", channel);
           if (status && status !== "all") params.set("status", status);
+          if (kind && kind !== "all") params.set("kind", kind);
           if (showLoading) setTaskListLoading(true);
           try {
             const data = await api(`/api/tasks/page?${params.toString()}`, {
@@ -4350,13 +4655,11 @@
             });
             setTaskTotal(Math.max(0, numberValue(data?.total)));
             setTaskPage(Math.max(1, numberValue(data?.page) || 1));
-            if (!String(keyword || "").trim()
-              && (!accountId || accountId === "all")
-              && (!sourceChannelId || sourceChannelId === "all")
-              && (!channel || channel === "all")
-              && (!status || status === "all")) {
-              setAllTaskTotal(Math.max(0, numberValue(data?.total)));
-            }
+            setAllTaskTotal(Math.max(0, numberValue(data?.allTotal)));
+            setTaskKindTotals({
+              image: Math.max(0, numberValue(data?.kindTotals?.image)),
+              chat: Math.max(0, numberValue(data?.kindTotals?.chat))
+            });
             return data;
           } catch (error) {
             if (error?.code === "REQUEST_ABORTED") return null;
@@ -4457,10 +4760,11 @@
             const data = await loadTaskPage({ page: 1, keyword });
             if (!data) return;
             if (!keyword) return;
+            const recordName = taskKind === "chat" ? "对话" : "生图";
             if (numberValue(data.total) > 0) {
-              message.success(`已找到 ${numberValue(data.total)} 条任务记录`);
+              message.success(`已找到 ${numberValue(data.total)} 条${recordName}记录`);
             } else {
-              message.warning("未找到匹配任务。可以只搜任务ID前半段或最后8位。");
+              message.warning(`未找到匹配的${recordName}记录。可以只搜任务ID前半段或最后8位。`);
             }
           } catch (error) {
             const text = taskListErrorMessage(error, "刷新任务记录失败");
@@ -5003,6 +5307,19 @@
             okText: "确认应用",
             cancelText: "返回检查",
             onOk: submitProxyAssignments
+          });
+        }
+
+        function handleTaskKindChange(kind) {
+          if (kind === taskKind) return;
+          markTaskListInteraction();
+          setTaskKind(kind);
+          setTasks([]);
+          setTaskTotal(0);
+          setTaskPage(1);
+          loadTaskPage({ page: 1, kind }).catch((error) => {
+            const text = taskListErrorMessage(error, "切换任务记录失败");
+            if (text) message.error(text);
           });
         }
 
@@ -5883,7 +6200,58 @@
           }
         ];
 
-        const taskColumns = [
+        function taskRecordContent(row, options = {}) {
+          const inputImageUrls = taskInputImageUrls(row);
+          return h("div", { className: "task-copy-cell" }, [
+            taskCopyBlock(options.chat ? "提问" : "任务描述", row.prompt || "-", {
+              key: "prompt",
+              limit: options.chat ? 420 : 320
+            }),
+            options.chat && row.responseText
+              ? taskCopyBlock("回复", row.responseText, { key: "answer", limit: 420, answer: true })
+              : null,
+            options.chat && inputImageUrls.length
+              ? h(Button, {
+                  key: "images",
+                  type: "link",
+                  size: "small",
+                  className: "task-upstream-action",
+                  icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null,
+                  onClick: () => setTaskPreview(row)
+                }, `查看对话图片（${inputImageUrls.length}）`)
+              : null,
+            taskMetaLine(row, config, { onInspectUpstream: openTaskUpstreamDetail, upstreamLoadingTaskId }),
+            taskTimingLine(row),
+            row.status === "interrupted"
+              ? h("div", { className: "task-response", key: "interrupted" }, [
+                  h("span", { key: "message" }, row.responseJson?.message || "服务重启时任务被中断，结果无法确认；此任务不计失败。"),
+                  (row.raw?.upstreamWaitExpired || row.raw?.manualRefreshAvailable)
+                    ? h(Button, {
+                        key: "retry",
+                        type: "link",
+                        size: "small",
+                        loading: String(retryingTaskId) === String(row.id),
+                        disabled: Boolean(retryingTaskId) && String(retryingTaskId) !== String(row.id),
+                        icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null,
+                        onClick: () => retryTaskResult(row)
+                      }, "重新查询")
+                    : null
+                ])
+              : null,
+            taskWaitingIssueText(row) ? h("div", { className: "task-response", key: "waiting" }, taskWaitingIssueText(row)) : null,
+            !options.chat && row.responseText
+              ? taskCopyBlock("返回内容", row.responseText, { key: "response", limit: 260, answer: true })
+              : null,
+            taskErrorDisplay(row),
+            taskJsonGrid(row),
+            taskRawErrorText(row) ? h("details", { className: "task-error-detail", key: "raw-error" }, [
+              h("summary", null, "查看原始错误"),
+              h("pre", null, taskRawErrorText(row))
+            ]) : null
+          ].filter(Boolean));
+        }
+
+        const imageTaskColumns = [
           {
             title: "预览",
             dataIndex: "imageUrls",
@@ -5909,44 +6277,161 @@
           },
           { title: "状态", dataIndex: "status", width: 90, render: statusTag },
           { title: "类型", dataIndex: "taskType", width: 90, render: taskTypeLabel },
-          { title: "模型", width: 180, render: (_, row) => taskModelText(row) },
-          { title: "渠道", width: 270, render: (_, row) => taskChannelFlow(row) },
+          { title: "模型", width: 150, render: (_, row) => taskModelText(row) },
+          { title: "渠道", width: 300, render: (_, row) => taskChannelFlow(row) },
           {
-            title: "描述",
+            title: "任务信息",
             dataIndex: "prompt",
-            render: (_, row) => h("div", null, [
-              h("div", { className: "primary-text" }, row.prompt || "-"),
-              taskMetaLine(row, config, { onInspectUpstream: openTaskUpstreamDetail, upstreamLoadingTaskId }),
-              row.status === "interrupted"
-                ? h("div", { className: "task-response" }, [
-                    h("span", { key: "message" }, row.responseJson?.message || "服务重启时任务被中断，结果无法确认；此任务不计失败。"),
-                    (row.raw?.upstreamWaitExpired || row.raw?.manualRefreshAvailable)
-                      ? h(Button, {
-                          key: "retry",
-                          type: "link",
-                          size: "small",
-                          loading: String(retryingTaskId) === String(row.id),
-                          disabled: Boolean(retryingTaskId) && String(retryingTaskId) !== String(row.id),
-                          icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null,
-                          onClick: () => retryTaskResult(row)
-                        }, "重新查询")
-                      : null
-                  ])
-                : null,
-              taskWaitingIssueText(row) ? h("div", { className: "task-response" }, taskWaitingIssueText(row)) : null,
-              row.responseText ? h("div", { className: "task-response" }, row.responseText) : null,
-              taskErrorDisplay(row),
-              taskJsonGrid(row),
-              taskRawErrorText(row) ? h("details", { className: "task-error-detail" }, [
-                h("summary", null, "查看原始错误"),
-                h("pre", null, taskRawErrorText(row))
-              ]) : null
-            ])
+            width: 620,
+            render: (_, row) => taskRecordContent(row)
           },
-          { title: "耗时", width: 130, render: (_, row) => taskDuration(row, nowTick) },
+          { title: "耗时", width: 120, render: (_, row) => taskDuration(row, nowTick) },
           { title: "比例", dataIndex: "ratio", width: 80 },
-          { title: "图片", dataIndex: "imageCount", width: 80 }
+          { title: "图片", dataIndex: "imageCount", width: 70 }
         ];
+
+        const chatTaskColumns = [
+          { title: "状态", dataIndex: "status", width: 90, render: statusTag },
+          { title: "模型", width: 150, render: (_, row) => taskModelText(row) },
+          { title: "渠道", width: 300, render: (_, row) => taskChannelFlow(row) },
+          {
+            title: "对话内容",
+            dataIndex: "prompt",
+            width: 760,
+            render: (_, row) => taskRecordContent(row, { chat: true })
+          },
+          { title: "耗时", width: 120, render: (_, row) => taskDuration(row, nowTick) }
+        ];
+
+        function taskRecordTabLabel(kind, label, icon) {
+          return h("span", { className: "task-record-tab-label" }, [
+            icon ? h(icon, { key: "icon" }) : null,
+            h("span", { key: "label" }, label),
+            h("span", { className: "task-record-tab-count", key: "count" }, numberValue(taskKindTotals[kind]).toLocaleString("zh-CN"))
+          ]);
+        }
+
+        function taskRecordPanel(kind) {
+          const isChat = kind === "chat";
+          const recordName = isChat ? "对话" : "生图";
+          return h("div", { className: "task-record-panel" }, [
+            h("div", { className: "task-record-context", key: "context" }, [
+              h("div", { key: "copy" }, [
+                h("div", { className: "task-record-context-title", key: "title" }, `${recordName}记录`),
+                h("div", { className: "task-record-context-desc", key: "desc" }, isChat
+                  ? "提问与回复默认显示摘要，完整内容可按需展开查看。"
+                  : "集中查看原图、生成结果、处理渠道、耗时和异常原因。")
+              ]),
+              h("div", { className: "toolbar-note", key: "total" }, `当前筛选 ${taskTotal.toLocaleString("zh-CN")} 条`)
+            ]),
+            !isChat ? h("div", { className: "task-summary-grid", key: "summary" }, [
+              h("div", { className: "task-summary-item" }, [
+                h("div", { className: "task-summary-label" }, "今日接收生图"),
+                h("div", { className: "task-summary-value" }, taskStats.today.tasks)
+              ]),
+              h("div", { className: "task-summary-item" }, [
+                h("div", { className: "task-summary-label" }, "今日成功生图"),
+                h("div", { className: "task-summary-value" }, taskStats.today.successTasks)
+              ]),
+              h("div", { className: "task-summary-item" }, [
+                h("div", { className: "task-summary-label" }, "今日处理成功率"),
+                h("div", { className: "task-summary-value" }, taskSuccessRateText(taskStats.today))
+              ]),
+              h("div", { className: "task-summary-item" }, [
+                h("div", { className: "task-summary-label" }, `${taskRangeTitle}接收生图`),
+                h("div", { className: "task-summary-value" }, taskRangeDisplay.tasks)
+              ]),
+              h("div", { className: "task-summary-item" }, [
+                h("div", { className: "task-summary-label" }, `${taskRangeTitle}成功生图`),
+                h("div", { className: "task-summary-value" }, taskRangeDisplay.successTasks)
+              ]),
+              h("div", { className: "task-summary-item" }, [
+                h("div", { className: "task-summary-label" }, `${taskRangeTitle}处理成功率`),
+                h("div", { className: "task-summary-value" }, taskSuccessRateText(taskRangeDisplay))
+              ])
+            ]) : null,
+            h("div", { className: "task-filters", key: "filters" }, [
+              h(Input.Search, {
+                allowClear: true,
+                placeholder: isChat ? "搜索任务ID、提问或回复内容" : "搜索任务ID、描述或错误内容",
+                value: taskKeyword,
+                loading: taskSearchLoading,
+                onSearch: handleTaskSearch,
+                onChange: (event) => setTaskKeyword(event.target.value),
+                style: { minWidth: 260, maxWidth: 360 }
+              }),
+              h(Select, { value: taskAccountFilter, onChange: (value) => handleTaskFilterChange("accountId", value), options: taskAccountOptions }),
+              h(Select, {
+                value: taskSourceChannelFilter,
+                onChange: (value) => handleTaskFilterChange("sourceChannelId", value),
+                options: taskSourceChannelOptions
+              }),
+              h(Select, { value: taskChannelFilter, onChange: (value) => handleTaskFilterChange("channel", value), options: [
+                { label: "全部通道", value: "all" },
+                { label: "绘图站", value: "drawing" },
+                { label: "聊天", value: "chatplus" }
+              ] }),
+              h(Select, { value: taskStatusFilter, onChange: (value) => handleTaskFilterChange("status", value), options: [
+                { label: "全部状态", value: "all" },
+                { label: "成功", value: "success" },
+                { label: "失败", value: "failed" },
+                { label: "处理中", value: "processing" },
+                { label: "等待上游", value: "waiting_upstream" },
+                { label: "结果待确认", value: "interrupted" }
+              ] }),
+              h("div", { className: "toolbar-note" }, `已加载 ${tasks.length} / ${taskTotal} 条；任务明细保留近2天`),
+              tasks.length < taskTotal
+                ? h(Button, {
+                    icon: Icon.DownOutlined ? h(Icon.DownOutlined) : null,
+                    onClick: loadMoreTasks,
+                    loading: taskListLoading
+                  }, "加载更多")
+                : null
+            ]),
+            !isChat ? h("div", { className: "task-trend", key: "trend" }, [
+              h("div", { className: "task-trend-header" }, [
+                h("div", null, [
+                  h("h3", { className: "task-trend-title" }, "每日生图结果"),
+                  h("div", { className: "task-trend-desc" }, "按任务完成日期统计接收任务、成功任务和处理成功率")
+                ]),
+                h(Segmented, {
+                  value: taskTrendDays,
+                  onChange: setTaskTrendDays,
+                  options: [
+                    { label: "近7天", value: 7 },
+                    { label: "近30天", value: 30 }
+                  ],
+                  size: "small"
+                })
+              ]),
+              trendHasData
+                ? h(TaskTrendChart, { data: trendData, onHoverDay: setTaskTrendHoverDay })
+                : h("div", { className: "task-trend-empty" }, h(Empty, {
+                    image: Empty.PRESENTED_IMAGE_SIMPLE,
+                    description: "所选范围暂无已完成的生图任务"
+                  }))
+            ]) : null,
+            h("div", { className: "task-toolbar", key: "toolbar" }, [
+              h("span", { className: "toolbar-note" }, isChat
+                ? "处理中会自动查询；长回复默认收起，不影响浏览其他记录"
+                : "处理中和等待上游会自动查询；连续 30 分钟没有结果会停止查询，且不记为失败"),
+              h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refreshProcessing, loading }, "刷新处理中")
+            ]),
+            h(Table, {
+              key: kind,
+              className: "task-record-table",
+              rowKey: "id",
+              rowClassName: "task-record-row",
+              columns: isChat ? chatTaskColumns : imageTaskColumns,
+              dataSource: filteredTasks,
+              loading: taskListLoading,
+              tableLayout: "fixed",
+              scroll: { x: isChat ? 1420 : 1620 },
+              pagination: { pageSize: 8, showSizeChanger: false },
+              locale: { emptyText: h(Empty, { description: `暂无${recordName}记录` }) }
+            })
+          ].filter(Boolean));
+        }
 
         const chatApiExample = `curl ${chatApiUrl} \\
   -H "Authorization: Bearer ${config?.apiKey || "你的API密钥"}" \\
@@ -6230,103 +6715,22 @@
                     key: "tasks",
                     label: "任务记录",
                     children: h("div", { className: "operation-body" }, [
-                      h("div", { className: "task-summary-grid" }, [
-                        h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, "今日接收任务"),
-                          h("div", { className: "task-summary-value" }, taskStats.today.tasks)
-                        ]),
-                        h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, "今日成功任务"),
-                          h("div", { className: "task-summary-value" }, taskStats.today.successTasks)
-                        ]),
-                        h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, "今日处理成功率"),
-                          h("div", { className: "task-summary-value" }, taskSuccessRateText(taskStats.today))
-                        ]),
-                        h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, `${taskRangeTitle}接收任务`),
-                          h("div", { className: "task-summary-value" }, taskRangeDisplay.tasks)
-                        ]),
-                        h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, `${taskRangeTitle}成功任务`),
-                          h("div", { className: "task-summary-value" }, taskRangeDisplay.successTasks)
-                        ]),
-                        h("div", { className: "task-summary-item" }, [
-                          h("div", { className: "task-summary-label" }, `${taskRangeTitle}处理成功率`),
-                          h("div", { className: "task-summary-value" }, taskSuccessRateText(taskRangeDisplay))
-                        ])
-                      ]),
-                      h("div", { className: "task-filters" }, [
-                        h(Input.Search, {
-                          allowClear: true,
-                          placeholder: "搜索洗图王任务ID、错误内容",
-                          value: taskKeyword,
-                          loading: taskSearchLoading,
-                          onSearch: handleTaskSearch,
-                          onChange: (event) => setTaskKeyword(event.target.value),
-                          style: { minWidth: 260, maxWidth: 360 }
-                        }),
-                        h(Select, { value: taskAccountFilter, onChange: (value) => handleTaskFilterChange("accountId", value), options: taskAccountOptions }),
-                        h(Select, {
-                          value: taskSourceChannelFilter,
-                          onChange: (value) => handleTaskFilterChange("sourceChannelId", value),
-                          options: taskSourceChannelOptions
-                        }),
-                        h(Select, { value: taskChannelFilter, onChange: (value) => handleTaskFilterChange("channel", value), options: [
-                          { label: "全部通道", value: "all" },
-                          { label: "绘图站", value: "drawing" },
-                          { label: "聊天", value: "chatplus" }
-                        ] }),
-                        h(Select, { value: taskStatusFilter, onChange: (value) => handleTaskFilterChange("status", value), options: [
-                          { label: "全部状态", value: "all" },
-                          { label: "成功", value: "success" },
-                          { label: "失败", value: "failed" },
-                          { label: "处理中", value: "processing" },
-                          { label: "等待上游", value: "waiting_upstream" },
-                          { label: "结果待确认", value: "interrupted" }
-                        ] }),
-                        h("div", { className: "toolbar-note" }, `已加载 ${tasks.length} / ${taskTotal} 条；任务明细保留近2天，统计来自独立累计`),
-                        tasks.length < taskTotal
-                          ? h(Button, {
-                              icon: Icon.DownOutlined ? h(Icon.DownOutlined) : null,
-                              onClick: loadMoreTasks,
-                              loading: taskListLoading
-                            }, "加载更多")
-                          : null
-                      ]),
-                      h("div", { className: "task-trend" }, [
-                        h("div", { className: "task-trend-header" }, [
-                          h("div", null, [
-                            h("h3", { className: "task-trend-title" }, "每日生图结果"),
-                            h("div", { className: "task-trend-desc" }, "按任务完成日期统计接收任务、成功任务和处理成功率")
-                          ]),
-                          h(Segmented, {
-                            value: taskTrendDays,
-                            onChange: setTaskTrendDays,
-                            options: [
-                              { label: "近7天", value: 7 },
-                              { label: "近30天", value: 30 }
-                            ],
-                            size: "small"
-                          })
-                        ]),
-                        trendHasData
-                          ? h(TaskTrendChart, { data: trendData, onHoverDay: setTaskTrendHoverDay })
-                          : h("div", { className: "task-trend-empty" }, h(Empty, {
-                              image: Empty.PRESENTED_IMAGE_SIMPLE,
-                              description: "所选范围暂无已完成的生图任务"
-                            }))
-                      ]),
-                      h("div", { className: "task-toolbar" }, [
-                        h("span", { className: "toolbar-note" }, "处理中和等待上游会自动查询；连续 30 分钟没有结果会停止查询，且不记为失败"),
-                        h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refreshProcessing, loading }, "刷新处理中")
-                      ]),
-                      h(Table, {
-                        rowKey: "id",
-                        columns: taskColumns,
-                        dataSource: filteredTasks,
-                        loading: taskListLoading,
-                        pagination: { pageSize: 8 }
+                      h(Tabs, {
+                        className: "task-record-tabs",
+                        activeKey: taskKind,
+                        onChange: handleTaskKindChange,
+                        items: [
+                          {
+                            key: "image",
+                            label: taskRecordTabLabel("image", "生图记录", Icon.PictureOutlined),
+                            children: taskKind === "image" ? taskRecordPanel("image") : null
+                          },
+                          {
+                            key: "chat",
+                            label: taskRecordTabLabel("chat", "对话记录", Icon.MessageOutlined),
+                            children: taskKind === "chat" ? taskRecordPanel("chat") : null
+                          }
+                        ]
                       })
                     ])
                   },
@@ -6659,7 +7063,7 @@
             ])
           ]),
           h(Modal, {
-            title: "原图与生成结果",
+            title: taskRecordKind(taskPreview || {}) === "chat" ? "对话图片" : "原图与生成结果",
             open: Boolean(taskPreview),
             onCancel: () => setTaskPreview(null),
             footer: null,
@@ -6668,10 +7072,15 @@
             destroyOnHidden: true
           }, [
             h("p", { className: "task-compare-note", key: "note" }, "点击图片可查看大图。"),
-            h("div", { className: "task-compare-grid", key: "comparison" }, [
-              taskComparisonSection("原图", taskInputImageUrls(taskPreview || {}), "该任务未保存原图"),
-              taskComparisonSection("生成结果", taskOutputImageUrls(taskPreview || {}), "暂无生成结果")
-            ])
+            h("div", {
+              className: `task-compare-grid${taskRecordKind(taskPreview || {}) === "chat" ? " is-single" : ""}`,
+              key: "comparison"
+            }, taskRecordKind(taskPreview || {}) === "chat"
+              ? [taskComparisonSection("对话图片", taskInputImageUrls(taskPreview || {}), "该任务未保存对话图片")]
+              : [
+                  taskComparisonSection("原图", taskInputImageUrls(taskPreview || {}), "该任务未保存原图"),
+                  taskComparisonSection("生成结果", taskOutputImageUrls(taskPreview || {}), "暂无生成结果")
+                ])
           ]),
           h(Modal, {
             title: editingChannel ? "编辑渠道" : "新增渠道",
