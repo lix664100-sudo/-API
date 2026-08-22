@@ -2436,6 +2436,25 @@
         }).replace(/\//g, "-");
       }
 
+      function formatRemainingTime(value, now = Date.now()) {
+        const resetAt = Date.parse(value || "");
+        if (!Number.isFinite(resetAt)) return "";
+        const currentTime = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+        const remainingMs = resetAt - currentTime;
+        if (remainingMs <= 0) return "即将恢复";
+        if (remainingMs < 60_000) return "剩余不到1分钟";
+
+        const totalMinutes = Math.floor(remainingMs / 60_000);
+        const days = Math.floor(totalMinutes / (24 * 60));
+        const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+        const minutes = totalMinutes % 60;
+        return `剩余${[
+          days ? `${days}天` : "",
+          hours ? `${hours}小时` : "",
+          minutes ? `${minutes}${days || hours ? "分" : "分钟"}` : ""
+        ].filter(Boolean).join("")}`;
+      }
+
       function formatClock(value) {
         const date = new Date(value);
         if (!Number.isFinite(date.getTime())) return "-";
@@ -2692,21 +2711,24 @@
         return Number.isFinite(expireTime) && expireTime <= Date.now();
       }
 
-      function accountQuotaResetText(account, channel) {
+      function accountQuotaResetText(account, channel, now = Date.now()) {
         if (channel?.type === "shareai") {
           const drawing = abilityStatus(account, "drawing");
           const chatplus = abilityStatus(account, "chatplus");
+          const drawingResetText = formatRemainingTime(drawing.quotaResetAt, now);
           const parts = [
-            channelAbilityEnabled(channel, "drawing") && drawing.quotaResetAt ? `绘图 ${formatDateTime(drawing.quotaResetAt)}` : "",
-            ...(channelAbilityEnabled(channel, "chatplus") ? chatQuotaResetTexts(channel, chatplus) : [])
+            channelAbilityEnabled(channel, "drawing") && drawingResetText
+              ? `绘图 ${drawingResetText}`
+              : "",
+            ...(channelAbilityEnabled(channel, "chatplus") ? chatQuotaResetTexts(channel, chatplus, now) : [])
           ].filter(Boolean);
           return parts.length ? parts.join("｜") : "-";
         }
         if (channel?.type === "chatplus") {
-          const parts = chatQuotaResetTexts(channel, account);
+          const parts = chatQuotaResetTexts(channel, account, now);
           return parts.length ? parts.join("｜") : "-";
         }
-        return formatDateTime(account.quotaResetAt);
+        return account.quotaResetAt ? formatRemainingTime(account.quotaResetAt, now) || "-" : "-";
       }
 
       function accountExpireText(account, channel) {
@@ -2905,7 +2927,7 @@
         return `${modelName} 额度未获取`;
       }
 
-      function chatQuotaResetTexts(channel, status = {}) {
+      function chatQuotaResetTexts(channel, status = {}, now = Date.now()) {
         return chatModelsForChannel(channel)
           .filter((item) => item.enabled)
           .map((item) => {
@@ -2915,7 +2937,10 @@
               ? status.quotaResetAt
               : "";
             const quotaResetAt = confirmedResetAt || usage.quotaResetAt;
-            if (quotaResetAt) return `${item.name} ${formatDateTime(quotaResetAt)}`;
+            if (quotaResetAt) {
+              const remainingText = formatRemainingTime(quotaResetAt, now);
+              return remainingText ? `${item.name} ${remainingText}` : "";
+            }
             if (usage.period) return `${item.name} 每 ${usage.period}`;
             return "";
           })
@@ -6601,7 +6626,7 @@
             render: (_, row) => accountQuotaText(row, channels.find((item) => item.id === row.channelId))
           },
           {
-            title: "额度重置",
+            title: "剩余时间",
             width: 190,
             render: (_, row) => accountQuotaResetText(row, channels.find((item) => item.id === row.channelId))
           },

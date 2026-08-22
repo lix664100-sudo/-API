@@ -4,6 +4,21 @@ import { test } from "node:test";
 import vm from "node:vm";
 
 const adminHtml = await readFile(new URL("../admin/index.html", import.meta.url), "utf8");
+const fixedNow = Date.parse("2026-08-23T00:00:00+08:00");
+
+const remainingTimeFunctionMatch = adminHtml.match(
+  /function formatRemainingTime\(value, now = Date\.now\(\)\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function formatClock/
+);
+
+assert.ok(remainingTimeFunctionMatch, "管理后台中应存在额度剩余时间显示方法");
+
+const remainingTimeFunctionSource = remainingTimeFunctionMatch[0].replace(
+  /\r?\n\r?\n      function formatClock$/,
+  ""
+);
+const formatRemainingTime = vm.runInNewContext(
+  `(${remainingTimeFunctionSource.replace(/^function /, "function ")})`
+);
 const confirmedQuotaFunctionMatch = adminHtml.match(
   /function confirmedChatQuotaEmpty\(status = \{\}\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function chatSubscriptionExpired/
 );
@@ -71,10 +86,10 @@ const aggregateChatReferenceUsage = vm.runInNewContext(
 );
 
 const resetFunctionMatch = adminHtml.match(
-  /function chatQuotaResetTexts\(channel, status = \{\}\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function accountBalanceForTotal/
+  /function chatQuotaResetTexts\(channel, status = \{\}, now = Date\.now\(\)\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function accountBalanceForTotal/
 );
 
-assert.ok(resetFunctionMatch, "管理后台中应存在聊天额度重置时间显示方法");
+assert.ok(resetFunctionMatch, "管理后台中应存在聊天额度剩余时间显示方法");
 
 const resetFunctionSource = resetFunctionMatch[0].replace(
   /\r?\n\r?\n      function accountBalanceForTotal$/,
@@ -88,7 +103,27 @@ const chatQuotaResetTexts = vm.runInNewContext(
     confirmedChatQuotaEmpty: (status = {}) => (
       status.status === "quota_empty" && status.quotaConfirmedByUpstream === true
     ),
-    formatDateTime: (value) => value
+    formatRemainingTime
+  }
+);
+
+const accountResetFunctionMatch = adminHtml.match(
+  /function accountQuotaResetText\(account, channel, now = Date\.now\(\)\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function accountExpireText/
+);
+
+assert.ok(accountResetFunctionMatch, "管理后台中应存在账号额度剩余时间显示方法");
+
+const accountResetFunctionSource = accountResetFunctionMatch[0].replace(
+  /\r?\n\r?\n      function accountExpireText$/,
+  ""
+);
+const accountQuotaResetText = vm.runInNewContext(
+  `(${accountResetFunctionSource.replace(/^function /, "function ")})`,
+  {
+    abilityStatus: (account, key) => account?.meta?.abilities?.[key] || {},
+    channelAbilityEnabled: (channel, ability) => channel?.settings?.enabledAbilities?.[ability] !== false,
+    chatQuotaResetTexts,
+    formatRemainingTime
   }
 );
 
@@ -339,12 +374,20 @@ test("渠道汇总中 GPT 套餐过期优先于其他账号可用", () => {
   );
 });
 
-test("GPT 已明确用完时优先显示准确恢复时间", () => {
+test("额度剩余时间覆盖未来、临近和已到时间", () => {
+  assert.equal(formatRemainingTime("2026-08-23T10:49:30+08:00", fixedNow), "剩余10小时49分");
+  assert.equal(formatRemainingTime("2026-08-24T02:03:00+08:00", fixedNow), "剩余1天2小时3分");
+  assert.equal(formatRemainingTime("2026-08-23T00:00:59+08:00", fixedNow), "剩余不到1分钟");
+  assert.equal(formatRemainingTime("2026-08-22T23:59:59+08:00", fixedNow), "即将恢复");
+  assert.equal(formatRemainingTime("错误时间", fixedNow), "");
+});
+
+test("GPT 已明确用完时优先显示准确倒计时", () => {
   const status = {
     status: "quota_empty",
     quotaConfirmedByUpstream: true,
     quotaModel: "gpt",
-    quotaResetAt: "2026-08-03T22:32:05+08:00",
+    quotaResetAt: "2026-08-23T02:30:00+08:00",
     meta: {
       chatModel: "gpt",
       referenceUsage: {
@@ -357,8 +400,35 @@ test("GPT 已明确用完时优先显示准确恢复时间", () => {
   };
 
   assert.deepEqual(
-    structuredClone(chatQuotaResetTexts({}, status)),
-    ["GPT 2026-08-03T22:32:05+08:00"]
+    structuredClone(chatQuotaResetTexts({}, status, fixedNow)),
+    ["GPT 剩余2小时30分"]
+  );
+});
+
+test("共享账号的绘图和聊天重置时间都显示倒计时", () => {
+  const account = {
+    meta: {
+      abilities: {
+        drawing: { quotaResetAt: "2026-08-23T00:30:00+08:00" },
+        chatplus: {
+          status: "ok",
+          meta: {
+            referenceUsage: {
+              gpt: { quotaResetAt: "2026-08-23T01:15:00+08:00" }
+            }
+          }
+        }
+      }
+    }
+  };
+  const channel = {
+    type: "shareai",
+    settings: { enabledAbilities: { drawing: true, chatplus: true } }
+  };
+
+  assert.equal(
+    accountQuotaResetText(account, channel, fixedNow),
+    "绘图 剩余30分钟｜GPT 剩余1小时15分"
   );
 });
 
@@ -380,9 +450,13 @@ test("GPT 恢复后没有准确时间时才显示额度周期", () => {
   };
 
   assert.deepEqual(
-    structuredClone(chatQuotaResetTexts({}, status)),
+    structuredClone(chatQuotaResetTexts({}, status, fixedNow)),
     ["GPT 每 12h"]
   );
+});
+
+test("账号表格使用剩余时间列名", () => {
+  assert.match(adminHtml, /title: "剩余时间"/);
 });
 
 test("套餐到期列优先显示 GPT 自己的到期时间", () => {
