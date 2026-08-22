@@ -53,6 +53,7 @@ const proxyStatusWrites = new Map();
 const taskSlotWaiters = new Set();
 const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
 const CHAT_USAGE_RECOVERY_CHECK_MS = 60 * 60 * 1000;
+const CHAT_USAGE_OBSERVATION_MS = 5 * 60 * 1000;
 const DRAWING_FAILURE_LIMIT = 3;
 const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
 const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
@@ -2833,6 +2834,30 @@ function targetLastCheckAt(target, status = {}) {
   return Number.isFinite(checkedAt) ? checkedAt : 0;
 }
 
+function chatUsagePeriodMs(value) {
+  const match = String(value || "").trim().match(/^(\d+(?:\.\d+)?)\s*(m|h|d)$/i);
+  if (!match) return 0;
+  const unitMs = { m: 60 * 1000, h: 60 * 60 * 1000, d: 24 * 60 * 60 * 1000 }[match[2].toLowerCase()];
+  const duration = Number(match[1]) * unitMs;
+  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+}
+
+function chatUsageRefreshDue(target, status = {}, now = Date.now()) {
+  const referenceUsage = status.meta?.referenceUsage;
+  if (!referenceUsage || typeof referenceUsage !== "object") return false;
+  const lastCheckAt = targetLastCheckAt(target, status);
+  return Object.values(referenceUsage).some((usage) => {
+    if (!usage || typeof usage !== "object") return false;
+    const resetAt = Date.parse(usage.quotaResetAt || "");
+    if (Number.isFinite(resetAt) && resetAt <= now) {
+      return lastCheckAt < resetAt || now - lastCheckAt >= CHAT_USAGE_OBSERVATION_MS;
+    }
+    return !Number.isFinite(resetAt)
+      && chatUsagePeriodMs(usage.period)
+      && now - lastCheckAt >= CHAT_USAGE_OBSERVATION_MS;
+  });
+}
+
 function chatRecoveryUsage(status = {}) {
   const referenceUsage = status.meta?.referenceUsage;
   if (referenceUsage && typeof referenceUsage === "object") {
@@ -2890,6 +2915,9 @@ function targetConfirmedQuotaRetryDue(target, input = {}) {
   );
   if (Number.isFinite(resetAt)) return resetAt <= Date.now();
   if (Number.isFinite(cooldownAt)) return cooldownAt <= Date.now();
+  if (chatUsagePeriodMs(recoveryUsage?.period)) {
+    return Date.now() - targetLastCheckAt(target, status) >= CHAT_USAGE_OBSERVATION_MS;
+  }
   return Date.now() - targetLastCheckAt(target, status) >= CHAT_USAGE_RECOVERY_CHECK_MS;
 }
 
@@ -2942,6 +2970,7 @@ function targetNeedsRecovery(target) {
       const recoveryInput = quotaStatus.quotaModel ? { model: quotaStatus.quotaModel } : {};
       return targetQuotaEmpty(target) && targetConfirmedQuotaRetryDue(target, recoveryInput);
     }
+    if (chatUsageRefreshDue(target, quotaStatus)) return true;
     return (
       accountCooling(target.account)
       || ["error", "failed", "disconnected"].includes(status)
@@ -2969,15 +2998,18 @@ async function recoverTarget(config, target) {
   const recovery = (async () => {
     const currentStatus = targetQuotaStatus(target);
     try {
-      const checked = successfulAccountCheckStatus(
-        await runChatplusAccountWork(
-          target.channel,
-          target.account,
-          () => getWorkClient(config, target.channel, target.account).check({
-            model: target.channel.type === "chatplus" ? currentStatus.quotaModel || "" : ""
-          })
-        )
+      const rawStatus = await runChatplusAccountWork(
+        target.channel,
+        target.account,
+        () => getWorkClient(config, target.channel, target.account).check({
+          model: target.channel.type === "chatplus" ? currentStatus.quotaModel || "" : "",
+          quotaOnly: target.channel.type === "chatplus"
+            && ["ok", "quota_empty"].includes(String(currentStatus.status || "").toLowerCase())
+        })
       );
+      const checked = target.channel.type === "chatplus"
+        ? successfulChatAccountCheckStatus(currentStatus, rawStatus)
+        : successfulAccountCheckStatus(rawStatus);
       const status = target.channel.type === "chatplus"
         ? preserveConfirmedChatQuota(currentStatus, checked)
         : checked;
@@ -4768,6 +4800,83 @@ function successfulAccountCheckStatus(status = {}) {
   };
 }
 
+function nextPeriodicResetAt(value, periodMs, now) {
+  const resetAt = Date.parse(value || "");
+  if (!Number.isFinite(resetAt) || !periodMs) return "";
+  if (resetAt > now) return new Date(resetAt).toISOString();
+  const elapsedPeriods = Math.floor((now - resetAt) / periodMs) + 1;
+  return new Date(resetAt + elapsedPeriods * periodMs).toISOString();
+}
+
+function chatUsageRecovered(previous = {}, current = {}) {
+  if (!knownChatUsageBalance(previous.balance) || !knownChatUsageBalance(current.balance)) return false;
+  const previousQuota = Number(previous.quota);
+  const currentQuota = Number(current.quota);
+  if (Number.isFinite(previousQuota) && Number.isFinite(currentQuota) && previousQuota !== currentQuota) return false;
+  const balanceIncreased = Number(current.balance) > Number(previous.balance);
+  const previousUsed = Number(previous.used);
+  const currentUsed = Number(current.used);
+  return balanceIncreased && (
+    !Number.isFinite(previousUsed)
+    || !Number.isFinite(currentUsed)
+    || currentUsed < previousUsed
+  );
+}
+
+function reconcileChatUsageResetTimes(currentStatus = {}, nextStatus = {}) {
+  const currentReferenceUsage = currentStatus.meta?.referenceUsage || {};
+  const nextReferenceUsage = nextStatus.meta?.referenceUsage;
+  if (!nextReferenceUsage || typeof nextReferenceUsage !== "object") return nextStatus;
+
+  const checkedAt = nextStatus.meta?.accountCheck?.checkedAt || new Date().toISOString();
+  const checkedTime = Date.parse(checkedAt);
+  const now = Number.isFinite(checkedTime) ? checkedTime : Date.now();
+  const referenceUsage = Object.fromEntries(Object.entries(nextReferenceUsage).map(([key, usageValue]) => {
+    const usage = usageValue && typeof usageValue === "object" ? usageValue : {};
+    const previous = currentReferenceUsage[key] || {};
+    const periodMs = chatUsagePeriodMs(usage.period || previous.period);
+    const hasPositiveBalance = knownChatUsageBalance(usage.balance) && Number(usage.balance) > 0;
+    const recovered = periodMs && chatUsageRecovered(previous, usage);
+    const upstreamResetAt = usage.quotaResetAt || "";
+    const upstreamResetTime = Date.parse(upstreamResetAt);
+
+    if (recovered) {
+      return [key, {
+        ...usage,
+        quotaResetAt: new Date(now + periodMs).toISOString(),
+        quotaResetObservedAt: new Date(now).toISOString()
+      }];
+    }
+    if (periodMs && hasPositiveBalance && Number.isFinite(upstreamResetTime) && upstreamResetTime <= now) {
+      return [key, {
+        ...usage,
+        quotaResetAt: nextPeriodicResetAt(upstreamResetAt, periodMs, now)
+      }];
+    }
+    if (periodMs && !upstreamResetAt && previous.quotaResetObservedAt && previous.quotaResetAt) {
+      return [key, {
+        ...usage,
+        quotaResetAt: nextPeriodicResetAt(previous.quotaResetAt, periodMs, now),
+        quotaResetObservedAt: previous.quotaResetObservedAt
+      }];
+    }
+    return [key, usage];
+  }));
+
+  return {
+    ...nextStatus,
+    meta: {
+      ...(currentStatus.meta || {}),
+      ...(nextStatus.meta || {}),
+      referenceUsage
+    }
+  };
+}
+
+function successfulChatAccountCheckStatus(currentStatus = {}, status = {}) {
+  return reconcileChatUsageResetTimes(currentStatus, successfulAccountCheckStatus(status));
+}
+
 function accountCheckTimeoutStatus(currentStatus = {}, error) {
   const previousCheck = currentStatus.meta?.accountCheck || {};
   const consecutiveTimeouts = Number(previousCheck.consecutiveTimeouts || 0) + 1;
@@ -4803,7 +4912,7 @@ async function checkShareAIAbility(config, channel, account, ability) {
   try {
     const checked = await runChatplusAccountWork(abilityChannel, account, () => client.check());
     const data = ability === "chatplus"
-      ? preserveConfirmedChatQuota(currentStatus, successfulAccountCheckStatus(checked))
+      ? preserveConfirmedChatQuota(currentStatus, successfulChatAccountCheckStatus(currentStatus, checked))
       : checked;
     return { ok: true, data };
   } catch (error) {
@@ -5028,9 +5137,10 @@ export async function checkAccount(accountId, options = {}) {
   }
   const client = getWorkClient(config, channel, account);
   try {
-    const checked = successfulAccountCheckStatus(
-      await runChatplusAccountWork(channel, account, () => client.check())
-    );
+    const rawStatus = await runChatplusAccountWork(channel, account, () => client.check());
+    const checked = channel.type === "chatplus"
+      ? successfulChatAccountCheckStatus(account, rawStatus)
+      : successfulAccountCheckStatus(rawStatus);
     const status = channel.type === "chatplus"
       ? preserveConfirmedChatQuota(account, checked)
       : checked;

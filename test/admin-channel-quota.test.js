@@ -374,11 +374,11 @@ test("渠道汇总中 GPT 套餐过期优先于其他账号可用", () => {
   );
 });
 
-test("额度剩余时间覆盖未来、临近和已到时间", () => {
-  assert.equal(formatRemainingTime("2026-08-23T10:49:30+08:00", fixedNow), "剩余10小时49分");
-  assert.equal(formatRemainingTime("2026-08-24T02:03:00+08:00", fixedNow), "剩余1天2小时3分");
-  assert.equal(formatRemainingTime("2026-08-23T00:00:59+08:00", fixedNow), "剩余不到1分钟");
-  assert.equal(formatRemainingTime("2026-08-22T23:59:59+08:00", fixedNow), "即将恢复");
+test("额度重置时间覆盖未来、临近和已到时间", () => {
+  assert.equal(formatRemainingTime("2026-08-23T10:49:30+08:00", fixedNow), "10小时49分后重置");
+  assert.equal(formatRemainingTime("2026-08-24T02:03:00+08:00", fixedNow), "1天2小时3分后重置");
+  assert.equal(formatRemainingTime("2026-08-23T00:00:59+08:00", fixedNow), "不到1分钟后重置");
+  assert.equal(formatRemainingTime("2026-08-22T23:59:59+08:00", fixedNow), "正在刷新额度…");
   assert.equal(formatRemainingTime("错误时间", fixedNow), "");
 });
 
@@ -401,7 +401,7 @@ test("GPT 已明确用完时优先显示准确倒计时", () => {
 
   assert.deepEqual(
     structuredClone(chatQuotaResetTexts({}, status, fixedNow)),
-    ["GPT 剩余2小时30分"]
+    ["GPT 2小时30分后重置"]
   );
 });
 
@@ -428,7 +428,7 @@ test("共享账号的绘图和聊天重置时间都显示倒计时", () => {
 
   assert.equal(
     accountQuotaResetText(account, channel, fixedNow),
-    "绘图 剩余30分钟｜GPT 剩余1小时15分"
+    "绘图 30分钟后重置｜GPT 1小时15分后重置"
   );
 });
 
@@ -451,12 +451,13 @@ test("GPT 恢复后没有准确时间时才显示额度周期", () => {
 
   assert.deepEqual(
     structuredClone(chatQuotaResetTexts({}, status, fixedNow)),
-    ["GPT 每 12h"]
+    ["GPT 每12小时重置（正在确认准确时间）"]
   );
 });
 
-test("账号表格使用剩余时间列名", () => {
-  assert.match(adminHtml, /title: "剩余时间"/);
+test("账号表格使用额度重置时间列名", () => {
+  assert.match(adminHtml, /title: "额度重置时间"/);
+  assert.match(adminHtml, /accountQuotaResetCell\(/);
 });
 
 test("套餐到期列优先显示 GPT 自己的到期时间", () => {

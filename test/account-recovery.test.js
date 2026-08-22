@@ -1135,6 +1135,36 @@ test("额度恢复核验会检查指定模型的额度和页面", async () => {
   assert.deepEqual(result.meta.recoveryUsage, geminiUsage);
 });
 
+test("后台观察额度时只读取额度，不进入聊天页面", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-quota-only", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let prepareCount = 0;
+  const gptUsage = {
+    quota: 220,
+    used: 43,
+    balance: 177,
+    quotaResetAt: "",
+    expireAt: activeSubscriptionExpireAt,
+    period: "12h"
+  };
+  client.loadAccountUsages = async () => ({ gpt: gptUsage });
+  client.prepareChatSession = async () => {
+    prepareCount += 1;
+    throw new Error("后台观察额度时不应进入聊天页面");
+  };
+
+  const result = await client.check({ model: "gpt", quotaOnly: true });
+
+  assert.equal(prepareCount, 0);
+  assert.equal(result.status, "ok");
+  assert.equal(result.message, "聊天额度已更新");
+  assert.deepEqual(result.meta.referenceUsage.gpt, gptUsage);
+});
+
 test("聊天总额度用完后立即停用账户并保留刷新时间", async () => {
   const client = new ChatplusClient({
     config: {},
@@ -2628,6 +2658,122 @@ async function saveChatUsageRecoveryFixture({
     }]
   });
 }
+
+async function saveAvailableChatUsageObservationFixture({ lastCheckAt, referenceUsage }) {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-chat-usage-observation",
+      channelId: "shareai",
+      name: "Chat Usage Observation",
+      username: "chat-usage-observation@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      lastCheckAt,
+      meta: {
+        abilities: {
+          drawing: { status: "ok", message: "drawing ok" },
+          chatplus: {
+            status: "ok",
+            lastCheckAt,
+            message: "chat ok",
+            meta: { chatModel: "gpt", referenceUsage }
+          }
+        }
+      }
+    }]
+  });
+}
+
+test("仍可用账号的重置时间到了也会自动刷新额度", async () => {
+  const pastResetAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  await saveAvailableChatUsageObservationFixture({
+    lastCheckAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+    referenceUsage: {
+      gemini: { quota: 70, used: 19, balance: 51, quotaResetAt: pastResetAt, period: "24h" }
+    }
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  let quotaOnly = false;
+  ChatplusClient.prototype.check = async (options = {}) => {
+    checkCount += 1;
+    quotaOnly = options.quotaOnly;
+    return {
+      status: "ok",
+      meta: {
+        chatModel: "gemini",
+        recoveryUsage: { quota: 70, used: 19, balance: 51, quotaResetAt: pastResetAt, period: "24h" },
+        referenceUsage: {
+          gemini: { quota: 70, used: 19, balance: 51, quotaResetAt: pastResetAt, period: "24h" }
+        }
+      }
+    };
+  };
+
+  try {
+    const firstResults = await recoverUnavailableChatAccounts();
+    const secondResults = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const resetAt = Date.parse(stored.accounts[0].meta.abilities.chatplus.meta.referenceUsage.gemini.quotaResetAt);
+
+    assert.equal(checkCount, 1);
+    assert.equal(quotaOnly, true);
+    assert.equal(firstResults[0].recovered, true);
+    assert.equal(secondResults.length, 0);
+    assert.ok(resetAt > Date.now());
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
+});
+
+test("GPT 观察到真实恢复后会记住下一次十二小时重置时间", async () => {
+  await saveAvailableChatUsageObservationFixture({
+    lastCheckAt: new Date(Date.now() - 6 * 60 * 1000).toISOString(),
+    referenceUsage: {
+      gpt: { quota: 220, used: 43, balance: 177, quotaResetAt: "", period: "12h" }
+    }
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async (options = {}) => {
+    checkCount += 1;
+    assert.equal(options.quotaOnly, true);
+    return {
+      status: "ok",
+      meta: {
+        chatModel: "gpt",
+        recoveryUsage: { quota: 220, used: 0, balance: 220, quotaResetAt: "", period: "12h" },
+        referenceUsage: {
+          gpt: { quota: 220, used: 0, balance: 220, quotaResetAt: "", period: "12h" }
+        }
+      }
+    };
+  };
+
+  const startedAt = Date.now();
+  try {
+    const firstResults = await recoverUnavailableChatAccounts();
+    const secondResults = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const usage = stored.accounts[0].meta.abilities.chatplus.meta.referenceUsage.gpt;
+    const resetAt = Date.parse(usage.quotaResetAt);
+
+    assert.equal(checkCount, 1);
+    assert.equal(firstResults[0].recovered, true);
+    assert.equal(secondResults.length, 0);
+    assert.ok(Date.parse(usage.quotaResetObservedAt) >= startedAt);
+    assert.ok(resetAt >= startedAt + 12 * 60 * 60 * 1000);
+    assert.ok(resetAt <= Date.now() + 12 * 60 * 60 * 1000 + 1000);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
+});
 
 test("聊天额度不足未满 1 小时不会后台复查", async () => {
   await saveChatUsageRecoveryFixture({

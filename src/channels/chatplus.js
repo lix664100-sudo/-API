@@ -2876,6 +2876,26 @@ export class ChatplusClient {
           }
         };
       }
+      if (options.quotaOnly === true) {
+        return {
+          status: "ok",
+          quota: null,
+          balance: null,
+          used: null,
+          quotaResetAt: "",
+          imageQuotaResetAt: "",
+          expireAt: usage.expireAt,
+          cooldownUntil: null,
+          quotaReason: "",
+          quotaConfirmedByUpstream: false,
+          message: "聊天额度已更新",
+          meta: {
+            chatModel: usageRoute.key,
+            recoveryUsage: usage,
+            referenceUsage
+          }
+        };
+      }
       const { init, route, selected } = await runAccountCheckStep(
         `进入 ${usageRoute.name} 页面`,
         () => this.prepareChatSession({

@@ -594,6 +594,43 @@
         font-size: 12px;
       }
 
+      .quota-reset-list {
+        display: grid;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .quota-reset-item {
+        display: grid;
+        grid-template-columns: 48px minmax(0, 1fr);
+        column-gap: 8px;
+        align-items: baseline;
+        line-height: 1.35;
+      }
+
+      .quota-reset-label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .quota-reset-value {
+        color: var(--ink);
+        font-size: 12px;
+        font-weight: 500;
+        white-space: nowrap;
+      }
+
+      .quota-reset-value.is-refreshing {
+        color: var(--primary);
+      }
+
+      .quota-reset-note {
+        grid-column: 2;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
       .account-status {
         display: grid;
         gap: 4px;
@@ -2441,18 +2478,18 @@
         if (!Number.isFinite(resetAt)) return "";
         const currentTime = Number.isFinite(Number(now)) ? Number(now) : Date.now();
         const remainingMs = resetAt - currentTime;
-        if (remainingMs <= 0) return "即将恢复";
-        if (remainingMs < 60_000) return "剩余不到1分钟";
+        if (remainingMs <= 0) return "正在刷新额度…";
+        if (remainingMs < 60_000) return "不到1分钟后重置";
 
         const totalMinutes = Math.floor(remainingMs / 60_000);
         const days = Math.floor(totalMinutes / (24 * 60));
         const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
         const minutes = totalMinutes % 60;
-        return `剩余${[
+        return `${[
           days ? `${days}天` : "",
           hours ? `${hours}小时` : "",
           minutes ? `${minutes}${days || hours ? "分" : "分钟"}` : ""
-        ].filter(Boolean).join("")}`;
+        ].filter(Boolean).join("")}后重置`;
       }
 
       function formatClock(value) {
@@ -2711,6 +2748,27 @@
         return Number.isFinite(expireTime) && expireTime <= Date.now();
       }
 
+      function accountQuotaResetCell(account, channel, now = Date.now()) {
+        const text = accountQuotaResetText(account, channel, now);
+        if (!text || text === "-") return "-";
+        return h("div", { className: "quota-reset-list" }, text.split("｜").map((line, index) => {
+          const separatorAt = line.indexOf(" ");
+          const label = separatorAt > 0 ? line.slice(0, separatorAt) : "额度";
+          const rawValue = separatorAt > 0 ? line.slice(separatorAt + 1) : line;
+          const waitingNote = "（正在确认准确时间）";
+          const waiting = rawValue.endsWith(waitingNote);
+          const value = waiting ? rawValue.slice(0, -waitingNote.length) : rawValue;
+          return h("div", { className: "quota-reset-item", key: `${label}-${index}` }, [
+            h("span", { className: "quota-reset-label", key: "label" }, label),
+            h("span", {
+              className: `quota-reset-value${value === "正在刷新额度…" ? " is-refreshing" : ""}`,
+              key: "value"
+            }, value),
+            waiting ? h("span", { className: "quota-reset-note", key: "note" }, "正在确认准确时间") : null
+          ].filter(Boolean));
+        }));
+      }
+
       function accountQuotaResetText(account, channel, now = Date.now()) {
         if (channel?.type === "shareai") {
           const drawing = abilityStatus(account, "drawing");
@@ -2941,7 +2999,13 @@
               const remainingText = formatRemainingTime(quotaResetAt, now);
               return remainingText ? `${item.name} ${remainingText}` : "";
             }
-            if (usage.period) return `${item.name} 每 ${usage.period}`;
+            if (usage.period) {
+              const period = String(usage.period).trim()
+                .replace(/^(\d+(?:\.\d+)?)\s*h$/i, "$1小时")
+                .replace(/^(\d+(?:\.\d+)?)\s*d$/i, "$1天")
+                .replace(/^(\d+(?:\.\d+)?)\s*m$/i, "$1分钟");
+              return `${item.name} 每${period}重置（正在确认准确时间）`;
+            }
             return "";
           })
           .filter(Boolean);
@@ -5277,6 +5341,11 @@
         }, []);
 
         useEffect(() => {
+          const timer = setInterval(() => setNowTick(Date.now()), 60_000);
+          return () => clearInterval(timer);
+        }, []);
+
+        useEffect(() => {
           if (!selectedChannelId && channels[0]) setSelectedChannelId(channels[0].id);
           if (selectedChannelId && channels.length && !channels.some((item) => item.id === selectedChannelId)) {
             setSelectedChannelId(channels[0].id);
@@ -6626,9 +6695,13 @@
             render: (_, row) => accountQuotaText(row, channels.find((item) => item.id === row.channelId))
           },
           {
-            title: "剩余时间",
-            width: 190,
-            render: (_, row) => accountQuotaResetText(row, channels.find((item) => item.id === row.channelId))
+            title: "额度重置时间",
+            width: 240,
+            render: (_, row) => accountQuotaResetCell(
+              row,
+              channels.find((item) => item.id === row.channelId),
+              nowTick
+            )
           },
           {
             title: "套餐到期",
