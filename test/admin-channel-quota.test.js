@@ -458,6 +458,8 @@ test("GPT 恢复后没有准确时间时才显示额度周期", () => {
 test("账号表格使用额度重置时间列名", () => {
   assert.match(adminHtml, /title: "额度重置时间"/);
   assert.match(adminHtml, /accountQuotaResetCell\(/);
+  assert.match(adminHtml, /h\(Tag, \{/);
+  assert.match(adminHtml, /className: `quota-reset-tag/);
 });
 
 test("套餐到期列优先显示 GPT 自己的到期时间", () => {

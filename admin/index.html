@@ -595,40 +595,62 @@
       }
 
       .quota-reset-list {
-        display: grid;
-        gap: 8px;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
         min-width: 0;
       }
 
-      .quota-reset-item {
-        display: grid;
-        grid-template-columns: 48px minmax(0, 1fr);
-        column-gap: 8px;
-        align-items: baseline;
-        line-height: 1.35;
+      .quota-reset-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        min-height: 24px;
+        margin: 0;
+        padding: 2px 8px;
+        color: #344054;
+        font-size: 12px;
+        line-height: 18px;
+        white-space: nowrap;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
       }
 
       .quota-reset-label {
-        color: var(--muted);
-        font-size: 12px;
+        color: #2563eb;
         font-weight: 600;
       }
 
-      .quota-reset-value {
-        color: var(--ink);
-        font-size: 12px;
-        font-weight: 500;
-        white-space: nowrap;
+      .quota-reset-divider {
+        width: 1px;
+        height: 12px;
+        background: #dbe3ee;
       }
 
-      .quota-reset-value.is-refreshing {
-        color: var(--primary);
+      .quota-reset-value {
+        font-weight: 500;
+      }
+
+      .quota-reset-tag.is-refreshing {
+        color: #175cd3;
+        background: #eff6ff;
+        border-color: #bfdbfe;
+      }
+
+      .quota-reset-tag.is-refreshing::before {
+        width: 6px;
+        height: 6px;
+        content: "";
+        background: #3b82f6;
+        border-radius: 50%;
       }
 
       .quota-reset-note {
-        grid-column: 2;
-        color: var(--muted);
+        color: #667085;
         font-size: 11px;
+        font-weight: 400;
       }
 
       .account-status {
@@ -2758,13 +2780,17 @@
           const waitingNote = "（正在确认准确时间）";
           const waiting = rawValue.endsWith(waitingNote);
           const value = waiting ? rawValue.slice(0, -waitingNote.length) : rawValue;
-          return h("div", { className: "quota-reset-item", key: `${label}-${index}` }, [
+          const refreshing = value === "正在刷新额度…";
+          return h(Tag, {
+            bordered: false,
+            className: `quota-reset-tag${refreshing ? " is-refreshing" : ""}${waiting ? " is-waiting" : ""}`,
+            key: `${label}-${index}`,
+            title: `${label} ${value}${waiting ? "，正在确认准确时间" : ""}`
+          }, [
             h("span", { className: "quota-reset-label", key: "label" }, label),
-            h("span", {
-              className: `quota-reset-value${value === "正在刷新额度…" ? " is-refreshing" : ""}`,
-              key: "value"
-            }, value),
-            waiting ? h("span", { className: "quota-reset-note", key: "note" }, "正在确认准确时间") : null
+            h("span", { className: "quota-reset-divider", "aria-hidden": true, key: "divider" }),
+            h("span", { className: "quota-reset-value", key: "value" }, value),
+            waiting ? h("span", { className: "quota-reset-note", key: "note" }, "· 正在确认准确时间") : null
           ].filter(Boolean));
         }));
       }
