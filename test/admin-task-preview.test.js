@@ -369,3 +369,10 @@ test("并发已满使用独立的黄色状态，不再显示为任务失败", ()
   assert.match(adminHtml, /concurrency_limited: \["warning", "并发已满"\]/);
   assert.match(adminHtml, /task-concurrency-card/);
 });
+
+test("账号满载后的任务明确显示为排队中", () => {
+  assert.match(adminHtml, /queued: \["processing", "排队中"\]/);
+  assert.match(adminHtml, /\{ label: "排队中", value: "queued" \}/);
+  assert.match(adminHtml, /满载自动排队/);
+  assert.doesNotMatch(adminHtml, /满载立即拒绝/);
+});

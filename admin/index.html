@@ -2937,6 +2937,7 @@
           failed: ["error", "失败"],
           concurrency_limited: ["warning", "并发已满"],
           cancelled: ["default", "已取消"],
+          queued: ["processing", "排队中"],
           processing: ["processing", "处理中"],
           waiting_upstream: ["processing", "等待上游"],
           interrupted: ["warning", "结果待确认"],
@@ -6855,6 +6856,7 @@
                 { label: "成功", value: "success" },
                 { label: "失败", value: "failed" },
                 { label: "并发已满", value: "concurrency_limited" },
+                { label: "排队中", value: "queued" },
                 { label: "处理中", value: "processing" },
                 { label: "等待上游", value: "waiting_upstream" },
                 { label: "结果待确认", value: "interrupted" }
@@ -7028,10 +7030,10 @@
                     Icon.ClusterOutlined ? h(Icon.ClusterOutlined) : null,
                     "实时并发"
                   ]),
-                  h("div", { className: "capacity-subtitle" }, "可用数量只统计状态正常的账号；等待上游不会占用调用名额，连续 30 分钟没有结果会自动停止查询")
+                  h("div", { className: "capacity-subtitle" }, "可用数量只统计状态正常的账号；任务完成或停止后会自动释放名额")
                 ]),
                 h(Tooltip, { title: "达到可用并发上限后，新任务会立即返回繁忙，不进入处理列表。" },
-                  h(Tag, { color: "blue" }, "满载立即拒绝")
+                  h(Tag, { color: "blue" }, "满载自动排队")
                 )
               ]),
               h("div", { className: "capacity-grid" }, [

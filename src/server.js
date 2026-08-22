@@ -575,6 +575,11 @@ async function readPreviewImage(filename) {
   }
 }
 
+function previewImageReader(previewUrl) {
+  const filename = path.basename(String(previewUrl || ""));
+  return async () => readPreviewImage(filename);
+}
+
 function imageMimeFromBuffer(buffer) {
   if (buffer?.[0] === 0x89 && buffer?.[1] === 0x50 && buffer?.[2] === 0x4e && buffer?.[3] === 0x47) return "image/png";
   if (buffer?.[0] === 0xff && buffer?.[1] === 0xd8) return "image/jpeg";
@@ -629,7 +634,7 @@ async function pushBufferedImage(files, buffer, part, { maxFiles, savePreview })
     mimetype,
     previewUrl,
     fieldname: part.fieldname || "",
-    toBuffer: async () => buffer
+    toBuffer: previewUrl ? previewImageReader(previewUrl) : async () => buffer
   });
 }
 
@@ -639,7 +644,11 @@ async function pushBase64Image(files, value, fieldname, options) {
   if (!file) return false;
   const buffer = await file.toBuffer();
   const previewUrl = options.savePreview ? await savePreviewImage(buffer, file) : "";
-  files.push({ ...file, previewUrl });
+  files.push({
+    ...file,
+    previewUrl,
+    ...(previewUrl ? { toBuffer: previewImageReader(previewUrl) } : {})
+  });
   return true;
 }
 
@@ -1281,7 +1290,9 @@ app.post("/api/draw/edit", async (request, reply) => {
   let admission = null;
   let admissionTransferred = false;
   try {
-    admission = await reserveImageRequestAdmission(request, requestMeta);
+    if (request.query?.wait === "1") {
+      admission = await reserveImageRequestAdmission(request, requestMeta);
+    }
     const parsed = await readImageInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
     input = parsed.input;
     files = parsed.files;
@@ -1421,7 +1432,9 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
   let admission = null;
   let admissionTransferred = false;
   try {
-    admission = await reserveImageRequestAdmission(request, requestMeta);
+    if (request.query?.wait !== "0") {
+      admission = await reserveImageRequestAdmission(request, requestMeta);
+    }
     const parsed = await readImageInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
     input = parsed.input;
     files = parsed.files;

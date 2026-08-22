@@ -823,6 +823,114 @@ test("Gemini 上游返回 500 后当前任务换车再提交一次", async () =>
   ]);
 });
 
+test("Gemini 多个并发任务遇到同一失效车位时只换一次车", async () => {
+  const testClient = client();
+  const enteredCars = [];
+  const cooldowns = [];
+  let expiredSubmissions = 0;
+  let healthySubmissions = 0;
+  let releaseExpiredSubmissions;
+  const allExpiredSubmissionsStarted = new Promise((resolve) => {
+    releaseExpiredSubmissions = resolve;
+  });
+
+  testClient.onImageCarCooldown = async (cooldown) => cooldowns.push(cooldown);
+  testClient.loginPortal = async () => {
+    testClient.portalLoggedIn = true;
+  };
+  testClient.fetchCars = async () => [
+    {
+      id: "shared-expired-car",
+      status: 1,
+      count: 0,
+      cooldown: 0,
+      desc: "expired",
+      label: "expired",
+      imageRemaining: 10,
+      imageRemainingKnown: true,
+      isIQ: false,
+      isPro: false,
+      isUltra: false,
+      isSuper: false,
+      isVirtual: false,
+      realCarIDs: []
+    },
+    {
+      id: "shared-healthy-car",
+      status: 1,
+      count: 1,
+      cooldown: 0,
+      desc: "healthy",
+      label: "healthy",
+      imageRemaining: 9,
+      imageRemainingKnown: true,
+      isIQ: false,
+      isPro: false,
+      isUltra: false,
+      isSuper: false,
+      isVirtual: false,
+      realCarIDs: []
+    }
+  ];
+  testClient.enterCar = async (carId, carType) => {
+    enteredCars.push(carId);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    testClient.portalLoggedIn = true;
+    testClient.carId = carId;
+    testClient.carType = carType;
+    testClient.cookies = [`car=${carId}`];
+    testClient.geminiSession = {
+      at: `token-${carId}`,
+      sid: `sid-${carId}`,
+      bl: "boq_assistant-bard-web-server_test",
+      pushId: "feeds/test",
+      uploadClientPctx: "CgcSBWjK7pYx",
+      sourcePath: "/app"
+    };
+  };
+  testClient.createSubmitClient = () => testClient;
+  testClient.sendGeminiConversation = async (_prompt, input, route, selected) => {
+    input.imageSubmissionState.started = true;
+    if (selected.carId === "shared-expired-car") {
+      expiredSubmissions += 1;
+      if (expiredSubmissions === 3) releaseExpiredSubmissions();
+      await allExpiredSubmissionsStarted;
+      const error = new Error("请求失败，请重试");
+      error.status = 500;
+      error.upstreamText = error.message;
+      throw error;
+    }
+
+    healthySubmissions += 1;
+    input.imageSubmissionState.confirmed = true;
+    return {
+      events: [],
+      conversationId: `conversation-${healthySubmissions}`,
+      model: "gemini",
+      upstreamModel: "gemini",
+      route,
+      selected,
+      submissionConfirmed: true,
+      directContent: "",
+      imageUrls: [`https://example.test/generated-${healthySubmissions}.png`]
+    };
+  };
+
+  const results = await Promise.all([1, 2, 3].map((index) => testClient.createImageTask({
+    prompt: `并发换车任务 ${index}`,
+    model: "gemini",
+    files: [fakeImageFile()],
+    concurrentSubmit: true
+  })));
+
+  assert.equal(expiredSubmissions, 3);
+  assert.equal(healthySubmissions, 3);
+  assert.deepEqual(enteredCars, ["shared-expired-car", "shared-healthy-car"]);
+  assert.deepEqual(results.map((result) => result.status), ["success", "success", "success"]);
+  assert.equal(new Set(results.map((result) => result.externalId)).size, 3);
+  assert.equal(cooldowns.every((cooldown) => cooldown.carId === "shared-expired-car"), true);
+});
+
 test("Gemini 参考图上传前发现车位失效时会先换车，不会误记为已经提交", async () => {
   const testClient = client();
   const selectedCars = [];

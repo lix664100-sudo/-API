@@ -2009,6 +2009,7 @@ export class ChatplusClient {
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWorks = new Map();
     this.concurrentChatSessions = new Map();
+    this.sessionRevision = 0;
     this.proCarsUnavailableUntil = savedProCarRestriction(account, channel) ? Infinity : 0;
     restoreSavedImageCarCooldowns(account, channel);
   }
@@ -2223,6 +2224,7 @@ export class ChatplusClient {
   }
 
   resetSession() {
+    this.sessionRevision += 1;
     this.cookies = [];
     this.portalLoggedIn = false;
     this.carId = "";
@@ -2264,6 +2266,7 @@ export class ChatplusClient {
   preparedChatSession(session = {}) {
     return {
       ...session,
+      revision: Number.isInteger(session.revision) ? session.revision : this.sessionRevision,
       snapshot: this.sessionSnapshot()
     };
   }
@@ -2348,7 +2351,7 @@ export class ChatplusClient {
     const route = this.chatRouteForInput(input);
     const key = this.chatSessionKey(route);
     const cached = this.concurrentChatSessions.get(key);
-    if (cached?.session) {
+    if (cached?.session && cached.session.revision === this.sessionRevision) {
       const cachedCarId = cached.session.selected?.carId;
       if (
         !ignoredCarIds.has(cachedCarId)
@@ -2363,8 +2366,10 @@ export class ChatplusClient {
         }, async () => this.cloneChatSession(cached.session));
       }
       this.concurrentChatSessions.delete(key);
+    } else if (cached?.session) {
+      this.concurrentChatSessions.delete(key);
     }
-    if (cached?.promise) {
+    if (cached?.promise && cached.revision === this.sessionRevision) {
       const session = await measureTaskStage(input.taskStageRecorder, (prepared) => ({
         key: "session_reuse",
         label: "等待可复用车位",
@@ -2380,14 +2385,22 @@ export class ChatplusClient {
         return this.cloneChatSession(session);
       }
       this.concurrentChatSessions.delete(key);
+    } else if (cached?.promise) {
+      this.concurrentChatSessions.delete(key);
     }
 
+    const revision = this.sessionRevision;
     const promise = this.prepareChatSession(input, ignoredCarIds, maxAttempts)
       .then((session) => this.preparedChatSession(session));
-    this.concurrentChatSessions.set(key, { promise });
+    this.concurrentChatSessions.set(key, { promise, revision });
     try {
       const session = await promise;
-      this.concurrentChatSessions.set(key, { session });
+      if (
+        session.revision === this.sessionRevision
+        && this.concurrentChatSessions.get(key)?.promise === promise
+      ) {
+        this.concurrentChatSessions.set(key, { session });
+      }
       return this.cloneChatSession(session);
     } catch (error) {
       if (this.concurrentChatSessions.get(key)?.promise === promise) this.concurrentChatSessions.delete(key);
@@ -2397,11 +2410,25 @@ export class ChatplusClient {
 
   rememberReusableChatSession(input = {}, session = {}, submitClient = this) {
     if (input.concurrentSubmit !== true || !session?.route || !session?.selected) return;
+    if (session.revision !== this.sessionRevision) return;
     const refreshed = this.cloneChatSession({
       ...session,
       snapshot: submitClient.sessionSnapshot()
     });
     this.concurrentChatSessions.set(this.chatSessionKey(session.route), { session: refreshed });
+  }
+
+  async invalidatePreparedChatSession(session = {}) {
+    const revision = Number.isInteger(session.revision)
+      ? session.revision
+      : this.sessionRevision;
+    let invalidated = false;
+    await this.sessionLock(async () => {
+      if (revision !== this.sessionRevision) return;
+      this.resetSession();
+      invalidated = true;
+    });
+    return invalidated;
   }
 
   async performPortalLogin(options = {}) {
@@ -2652,7 +2679,7 @@ export class ChatplusClient {
               carType: selected.carType
             }, async () => this.loadInit(requestOptions))
           : {};
-        return { route, selected, init };
+        return { route, selected, init, revision: this.sessionRevision };
       } catch (error) {
         if (route.key === "gpt" && isChatSubscriptionExpiredText(`${error?.message || ""} ${error?.body || ""}`)) {
           subscriptionExpiredAttempts += 1;
@@ -3379,12 +3406,16 @@ export class ChatplusClient {
     for (let attempt = 0; attempt < MAX_CHAT_CAR_ATTEMPTS; attempt += 1) {
       let selected = null;
       let activeRoute = null;
+      let preparedSession = null;
       const imageSubmissionState = { started: false };
       const requestInput = { ...input, imageSubmissionState };
       try {
         const session = input.concurrentSubmit === true
           ? await this.prepareReusableChatSession(requestInput, ignoredCarIds, 1)
           : await this.prepareChatSession(requestInput, ignoredCarIds, 1);
+        preparedSession = Number.isInteger(session.revision)
+          ? session
+          : { ...session, revision: this.sessionRevision };
         const { route, init } = session;
         activeRoute = route;
         const submitClient = input.concurrentSubmit === true ? this.createSubmitClient(session) : this;
@@ -3498,7 +3529,7 @@ export class ChatplusClient {
           unconfirmedCars.push(carAttempt);
           errors.push(message);
           await this.rememberUnconfirmedCar(selected, error);
-          await this.sessionLock(async () => this.resetSession());
+          await this.invalidatePreparedChatSession(preparedSession);
           if (unconfirmedCars.length >= MAX_UNCONFIRMED_CAR_ATTEMPTS) {
             const failedCars = unconfirmedCars.map((item) => item.carId).filter(Boolean).join("、");
             const finalError = new Error(
@@ -3538,13 +3569,13 @@ export class ChatplusClient {
         }
         if (selected && error.imageCarQuotaExhausted === true) {
           await this.rememberImageFailedCar(selected, error);
-          await this.sessionLock(async () => this.resetSession());
+          await this.invalidatePreparedChatSession(preparedSession);
           imageCarQuotaErrors.push(error.message || "当前车位不能继续生图");
           continue;
         }
         if (selected && isRetryableImageSubmissionRejection(error)) {
           this.rememberAuthFailedCar(selected);
-          await this.sessionLock(async () => this.resetSession());
+          await this.invalidatePreparedChatSession(preparedSession);
           errors.push(error.message || "上游拒绝了当前聊天车位");
           continue;
         }
@@ -3558,14 +3589,14 @@ export class ChatplusClient {
         if (retryableCarError) {
           this.rememberProCarsUnavailable(error);
           this.rememberAuthFailedCar(selected);
-          await this.sessionLock(async () => this.resetSession());
+          await this.invalidatePreparedChatSession(preparedSession);
           errors.push(error.message || "调用失败");
           continue;
         }
         if (Number(error.status || error.statusCode || 0) === 400) throw error;
         if (isAuthSessionError(error)) {
           this.rememberAuthFailedCar(selected);
-          await this.sessionLock(async () => this.resetSession());
+          await this.invalidatePreparedChatSession(preparedSession);
         }
         errors.push(error.message || "调用失败");
       }

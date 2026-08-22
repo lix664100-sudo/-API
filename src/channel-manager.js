@@ -50,6 +50,7 @@ const accountRecoveryRetryAt = new Map();
 const activeProxyChecks = new Map();
 const persistedProxyStatuses = new Map();
 const proxyStatusWrites = new Map();
+const taskSlotWaiters = new Set();
 const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
 const CHAT_USAGE_RECOVERY_CHECK_MS = 60 * 60 * 1000;
 const DRAWING_FAILURE_LIMIT = 3;
@@ -60,6 +61,7 @@ const FAST_TASK_REFRESH_TIMEOUT_SEC = 30;
 const UPSTREAM_RESULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS = 20;
+const TASK_SLOT_RECHECK_MS = 1000;
 const PROXY_GUARDED_CLIENT_METHODS = new Set([
   "check",
   "createChatCompletion",
@@ -606,7 +608,24 @@ async function tryReserveTaskSlot(slot, target = {}, input = {}) {
       if (nextModelCount) activeDrawingModelCounts.set(drawingModelKey, nextModelCount);
       else activeDrawingModelCounts.delete(drawingModelKey);
     }
+    for (const notify of [...taskSlotWaiters]) notify();
   };
+}
+
+function waitForTaskSlotChange() {
+  return new Promise((resolve) => {
+    let finished = false;
+    let timer = null;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      taskSlotWaiters.delete(finish);
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    taskSlotWaiters.add(finish);
+    timer = setTimeout(finish, TASK_SLOT_RECHECK_MS);
+  });
 }
 
 function accountSessionKey(account = {}, modelKey = "") {
@@ -3194,6 +3213,30 @@ async function reserveFirstAvailableTarget(targets, taskType, options = {}) {
   });
 }
 
+async function tryReserveFirstAvailableTarget(targets, taskType, options = {}) {
+  try {
+    return await reserveFirstAvailableTarget(targets, taskType, options);
+  } catch (error) {
+    if (error?.code === "CONCURRENCY_LIMIT") return null;
+    throw error;
+  }
+}
+
+async function waitForFirstAvailableTarget(targets, taskType, options = {}) {
+  const queuedAt = Date.now();
+  while (true) {
+    const reserved = await tryReserveFirstAvailableTarget(targets, taskType, options);
+    if (reserved) {
+      return {
+        ...reserved,
+        attempts: [],
+        queueWaitMs: Math.max(0, Date.now() - queuedAt)
+      };
+    }
+    await waitForTaskSlotChange();
+  }
+}
+
 function consumeAdmissionReservation(admission, targets, input = {}) {
   if (!admission?.release) return null;
   const target = targets.find((item) => sameTarget(item, admission.target));
@@ -3396,7 +3439,7 @@ function taskResponseJson(value = {}) {
   return jsonValue(value) || {};
 }
 
-function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrls, raw, requestMeta = {} }) {
+function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrls, raw, requestMeta = {}, status = "processing" }) {
   const meta = taskRequestMeta(requestMeta);
   const sourceTaskId = meta.sourceTaskId || sourceTaskIdFrom(input);
   const requestMetaPayload = sourceTaskId && !meta.sourceTaskId ? { ...meta, sourceTaskId } : meta;
@@ -3404,7 +3447,7 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
   return {
     id: `task-${randomUUID()}`,
     ...(sourceTaskId ? { sourceTaskId } : {}),
-    status: "processing",
+    status,
     prompt: prompt ?? cleanPrompt(input),
     taskType,
     modelId: input.model_id || input.modelId || input.model || "",
@@ -3438,6 +3481,32 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
     completedAt: null,
     createdAt: new Date().toISOString()
   };
+}
+
+async function startQueuedTask(task, target, queueWaitMs = 0) {
+  const startedAtMs = Date.parse(task.createdAt || "");
+  const queueStage = completedTaskStage(
+    "account_queue",
+    "等待可用账号",
+    Number.isFinite(startedAtMs) ? startedAtMs : Date.now()
+  );
+  const nextTask = {
+    ...task,
+    status: "processing",
+    channelId: target.channel.id,
+    channelName: target.channel.name,
+    channelType: target.channel.type,
+    accountId: target.account.id,
+    accountName: target.account.name,
+    network: taskNetworkMeta(target.account),
+    raw: mergeTaskRaw(task.raw, {
+      waitingForSlot: false,
+      queueWaitMs: Math.max(Number(queueWaitMs || 0), queueStage.durationMs),
+      stageTimings: [queueStage]
+    })
+  };
+  await upsertTask(nextTask);
+  return nextTask;
 }
 
 function readableAttemptError(attempts) {
@@ -3747,14 +3816,19 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { input });
-  const attempts = [...(reserved?.attempts || [])];
+  let taskReservation = reserved;
   let latestTask = task;
-  let reservedRelease = reserved?.release || null;
+  if (!taskReservation && options.waitForSlot === true) {
+    taskReservation = await waitForFirstAvailableTarget(targets, "text2img", { input });
+    latestTask = await startQueuedTask(latestTask, taskReservation.target, taskReservation.queueWaitMs);
+  }
+  const attempts = [...(taskReservation?.attempts || [])];
+  let reservedRelease = taskReservation?.release || null;
   try {
-    for (const target of orderedTargets(targets, reserved)) {
+    for (const target of orderedTargets(targets, taskReservation)) {
       const { channel, account } = target;
       let release = null;
-      const usingReserved = reservedRelease && sameTarget(target, reserved?.target);
+      const usingReserved = reservedRelease && sameTarget(target, taskReservation?.target);
       if (usingReserved) {
         release = reservedRelease;
         reservedRelease = null;
@@ -3912,17 +3986,22 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", { accountId: requestedAccountId, input });
-  const attempts = [...(reserved?.attempts || [])];
+  let taskReservation = reserved;
   let latestTask = task;
-  let reservedRelease = reserved?.release || null;
+  if (!taskReservation && options.waitForSlot === true) {
+    taskReservation = await waitForFirstAvailableTarget(targets, "img2img", { input });
+    latestTask = await startQueuedTask(latestTask, taskReservation.target, taskReservation.queueWaitMs);
+  }
+  const attempts = [...(taskReservation?.attempts || [])];
+  let reservedRelease = taskReservation?.release || null;
   try {
     const executionTargets = Array.isArray(options.orderedTargets)
       ? options.orderedTargets
-      : orderedTargets(targets, reserved);
+      : orderedTargets(targets, taskReservation);
     for (const target of executionTargets) {
       const { channel, account } = target;
       let release = null;
-      const usingReserved = reservedRelease && sameTarget(target, reserved?.target);
+      const usingReserved = reservedRelease && sameTarget(target, taskReservation?.target);
       if (usingReserved) {
         release = reservedRelease;
         reservedRelease = null;
@@ -4152,18 +4231,30 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { input });
   if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel, input });
 
-  const reserved = await reserveFirstAvailableTarget(targets, "text2img", { input });
-  const task = queuedTask({ input, target: reserved.target, taskType: "text2img", requestMeta });
+  const reserved = await tryReserveFirstAvailableTarget(targets, "text2img", { input });
+  const queueOrder = reserved?.orderedTargets || await orderTargetsByRoutingUsage(targets, "text2img", input);
+  const target = reserved?.target || queueOrder[0];
+  const task = queuedTask({
+    input,
+    target,
+    taskType: "text2img",
+    requestMeta,
+    status: reserved ? "processing" : "queued",
+    raw: reserved ? {} : { waitingForSlot: true }
+  });
   try {
     await upsertTask(task);
   } catch (error) {
-    reserved.release();
+    reserved?.release();
     throw error;
   }
   scheduledImageTasks.add(task.id);
   runInBackground(async () => {
     try {
-      await runQueuedTextTask(task, input, reserved, { waitForChatplusImages: true });
+      await runQueuedTextTask(task, input, reserved, {
+        waitForChatplusImages: true,
+        waitForSlot: !reserved
+      });
     } finally {
       scheduledImageTasks.delete(task.id);
     }
@@ -4198,19 +4289,31 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
     });
   }
 
-  const reserved = selection.reserved || await reserveFirstAvailableTarget(targets, "img2img", { input });
-  const task = queuedTask({ input: { ...input, files }, target: reserved.target, taskType: "img2img", requestMeta });
+  const reserved = selection.reserved || await tryReserveFirstAvailableTarget(targets, "img2img", { input });
+  const queueOrder = reserved?.orderedTargets || await orderTargetsByRoutingUsage(targets, "img2img", input);
+  const target = reserved?.target || queueOrder[0];
+  const task = queuedTask({
+    input: { ...input, files },
+    target,
+    taskType: "img2img",
+    requestMeta,
+    status: reserved ? "processing" : "queued",
+    raw: reserved ? {} : { waitingForSlot: true }
+  });
   try {
-    reserved.handoff?.();
+    reserved?.handoff?.();
     await upsertTask(task);
   } catch (error) {
-    reserved.release();
+    reserved?.release();
     throw error;
   }
   scheduledImageTasks.add(task.id);
   runInBackground(async () => {
     try {
-      await runQueuedImageTask(task, input, files, reserved, { waitForChatplusImages: true });
+      await runQueuedImageTask(task, input, files, reserved, {
+        waitForChatplusImages: true,
+        waitForSlot: !reserved
+      });
     } finally {
       scheduledImageTasks.delete(task.id);
     }
@@ -4234,30 +4337,42 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
     });
   }
 
-  const reserved = await reserveFirstAvailableTarget(targets, "chat", { input });
+  const reserved = await tryReserveFirstAvailableTarget(targets, "chat", { input });
+  const queueOrder = reserved?.orderedTargets || await orderTargetsByRoutingUsage(targets, "chat", input);
+  const target = reserved?.target || queueOrder[0];
   const task = queuedTask({
     input,
-    target: reserved.target,
+    target,
     taskType: "chat",
     prompt: cleanChatPrompt(input),
     imageCount: chatImageCount(input),
     inputImageUrls: taskInputPreviewUrls(input, taskOptions.inputImageUrls),
-    raw: { endpoint: "/v1/chat/completions" },
-    requestMeta
+    raw: {
+      endpoint: "/v1/chat/completions",
+      ...(reserved ? {} : { waitingForSlot: true })
+    },
+    requestMeta,
+    status: reserved ? "processing" : "queued"
   });
   try {
     await upsertTask(task);
   } catch (error) {
-    reserved.release();
+    reserved?.release();
     throw error;
   }
   scheduledChatTasks.add(task.id);
   runInBackground(async () => {
+    let taskReservation = reserved;
     try {
-      await runChatCompletionTask(task, input);
+      let queuedChatTask = task;
+      if (!taskReservation) {
+        taskReservation = await waitForFirstAvailableTarget(targets, "chat", { input });
+        queuedChatTask = await startQueuedTask(task, taskReservation.target, taskReservation.queueWaitMs);
+      }
+      await runChatCompletionTask(queuedChatTask, input);
     } finally {
       scheduledChatTasks.delete(task.id);
-      reserved.release();
+      taskReservation?.release();
     }
   });
   return task;

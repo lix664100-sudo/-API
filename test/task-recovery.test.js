@@ -2467,13 +2467,13 @@ test("聊天生图等待上游任务会继续占用并发名额", async () => {
       tasks.find((task) => task.prompt === "job-1")?.raw?.stageTimings?.map((stage) => stage.id),
       ["stage-job-1"]
     );
-    await assert.rejects(
-      () => queueImageTask({
-        input: { channel: "chatplus", prompt: "job-6" },
-        files: [{ filename: "source-6.png", mimetype: "image/png", buffer: Buffer.from("x") }]
-      }),
-      (error) => error?.status === 429
-    );
+    const queuedSixth = await queueImageTask({
+      input: { channel: "chatplus", prompt: "job-6" },
+      files: [{ filename: "source-6.png", mimetype: "image/png", buffer: Buffer.from("x") }]
+    });
+
+    assert.equal(queuedSixth.status, "queued");
+    assert.equal(submittedJobs.includes("job-6"), false);
 
     const completed = tasks.find((task) => task.prompt === "job-1");
     await upsertTask({
@@ -2484,12 +2484,7 @@ test("聊天生图等待上游任务会继续占用并发名额", async () => {
       completedAt: new Date().toISOString()
     });
 
-    await queueImageTask({
-      input: { channel: "chatplus", prompt: "job-6" },
-      files: [{ filename: "source-6.png", mimetype: "image/png", buffer: Buffer.from("x") }]
-    });
-
-    for (let attempt = 0; attempt < 30; attempt += 1) {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
       tasks = await listTasks();
       if (tasks.some((task) => task.prompt === "job-6" && task.status === "waiting_upstream")) break;
       await new Promise((resolve) => setTimeout(resolve, 20));
