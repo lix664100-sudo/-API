@@ -35,6 +35,18 @@ function completionChunk(completion, delta, finishReason) {
   };
 }
 
+function usageChunk(completion) {
+  if (!completion.usage || typeof completion.usage !== "object") return null;
+  return {
+    id: completion.id,
+    object: "chat.completion.chunk",
+    created: completion.created,
+    model: completion.model,
+    choices: [],
+    usage: completion.usage
+  };
+}
+
 export function chatCompletionSseBody(completion = {}) {
   const content = completion.choices?.[0]?.message?.content ?? "";
   const first = completionChunk(
@@ -43,5 +55,7 @@ export function chatCompletionSseBody(completion = {}) {
     null
   );
   const last = completionChunk(completion, {}, "stop");
-  return `data: ${JSON.stringify(first)}\n\ndata: ${JSON.stringify(last)}\n\ndata: [DONE]\n\n`;
+  const usage = usageChunk(completion);
+  const events = [first, last, ...(usage ? [usage] : [])];
+  return `${events.map((event) => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\ndata: [DONE]\n\n`;
 }
