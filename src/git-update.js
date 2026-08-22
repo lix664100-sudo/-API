@@ -1,8 +1,9 @@
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { normalizeProxyUrl, safeProxyEndpoint } from "./proxy.js";
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const minimumProxyTimeoutMs = 5_000;
 const maximumProxyTimeoutMs = 30_000;
 
@@ -97,6 +98,10 @@ function commandErrorText(error) {
   return String(error?.stderr || error?.message || "");
 }
 
+function executeGitFetch(options) {
+  return execFileAsync("git", ["fetch", "--quiet"], options);
+}
+
 export async function inspectGitUpdateState(options = {}) {
   const {
     cwd,
@@ -104,6 +109,7 @@ export async function inspectGitUpdateState(options = {}) {
     timeoutMs = 120_000,
     maxBuffer = 2 * 1024 * 1024,
     execute = execAsync,
+    fetch = executeGitFetch,
     baseEnv = process.env,
     random = Math.random,
     now = Date.now()
@@ -123,19 +129,21 @@ export async function inspectGitUpdateState(options = {}) {
     let lastFetchError = null;
 
     if (proxies.length) {
-      const maximumAttempts = Math.max(1, Math.floor(timeoutMs / minimumProxyTimeoutMs));
+      const directTimeoutMs = Math.max(
+        minimumProxyTimeoutMs,
+        Math.min(maximumProxyTimeoutMs, Math.floor(timeoutMs / 3))
+      );
+      const proxyBudgetMs = Math.max(minimumProxyTimeoutMs, timeoutMs - directTimeoutMs);
+      const maximumAttempts = Math.max(1, Math.floor(proxyBudgetMs / minimumProxyTimeoutMs));
       const candidates = proxies.slice(0, maximumAttempts);
       const proxyTimeoutMs = Math.max(
         minimumProxyTimeoutMs,
-        Math.min(maximumProxyTimeoutMs, Math.floor(timeoutMs / candidates.length))
+        Math.min(maximumProxyTimeoutMs, Math.floor(proxyBudgetMs / candidates.length))
       );
       for (const proxy of candidates) {
         const candidateEnv = gitProxyEnvironment(proxy.url, baseEnv);
         try {
-          await execute(
-            "git fetch --quiet",
-            commandOptions(cwd, proxyTimeoutMs, maxBuffer, candidateEnv)
-          );
+          await fetch(commandOptions(cwd, proxyTimeoutMs, maxBuffer, candidateEnv));
           gitEnv = candidateEnv;
           break;
         } catch (error) {
@@ -143,18 +151,27 @@ export async function inspectGitUpdateState(options = {}) {
         }
       }
       if (!gitEnv) {
-        return {
-          checked: false,
-          message: "账号代理均无法连接 GitHub，未执行更新。",
-          stderr: redactGitProxyCredentials(
+        try {
+          await fetch(commandOptions(cwd, directTimeoutMs, maxBuffer, baseEnv));
+          gitEnv = { ...baseEnv };
+        } catch (directError) {
+          const proxyError = redactGitProxyCredentials(
             commandErrorText(lastFetchError),
             gitProxyEnvironment(candidates.at(-1)?.url, baseEnv)
-          )
-        };
+          );
+          return {
+            checked: false,
+            message: "账号代理和服务器直连都无法连接代码仓库，未执行更新。",
+            stderr: [
+              proxyError ? `账号代理：${proxyError}` : "",
+              commandErrorText(directError) ? `服务器直连：${commandErrorText(directError)}` : ""
+            ].filter(Boolean).join("\n")
+          };
+        }
       }
     } else {
       try {
-        await execute("git fetch --quiet", localOptions);
+        await fetch(localOptions);
         gitEnv = { ...baseEnv };
       } catch (error) {
         return {

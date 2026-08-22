@@ -51,23 +51,21 @@ test("账号 Git 代理会排除停用、过期和无效配置，并去掉重复
 
 test("Git 检查遇到坏代理会自动换下一条", async () => {
   const fetchProxyHosts = [];
-  const execute = async (command, options) => {
-    if (command === "git fetch --quiet") {
-      const proxyUrl = options.env.GIT_CONFIG_VALUE_0;
-      fetchProxyHosts.push(new URL(proxyUrl).hostname);
-      if (proxyUrl.includes("proxy-a.example.test")) {
-        const error = new Error("first proxy failed");
-        error.stderr = "first proxy failed";
-        throw error;
-      }
+  const fetch = async (options) => {
+    const proxyUrl = options.env.GIT_CONFIG_VALUE_0;
+    fetchProxyHosts.push(new URL(proxyUrl).hostname);
+    if (proxyUrl.includes("proxy-a.example.test")) {
+      const error = new Error("first proxy failed");
+      error.stderr = "first proxy failed";
+      throw error;
     }
-    return successfulLocalCommand(command);
   };
 
   const result = await inspectGitUpdateState({
     cwd: "/test/repo",
     config: updateConfig([account(activeProxyA), account(activeProxyB)]),
-    execute,
+    execute: async (command) => successfulLocalCommand(command),
+    fetch,
     baseEnv: { TEST_ENV: "kept" },
     random: () => 0.999,
     now: Date.parse("2026-07-27T00:00:00+08:00")
@@ -80,41 +78,68 @@ test("Git 检查遇到坏代理会自动换下一条", async () => {
   assert.equal(new URL(result.gitEnv.GIT_CONFIG_VALUE_0).hostname, "proxy-b.example.test");
 });
 
-test("所有账号代理失败时停止更新并隐藏代理密码", async () => {
-  const execute = async (command, options) => {
-    if (command === "git fetch --quiet") {
+test("所有账号代理失败后会尝试服务器直连", async () => {
+  const attempts = [];
+  const fetch = async (options) => {
+    const proxyUrl = options.env.GIT_CONFIG_VALUE_0;
+    attempts.push(proxyUrl ? new URL(proxyUrl).hostname : "direct");
+    if (proxyUrl) {
       const error = new Error("proxy failed");
       error.stderr = `无法连接 ${options.env.GIT_CONFIG_VALUE_0}`;
       throw error;
     }
-    return successfulLocalCommand(command);
   };
 
   const result = await inspectGitUpdateState({
     cwd: "/test/repo",
     config: updateConfig([account(activeProxyA), account(activeProxyB)]),
-    execute,
+    execute: async (command) => successfulLocalCommand(command),
+    fetch,
+    baseEnv: { TEST_ENV: "direct-fallback" },
+    random: () => 0.999,
+    now: Date.parse("2026-07-27T00:00:00+08:00")
+  });
+
+  assert.deepEqual(attempts, ["proxy-a.example.test", "proxy-b.example.test", "direct"]);
+  assert.equal(result.checked, true);
+  assert.equal(result.gitEnv.TEST_ENV, "direct-fallback");
+  assert.equal(result.gitEnv.GIT_CONFIG_VALUE_0, undefined);
+});
+
+test("代理和服务器直连都失败时停止更新并隐藏代理密码", async () => {
+  const fetch = async (options) => {
+    const error = new Error("fetch failed");
+    error.stderr = options.env.GIT_CONFIG_VALUE_0
+      ? `无法连接 ${options.env.GIT_CONFIG_VALUE_0}`
+      : "服务器直连失败";
+    throw error;
+  };
+
+  const result = await inspectGitUpdateState({
+    cwd: "/test/repo",
+    config: updateConfig([account(activeProxyA), account(activeProxyB)]),
+    execute: async (command) => successfulLocalCommand(command),
+    fetch,
     random: () => 0.999,
     now: Date.parse("2026-07-27T00:00:00+08:00")
   });
 
   assert.equal(result.checked, false);
-  assert.equal(result.message, "账号代理均无法连接 GitHub，未执行更新。");
+  assert.equal(result.message, "账号代理和服务器直连都无法连接代码仓库，未执行更新。");
   assert.doesNotMatch(result.stderr, /password-a|password-b/);
   assert.match(result.stderr, /\[账号代理\]/);
+  assert.match(result.stderr, /服务器直连失败/);
 });
 
 test("没有可用账号代理时保留原来的直连检查", async () => {
   let fetchEnv;
-  const execute = async (command, options) => {
-    if (command === "git fetch --quiet") fetchEnv = options.env;
-    return successfulLocalCommand(command);
-  };
+  const fetch = async (options) => { fetchEnv = options.env; };
 
   const result = await inspectGitUpdateState({
     cwd: "/test/repo",
     config: updateConfig([]),
-    execute,
+    execute: async (command) => successfulLocalCommand(command),
+    fetch,
     baseEnv: { TEST_ENV: "direct" }
   });
 
