@@ -34,7 +34,7 @@ const quotaTextFunctionSource = quotaTextFunctionMatch[0].replace(
 const chatQuotaText = vm.runInNewContext(
   `(${quotaTextFunctionSource.replace(/^function /, "function ")})`,
   {
-    checkedChatModelName: () => "Gemini",
+    checkedChatModelName: () => "GPT",
     chatSubscriptionExpired: () => false,
     chatModelsForChannel: () => [
       { key: "gpt", name: "GPT", enabled: true },
@@ -43,6 +43,20 @@ const chatQuotaText = vm.runInNewContext(
     confirmedChatQuotaEmpty,
     valueText: (value) => String(value)
   }
+);
+
+const drawingDisplayStatusFunctionMatch = adminHtml.match(
+  /function drawingDisplayStatus\(status = \{\}\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function aggregateChatStatus/
+);
+
+assert.ok(drawingDisplayStatusFunctionMatch, "管理后台中应存在绘图额度状态显示方法");
+
+const drawingDisplayStatusFunctionSource = drawingDisplayStatusFunctionMatch[0].replace(
+  /\r?\n\r?\n      function aggregateChatStatus$/,
+  ""
+);
+const drawingDisplayStatus = vm.runInNewContext(
+  `(${drawingDisplayStatusFunctionSource.replace(/^function /, "function ")})`
 );
 
 const functionMatch = adminHtml.match(
@@ -113,7 +127,8 @@ const accountEffectiveStatus = vm.runInNewContext(
   {
     abilityStatus: (account, key) => account?.meta?.abilities?.[key] || {},
     channelAbilityEnabled: (channel, ability) => channel?.settings?.enabledAbilities?.[ability] !== false,
-    chatDisplayStatus: (status = {}) => status.status || "unknown"
+    chatDisplayStatus: (status = {}) => status.status || "unknown",
+    drawingDisplayStatus
   }
 );
 
@@ -273,7 +288,7 @@ test("后台明确显示当前模型剩余为零时账号状态显示额度不�
   }), false);
 });
 
-test("一个模型用完时仍显示另一个模型的可用额度", () => {
+test("一个模型为零时仍显示零和另一个模型的可用额度", () => {
   assert.equal(chatQuotaText(null, {}, {
     status: "quota_empty",
     quotaReason: "chat_usage_limit",
@@ -286,7 +301,20 @@ test("一个模型用完时仍显示另一个模型的可用额度", () => {
         gemini: { quota: 70, used: 70, balance: 0 }
       }
     }
-  }), "GPT 剩余 200/220｜Gemini 已用完");
+  }), "GPT 剩余 200/220｜Gemini 剩余 0/70");
+});
+
+test("聊天状态可用但没有额度数据时显示额度未获取", () => {
+  assert.equal(chatQuotaText(null, {}, {
+    status: "ok",
+    meta: { chatModel: "gpt", referenceUsage: {} }
+  }), "GPT 额度未获取");
+});
+
+test("绘图余额小于两点时不能显示可用", () => {
+  assert.equal(drawingDisplayStatus({ status: "ok", balance: 0 }), "quota_empty");
+  assert.equal(drawingDisplayStatus({ status: "ok", balance: 1 }), "quota_empty");
+  assert.equal(drawingDisplayStatus({ status: "ok", balance: 2 }), "ok");
 });
 
 test("渠道汇总中 GPT 套餐过期优先于其他账号可用", () => {
@@ -418,4 +446,23 @@ test("GPT 套餐过期时整体状态不能被绘图可用覆盖", () => {
   };
 
   assert.equal(accountEffectiveStatus(account, channel), "subscription_expired");
+});
+
+test("绘图余额不足时整体状态不能显示可用", () => {
+  const account = {
+    enabled: true,
+    status: "ok",
+    meta: {
+      abilities: {
+        drawing: { status: "ok", balance: 1 },
+        chatplus: { status: "quota_empty", quotaConfirmedByUpstream: true }
+      }
+    }
+  };
+  const channel = {
+    type: "shareai",
+    settings: { enabledAbilities: { drawing: true, chatplus: false } }
+  };
+
+  assert.equal(accountEffectiveStatus(account, channel), "quota_empty");
 });

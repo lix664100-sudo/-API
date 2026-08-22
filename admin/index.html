@@ -2879,10 +2879,18 @@
           .filter((item) => item.enabled)
           .map((item) => {
             const usage = status.meta?.referenceUsage?.[item.key];
-            if (!usage || usage.quota === null || usage.quota === undefined || usage.balance === null || usage.balance === undefined) return "";
-            return Number(usage.balance) <= 0
-              ? `${item.name} 已用完`
-              : `${item.name} 剩余 ${valueText(usage.balance)}/${valueText(usage.quota)}`;
+            const quotaKnown = usage
+              && usage.quota !== null
+              && usage.quota !== undefined
+              && String(usage.quota).trim() !== ""
+              && Number.isFinite(Number(usage.quota));
+            const balanceKnown = usage
+              && usage.balance !== null
+              && usage.balance !== undefined
+              && String(usage.balance).trim() !== ""
+              && Number.isFinite(Number(usage.balance));
+            if (!quotaKnown || !balanceKnown) return "";
+            return `${item.name} 剩余 ${valueText(usage.balance)}/${valueText(usage.quota)}`;
           })
           .filter(Boolean);
         if (referenceParts.length) return referenceParts.join("｜");
@@ -2894,7 +2902,7 @@
         if (status.status === "unknown" || !status.status) return `${modelName} 未检测`;
         if (status.status === "activation_required") return `${modelName} 未激活`;
         if (["error", "failed", "disconnected", "disabled"].includes(status.status)) return `${modelName} 暂不可用`;
-        return `${modelName} 可用`;
+        return `${modelName} 额度未获取`;
       }
 
       function chatQuotaResetTexts(channel, status = {}) {
@@ -4276,6 +4284,16 @@
         return status.status || "unknown";
       }
 
+      function drawingDisplayStatus(status = {}) {
+        const balance = status.balance;
+        const balanceKnown = balance !== null
+          && balance !== undefined
+          && String(balance).trim() !== ""
+          && Number.isFinite(Number(balance));
+        if (balanceKnown && Number(balance) < 2) return "quota_empty";
+        return status.status || "unknown";
+      }
+
       function aggregateChatStatus(accounts, channel) {
         const statuses = accounts
           .filter((item) => item.enabled !== false)
@@ -4308,7 +4326,7 @@
         if (channel?.type === "chatplus") return chatDisplayStatus(account);
         if (channel?.type !== "shareai") return account.status || "unknown";
         const statuses = [
-          channelAbilityEnabled(channel, "drawing") ? abilityStatus(account, "drawing").status : "",
+          channelAbilityEnabled(channel, "drawing") ? drawingDisplayStatus(abilityStatus(account, "drawing")) : "",
           channelAbilityEnabled(channel, "chatplus") ? chatDisplayStatus(abilityStatus(account, "chatplus")) : ""
         ].filter(Boolean);
         if (!statuses.length) return account.status || "unknown";
@@ -6487,7 +6505,7 @@
                       h(Tag, { color: "orange" }, `${chatplusAvailable ? "仅绘图站冷却" : "绘图站冷却中"} · ${drawingCooldownText(row)}`)
                     ));
                   } else {
-                    tags.push(labeledStatusTag("drawing", "绘图", drawing.status || "unknown"));
+                    tags.push(labeledStatusTag("drawing", "绘图", drawingDisplayStatus(drawing)));
                   }
                 }
                 if (channelAbilityEnabled(rowChannel, "chatplus")) {

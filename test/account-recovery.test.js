@@ -2529,6 +2529,63 @@ test("background recovery refreshes expired drawing quota", async () => {
   }
 });
 
+test("绘图状态误标为可用且余额不足时仍会后台恢复", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-background-drawing-stale-status",
+      channelId: "shareai",
+      name: "Background Drawing Stale Status",
+      username: "background-drawing-stale@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: {
+            status: "ok",
+            quota: 100,
+            balance: 1,
+            quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+            message: "drawing ok"
+          },
+          chatplus: { status: "ok", message: "chat image ok" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  let checkCount = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 100,
+      balance: 100,
+      quotaResetAt: new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString(),
+      message: "drawing ok"
+    };
+  };
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const drawing = stored.accounts[0].meta.abilities.drawing;
+
+    assert.equal(checkCount, 1);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].channelId, "shareai:drawing");
+    assert.equal(results[0].recovered, true);
+    assert.equal(drawing.status, "ok");
+    assert.equal(drawing.balance, 100);
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+  }
+});
+
 async function saveChatUsageRecoveryFixture({
   lastCheckAt,
   quotaResetAt,
@@ -2935,6 +2992,67 @@ test("聊天额度恢复时只放行一个真实探测请求", async () => {
     assert.equal(chatplus.meta.referenceUsage.gemini, undefined);
   } finally {
     releaseFirst?.();
+    ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
+  }
+});
+
+test("聊天调用成功后保留已知的正数额度", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-chat-positive-usage",
+      channelId: "shareai",
+      name: "Chat Positive Usage",
+      username: "chat-positive-usage@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", quota: 100, balance: 100 },
+          chatplus: {
+            status: "ok",
+            meta: {
+              chatModel: "gpt",
+              referenceUsage: {
+                gpt: {
+                  quota: 220,
+                  used: 7,
+                  balance: 213,
+                  quotaResetAt: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString(),
+                  period: "12h"
+                }
+              }
+            }
+          }
+        }
+      }
+    }]
+  });
+
+  const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
+  ChatplusClient.prototype.createChatCompletion = async () => ({
+    externalId: "positive-usage-chat",
+    model: "gpt",
+    content: "调用成功",
+    imageUrls: [],
+    raw: {}
+  });
+
+  try {
+    await createChatCompletion({
+      channel: "chatplus",
+      model: "gpt",
+      messages: [{ role: "user", content: "保留额度" }]
+    });
+
+    const stored = await loadConfig();
+    const usage = stored.accounts[0].meta.abilities.chatplus.meta.referenceUsage.gpt;
+    assert.equal(usage.quota, 220);
+    assert.equal(usage.balance, 213);
+  } finally {
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
   }
 });

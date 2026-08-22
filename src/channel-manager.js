@@ -1795,11 +1795,31 @@ async function clearRecoveredChatModelUsage(accountId, channel, modelKey) {
       : { meta: accountMeta };
     const statusMeta = { ...(currentStatus.meta || accountMeta || {}) };
     const referenceUsage = { ...(statusMeta.referenceUsage || {}) };
-    delete referenceUsage[normalizedModelKey];
-    statusMeta.referenceUsage = referenceUsage;
-    if (modelRequestKey(statusMeta.chatModel) === normalizedModelKey) {
-      delete statusMeta.recoveryUsage;
+    const referenceBalance = referenceUsage[normalizedModelKey]?.balance;
+    const referenceBalanceKnown = referenceBalance !== null
+      && referenceBalance !== undefined
+      && String(referenceBalance).trim() !== ""
+      && Number.isFinite(Number(referenceBalance));
+    const recoveryBalance = statusMeta.recoveryUsage?.balance;
+    const recoveryBalanceKnown = recoveryBalance !== null
+      && recoveryBalance !== undefined
+      && String(recoveryBalance).trim() !== ""
+      && Number.isFinite(Number(recoveryBalance));
+    let changed = false;
+    if (referenceBalanceKnown && Number(referenceBalance) <= 0) {
+      delete referenceUsage[normalizedModelKey];
+      statusMeta.referenceUsage = referenceUsage;
+      changed = true;
     }
+    if (
+      modelRequestKey(statusMeta.chatModel) === normalizedModelKey
+      && recoveryBalanceKnown
+      && Number(recoveryBalance) <= 0
+    ) {
+      delete statusMeta.recoveryUsage;
+      changed = true;
+    }
+    if (!changed) return accountMeta;
     if (!ability) return statusMeta;
     return {
       ...accountMeta,
@@ -1986,24 +2006,30 @@ async function updateAccountAfterTask(account, channel, result = {}) {
         return true;
       }
 
+      const quotaEmpty = drawingBalanceInsufficient(drawing.balance);
       await updateTargetAccountStatus(account.id, channel, {
-        status: "ok",
+        status: quotaEmpty ? "quota_empty" : "ok",
         cooldownUntil: null,
         cooldownReason: "",
         upstreamFailureCode: severeFailureReason,
         upstreamFailureStreak,
-        message: `${severeFailureText}，连续失败 ${upstreamFailureStreak}/${DRAWING_FAILURE_LIMIT} 次。`
+        message: quotaEmpty
+          ? "绘图积分不足"
+          : `${severeFailureText}，连续失败 ${upstreamFailureStreak}/${DRAWING_FAILURE_LIMIT} 次。`
       });
       return false;
     }
 
+    const quotaEmpty = drawingBalanceInsufficient(drawing.balance);
     await updateTargetAccountStatus(account.id, channel, {
-      status: "ok",
+      status: quotaEmpty ? "quota_empty" : "ok",
       cooldownUntil: null,
       cooldownReason: "",
       upstreamFailureCode: "",
       upstreamFailureStreak: 0,
-      message: result.status === "success" ? "最近绘图调用成功" : "绘图账号可继续使用"
+      message: quotaEmpty
+        ? "绘图积分不足"
+        : result.status === "success" ? "最近绘图调用成功" : "绘图账号可继续使用"
     });
     return false;
   });
@@ -2921,7 +2947,7 @@ function targetNeedsRecovery(target) {
       || ["error", "failed", "disconnected"].includes(status)
     );
   }
-  if (status === "quota_empty") {
+  if (status === "quota_empty" || targetDrawingBalanceInsufficient(target)) {
     const resetAt = Date.parse(
       quotaStatus.quotaReason === "image_quota"
         ? quotaStatus.imageQuotaResetAt || quotaStatus.quotaResetAt || ""
