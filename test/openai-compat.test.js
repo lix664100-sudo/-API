@@ -43,3 +43,26 @@ test("OpenAI 流式回复使用 chat.completion.chunk 并以 DONE 结束", () =>
   assert.deepEqual(last.choices[0].delta, {});
   assert.equal(last.choices[0].finish_reason, "stop");
 });
+
+test("OpenAI 流式回复会在 DONE 前返回 TOKEN 用量", () => {
+  const usage = {
+    prompt_tokens: 25195,
+    completion_tokens: 1507,
+    total_tokens: 26702,
+    estimated: true
+  };
+  const body = chatCompletionSseBody({
+    id: "chatcmpl-usage",
+    created: 456,
+    model: "gemini-3.1-pro",
+    choices: [{ message: { content: "测试成功" } }],
+    usage
+  });
+  const events = body.trim().split("\n\n");
+
+  assert.equal(events.at(-1), "data: [DONE]");
+  const usageEvent = JSON.parse(events.at(-2).slice("data: ".length));
+  assert.equal(usageEvent.object, "chat.completion.chunk");
+  assert.deepEqual(usageEvent.choices, []);
+  assert.deepEqual(usageEvent.usage, usage);
+});
