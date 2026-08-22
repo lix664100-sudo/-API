@@ -654,6 +654,8 @@ function finalizeShareAIAccount(account) {
   const drawing = abilities.drawing || {};
   const chatplus = abilities.chatplus || {};
   const subscriptionExpired = [drawing.status, chatplus.status].includes("subscription_expired");
+  const activationRequired = [drawing.status, chatplus.status].includes("activation_required")
+    || account.meta?.registration?.status === "activation_required";
   const disconnected = [drawing.status, chatplus.status].includes("disconnected");
   const ok = [drawing.status, chatplus.status].includes("ok");
   const failed = [drawing.status, chatplus.status].some((status) => ["error", "failed"].includes(status));
@@ -662,7 +664,7 @@ function finalizeShareAIAccount(account) {
     ...account,
     channelId: account.channelId || "shareai",
     name: account.name || account.username || "ShareAI账号",
-    status: subscriptionExpired ? "subscription_expired" : disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : account.status || "unknown",
+    status: subscriptionExpired ? "subscription_expired" : activationRequired ? "activation_required" : disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : account.status || "unknown",
     lastCheckAt: account.lastCheckAt || drawing.lastCheckAt || chatplus.lastCheckAt || null,
     cooldownUntil: chatplus.cooldownUntil || null,
     quota: drawing.quota ?? account.quota ?? null,

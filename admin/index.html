@@ -1017,6 +1017,19 @@
         gap: 0 12px;
       }
 
+      .field-label {
+        margin-bottom: 7px;
+        color: #344054;
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .field-help {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
       .proxy-assign-controls {
         display: grid;
         grid-template-columns: minmax(260px, 1.2fr) minmax(210px, 0.8fr) minmax(260px, 1fr);
@@ -2753,6 +2766,24 @@
         }
       }
 
+      function chatAccountActivationAvailable(channel) {
+        if (!channel) return false;
+        let value = "";
+        if (channel.type === "shareai") {
+          if (!channelAbilityEnabled(channel, "chatplus")) return false;
+          value = channel.settings?.chatBaseUrl || "";
+        } else if (channel.type === "chatplus") {
+          value = channel.settings?.baseUrl || "";
+        } else {
+          return false;
+        }
+        try {
+          return new URL(value).protocol === "https:";
+        } catch {
+          return false;
+        }
+      }
+
       function abilityStatus(account, key) {
         return account?.meta?.abilities?.[key] || {};
       }
@@ -2822,6 +2853,7 @@
           .filter(Boolean);
         if (referenceParts.length) return referenceParts.join("｜");
         if (status.status === "unknown" || !status.status) return `${modelName} 未检测`;
+        if (status.status === "activation_required") return `${modelName} 未激活`;
         if (["error", "failed", "disconnected", "disabled"].includes(status.status)) return `${modelName} 暂不可用`;
         return `${modelName} 可用`;
       }
@@ -2908,6 +2940,15 @@
           processing: ["processing", "处理中"],
           waiting_upstream: ["processing", "等待上游"],
           interrupted: ["warning", "结果待确认"],
+          activation_required: ["warning", "未激活"],
+          activation_failed: ["error", "激活失败"],
+          activation_uncertain: ["warning", "激活待确认"],
+          registration_failed: ["error", "注册失败"],
+          registration_uncertain: ["warning", "注册待确认"],
+          ready: ["success", "已激活"],
+          already_bound: ["success", "已绑定"],
+          duplicate: ["warning", "重复"],
+          valid: ["default", "待处理"],
           disabled: ["default", "已停用"],
           empty: ["warning", "未绑定账号"],
           unknown: ["default", "未检测"]
@@ -3053,6 +3094,44 @@
         } catch {
           return "格式不正确";
         }
+      }
+
+      function maskedActivationCode(value) {
+        const text = String(value || "").trim();
+        if (text.length <= 8) return text ? `${text.slice(0, 2)}••••` : "-";
+        return `${text.slice(0, 4)}••••${text.slice(-4)}`;
+      }
+
+      function parseCloudlianRegistrationText(value) {
+        const lines = String(value || "").split(/\r?\n/);
+        const source = lines
+          .map((line, index) => ({ rowNumber: index + 1, text: line.trim() }))
+          .filter((row) => row.text);
+        if (source.length > 500) return { rows: [], error: "每次最多处理 500 条激活码，请拆分后重试。" };
+        const seen = new Set();
+        const rows = source.map((row, index) => {
+          const fields = row.text.split(/\s+/).filter(Boolean);
+          const activationCode = fields[0] || "";
+          const proxyUrl = fields[1] || "";
+          const errors = [];
+          if (fields.length > 2) errors.push("每行只能填写激活码和一个注册 IP");
+          if (activationCode.length > 512) errors.push("激活码过长");
+          if (proxyUrl.length > 2048) errors.push("注册 IP 内容过长");
+          if (proxyUrl && !validAccountImportProxy(proxyUrl)) errors.push("注册 IP 格式不正确");
+          const duplicateKey = activationCode.toLowerCase();
+          const duplicate = !errors.length && seen.has(duplicateKey);
+          if (!errors.length && !duplicate) seen.add(duplicateKey);
+          return {
+            key: `cloudlian-registration-${index}`,
+            rowId: String(row.rowNumber),
+            rowNumber: row.rowNumber,
+            activationCode,
+            proxyUrl,
+            status: errors.length ? "failed" : duplicate ? "duplicate" : "valid",
+            message: errors.join("；") || (duplicate ? "本次名单中有相同激活码" : "等待注册")
+          };
+        });
+        return { rows, error: "" };
       }
 
       function parseProxyAssignText(value) {
@@ -4146,6 +4225,7 @@
         if (statuses.some((status) => status === "error" || status === "failed")) return "error";
         if (statuses.some((status) => status === "ok")) return "ok";
         if (statuses.some((status) => status === "quota_empty")) return "quota_empty";
+        if (statuses.some((status) => status === "activation_required")) return "activation_required";
         return "unknown";
       }
 
@@ -4179,7 +4259,7 @@
         if (available) return withReferenceUsage({ ...available, status: "ok", quotaConfirmedByUpstream: false });
         const explicitEmpty = statuses.find(confirmedChatQuotaEmpty);
         if (explicitEmpty && statuses.every((item) => confirmedChatQuotaEmpty(item))) return withReferenceUsage(explicitEmpty);
-        const unavailable = statuses.find((item) => ["subscription_expired", "error", "failed", "disconnected", "disabled"].includes(chatDisplayStatus(item)));
+        const unavailable = statuses.find((item) => ["subscription_expired", "activation_required", "error", "failed", "disconnected", "disabled"].includes(chatDisplayStatus(item)));
         return withReferenceUsage(unavailable || statuses[0] || { status: "unknown" });
       }
 
@@ -4197,6 +4277,7 @@
         if (statuses.some((status) => status === "error" || status === "failed")) return "error";
         if (statuses.includes("ok")) return "ok";
         if (statuses.includes("quota_empty")) return "quota_empty";
+        if (statuses.includes("activation_required")) return "activation_required";
         return account.status || "unknown";
       }
 
@@ -4378,8 +4459,13 @@
         const [accountImportError, setAccountImportError] = useState("");
         const [accountImporting, setAccountImporting] = useState(false);
         const [cloudlianRegistrationOpen, setCloudlianRegistrationOpen] = useState(false);
+        const [cloudlianRegistrationText, setCloudlianRegistrationText] = useState("");
+        const [cloudlianRegistrationRows, setCloudlianRegistrationRows] = useState([]);
+        const [cloudlianRegistrationError, setCloudlianRegistrationError] = useState("");
         const [cloudlianRegistering, setCloudlianRegistering] = useState(false);
-        const [cloudlianRetryAccountId, setCloudlianRetryAccountId] = useState("");
+        const [accountActivationOpen, setAccountActivationOpen] = useState(false);
+        const [accountActivating, setAccountActivating] = useState(false);
+        const [accountToActivate, setAccountToActivate] = useState(null);
         const [proxyAssignOpen, setProxyAssignOpen] = useState(false);
         const [proxyAssignText, setProxyAssignText] = useState("");
         const [proxyAssignChannelIds, setProxyAssignChannelIds] = useState([]);
@@ -4397,7 +4483,7 @@
         const [editForm] = Form.useForm();
         const [channelForm] = Form.useForm();
         const [accountForm] = Form.useForm();
-        const [cloudlianRegistrationForm] = Form.useForm();
+        const [accountActivationForm] = Form.useForm();
         const [globalForm] = Form.useForm();
         const editingChannelType = Form.useWatch("type", channelForm);
         const editingChannelAbilities = Form.useWatch(["settings", "enabledAbilities"], channelForm) || {};
@@ -5340,42 +5426,96 @@
         }
 
         function openCloudlianRegistration() {
-          cloudlianRegistrationForm.resetFields();
-          cloudlianRegistrationForm.setFieldsValue({ activationCode: "", proxyUrl: "" });
-          setCloudlianRetryAccountId("");
+          setCloudlianRegistrationText("");
+          setCloudlianRegistrationRows([]);
+          setCloudlianRegistrationError("");
           setCloudlianRegistrationOpen(true);
         }
 
-        async function submitCloudlianRegistration(values) {
+        function previewCloudlianRegistrations(value = cloudlianRegistrationText) {
+          const parsed = parseCloudlianRegistrationText(value);
+          setCloudlianRegistrationRows(parsed.rows);
+          setCloudlianRegistrationError(parsed.error);
+          if (parsed.error) message.error(parsed.error);
+          else if (!parsed.rows.length) message.warning("没有读取到激活码");
+        }
+
+        async function submitCloudlianRegistrations() {
           if (!selectedChannel?.id) return;
+          if (!cloudlianRegistrationRows.length) {
+            previewCloudlianRegistrations();
+            return;
+          }
+          const validRows = cloudlianRegistrationRows.filter((row) => row.status === "valid");
+          if (!validRows.length) {
+            message.warning("没有可以注册的激活码");
+            return;
+          }
           setCloudlianRegistering(true);
           try {
-            const response = await api(`/api/channels/${encodeURIComponent(selectedChannel.id)}/cloudlian/register`, {
+            const response = await api(`/api/channels/${encodeURIComponent(selectedChannel.id)}/cloudlian/register-batch`, {
               method: "POST",
               body: {
-                activationCode: values.activationCode,
-                proxyUrl: values.proxyUrl || "",
-                resumeAccountId: cloudlianRetryAccountId
+                rows: validRows.map((row) => ({
+                  rowId: row.rowId,
+                  activationCode: row.activationCode,
+                  proxyUrl: row.proxyUrl
+                }))
               }
             });
             setConfig(response.config);
             await refreshRuntimeStatus();
             const result = response.result || {};
-            if (["ready", "already_bound"].includes(result.status)) {
-              setCloudlianRegistrationOpen(false);
-              setCloudlianRetryAccountId("");
-              cloudlianRegistrationForm.resetFields();
-              if (result.status === "already_bound") message.info(result.message || "这个激活码已经绑定");
-              else message.success(result.message || "账号已注册并绑定");
-              if (result.warning) message.warning(`账号已绑定，自动检测提示：${result.warning}`);
-              return;
+            const byId = new Map((result.results || []).map((row) => [String(row.rowId), row]));
+            setCloudlianRegistrationRows((current) => current.map((row) => {
+              const completed = byId.get(String(row.rowId));
+              return completed ? { ...row, ...completed } : row;
+            }));
+            const summary = result.summary || {};
+            if (summary.failed || summary.pending) {
+              message.warning(`处理完成：成功 ${summary.success || 0} 条，未激活或待确认 ${summary.pending || 0} 条，失败 ${summary.failed || 0} 条`);
+            } else {
+              message.success(`已完成 ${summary.success || validRows.length} 条注册`);
             }
-            if (result.accountId) setCloudlianRetryAccountId(result.accountId);
-            message.warning(result.message || "账号已保留，请检查后重试");
           } catch (error) {
             message.error(error.message);
           } finally {
             setCloudlianRegistering(false);
+          }
+        }
+
+        function openAccountActivation(account) {
+          setAccountToActivate(account);
+          accountActivationForm.resetFields();
+          accountActivationForm.setFieldsValue({ activationCode: "" });
+          setAccountActivationOpen(true);
+        }
+
+        async function submitAccountActivation(values) {
+          if (!accountToActivate?.id) return;
+          setAccountActivating(true);
+          try {
+            const response = await api(`/api/accounts/${encodeURIComponent(accountToActivate.id)}/activate`, {
+              method: "POST",
+              body: { activationCode: values.activationCode }
+            });
+            setConfig(response.config);
+            await refreshRuntimeStatus();
+            const result = response.result || {};
+            if (["ready", "already_bound"].includes(result.status)) {
+              setAccountActivationOpen(false);
+              setAccountToActivate(null);
+              accountActivationForm.resetFields();
+              if (result.status === "already_bound") message.info(result.message || "这个激活码已经用于当前账号");
+              else message.success(result.message || "账号激活成功");
+              if (result.warning) message.warning(`激活成功，账号检测提示：${result.warning}`);
+              return;
+            }
+            message.warning(result.message || "激活没有完成，请检查后重试");
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setAccountActivating(false);
           }
         }
 
@@ -6243,6 +6383,33 @@
           }
         ];
 
+        const cloudlianRegistrationColumns = [
+          { title: "行", dataIndex: "rowNumber", width: 54 },
+          {
+            title: "激活码",
+            dataIndex: "activationCode",
+            width: 150,
+            render: (value) => h("span", { className: "mono" }, maskedActivationCode(value))
+          },
+          {
+            title: "注册 IP",
+            dataIndex: "proxyUrl",
+            width: 170,
+            render: (value) => accountImportProxyLabel(value)
+          },
+          {
+            title: "状态",
+            dataIndex: "status",
+            width: 100,
+            render: (value) => statusTag(value)
+          },
+          {
+            title: "结果",
+            dataIndex: "message",
+            render: (value, row) => h("span", null, row.warning ? `${value || "已完成"}；检测提示：${row.warning}` : value || "-")
+          }
+        ];
+
         const accountColumns = [
           { title: "账号名称", dataIndex: "name", width: 130 },
           { title: "登录账号", dataIndex: "username", ellipsis: true },
@@ -6396,11 +6563,20 @@
           },
           {
             title: "操作",
-            width: 310,
+            width: 410,
             render: (_, row) => {
               const cooling = drawingAccountIsCooling(row);
+              const rowChannel = channels.find((item) => item.id === row.channelId);
               return h(Space, { size: 6 }, [
                 h(Button, { size: "small", onClick: () => testAccount(row.id), loading: checkingAll || checkingAccountIds.includes(row.id), icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null }, "检测"),
+                chatAccountActivationAvailable(rowChannel)
+                  ? h(Button, {
+                      key: "activate",
+                      size: "small",
+                      onClick: () => openAccountActivation(row),
+                      icon: Icon.KeyOutlined ? h(Icon.KeyOutlined) : null
+                    }, "激活/续期")
+                  : null,
                 cooling ? h(Popconfirm, {
                   key: "clear-cooldown",
                   title: "确认解除绘图冷却？",
@@ -6978,7 +7154,7 @@
                         h("h3", null, "渠道账号"),
                         h(Space, { size: 8, wrap: true }, [
                           cloudlianRegistrationAvailable(selectedChannel)
-                            ? h(Button, { icon: Icon.UserAddOutlined ? h(Icon.UserAddOutlined) : null, onClick: openCloudlianRegistration }, "激活码注册")
+                            ? h(Button, { icon: Icon.UserAddOutlined ? h(Icon.UserAddOutlined) : null, onClick: openCloudlianRegistration }, "批量自动注册")
                             : null,
                           h(Button, { icon: Icon.UploadOutlined ? h(Icon.UploadOutlined) : null, onClick: openAccountImport, disabled: !channels.length }, "批量导入"),
                           h(Button, { icon: Icon.ApartmentOutlined ? h(Icon.ApartmentOutlined) : null, onClick: openProxyAssign, disabled: !accounts.length }, "批量分配代理"),
@@ -6990,7 +7166,7 @@
                         columns: accountColumns,
                         dataSource: selectedAccounts,
                         pagination: selectedAccounts.length > 5 ? { pageSize: 5 } : false,
-                        scroll: { x: 1810 },
+                        scroll: { x: 1910 },
                         size: "small",
                         locale: { emptyText: "这个渠道还没有绑定账号" }
                       })
@@ -7521,26 +7697,85 @@
               : null
           ])),
           h(Modal, {
-            title: "激活码注册",
+            title: "批量自动注册",
             open: cloudlianRegistrationOpen,
             onCancel: () => {
               if (!cloudlianRegistering) setCloudlianRegistrationOpen(false);
             },
-            onOk: () => cloudlianRegistrationForm.submit(),
-            okText: cloudlianRetryAccountId ? "继续完成" : "开始注册",
-            cancelText: "取消",
+            onOk: submitCloudlianRegistrations,
+            okText: cloudlianRegistrationRows.length ? "开始注册" : "读取名单",
+            cancelText: "关闭",
             confirmLoading: cloudlianRegistering,
             maskClosable: !cloudlianRegistering,
+            okButtonProps: {
+              disabled: cloudlianRegistrationRows.length > 0
+                && !cloudlianRegistrationRows.some((row) => row.status === "valid")
+            },
+            width: 900,
+            destroyOnClose: true
+          }, h("div", null, [
+            h(Alert, {
+              type: "info",
+              showIcon: true,
+              message: `自动注册到“${selectedChannel?.name || ""}”`,
+              description: "每行填写一个激活码，后面可以跟一个注册 IP。系统会随机生成账号，密码固定为 123456；激活码无效时也会保留账号并标记为未激活。",
+              style: { marginBottom: 16 }
+            }),
+            h("div", { className: "field-label", key: "label" }, "激活码和注册 IP"),
+            h(Input.TextArea, {
+              key: "input",
+              value: cloudlianRegistrationText,
+              onChange: (event) => {
+                setCloudlianRegistrationText(event.target.value);
+                setCloudlianRegistrationRows([]);
+                setCloudlianRegistrationError("");
+              },
+              disabled: cloudlianRegistering,
+              rows: 8,
+              autoComplete: "off",
+              placeholder: "激活码1 IP1\n激活码2 IP2\n激活码3"
+            }),
+            h("div", { className: "field-help", key: "help", style: { marginTop: 6, marginBottom: 14 } }, "IP 留空时使用服务器网络。支持 IP:端口，或 IP|端口|账号|密码|到期日期。每次最多 500 条。"),
+            cloudlianRegistrationError
+              ? h(Alert, { key: "error", type: "error", showIcon: true, message: cloudlianRegistrationError, style: { marginBottom: 14 } })
+              : null,
+            cloudlianRegistrationRows.length
+              ? h(Table, {
+                  key: "preview",
+                  rowKey: "key",
+                  columns: cloudlianRegistrationColumns,
+                  dataSource: cloudlianRegistrationRows,
+                  pagination: false,
+                  size: "small",
+                  scroll: { x: 720, y: 320 },
+                  locale: { emptyText: "没有读取到激活码" }
+                })
+              : null
+          ])),
+          h(Modal, {
+            title: "账号激活/续期",
+            open: accountActivationOpen,
+            onCancel: () => {
+              if (!accountActivating) {
+                setAccountActivationOpen(false);
+                setAccountToActivate(null);
+              }
+            },
+            onOk: () => accountActivationForm.submit(),
+            okText: "确认激活",
+            cancelText: "取消",
+            confirmLoading: accountActivating,
+            maskClosable: !accountActivating,
             width: 560,
             destroyOnClose: true
-          }, h(Form, { form: cloudlianRegistrationForm, layout: "vertical", onFinish: submitCloudlianRegistration }, [
+          }, h(Form, { form: accountActivationForm, layout: "vertical", onFinish: submitAccountActivation }, [
             h(Alert, {
-              type: cloudlianRetryAccountId ? "warning" : "info",
+              type: "info",
               showIcon: true,
-              message: cloudlianRetryAccountId ? "继续完成已保留的账号" : `自动注册到“${selectedChannel?.name || ""}”`,
-              description: cloudlianRetryAccountId
-                ? "上次流程没有全部完成。修正激活码或注册 IP 后，系统会继续处理同一个账号。"
-                : "系统会随机生成登录账号，密码固定为 123456；激活成功后自动绑定并检测。",
+              message: `为“${accountToActivate?.name || accountToActivate?.username || "当前账号"}”激活或续期`,
+              description: channelAbilityEnabled(channelForAccount(accountToActivate), "drawing")
+                ? "系统会登录聊天站兑换激活码，然后同时检测聊天站和绘图站。使用账号当前保存的 IP；没有 IP 时使用服务器网络。"
+                : "系统会登录聊天站兑换激活码并重新检测账号。使用账号当前保存的 IP；没有 IP 时使用服务器网络。",
               style: { marginBottom: 16 }
             }),
             h(Form.Item, {
@@ -7550,13 +7785,7 @@
                 { required: true, whitespace: true, message: "请输入激活码" },
                 { max: 512, message: "激活码过长，请检查后重试" }
               ]
-            }, h(Input, { allowClear: true, autoComplete: "off", placeholder: "请输入激活码" })),
-            h(Form.Item, {
-              label: "注册 IP（可选）",
-              name: "proxyUrl",
-              extra: "留空将使用线上服务器网络。支持 IP:端口，或 IP|端口|账号|密码|到期日期。",
-              rules: [{ max: 2048, message: "注册 IP 内容过长，请检查后重试" }]
-            }, h(Input, { allowClear: true, autoComplete: "off", placeholder: "不填则使用线上服务器网络" }))
+            }, h(Input, { allowClear: true, autoComplete: "off", placeholder: "请输入新的激活码" }))
           ])),
           h(Modal, {
             title: editingAccount ? "编辑账号" : "新增账号",

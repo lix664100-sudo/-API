@@ -2547,7 +2547,7 @@ function targetAbilityCooling(target) {
 function targetKnownUnavailable(target) {
   const status = String(targetQuotaStatus(target).status || "unknown").toLowerCase();
   return targetSubscriptionExpired(target)
-    || ["error", "failed", "disconnected", "disabled"].includes(status);
+    || ["activation_required", "error", "failed", "disconnected", "disabled"].includes(status);
 }
 
 function targetQuotaEmpty(target) {
@@ -4545,6 +4545,18 @@ export async function checkAccount(accountId, options = {}) {
       expireAt: account.expireAt || "",
       message: "账号已停用，已跳过检测，不会登录该账号。",
       disabled: true,
+      checkSkipped: true
+    };
+  }
+  if (String(account.status || "").toLowerCase() === "activation_required") {
+    return {
+      status: "activation_required",
+      quota: account.quota ?? null,
+      balance: account.balance ?? null,
+      quotaResetAt: account.quotaResetAt || "",
+      expireAt: account.expireAt || "",
+      message: account.message || "账号尚未激活，请先填写激活码。",
+      activationRequired: true,
       checkSkipped: true
     };
   }

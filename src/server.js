@@ -28,7 +28,11 @@ import {
   refreshTask
 } from "./channel-manager.js";
 import { DrawingClient } from "./channels/drawing.js";
-import { registerCloudlianAccount } from "./cloudlian-registration.js";
+import {
+  activateChatAccount,
+  registerCloudlianAccount,
+  registerCloudlianAccounts
+} from "./cloudlian-registration.js";
 import {
   cleanupResultImages,
   getResultImageStorageStats,
@@ -978,30 +982,86 @@ app.post("/api/accounts", async (request) => {
   return { ok: true, data: publicConfig(config) };
 });
 
+async function verifyBoundAccount(result) {
+  if (!["ready", "already_bound"].includes(result?.status) || !result.accountId) return result;
+  let verified = false;
+  let warning = "";
+  try {
+    const checked = await checkAccount(result.accountId);
+    verified = checked?.status === "ok";
+    if (!verified && checked?.message) warning = checked.message;
+  } catch (error) {
+    warning = error?.message || "账号已绑定，但自动检测暂时失败。";
+  }
+  return { ...result, verified, warning };
+}
+
+async function verifyBoundAccounts(results, concurrency = 3) {
+  const verified = new Array(results.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < results.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      verified[index] = await verifyBoundAccount(results[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, results.length) }, () => worker()));
+  return verified;
+}
+
 app.post("/api/channels/:id/cloudlian/register", async (request, reply) => {
   try {
-    const result = await registerCloudlianAccount({
+    const registered = await registerCloudlianAccount({
       channelId: request.params.id,
       activationCode: request.body?.activationCode,
       proxyUrl: request.body?.proxyUrl,
       resumeAccountId: request.body?.resumeAccountId
     });
-    let verified = false;
-    let warning = "";
-    if (["ready", "already_bound"].includes(result.status)) {
-      try {
-        const checked = await checkAccount(result.accountId);
-        verified = checked?.status === "ok";
-        if (!verified && checked?.message) warning = checked.message;
-      } catch (error) {
-        warning = error?.message || "账号已绑定，但自动检测暂时失败。";
-      }
-    }
+    const result = await verifyBoundAccount(registered);
     return {
       ok: true,
       data: {
         config: publicConfig(await loadConfig()),
-        result: { ...result, verified, warning }
+        result
+      }
+    };
+  } catch (error) {
+    return sendError(reply, error);
+  }
+});
+
+app.post("/api/channels/:id/cloudlian/register-batch", async (request, reply) => {
+  try {
+    const batch = await registerCloudlianAccounts({
+      channelId: request.params.id,
+      rows: request.body?.rows
+    });
+    const results = await verifyBoundAccounts(batch.results);
+    return {
+      ok: true,
+      data: {
+        config: publicConfig(await loadConfig()),
+        result: { ...batch, results }
+      }
+    };
+  } catch (error) {
+    return sendError(reply, error);
+  }
+});
+
+app.post("/api/accounts/:id/activate", async (request, reply) => {
+  try {
+    const activated = await activateChatAccount({
+      accountId: request.params.id,
+      activationCode: request.body?.activationCode
+    });
+    const result = await verifyBoundAccount(activated);
+    return {
+      ok: true,
+      data: {
+        config: publicConfig(await loadConfig()),
+        result
       }
     };
   } catch (error) {

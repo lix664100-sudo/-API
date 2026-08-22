@@ -65,6 +65,47 @@ test("停用账号单独检测不会登录", async () => {
   }
 });
 
+test("未激活账号检测时保持未激活且不会登录", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-activation-required",
+      channelId: "shareai",
+      name: "未激活账号",
+      username: "activation-required@example.com",
+      password: "test",
+      enabled: true,
+      status: "activation_required",
+      message: "账号已注册但尚未激活。",
+      meta: {
+        abilities: {
+          drawing: { status: "activation_required", message: "未激活" },
+          chatplus: { status: "activation_required", message: "未激活" }
+        }
+      }
+    }]
+  });
+
+  const originalChatCheck = ChatplusClient.prototype.check;
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => { checkCount += 1; };
+  DrawingClient.prototype.check = async () => { checkCount += 1; };
+
+  try {
+    const result = await checkAccount("account-activation-required");
+    assert.equal(checkCount, 0);
+    assert.equal(result.status, "activation_required");
+    assert.equal(result.activationRequired, true);
+    assert.equal(result.checkSkipped, true);
+  } finally {
+    ChatplusClient.prototype.check = originalChatCheck;
+    DrawingClient.prototype.check = originalDrawingCheck;
+  }
+});
+
 test("停用账号不会被后台自动恢复登录", async () => {
   const config = await loadConfig();
   await saveConfig({
