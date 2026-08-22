@@ -1634,14 +1634,7 @@ function shouldKeepStoredTask(current, incoming) {
 
 function taskIdentityIndex(tasks, task) {
   const id = String(task?.id || "").trim();
-  if (id) {
-    const idIndex = tasks.findIndex((item) => String(item.id) === id);
-    if (idIndex >= 0) return idIndex;
-  }
-  const sourceTaskId = taskSourceTaskId(task);
-  return sourceTaskId
-    ? tasks.findIndex((item) => taskSourceTaskId(item) === sourceTaskId)
-    : -1;
+  return id ? tasks.findIndex((item) => String(item.id) === id) : -1;
 }
 
 export async function upsertTask(task) {

@@ -231,7 +231,7 @@ test("Gemini reasoning effort 写错时改用最快模型", () => {
   assert.equal(route.geminiParameterFallback, true);
 });
 
-test("Gemini 额度用完换车时保持原模型和强度", async () => {
+test("Gemini 账户额度用完后不再换车", async () => {
   const testClient = client();
   const selectedCars = [];
   const selectedRoutes = [];
@@ -247,41 +247,28 @@ test("Gemini 额度用完换车时保持原模型和强度", async () => {
   testClient.sendGeminiConversation = async (_prompt, _input, route, selected) => {
     selectedCars.push(selected.carId);
     selectedRoutes.push([route.model, route.thinkingLevel]);
-    if (selectedCars.length === 1) {
-      const error = new Error("当前 Gemini 账号的使用次数已用完。");
-      error.imageQuotaExhausted = true;
-      error.quotaConfirmedByUpstream = true;
-      error.quotaReason = "chat_usage_limit";
-      throw error;
-    }
-    return {
-      events: [],
-      conversationId: "conversation-after-switch",
-      model: route.model,
-      upstreamModel: route.model,
-      route,
-      selected,
-      directContent: "换车成功",
-      imageUrls: []
-    };
+    const error = new Error("当前 Gemini 账号的使用次数已用完。");
+    error.imageQuotaExhausted = true;
+    error.quotaConfirmedByUpstream = true;
+    error.quotaReason = "chat_usage_limit";
+    throw error;
   };
 
-  const result = await testClient.withImageQuotaFallback(
-    "额度换车测试",
-    {
-      model: "gemini-3.1-pro",
-      thinking_level: "extended",
-      files: []
-    },
-    async (conversation) => conversation
+  await assert.rejects(
+    testClient.withImageQuotaFallback(
+      "额度停用测试",
+      {
+        model: "gemini-3.1-pro",
+        thinking_level: "extended",
+        files: []
+      },
+      async (conversation) => conversation
+    ),
+    /使用次数已用完/
   );
 
-  assert.deepEqual(selectedCars, ["quota-car-1", "quota-car-2"]);
-  assert.deepEqual(selectedRoutes, [
-    ["gemini-3.1-pro", "extended"],
-    ["gemini-3.1-pro", "extended"]
-  ]);
-  assert.equal(result.directContent, "换车成功");
+  assert.deepEqual(selectedCars, ["quota-car-1"]);
+  assert.deepEqual(selectedRoutes, [["gemini-3.1-pro", "extended"]]);
 });
 
 test("Gemini 所有车都用完时保留聊天次数错误而不是误报图片额度", async () => {
@@ -321,7 +308,7 @@ test("Gemini 所有车都用完时保留聊天次数错误而不是误报图片�
     (error) => error.code === "CHAT_USAGE_LIMIT" && error.quotaReason === "chat_usage_limit"
   );
 
-  assert.equal(attempts, 5);
+  assert.equal(attempts, 1);
 });
 
 test("GPT 图生图模型不会因为渠道默认值而转到 Gemini", async () => {
@@ -1116,6 +1103,7 @@ test("Gemini 上游连续返回 500 时当前任务最多提交两次", async ()
 
 test("Gemini 明确触发内容安全限制时不会重复换车", async () => {
   const testClient = client();
+  const message = "We're so sorry, but the prompt may violate our content policies. If you think we got it wrong, please retry or edit your prompt.";
   let attempts = 0;
   testClient.prepareChatSession = async (input, ignoredCarIds) => {
     attempts += 1;
@@ -1134,7 +1122,7 @@ test("Gemini 明确触发内容安全限制时不会重复换车", async () => {
     upstreamModel: "gemini",
     route,
     selected,
-    directContent: "This request may violate our content policy for image generation.",
+    directContent: message,
     imageUrls: []
   });
 
@@ -1145,7 +1133,10 @@ test("Gemini 明确触发内容安全限制时不会重复换车", async () => {
       files: [fakeImageFile()],
       onSubmitted: async () => {}
     }),
-    (error) => error.code === "content_policy" && error.upstreamExplicitFailure === true
+    (error) => error.code === "content_policy"
+      && error.upstreamExplicitFailure === true
+      && error.message === message
+      && error.upstreamText === message
   );
 
   assert.equal(attempts, 1);
@@ -1306,14 +1297,16 @@ test("Gemini 返回 BardErrorInfo 且没有对话编号时明确标记车位失�
   assert.equal(state.confirmed, undefined);
 });
 
-test("Gemini 上游明确返回用量上限时标记为额度不足", async () => {
+test("Gemini 上游明确返回用量上限时记录账户额度和恢复时间", async () => {
   const testClient = client();
   testClient.geminiSession.bl = "boq_assistant-bard-web-server_test";
   testClient.uploadGeminiImages = async () => [];
   testClient.http = async () => ({
     status: 200,
     headers: {},
-    body: geminiResponse({ error: "usage count has reached the limit" })
+    body: geminiResponse({
+      error: "Your account's current usage count has reached the limit: used 71, reserved 0, total occupied 71/70, this request needs 1, remaining 0, please try again after 2026-08-23 10:49:52 or purchase a higher usage plan."
+    })
   });
 
   await assert.rejects(
@@ -1323,7 +1316,15 @@ test("Gemini 上游明确返回用量上限时标记为额度不足", async () =
       { key: "gemini", strategy: "thinking", model: "" },
       { carId: "car-test", carType: "gemini" }
     ),
-    (error) => error.imageQuotaExhausted === true && error.quotaReason === "chat_usage_limit"
+    (error) => {
+      assert.equal(error.imageQuotaExhausted, true);
+      assert.equal(error.quotaReason, "chat_usage_limit");
+      assert.equal(error.quota, 70);
+      assert.equal(error.used, 71);
+      assert.equal(error.balance, 0);
+      assert.equal(error.quotaResetAt, "2026-08-23T10:49:52+08:00");
+      return true;
+    }
   );
 });
 test("Gemini 传图会改走镜像站自己的上传链路", async () => {

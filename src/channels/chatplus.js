@@ -309,6 +309,13 @@ function isExplicitAuthSessionError(error) {
   return /\b401\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|聊天记录.{0,12}(?:删除|已删除)|换车继续聊|unauthorized|session expired/i.test(text);
 }
 
+function tagCarPoolUnavailable(error) {
+  error.code ||= "CHAT_CAR_POOL_UNAVAILABLE";
+  error.carPoolUnavailable = true;
+  error.authScope = "car";
+  return error;
+}
+
 function isRetryableImageSubmissionRejection(error) {
   if (error?.imageSubmissionAttempted !== true || error?.upstreamExplicitFailure !== true) return false;
   const status = Number(error?.status || error?.statusCode || 0);
@@ -1125,6 +1132,26 @@ function isImagePromptEnvelope(content) {
   }
 }
 
+function isSearchToolAction(content) {
+  let text = String(content || "").trim();
+  if (!text) return false;
+  if (text.startsWith("\"") && text.endsWith("\"")) {
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed === "string") text = parsed.trim();
+    } catch {
+      // Keep the original text when the upstream only returned part of a JSON string.
+    }
+  }
+  return /^(?:search|search_query|web(?:\.search|\.run)?)\s*\(/i.test(text);
+}
+
+export function isChatImageIntermediateResponse(content) {
+  return isImagePromptEnvelope(content)
+    || isSkippedMainlineContent(content)
+    || isSearchToolAction(content);
+}
+
 function isImageGenerationParametersEnvelope(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
   return Object.prototype.hasOwnProperty.call(payload, "prompt")
@@ -1237,10 +1264,10 @@ function chatUsageFromPayload(payload = {}, modelKey = "gpt") {
 function chatUsageLimitFromText(value) {
   const text = String(value || "").trim();
   if (!/使用次数已达上限|usage count has reached the limit/i.test(text)) return null;
-  const occupiedMatch = text.match(/合计占用\s*(\d+)\s*\/\s*(\d+)/);
-  const usedMatch = text.match(/已使用\s*(\d+)/);
-  const remainingMatch = text.match(/剩余\s*(\d+)/);
-  const resetMatch = text.match(/请\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*后重试/);
+  const occupiedMatch = text.match(/(?:合计占用|total occupied)\s*:?\s*(\d+)\s*\/\s*(\d+)/i);
+  const usedMatch = text.match(/(?:已使用|\bused)\s*:?\s*(\d+)/i);
+  const remainingMatch = text.match(/(?:剩余|\bremaining)\s*:?\s*(\d+)/i);
+  const resetMatch = text.match(/(?:请\s*|try again after\s*)(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})(?:\s*后重试)?/i);
   const quota = numberOrNull(occupiedMatch?.[2]);
   const used = numberOrNull(usedMatch?.[1] ?? occupiedMatch?.[1]);
   const balance = numberOrNull(remainingMatch?.[1]) ?? (quota === null || used === null ? 0 : Math.max(0, quota - used));
@@ -1301,6 +1328,11 @@ function conversationSubmitError(response) {
     error.upstreamStatus = "failed";
   }
   return error;
+}
+
+function isConfirmedChatUsageLimitError(error) {
+  return error?.quotaConfirmedByUpstream === true
+    && (error?.quotaReason === "chat_usage_limit" || error?.code === "CHAT_USAGE_LIMIT");
 }
 
 function conversationNotCreatedError(selected, detail = "", upstreamText = "") {
@@ -1398,6 +1430,97 @@ function extractAssistantText(events) {
   if (patchText) candidates.push(patchText);
   candidates.push(...collectAssistantText(events).filter(Boolean));
   return candidates.sort((a, b) => b.length - a.length)[0] || "";
+}
+
+function finalAssistantMessageText(message = {}) {
+  if (message?.author?.role !== "assistant") return "";
+  const contentType = String(message?.content?.content_type || "").toLowerCase();
+  if (["thoughts", "reasoning_recap", "tether_browsing_display"].includes(contentType)) return "";
+  if (message?.metadata?.is_visually_hidden_from_conversation === true) return "";
+  const status = String(message.status || "").toLowerCase();
+  const finished = message.end_turn === true
+    || (
+      message.end_turn !== false
+      && ["finished", "finished_successfully", "complete", "completed"].includes(status)
+    );
+  return finished ? textFromAssistantContent(message.content) : "";
+}
+
+function collectFinalAssistantText(value, output = []) {
+  if (!value) return output;
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectFinalAssistantText(item, output));
+    return output;
+  }
+  if (typeof value !== "object") return output;
+
+  const direct = finalAssistantMessageText(value);
+  if (direct) output.push(direct);
+  const nested = finalAssistantMessageText(value.message);
+  if (nested) output.push(nested);
+  Object.values(value).forEach((item) => collectFinalAssistantText(item, output));
+  return output;
+}
+
+function currentConversationBranchMessages(value) {
+  const mapping = value?.mapping;
+  let nodeId = String(value?.current_node || "").trim();
+  if (!nodeId || !mapping || typeof mapping !== "object") return [];
+  const messages = [];
+  const visited = new Set();
+  while (nodeId && !visited.has(nodeId)) {
+    visited.add(nodeId);
+    const node = mapping[nodeId];
+    if (!node || typeof node !== "object") break;
+    const message = node.message;
+    const hidden = node.metadata?.is_visually_hidden_from_conversation === true
+      || message?.metadata?.is_visually_hidden_from_conversation === true;
+    if (message && !hidden) messages.push(message);
+    nodeId = String(node.parent || "").trim();
+  }
+  return messages;
+}
+
+function scanForVisibleGeneratedImageRefs(value, baseUrl) {
+  const branchMessages = currentConversationBranchMessages(value);
+  if (!branchMessages.length) return scanForGeneratedImageRefs(value, baseUrl);
+  const output = { urls: new Set(), fileIds: new Set() };
+  for (const message of branchMessages) {
+    const role = messageRole(message);
+    if (role === "assistant" || role === "tool") {
+      scanForImageRefs(message.content || message.parts || message, baseUrl, output);
+    }
+  }
+  return output;
+}
+
+function assistantMessageInProgress(message = {}) {
+  if (message?.author?.role !== "assistant") return false;
+  const status = String(message.status || "").toLowerCase();
+  return message.end_turn === false
+    || ["in_progress", "processing", "pending", "running"].includes(status);
+}
+
+function hasInProgressAssistantMessage(value, seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((item) => hasInProgressAssistantMessage(item, seen));
+  if (assistantMessageInProgress(value) || assistantMessageInProgress(value.message)) return true;
+  return Object.values(value).some((item) => hasInProgressAssistantMessage(item, seen));
+}
+
+function imageAssistantResponseState(value) {
+  const currentNode = String(value?.current_node || "").trim();
+  const currentText = currentNode
+    ? finalAssistantMessageText(value?.mapping?.[currentNode]?.message)
+    : "";
+  const finalText = currentText
+    || collectFinalAssistantText(value).filter(Boolean).sort((a, b) => b.length - a.length)[0]
+    || "";
+  return {
+    content: finalText || extractAssistantText(value),
+    inProgress: !finalText && hasInProgressAssistantMessage(value)
+  };
 }
 
 function explicitConversationState(value, seen = new Set()) {
@@ -2419,8 +2542,9 @@ export class ChatplusClient {
   }
 
   async invalidatePreparedChatSession(session = {}) {
-    const revision = Number.isInteger(session.revision)
-      ? session.revision
+    const preparedSession = session || {};
+    const revision = Number.isInteger(preparedSession.revision)
+      ? preparedSession.revision
       : this.sessionRevision;
     let invalidated = false;
     await this.sessionLock(async () => {
@@ -2477,31 +2601,33 @@ export class ChatplusClient {
     return usages[route.key] || usages.gpt;
   }
 
-  async enterCar(carId, carType, options = {}) {
-    await this.sessionLock(async () => {
-      if (!this.portalLoggedIn) await this.performPortalLogin(options);
-      const session = await this.json(`/auth/loginSession?carid=${encodeURIComponent(carId)}&carType=${encodeURIComponent(carType)}`, {
-        timeoutSec: options.timeoutSec
-      });
-      if (session?.code !== 1) throw new Error(session?.msg || "进入聊天车队失败。");
-      const page = await this.http(carType === "gemini" ? "/app" : "/", {
-        followRedirect: true,
-        timeoutSec: options.timeoutSec,
-        headers: {
-          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "upgrade-insecure-requests": "1"
-        }
-      });
-      if (page.status >= 400) {
-        const error = new Error(`进入聊天页面失败：${page.status}`);
-        error.status = page.status;
-        error.body = page.body;
-        throw error;
-      }
-      if (carType === "gemini") {
-        this.geminiSession = geminiSessionFromPage(page.body, this.geminiSession);
+  async performEnterCar(carId, carType, options = {}) {
+    if (!this.portalLoggedIn) await this.performPortalLogin(options);
+    const session = await this.json(`/auth/loginSession?carid=${encodeURIComponent(carId)}&carType=${encodeURIComponent(carType)}`, {
+      timeoutSec: options.timeoutSec
+    });
+    if (session?.code !== 1) throw new Error(session?.msg || "进入聊天车队失败。");
+    const page = await this.http(carType === "gemini" ? "/app" : "/", {
+      followRedirect: true,
+      timeoutSec: options.timeoutSec,
+      headers: {
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "upgrade-insecure-requests": "1"
       }
     });
+    if (page.status >= 400) {
+      const error = new Error(`进入聊天页面失败：${page.status}`);
+      error.status = page.status;
+      error.body = page.body;
+      throw error;
+    }
+    if (carType === "gemini") {
+      this.geminiSession = geminiSessionFromPage(page.body, this.geminiSession);
+    }
+  }
+
+  async enterCar(carId, carType, options = {}) {
+    await this.sessionLock(() => this.performEnterCar(carId, carType, options));
   }
 
   async login(options = {}) {
@@ -2702,6 +2828,8 @@ export class ChatplusClient {
       error.code = "CHAT_SUBSCRIPTION_EXPIRED";
       error.status = 403;
       error.subscriptionExpired = true;
+    } else if (errors.length) {
+      tagCarPoolUnavailable(error);
     }
     throw error;
   }
@@ -2717,6 +2845,36 @@ export class ChatplusClient {
       const usage = referenceUsage[usageRoute.key] || referenceUsage.gpt;
       if (usageRoute.key === "gpt" && chatUsageExpired(usage)) {
         throw chatSubscriptionExpiredError(usage.expireAt);
+      }
+      const hasKnownBalance = usage?.balance !== null
+        && usage?.balance !== undefined
+        && String(usage.balance).trim() !== ""
+        && Number.isFinite(Number(usage.balance));
+      if (hasKnownBalance && Number(usage.balance) <= 0) {
+        const resetAt = usage.quotaResetAt || "";
+        const resetTime = Date.parse(resetAt);
+        return {
+          status: "quota_empty",
+          quota: usage.quota,
+          balance: 0,
+          used: usage.used,
+          quotaResetAt: resetAt,
+          imageQuotaResetAt: "",
+          expireAt: usage.expireAt,
+          cooldownUntil: Number.isFinite(resetTime) && resetTime > Date.now() ? resetAt : null,
+          quotaReason: "chat_usage_limit",
+          quotaModel: usageRoute.key,
+          quotaConfirmedByUpstream: true,
+          period: usage.period || "",
+          message: resetAt
+            ? `${usageRoute.name} 额度已用完，将在额度刷新后自动恢复。`
+            : `${usageRoute.name} 额度已用完，系统稍后会自动复查。`,
+          meta: {
+            chatModel: usageRoute.key,
+            recoveryUsage: usage,
+            referenceUsage
+          }
+        };
       }
       const { init, route, selected } = await runAccountCheckStep(
         `进入 ${usageRoute.name} 页面`,
@@ -2861,7 +3019,7 @@ export class ChatplusClient {
   async imageUrlsFrom(value, options = {}) {
     if (options.gemini) return extractGeminiImageUrls(value, this.baseUrl);
     const refs = options.generatedOnly
-      ? scanForGeneratedImageRefs(value, this.baseUrl)
+      ? scanForVisibleGeneratedImageRefs(value, this.baseUrl)
       : scanForImageRefs(value, this.baseUrl);
     const urls = [...refs.urls];
     for (const fileId of refs.fileIds) urls.push(await this.imageDownloadUrl(fileId));
@@ -3072,6 +3230,17 @@ export class ChatplusClient {
     const imageUrls = extractGeminiImageUrls(events, this.baseUrl);
     const upstreamError = extractGeminiErrorText(events);
     const conversationId = extractGeminiConversationId(events);
+    const usageLimitText = [upstreamError, directContent, response.body]
+      .find((value) => isChatUsageLimitMessage(value));
+    if (usageLimitText) {
+      const usage = chatUsageLimitFromText(response.body) || chatUsageLimitFromText(usageLimitText) || {};
+      const error = chatUsageLimitError(
+        `当前 Gemini 账号的使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`,
+        usage
+      );
+      error.imageQuotaExhausted = true;
+      throw error;
+    }
     if (!conversationId) {
       throw conversationNotCreatedError(
         selected,
@@ -3081,19 +3250,9 @@ export class ChatplusClient {
     }
     if (input.imageSubmissionState) input.imageSubmissionState.confirmed = true;
     throwIfImageGenerationLimit(response.body);
-    if (isChatUsageLimitMessage(response.body)) {
-      const error = chatUsageLimitError("当前 Gemini 账号的使用次数已用完。");
-      error.imageQuotaExhausted = true;
-      throw error;
-    }
     throwIfImageGenerationLimit(directContent);
     if (isImageGenerationLimitMessage(upstreamError)) {
       throw imageQuotaError("当前 Gemini 账号的图片生成额度已用完。");
-    }
-    if (isChatUsageLimitMessage(upstreamError)) {
-      const error = chatUsageLimitError("当前 Gemini 账号的使用次数已用完。");
-      error.imageQuotaExhausted = true;
-      throw error;
     }
     if (!directContent && !imageUrls.length && upstreamError) {
       const error = new Error(upstreamError);
@@ -3318,7 +3477,11 @@ export class ChatplusClient {
       throw imageQuotaError("当前 Grok 账号的图片生成额度已用完。");
     }
     if (isChatUsageLimitMessage(response.body)) {
-      throw chatUsageLimitError("当前 Grok 账号的使用次数已用完。");
+      const usage = chatUsageLimitFromText(response.body) || {};
+      throw chatUsageLimitError(
+        `当前 Grok 账号的使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`,
+        usage
+      );
     }
     if ([301, 302, 303, 307, 308, 401, 403].includes(response.status)) {
       const error = new Error("Grok 上游拦截了后台直连请求，需要真实浏览器会话才能提交；当前 API 请先使用 GPT 通道。");
@@ -3353,7 +3516,11 @@ export class ChatplusClient {
       throw imageQuotaError("当前 Grok 账号的图片生成额度已用完。");
     }
     if (isChatUsageLimitMessage(directContent)) {
-      throw chatUsageLimitError("当前 Grok 账号的使用次数已用完。");
+      const usage = chatUsageLimitFromText(directContent) || {};
+      throw chatUsageLimitError(
+        `当前 Grok 账号的使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`,
+        usage
+      );
     }
     if (imageGeneration && !imageUrls.length) {
       const error = new Error(upstreamError || directContent || "Grok 没有返回可用的图片。");
@@ -3398,6 +3565,7 @@ export class ChatplusClient {
     const errors = [];
     const imageCarQuotaErrors = [];
     const unconfirmedCars = [];
+    let carPoolErrorCount = 0;
     let lastError = null;
     let lastUpstreamText = "";
     const runSubmitStep = input.concurrentSubmit === true
@@ -3468,6 +3636,13 @@ export class ChatplusClient {
         if (response.status < 200 || response.status >= 300) {
           throw conversationSubmitError(response);
         }
+        if (isChatUsageLimitMessage(response.body)) {
+          const usage = chatUsageLimitFromText(response.body) || {};
+          throw chatUsageLimitError(
+            `当前 GPT 账号的使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`,
+            usage
+          );
+        }
 
         const events = parseSse(response.body);
         throwIfImageGenerationLimit(events, { car: requestInput.imageGeneration === true });
@@ -3499,6 +3674,13 @@ export class ChatplusClient {
       } catch (error) {
         lastError = error;
         lastUpstreamText = String(error?.upstreamText || error?.body || lastUpstreamText).trim();
+        const carScopedFailure = error?.carPoolUnavailable === true
+          || error?.authScope === "car"
+          || Boolean(selected);
+        const recordCarError = (message) => {
+          errors.push(message);
+          if (carScopedFailure) carPoolErrorCount += 1;
+        };
         if (imageSubmissionState.started) {
           error.imageSubmissionAttempted = true;
           if (imageSubmissionState.confirmed) error.imageSubmissionConfirmed = true;
@@ -3509,6 +3691,10 @@ export class ChatplusClient {
           if (selected && shouldQuarantineImageSubmissionCar(error)) {
             await this.rememberImageFailedCar(selected);
           }
+        }
+        if (isConfirmedChatUsageLimitError(error)) {
+          error.quotaModel = activeRoute?.key || "";
+          throw error;
         }
         if (
           selected
@@ -3527,7 +3713,7 @@ export class ChatplusClient {
             upstreamText: String(error?.upstreamText || error?.body || "").trim()
           };
           unconfirmedCars.push(carAttempt);
-          errors.push(message);
+          recordCarError(message);
           await this.rememberUnconfirmedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
           if (unconfirmedCars.length >= MAX_UNCONFIRMED_CAR_ATTEMPTS) {
@@ -3576,7 +3762,7 @@ export class ChatplusClient {
         if (selected && isRetryableImageSubmissionRejection(error)) {
           this.rememberAuthFailedCar(selected);
           await this.invalidatePreparedChatSession(preparedSession);
-          errors.push(error.message || "上游拒绝了当前聊天车位");
+          recordCarError(error.message || "上游拒绝了当前聊天车位");
           continue;
         }
         if (error.noRetry || error.imageQuotaExhausted || error.imageSubmissionAttempted) {
@@ -3598,11 +3784,14 @@ export class ChatplusClient {
           this.rememberAuthFailedCar(selected);
           await this.invalidatePreparedChatSession(preparedSession);
         }
-        errors.push(error.message || "调用失败");
+        recordCarError(error.message || "调用失败");
       }
     }
     const error = new Error(`自动换车失败：${[...imageCarQuotaErrors, ...errors].join("；")}`);
     if (imageCarQuotaErrors.length) error.imageCarQuotaExhausted = true;
+    if (!imageCarQuotaErrors.length && errors.length && carPoolErrorCount === errors.length) {
+      tagCarPoolUnavailable(error);
+    }
     error.upstreamText = lastUpstreamText || String(lastError?.upstreamText || lastError?.body || "").trim();
     throw error;
   }
@@ -3644,6 +3833,7 @@ export class ChatplusClient {
         const conversation = await this.sendConversation(prompt, input, ignoredCarIds);
         return await work(conversation);
       } catch (error) {
+        if (isConfirmedChatUsageLimitError(error)) throw error;
         if (error.retryableImageCar === true) {
           textResponseErrors.push(error);
           continue;
@@ -3674,14 +3864,15 @@ export class ChatplusClient {
   }
 
   async waitForConversationImages(events, conversationId, timeoutSec, options = {}) {
-    const initialContent = extractAssistantText(events);
-    const initialPromptEnvelope = isImagePromptEnvelope(initialContent);
-    if (!initialPromptEnvelope || imageGenerationLimitContent(events)) {
+    const initialResponse = imageAssistantResponseState(events);
+    const initialContent = initialResponse.content;
+    const initialIntermediateResponse = isChatImageIntermediateResponse(initialContent);
+    if (!initialIntermediateResponse || imageGenerationLimitContent(events)) {
       throwIfImageGenerationLimit(events, { car: true });
     }
     let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: options.generatedOnly });
     if (imageUrls.length || !conversationId) return imageUrls;
-    if (!initialPromptEnvelope) {
+    if (!initialIntermediateResponse && !initialResponse.inProgress) {
       throwIfTerminalImageFailure(initialContent);
       throwIfTextImageResponse(initialContent);
     }
@@ -3691,14 +3882,15 @@ export class ChatplusClient {
     while (Date.now() < deadline) {
       try {
         const detail = await this.conversationDetail(conversationId);
-        const content = extractAssistantText(detail);
-        const promptEnvelope = isImagePromptEnvelope(content);
-        if (!promptEnvelope || imageGenerationLimitContent(detail)) {
+        const responseState = imageAssistantResponseState(detail);
+        const content = responseState.content;
+        const intermediateResponse = isChatImageIntermediateResponse(content);
+        if (!intermediateResponse || imageGenerationLimitContent(detail)) {
           throwIfImageGenerationLimit(detail, { car: true });
         }
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
-        if (!promptEnvelope) {
+        if (!intermediateResponse && !responseState.inProgress) {
           throwIfTerminalImageFailure(content);
           throwIfTextImageResponse(content);
         }
@@ -3722,9 +3914,10 @@ export class ChatplusClient {
     if (!externalId) throw new Error("缺少上游任务编号。");
     const timeoutSec = Number(context.timeoutSec || 0);
     const requestOptions = timeoutSec > 0 ? { timeoutSec } : {};
-    await this.loginPortal(requestOptions);
-    const readDetail = async () => {
-      const payload = await this.conversationDetail(externalId, requestOptions);
+    const taskCarId = String(context.carId || "").trim();
+    const taskCarType = String(context.carType || "chatgpt").trim() || "chatgpt";
+    const readDetail = async (reader = this) => {
+      const payload = await reader.conversationDetail(externalId, requestOptions);
       if (!payload || typeof payload !== "object") {
         const error = new Error("上游暂时没有返回有效任务状态。");
         error.code = "UPSTREAM_TASK_STATE_UNAVAILABLE";
@@ -3740,28 +3933,36 @@ export class ChatplusClient {
       return payload;
     };
     const restoreConversationSession = async (reset = false) => {
+      if (taskCarId) {
+        return this.sessionLock(async () => {
+          if (reset) this.resetSession();
+          if (!this.portalLoggedIn) await this.performPortalLogin(requestOptions);
+          this.carId = taskCarId;
+          this.carType = taskCarType;
+          await this.performEnterCar(taskCarId, taskCarType, requestOptions);
+          return this.createSubmitClient({ snapshot: this.sessionSnapshot() });
+        });
+      }
       if (reset) await this.sessionLock(async () => this.resetSession());
       await this.loginPortal(requestOptions);
-      if (context.carId) {
-        this.carId = String(context.carId);
-        this.carType = String(context.carType || "chatgpt");
-        await this.enterCar(this.carId, this.carType, requestOptions);
-      } else if (!this.carId) {
-        await this.login(requestOptions);
-      }
+      if (!this.carId) await this.login(requestOptions);
+      return this;
     };
     let detail = null;
-    try {
-      detail = await readDetail();
-    } catch (directError) {
-      const resetAfterDirectRead = isAuthSessionError(directError);
-      await restoreConversationSession(resetAfterDirectRead);
+    if (taskCarId) {
+      try {
+        detail = await readDetail(await restoreConversationSession());
+      } catch (directError) {
+        if (!isAuthSessionError(directError)) throw directError;
+        detail = await readDetail(await restoreConversationSession(true));
+      }
+    } else {
+      await this.loginPortal(requestOptions);
       try {
         detail = await readDetail();
-      } catch (retryError) {
-        if (resetAfterDirectRead || !isAuthSessionError(retryError)) throw retryError;
-        await restoreConversationSession(true);
-        detail = await readDetail();
+      } catch (directError) {
+        const resetAfterDirectRead = isAuthSessionError(directError);
+        detail = await readDetail(await restoreConversationSession(resetAfterDirectRead));
       }
     }
     const imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
@@ -3779,9 +3980,9 @@ export class ChatplusClient {
         raw: detail
       };
     }
-    const content = extractAssistantText(detail);
-    const promptEnvelope = isImagePromptEnvelope(content);
-    const intermediateResponse = promptEnvelope || isSkippedMainlineContent(content);
+    const responseState = imageAssistantResponseState(detail);
+    const content = responseState.content;
+    const intermediateResponse = isChatImageIntermediateResponse(content);
     const quotaContent = imageGenerationLimitContent(detail);
     if (quotaContent) {
       const quotaError = imageCarQuotaError(quotaContent);
@@ -3802,7 +4003,7 @@ export class ChatplusClient {
         }
       };
     }
-    if (!intermediateResponse && isTerminalImageFailureMessage(content)) {
+    if (!intermediateResponse && !responseState.inProgress && isTerminalImageFailureMessage(content)) {
       return {
         externalId,
         status: "failed",
@@ -3812,7 +4013,7 @@ export class ChatplusClient {
         raw: detail
       };
     }
-    if (!intermediateResponse && content) {
+    if (!intermediateResponse && content && !responseState.inProgress) {
       return {
         externalId,
         status: "failed",

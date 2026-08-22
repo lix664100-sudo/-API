@@ -49,6 +49,16 @@ function loadTaskIdentityHelpers() {
   return context.helpers;
 }
 
+function loadTaskIdHelpers() {
+  const start = adminHtml.indexOf("function taskSourceId");
+  const end = adminHtml.indexOf("function taskSearchHaystack", start);
+  assert.ok(start >= 0 && end > start, "任务编号辅助逻辑必须存在");
+
+  const context = {};
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskSourceId, taskIdentityItems };`, context);
+  return context.helpers;
+}
+
 function loadTaskRecordHelpers() {
   const start = adminHtml.indexOf("function taskRecordKind");
   const end = adminHtml.indexOf("function taskTypeLabel", start);
@@ -121,6 +131,23 @@ test("历史任务没有原图时返回空列表，界面显示明确提示", ()
   assert.deepEqual(localValue(taskInputImageUrls({ imageUrls: ["https://example.test/result.png"] })), []);
   assert.match(adminHtml, /该任务未保存原图/);
   assert.match(adminHtml, /暂无生成结果/);
+});
+
+test("对话记录始终显示本地任务ID，并单独显示调用方任务ID", () => {
+  const { taskIdentityItems } = loadTaskIdHelpers();
+
+  assert.deepEqual(localValue(taskIdentityItems({ id: "task-local-001" })), [
+    ["本地任务ID", "task-local-001"]
+  ]);
+  assert.deepEqual(localValue(taskIdentityItems({
+    id: "task-local-002",
+    sourceTaskId: "erp-order-88"
+  })), [
+    ["本地任务ID", "task-local-002"],
+    ["调用方任务ID", "erp-order-88"]
+  ]);
+  assert.match(adminHtml, /\["本地任务ID", detail\.taskId\]/);
+  assert.match(adminHtml, /\["调用方任务ID", detail\.sourceTaskId\]/);
 });
 
 test("任务缩略图打开原图与生成结果弹窗，并支持多图放大和窄屏排列", () => {
@@ -368,6 +395,29 @@ test("并发已满使用独立的黄色状态，不再显示为任务失败", ()
   assert.equal(taskPresentationStatus(realFailure), "failed");
   assert.match(adminHtml, /concurrency_limited: \["warning", "并发已满"\]/);
   assert.match(adminHtml, /task-concurrency-card/);
+});
+
+test("共享车位失效不会再显示为聊天账号掉线", () => {
+  const { taskErrorText } = loadTaskFailureHelpers();
+  const currentTask = {
+    status: "failed",
+    taskType: "img2img",
+    responseJson: {
+      code: "CHAT_CAR_POOL_UNAVAILABLE",
+      message: "上游共享车位暂时不可用，任务未能提交。请稍后重试。",
+      attempts: [{ carPoolUnavailable: true, message: "用户认证失败，请重新登录" }]
+    }
+  };
+  const legacyTask = {
+    status: "failed",
+    taskType: "img2img",
+    channelName: "聊天生图",
+    errorMessage: "自动换车失败：GPT 自动找车失败：用户认证失败，请重新登录"
+  };
+
+  assert.equal(taskErrorText(currentTask), "上游共享车位暂时不可用，任务未能提交。请稍后重试。");
+  assert.equal(taskErrorText(legacyTask), "上游共享车位暂时不可用，任务未能提交。请稍后重试。");
+  assert.doesNotMatch(taskErrorText(legacyTask), /掉线/);
 });
 
 test("账号满载后的任务明确显示为排队中", () => {

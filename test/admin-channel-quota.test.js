@@ -4,6 +4,47 @@ import { test } from "node:test";
 import vm from "node:vm";
 
 const adminHtml = await readFile(new URL("../admin/index.html", import.meta.url), "utf8");
+const confirmedQuotaFunctionMatch = adminHtml.match(
+  /function confirmedChatQuotaEmpty\(status = \{\}\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function chatSubscriptionExpired/
+);
+
+assert.ok(confirmedQuotaFunctionMatch, "管理后台中应存在聊天零额度判断方法");
+
+const confirmedQuotaFunctionSource = confirmedQuotaFunctionMatch[0].replace(
+  /\r?\n\r?\n      function chatSubscriptionExpired$/,
+  ""
+);
+const confirmedChatQuotaEmpty = vm.runInNewContext(
+  `(${confirmedQuotaFunctionSource.replace(/^function /, "function ")})`,
+  {
+    chatModelKey: (value) => String(value || "").trim().toLowerCase()
+  }
+);
+
+const quotaTextFunctionMatch = adminHtml.match(
+  /function chatQuotaText\(account, channel, status = \{\}\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function chatQuotaResetTexts/
+);
+
+assert.ok(quotaTextFunctionMatch, "管理后台中应存在聊天额度显示方法");
+
+const quotaTextFunctionSource = quotaTextFunctionMatch[0].replace(
+  /\r?\n\r?\n      function chatQuotaResetTexts$/,
+  ""
+);
+const chatQuotaText = vm.runInNewContext(
+  `(${quotaTextFunctionSource.replace(/^function /, "function ")})`,
+  {
+    checkedChatModelName: () => "Gemini",
+    chatSubscriptionExpired: () => false,
+    chatModelsForChannel: () => [
+      { key: "gpt", name: "GPT", enabled: true },
+      { key: "gemini", name: "Gemini", enabled: true }
+    ],
+    confirmedChatQuotaEmpty,
+    valueText: (value) => String(value)
+  }
+);
+
 const functionMatch = adminHtml.match(
   /function aggregateChatReferenceUsage\(accounts, channelType, modelKeys\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function chatQuotaText/
 );
@@ -208,6 +249,44 @@ test("没有任何有效额度数据时不显示虚假的零额度", () => {
     structuredClone(aggregateChatReferenceUsage(accounts, "shareai", ["gpt"])),
     {}
   );
+});
+
+test("后台明确显示当前模型剩余为零时账号状态显示额度不足", () => {
+  assert.equal(confirmedChatQuotaEmpty({
+    status: "ok",
+    meta: {
+      chatModel: "gemini",
+      referenceUsage: {
+        gemini: { quota: 70, used: 70, balance: 0 }
+      }
+    }
+  }), true);
+  assert.equal(confirmedChatQuotaEmpty({
+    status: "ok",
+    meta: {
+      chatModel: "gpt",
+      referenceUsage: {
+        gpt: { quota: 220, used: 20, balance: 200 },
+        gemini: { quota: 70, used: 70, balance: 0 }
+      }
+    }
+  }), false);
+});
+
+test("一个模型用完时仍显示另一个模型的可用额度", () => {
+  assert.equal(chatQuotaText(null, {}, {
+    status: "quota_empty",
+    quotaReason: "chat_usage_limit",
+    quotaModel: "gemini",
+    quotaConfirmedByUpstream: true,
+    meta: {
+      chatModel: "gemini",
+      referenceUsage: {
+        gpt: { quota: 220, used: 20, balance: 200 },
+        gemini: { quota: 70, used: 70, balance: 0 }
+      }
+    }
+  }), "GPT 剩余 200/220｜Gemini 已用完");
 });
 
 test("渠道汇总中 GPT 套餐过期优先于其他账号可用", () => {

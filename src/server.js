@@ -178,7 +178,7 @@ async function persistReturnedErrorTask(error, context, payload, status) {
   if (!sourceTaskId) return null;
 
   const attempts = error.attempts || responseJson.attempts || error.task?.attempts || [];
-  const existing = error.task || await getTaskBySourceTaskId(sourceTaskId);
+  const existing = error.task || null;
   const firstAttempt = Array.isArray(attempts) ? attempts[0] || {} : {};
   const now = new Date().toISOString();
   const responsePayload = {

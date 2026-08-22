@@ -239,6 +239,218 @@ test("账号检测遇到失效车位后会自动换车", async () => {
   assert.equal(enteredCount, 3);
 });
 
+test("共享车位全部认证失败时不会冒充账号掉线", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-car-pool", username: "car-pool@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let selectedCount = 0;
+  client.selectCar = async () => ({
+    carId: `expired-car-${++selectedCount}`,
+    carType: "chatgpt",
+    strategy: "image"
+  });
+  client.enterCar = async () => {
+    const error = new Error("用户认证失败，请重新登录");
+    error.status = 403;
+    throw error;
+  };
+
+  await assert.rejects(
+    client.prepareChatSession({ model: "gpt" }, new Set(), 2),
+    (error) => {
+      assert.equal(error.code, "CHAT_CAR_POOL_UNAVAILABLE");
+      assert.equal(error.carPoolUnavailable, true);
+      assert.equal(error.authScope, "car");
+      return true;
+    }
+  );
+  assert.equal(selectedCount, 2);
+});
+
+test("自动换完车仍失败时会保留共享车位故障身份", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-car-switch", username: "car-switch@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let attemptCount = 0;
+  client.prepareChatSession = async () => {
+    attemptCount += 1;
+    const error = new Error("GPT 自动找车失败：用户认证失败，请重新登录");
+    error.code = "CHAT_CAR_POOL_UNAVAILABLE";
+    error.carPoolUnavailable = true;
+    error.authScope = "car";
+    throw error;
+  };
+
+  await assert.rejects(
+    client.sendConversation("测试自动换车"),
+    (error) => {
+      assert.equal(error.code, "CHAT_CAR_POOL_UNAVAILABLE");
+      assert.equal(error.carPoolUnavailable, true);
+      assert.equal(error.authScope, "car");
+      return true;
+    }
+  );
+  assert.ok(attemptCount > 1);
+});
+
+test("检测账号时共享车位不可用只标记线路异常", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-car-pool-check",
+      channelId: "shareai",
+      name: "共享车位检测账号",
+      username: "car-pool-check@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", message: "绘图账号可用" },
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalChatCheck = ChatplusClient.prototype.check;
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  DrawingClient.prototype.check = async () => ({
+    status: "ok",
+    quota: 100,
+    balance: 80,
+    message: "绘图账号可用"
+  });
+  ChatplusClient.prototype.check = async () => {
+    const error = new Error("GPT 自动找车失败：车位一：用户认证失败，请重新登录");
+    error.code = "CHAT_CAR_POOL_UNAVAILABLE";
+    error.carPoolUnavailable = true;
+    error.authScope = "car";
+    throw error;
+  };
+
+  try {
+    await assert.rejects(
+      checkAccount("account-car-pool-check"),
+      /上游共享车位暂时不可用/
+    );
+
+    const stored = await loadConfig();
+    const account = stored.accounts.find((item) => item.id === "account-car-pool-check");
+    assert.equal(account.status, "error");
+    assert.equal(account.meta.abilities.chatplus.status, "error");
+    assert.doesNotMatch(account.message, /掉线/);
+    assert.match(account.meta.abilities.chatplus.message, /上游共享车位暂时不可用/);
+  } finally {
+    ChatplusClient.prototype.check = originalChatCheck;
+    DrawingClient.prototype.check = originalDrawingCheck;
+  }
+});
+
+test("检测账号时门户认证失败仍然标记为掉线", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-portal-login-check",
+      channelId: "shareai",
+      name: "门户登录检测账号",
+      username: "portal-login-check@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok"
+    }]
+  });
+
+  const originalChatCheck = ChatplusClient.prototype.check;
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  DrawingClient.prototype.check = async () => ({ status: "ok", message: "绘图账号可用" });
+  ChatplusClient.prototype.check = async () => {
+    const error = new Error("身份验证失败，请重新登录");
+    error.status = 401;
+    throw error;
+  };
+
+  try {
+    await assert.rejects(checkAccount("account-portal-login-check"), /身份验证失败/);
+
+    const stored = await loadConfig();
+    const account = stored.accounts.find((item) => item.id === "account-portal-login-check");
+    assert.equal(account.status, "disconnected");
+    assert.equal(account.meta.abilities.chatplus.status, "disconnected");
+  } finally {
+    ChatplusClient.prototype.check = originalChatCheck;
+    DrawingClient.prototype.check = originalDrawingCheck;
+  }
+});
+
+test("改图任务遇到共享车位故障时返回正式提示并保留账号在线", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-car-pool-task",
+      channelId: "shareai",
+      name: "共享车位任务账号",
+      username: "car-pool-task@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", balance: 0, message: "绘图积分不足" },
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  ChatplusClient.prototype.createImageTask = async () => {
+    const error = new Error("自动换车失败：GPT 自动找车失败：用户认证失败，请重新登录");
+    error.code = "CHAT_CAR_POOL_UNAVAILABLE";
+    error.carPoolUnavailable = true;
+    error.authScope = "car";
+    throw error;
+  };
+
+  try {
+    await assert.rejects(
+      createImageTask({
+        input: { channel: "chatplus", prompt: "共享车位故障测试" },
+        files: [{ filename: "source.png", mimetype: "image/png" }],
+        wait: true
+      }),
+      (error) => {
+        assert.equal(error.status, 503);
+        assert.equal(error.code, "CHAT_CAR_POOL_UNAVAILABLE");
+        assert.equal(error.message, "上游共享车位暂时不可用，任务未能提交。请稍后重试。");
+        assert.equal(error.task.responseJson.failureType, undefined);
+        assert.equal(error.task.attempts[0].carPoolUnavailable, true);
+        return true;
+      }
+    );
+
+    const stored = await loadConfig();
+    const account = stored.accounts.find((item) => item.id === "account-car-pool-task");
+    assert.equal(account.status, "error");
+    assert.equal(account.meta.abilities.chatplus.status, "error");
+    assert.match(account.meta.abilities.chatplus.message, /上游共享车位暂时不可用/);
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+  }
+});
+
 test("GPT 套餐时间已过期时不再沿用旧的可用状态", async () => {
   const client = new ChatplusClient({
     config: {},
@@ -424,12 +636,13 @@ test("读取旧任务遇到登录失效会重新登录并回到原车位", async
     client.portalLoggedIn = true;
     client.cookies = ["portal=fresh"];
   };
-  client.enterCar = async (carId, carType) => {
+  client.performEnterCar = async (carId, carType) => {
     enterCarCount += 1;
     client.carId = carId;
     client.carType = carType;
     client.cookies.push(`car=${carId}`);
   };
+  client.createSubmitClient = () => client;
   client.json = async (pathName) => {
     assert.equal(pathName, "/backend-api/conversation/conversation-session-recovery");
     detailReadCount += 1;
@@ -450,11 +663,75 @@ test("读取旧任务遇到登录失效会重新登录并回到原车位", async
   assert.equal(result.status, "waiting_upstream");
   assert.equal(resetCount, 1);
   assert.equal(loginCount, 1);
-  assert.equal(enterCarCount, 1);
+  assert.equal(enterCarCount, 2);
   assert.equal(detailReadCount, 2);
   assert.equal(client.carId, "original-car");
   assert.equal(client.cookies.includes("expired=session"), false);
   assert.equal(client.cookies.includes("portal=fresh"), true);
+});
+
+test("读取旧任务即使没有报错也会在第一次查询前回到原车位", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { baseUrl: "https://one.aishare.icu" } },
+    account: { id: "account-task-original-car", username: "task-original-car@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  client.portalLoggedIn = true;
+  client.carId = "stale-car";
+  const events = [];
+  client.performEnterCar = async (carId) => {
+    events.push(`enter:${carId}`);
+  };
+  client.createSubmitClient = () => client;
+  client.conversationDetail = async () => {
+    events.push(`read:${client.carId}`);
+    return { mapping: {} };
+  };
+  client.imageUrlsFrom = async () => [];
+
+  const result = await client.getTask("conversation-valid-empty", {
+    carId: "original-car",
+    carType: "chatgpt"
+  });
+
+  assert.equal(result.status, "waiting_upstream");
+  assert.deepEqual(events, ["enter:original-car", "read:original-car"]);
+});
+
+test("两个旧任务同时查询时会各自使用原车位的独立状态", async () => {
+  let lockTail = Promise.resolve();
+  const sessionLock = (work) => {
+    const current = lockTail.catch(() => {}).then(work);
+    lockTail = current;
+    return current;
+  };
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { baseUrl: "https://one.aishare.icu" } },
+    account: { id: "account-task-concurrent-cars", username: "task-concurrent-cars@example.com", password: "test" },
+    sessionLock
+  });
+  client.portalLoggedIn = true;
+  client.performEnterCar = async () => {};
+  client.createSubmitClient = ({ snapshot }) => ({
+    conversationDetail: async (externalId) => {
+      await new Promise((resolve) => setImmediate(resolve));
+      return { externalId, taskCarId: snapshot.carId };
+    }
+  });
+  client.imageUrlsFrom = async (detail) => [
+    `https://example.test/${detail.taskCarId}/${detail.externalId}.png`
+  ];
+  client.rememberImageSuccessfulCar = async () => {};
+
+  const [first, second] = await Promise.all([
+    client.getTask("conversation-a", { carId: "car-a", carType: "chatgpt" }),
+    client.getTask("conversation-b", { carId: "car-b", carType: "chatgpt" })
+  ]);
+
+  assert.deepEqual(first.imageUrls, ["https://example.test/car-a/conversation-a.png"]);
+  assert.deepEqual(second.imageUrls, ["https://example.test/car-b/conversation-b.png"]);
 });
 
 test("第一次账号检测超时保留可用状态，连续两次才异常，成功后清零", async () => {
@@ -773,7 +1050,7 @@ test("Gemini 数据缺失时不会借用 GPT 额度，但仍保留共享套餐�
   });
 });
 
-test("后台显示额度为零时仍会检测真实车位并保持可用", async () => {
+test("后台显示额度为零时直接暂停账号，不再进入车位", async () => {
   const client = new ChatplusClient({
     config: {},
     channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
@@ -802,14 +1079,16 @@ test("后台显示额度为零时仍会检测真实车位并保持可用", async
 
   const result = await client.check();
 
-  assert.equal(prepareCount, 1);
-  assert.equal(result.status, "ok");
-  assert.equal(result.quota, null);
-  assert.equal(result.balance, null);
-  assert.equal(result.used, null);
-  assert.equal(result.quotaReason, "");
-  assert.equal(result.quotaConfirmedByUpstream, false);
-  assert.equal(result.meta.selectedCarId, "car-dashboard-zero");
+  assert.equal(prepareCount, 0);
+  assert.equal(result.status, "quota_empty");
+  assert.equal(result.quota, 220);
+  assert.equal(result.balance, 0);
+  assert.equal(result.used, 220);
+  assert.equal(result.quotaReason, "chat_usage_limit");
+  assert.equal(result.quotaModel, "gpt");
+  assert.equal(result.quotaResetAt, "2026-07-22T19:32:29+08:00");
+  assert.equal(result.quotaConfirmedByUpstream, true);
+  assert.equal(result.meta.selectedCarId, undefined);
 });
 
 test("额度恢复核验会检查指定模型的额度和页面", async () => {
@@ -856,7 +1135,7 @@ test("额度恢复核验会检查指定模型的额度和页面", async () => {
   assert.deepEqual(result.meta.recoveryUsage, geminiUsage);
 });
 
-test("聊天总额度上限没有创建对话时换一次车并保留刷新时间", async () => {
+test("聊天总额度用完后立即停用账户并保留刷新时间", async () => {
   const client = new ChatplusClient({
     config: {},
     channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
@@ -888,7 +1167,7 @@ test("聊天总额度上限没有创建对话时换一次车并保留刷新时�
   await assert.rejects(
     client.sendConversation("额度测试", {}),
     (error) => {
-      assert.equal(error.code, "UPSTREAM_CONVERSATION_NOT_CREATED");
+      assert.equal(error.code, "CHAT_USAGE_LIMIT");
       assert.equal(error.quotaEmpty, true);
       assert.equal(error.quota, 220);
       assert.equal(error.balance, 0);
@@ -898,7 +1177,7 @@ test("聊天总额度上限没有创建对话时换一次车并保留刷新时�
       return true;
     }
   );
-  assert.equal(prepareCount, 2);
+  assert.equal(prepareCount, 1);
 });
 
 test("GPT 聊天生图会忽略旧模型并使用网页当前模型", async () => {
@@ -2492,6 +2771,53 @@ test("聊天重置后额度仍为零会保持用完状态并延后复查", async
   }
 });
 
+test("聊天重置后后台仍报告零且没有新时间时延后一小时复查", async () => {
+  const pastResetAt = new Date(Date.now() - 1000).toISOString();
+  await saveChatUsageRecoveryFixture({
+    lastCheckAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+    quotaResetAt: pastResetAt
+  });
+
+  const originalCheck = ChatplusClient.prototype.check;
+  let checkCount = 0;
+  ChatplusClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "quota_empty",
+      quota: 70,
+      used: 70,
+      balance: 0,
+      quotaResetAt: pastResetAt,
+      cooldownUntil: null,
+      quotaReason: "chat_usage_limit",
+      quotaModel: "gemini",
+      quotaConfirmedByUpstream: true,
+      meta: {
+        chatModel: "gemini",
+        recoveryUsage: { quota: 70, used: 70, balance: 0, quotaResetAt: pastResetAt },
+        referenceUsage: {
+          gemini: { quota: 70, used: 70, balance: 0, quotaResetAt: pastResetAt }
+        }
+      }
+    };
+  };
+
+  try {
+    const firstResults = await recoverUnavailableChatAccounts();
+    const secondResults = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const chatplus = stored.accounts[0].meta.abilities.chatplus;
+    const retryAt = Date.parse(chatplus.cooldownUntil || "");
+
+    assert.equal(checkCount, 1);
+    assert.equal(firstResults[0].status, "quota_empty");
+    assert.equal(secondResults.length, 0);
+    assert.ok(retryAt >= Date.now() + 50 * 60 * 1000);
+  } finally {
+    ChatplusClient.prototype.check = originalCheck;
+  }
+});
+
 test("聊天额度后台恢复并发触发时只核验一次", async () => {
   await saveChatUsageRecoveryFixture({
     lastCheckAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
@@ -2547,7 +2873,16 @@ test("聊天额度后台恢复并发触发时只核验一次", async () => {
 test("聊天额度恢复时只放行一个真实探测请求", async () => {
   await saveChatUsageRecoveryFixture({
     lastCheckAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
-    quotaResetAt: new Date(Date.now() - 1000).toISOString()
+    quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+    referenceUsage: {
+      gemini: {
+        quota: 70,
+        used: 70,
+        balance: 0,
+        quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+        period: "24h"
+      }
+    }
   });
 
   const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
@@ -2566,7 +2901,7 @@ test("聊天额度恢复时只放行一个真实探测请求", async () => {
     await holdFirst;
     return {
       externalId: "single-recovery-probe",
-      model: "gpt",
+      model: "gemini",
       content: "恢复成功",
       imageUrls: [],
       raw: {}
@@ -2576,6 +2911,7 @@ test("聊天额度恢复时只放行一个真实探测请求", async () => {
   try {
     const first = createChatCompletion({
       channel: "chatplus",
+      model: "gemini",
       messages: [{ role: "user", content: "第一个恢复探测" }]
     });
     await firstEntered;
@@ -2583,6 +2919,7 @@ test("聊天额度恢复时只放行一个真实探测请求", async () => {
     await assert.rejects(
       createChatCompletion({
         channel: "chatplus",
+        model: "gemini",
         messages: [{ role: "user", content: "并发恢复探测" }]
       }),
       /正在处理|并发|繁忙|失败/
@@ -2595,6 +2932,7 @@ test("聊天额度恢复时只放行一个真实探测请求", async () => {
     const chatplus = stored.accounts[0].meta.abilities.chatplus;
     assert.equal(chatplus.status, "ok");
     assert.equal(chatplus.quotaConfirmedByUpstream, false);
+    assert.equal(chatplus.meta.referenceUsage.gemini, undefined);
   } finally {
     releaseFirst?.();
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;

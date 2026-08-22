@@ -1993,6 +1993,19 @@
         return /\b401\b|身份验证失败|认证失败|请重新登录|重新登陆|未登录|未登陆|其他设备登|聊天站登录状态|掉线/.test(String(value || ""));
       }
 
+      function isCarPoolUnavailableTask(row) {
+        const code = String(row?.responseJson?.code || row?.code || "").trim().toUpperCase();
+        if (code === "CHAT_CAR_POOL_UNAVAILABLE") return true;
+        const attempts = taskAttempts(row);
+        if (attempts.length && attempts.every((item) => item.carPoolUnavailable === true)) return true;
+        const text = [
+          row?.errorMessage,
+          row?.responseJson?.message,
+          ...attempts.map((item) => item.message)
+        ].filter(Boolean).join("；");
+        return /自动(?:找车|换车)失败/.test(text) && isChatLoginErrorText(text);
+      }
+
       function drawingUpstreamErrorText(value) {
         const text = String(value || "");
         const relayFailure = text.match(/中转接口请求失败[^\d]*状态码\s*[:：]\s*(\d{3})/);
@@ -2054,6 +2067,9 @@
 
       function taskErrorText(row) {
         if (!isFailedTaskRow(row)) return "";
+        if (isCarPoolUnavailableTask(row)) {
+          return "上游共享车位暂时不可用，任务未能提交。请稍后重试。";
+        }
         if (taskFailureType(row)) {
           return row?.responseJson?.message || row?.errorMessage || "生图任务失败";
         }
@@ -2250,6 +2266,15 @@
           || "";
       }
 
+      function taskIdentityItems(row) {
+        const localTaskId = String(row?.id || "").trim();
+        const sourceTaskId = taskSourceId(row);
+        return [
+          localTaskId ? ["本地任务ID", localTaskId] : null,
+          sourceTaskId ? ["调用方任务ID", sourceTaskId] : null
+        ].filter(Boolean);
+      }
+
       function taskSearchHaystack(row) {
         const request = row?.requestJson || {};
         const response = row?.responseJson || {};
@@ -2350,7 +2375,8 @@
           ["上游标题", detail.title],
           ["上游对话", detail.conversationId || detail.externalId],
           ["车位ID", detail.carId],
-          ["任务ID", detail.sourceTaskId || detail.taskId],
+          ["本地任务ID", detail.taskId],
+          ["调用方任务ID", detail.sourceTaskId],
           ["图片数", detail.imageCount ?? images.length],
           ["车位类型", detail.carType]
         ].filter(([, value]) => value !== null && value !== undefined && value !== "");
@@ -2583,7 +2609,6 @@
 
       function taskMetaLine(row, config, options = {}) {
         const meta = row?.requestMeta || {};
-        const sourceTaskId = taskSourceId(row);
         const conversationAction = taskConversationAction(row, config, options);
         const upstreamTitle = taskUpstreamTitle(row);
         const carId = taskCarId(row);
@@ -2591,7 +2616,7 @@
           conversationAction ? ["上游对话", conversationAction] : null,
           upstreamTitle ? ["上游标题", upstreamTitle] : null,
           carId ? ["车位ID", carId] : null,
-          sourceTaskId ? ["任务ID", sourceTaskId] : null,
+          ...taskIdentityItems(row),
           meta.callerIp ? ["调用IP", meta.callerIp] : null,
           meta.calledAt ? ["调用时间", formatDateTime(meta.calledAt)] : null,
           taskNetworkLabel(row) ? ["代理", taskNetworkLabel(row)] : null
@@ -2644,7 +2669,19 @@
       }
 
       function confirmedChatQuotaEmpty(status = {}) {
-        return status.status === "quota_empty" && status.quotaConfirmedByUpstream === true;
+        if (status.status === "quota_empty" && status.quotaConfirmedByUpstream === true) return true;
+        const directBalanceKnown = status.balance !== null
+          && status.balance !== undefined
+          && String(status.balance).trim() !== ""
+          && Number.isFinite(Number(status.balance));
+        if (status.status === "quota_empty" && directBalanceKnown && Number(status.balance) <= 0) return true;
+        const modelKey = chatModelKey(status.quotaModel || status.meta?.chatModel || "gpt") || "gpt";
+        const usage = status.meta?.referenceUsage?.[modelKey];
+        const referenceBalanceKnown = usage?.balance !== null
+          && usage?.balance !== undefined
+          && String(usage.balance).trim() !== ""
+          && Number.isFinite(Number(usage.balance));
+        return referenceBalanceKnown && Number(usage.balance) <= 0;
       }
 
       function chatSubscriptionExpired(status = {}) {
@@ -2838,20 +2875,22 @@
       function chatQuotaText(account, channel, status = {}) {
         const modelName = checkedChatModelName(account, channel);
         if (chatSubscriptionExpired(status)) return `${modelName} 套餐已过期`;
-        if (confirmedChatQuotaEmpty(status)) {
-          return status.quotaReason === "image_quota"
-            ? `${modelName} 生图已用完`
-            : `${modelName} 已用完`;
-        }
         const referenceParts = chatModelsForChannel(channel)
           .filter((item) => item.enabled)
           .map((item) => {
             const usage = status.meta?.referenceUsage?.[item.key];
             if (!usage || usage.quota === null || usage.quota === undefined || usage.balance === null || usage.balance === undefined) return "";
-            return `${item.name} 剩余 ${valueText(usage.balance)}/${valueText(usage.quota)}`;
+            return Number(usage.balance) <= 0
+              ? `${item.name} 已用完`
+              : `${item.name} 剩余 ${valueText(usage.balance)}/${valueText(usage.quota)}`;
           })
           .filter(Boolean);
         if (referenceParts.length) return referenceParts.join("｜");
+        if (confirmedChatQuotaEmpty(status)) {
+          return status.quotaReason === "image_quota"
+            ? `${modelName} 生图已用完`
+            : `${modelName} 已用完`;
+        }
         if (status.status === "unknown" || !status.status) return `${modelName} 未检测`;
         if (status.status === "activation_required") return `${modelName} 未激活`;
         if (["error", "failed", "disconnected", "disabled"].includes(status.status)) return `${modelName} 暂不可用`;

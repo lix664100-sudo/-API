@@ -103,7 +103,7 @@ test("洗图王任务 ID 会保存到本地记录，失败返回也会带回去"
   }
 });
 
-test("相同洗图王任务 ID 的失败结果会更新原任务记录", async () => {
+test("相同调用方任务 ID 的不同提交会分别保留，同一次提交仍更新原记录", async () => {
   const sourceTaskId = "task_xituwang_source_api_1234abcd";
   const createdAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   const completedAt = new Date(Date.now() - 60 * 60 * 1000 + 5000).toISOString();
@@ -113,28 +113,47 @@ test("相同洗图王任务 ID 的失败结果会更新原任务记录", async (
     sourceTaskId,
     status: "processing",
     taskType: "img2img",
+    modelId: "gpt",
     requestJson: { client_task_id: sourceTaskId },
     createdAt
   });
 
   await upsertTask({
-    id: "local-source-task-fallback",
+    id: "local-source-task-original",
     sourceTaskId,
     status: "failed",
     taskType: "img2img",
-    errorMessage: "并发上限",
-    responseJson: { ok: false, code: "CONCURRENCY_LIMIT", sourceTaskId },
+    modelId: "gpt",
+    errorMessage: "GPT 请求超时",
+    responseJson: { ok: false, code: "TIMEOUT", sourceTaskId },
     completedAt
+  });
+
+  await upsertTask({
+    id: "local-source-task-gemini",
+    sourceTaskId,
+    status: "failed",
+    taskType: "img2img",
+    modelId: "gemini",
+    errorMessage: "Gemini 未返回图片",
+    requestJson: { client_task_id: sourceTaskId, model: "Gemini" },
+    responseJson: { ok: false, code: "UPSTREAM_NO_IMAGE", sourceTaskId },
+    createdAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+    completedAt: new Date(Date.now() - 30 * 60 * 1000 + 5000).toISOString()
   });
 
   const tasks = await listTasks();
   const matched = tasks.filter((task) => task.sourceTaskId === sourceTaskId);
 
-  assert.equal(matched.length, 1);
-  assert.equal(matched[0].id, "local-source-task-original");
-  assert.equal(matched[0].status, "failed");
-  assert.equal(matched[0].responseJson.code, "CONCURRENCY_LIMIT");
-  assert.equal((await getTaskBySourceTaskId(sourceTaskId)).id, "local-source-task-original");
+  assert.equal(matched.length, 2);
+  assert.deepEqual(
+    matched.map((task) => [task.id, task.modelId, task.responseJson.code]),
+    [
+      ["local-source-task-gemini", "gemini", "UPSTREAM_NO_IMAGE"],
+      ["local-source-task-original", "gpt", "TIMEOUT"]
+    ]
+  );
+  assert.equal((await getTaskBySourceTaskId(sourceTaskId)).id, "local-source-task-gemini");
 });
 
 test("额度检测不会占用生图并发", async () => {
@@ -330,6 +349,60 @@ test("chatplus text-only image wait returns upstream text immediately", async ()
   );
 });
 
+test("chatplus 只返回当前对话分支中用户可见的生成图", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-visible-image-account", username: "visible-image@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  client.imageDownloadUrl = async (fileId) => `https://one.example.test/files/${fileId}.png`;
+
+  const imageUrls = await client.imageUrlsFrom({
+    current_node: "finalText",
+    mapping: {
+      user: {
+        parent: null,
+        message: {
+          author: { role: "user" },
+          content: { parts: ["file-service://file_source"] }
+        }
+      },
+      hiddenIntermediate: {
+        parent: "user",
+        message: {
+          author: { role: "assistant" },
+          metadata: { is_visually_hidden_from_conversation: true },
+          content: { content_type: "image_asset_pointer", parts: ["file-service://file_intermediate"] }
+        }
+      },
+      finalImage: {
+        parent: "hiddenIntermediate",
+        message: {
+          author: { role: "assistant" },
+          content: { content_type: "image_asset_pointer", parts: ["file-service://file_final"] }
+        }
+      },
+      finalText: {
+        parent: "finalImage",
+        message: {
+          author: { role: "assistant" },
+          content: { content_type: "text", parts: ["图片已经生成。"] }
+        }
+      },
+      otherBranch: {
+        parent: "user",
+        message: {
+          author: { role: "assistant" },
+          content: { content_type: "image_asset_pointer", parts: ["file-service://file_other_branch"] }
+        }
+      }
+    }
+  }, { generatedOnly: true });
+
+  assert.deepEqual(imageUrls, ["https://one.example.test/files/file_final.png"]);
+});
+
 test("chatplus image wait treats prompt JSON as an intermediate response", async () => {
   const promptEnvelope = JSON.stringify({ prompt: "整理后的绘图提示词" });
   const resultUrl = "https://one.example.test/generated-after-prompt.png";
@@ -495,6 +568,225 @@ test("chatplus image wait ignores skipped mainline marker and keeps waiting", as
 
   assert.deepEqual(imageUrls, [resultUrl]);
   assert.equal(imageReadCount, 2);
+});
+
+test("chatplus image wait treats search tool output as an intermediate response", async () => {
+  const searchAction = String.raw`search(\"\u5546\u54c1\u8d44\u6599\")`;
+  const resultUrl = "https://one.example.test/generated-after-search.png";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-search-account", username: "search@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  let imageReadCount = 0;
+  let detailReadCount = 0;
+  client.imageUrlsFrom = async () => {
+    imageReadCount += 1;
+    return imageReadCount === 1 ? [] : [resultUrl];
+  };
+  client.json = async () => {
+    detailReadCount += 1;
+    return {
+      mapping: {
+        assistant: {
+          message: {
+            author: { role: "assistant" },
+            content: { parts: [searchAction] }
+          }
+        }
+      }
+    };
+  };
+
+  const imageUrls = await client.waitForConversationImages([{
+    message: {
+      author: { role: "assistant" },
+      content: { parts: [searchAction] }
+    }
+  }], "conversation-with-search-action", 30, { generatedOnly: true });
+
+  assert.deepEqual(imageUrls, [resultUrl]);
+  assert.equal(detailReadCount, 1);
+  assert.equal(imageReadCount, 2);
+});
+
+test("chatplus image wait keeps waiting for a non-final progress message", async () => {
+  const progressMessage = "正在查询商品资料并准备图片。";
+  const resultUrl = "https://one.example.test/generated-after-progress.png";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-progress-account", username: "progress@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  let imageReadCount = 0;
+  client.imageUrlsFrom = async () => {
+    imageReadCount += 1;
+    return imageReadCount === 1 ? [] : [resultUrl];
+  };
+  client.json = async () => ({
+    mapping: {
+      assistant: {
+        message: {
+          author: { role: "assistant" },
+          status: "finished_successfully",
+          end_turn: false,
+          content: { content_type: "text", parts: [progressMessage] }
+        }
+      }
+    }
+  });
+
+  const imageUrls = await client.waitForConversationImages([{
+    message: {
+      author: { role: "assistant" },
+      status: "finished_successfully",
+      end_turn: false,
+      content: { content_type: "text", parts: [progressMessage] }
+    }
+  }], "conversation-with-progress-message", 30, { generatedOnly: true });
+
+  assert.deepEqual(imageUrls, [resultUrl]);
+  assert.equal(imageReadCount, 2);
+});
+
+test("chatplus task refresh keeps search tool output in progress", async () => {
+  const searchAction = "search(\"商品资料\")";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-search-refresh-account", username: "search-refresh@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  client.loginPortal = async () => {};
+  client.imageUrlsFrom = async () => [];
+  client.json = async () => ({
+    mapping: {
+      assistant: {
+        message: {
+          author: { role: "assistant" },
+          content: { parts: [searchAction] }
+        }
+      }
+    }
+  });
+
+  const task = await client.getTask("conversation-with-search-action");
+
+  assert.equal(task.status, "waiting_upstream");
+  assert.equal(task.errorMessage, "");
+  assert.deepEqual(task.imageUrls, []);
+});
+
+test("chatplus task refresh prefers the final assistant reply over longer search thoughts", async () => {
+  const finalMessage = "I wasn't able to generate the image due to an error on my side.";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-final-reply-account", username: "final-reply@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  client.loginPortal = async () => {};
+  client.imageUrlsFrom = async () => [];
+  client.json = async () => ({
+    current_node: "final",
+    mapping: {
+      search: {
+        message: {
+          author: { role: "assistant" },
+          status: "finished_successfully",
+          end_turn: false,
+          content: {
+            content_type: "thoughts",
+            parts: [`search("${"商品资料 ".repeat(30)}")`]
+          }
+        }
+      },
+      final: {
+        message: {
+          author: { role: "assistant" },
+          status: "finished_successfully",
+          end_turn: true,
+          content: { content_type: "text", parts: [finalMessage] }
+        }
+      }
+    }
+  });
+
+  const task = await client.getTask("conversation-with-final-reply");
+
+  assert.equal(task.status, "failed");
+  assert.equal(task.errorMessage, finalMessage);
+});
+
+test("submitted chat image task misclassified from search output can resume refreshing", async () => {
+  const originalConfig = await loadConfig();
+  const searchAction = "search(\"商品资料\")";
+  const wrappedFailure = `上游生成失败：图片和生图要求已完整提交，但上游没有返回图片。上游回复：${searchAction}`;
+  await saveConfig({
+    ...originalConfig,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-search-recovery",
+      channelId: "shareai",
+      name: "搜索中间结果恢复账号",
+      username: "search-recovery@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok"
+    }]
+  });
+  await upsertTask({
+    id: "task-search-intermediate-recovery",
+    externalId: "conversation-search-intermediate-recovery",
+    status: "failed",
+    taskType: "img2img",
+    prompt: "恢复搜索后的图片",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: "account-search-recovery",
+    accountName: "搜索中间结果恢复账号",
+    imageCount: 0,
+    imageUrls: [],
+    upstreamText: searchAction,
+    errorMessage: wrappedFailure,
+    responseJson: { status: "failed", message: wrappedFailure, upstreamText: searchAction },
+    raw: {
+      submitted: true,
+      conversationId: "conversation-search-intermediate-recovery"
+    },
+    createdAt: new Date().toISOString(),
+    completedAt: new Date().toISOString()
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  let refreshReadCount = 0;
+  ChatplusClient.prototype.getTask = async () => {
+    refreshReadCount += 1;
+    return {
+      externalId: "conversation-search-intermediate-recovery",
+      status: "waiting_upstream",
+      imageCount: 0,
+      imageUrls: [],
+      errorMessage: "",
+      raw: { conversationId: "conversation-search-intermediate-recovery" }
+    };
+  };
+
+  try {
+    const recovered = await refreshTask("task-search-intermediate-recovery");
+    assert.equal(refreshReadCount, 1);
+    assert.equal(recovered.status, "waiting_upstream");
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    await saveConfig(originalConfig);
+  }
 });
 
 test("chatplus task refresh keeps skipped mainline marker in progress", async () => {

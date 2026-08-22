@@ -584,7 +584,7 @@ test("expired confirmed chat quota allows a real image request without dashboard
   }
 });
 
-test("unconfirmed dashboard quota zero does not block image admission", async () => {
+test("dashboard quota zero blocks image admission before entering a car", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -598,7 +598,9 @@ test("unconfirmed dashboard quota zero does not block image admission", async ()
       settings: {
         drawingBaseUrl: "https://drawing.example.test",
         chatBaseUrl: "https://chat.example.test",
-        defaultModelId: 1
+        defaultModelId: 1,
+        defaultChatModel: "gemini",
+        chatModels: [{ key: "gemini", name: "Gemini", enabled: true, default: true }]
       }
     }],
     accounts: [{
@@ -613,12 +615,22 @@ test("unconfirmed dashboard quota zero does not block image admission", async ()
         abilities: {
           drawing: { status: "ok" },
           chatplus: {
-            status: "quota_empty",
-            quota: 220,
-            used: 220,
-            balance: 0,
-            quotaReason: "chat_usage_limit",
-            quotaResetAt: "2099-01-02T03:04:05+08:00"
+            status: "ok",
+            quota: null,
+            used: null,
+            balance: null,
+            meta: {
+              chatModel: "gemini",
+              referenceUsage: {
+                gemini: {
+                  quota: 70,
+                  used: 70,
+                  balance: 0,
+                  quotaResetAt: "2099-01-02T03:04:05+08:00",
+                  period: "24h"
+                }
+              }
+            }
           }
         }
       }
@@ -643,23 +655,107 @@ test("unconfirmed dashboard quota zero does not block image admission", async ()
   };
 
   try {
-    const admitted = await reserveImageTaskAdmission({
-      channel: "chatplus",
-      accountId: "chat-usage-empty",
-      prompt: "quota test"
-    });
-    admitted.release();
+    await assert.rejects(
+      reserveImageTaskAdmission({
+        channel: "chatplus",
+        accountId: "chat-usage-empty",
+        model: "gemini",
+        prompt: "quota test"
+      }),
+      /额度|恢复|可用/
+    );
 
     const stored = await loadConfig();
     const chatplus = stored.accounts[0].meta.abilities.chatplus;
     assert.equal(checkCount, 0);
-    assert.equal(admitted.target.channel.type, "chatplus");
-    assert.equal(chatplus.status, "quota_empty");
-    assert.equal(chatplus.balance, 0);
-    assert.equal(chatplus.quotaConfirmedByUpstream, undefined);
+    assert.equal(chatplus.status, "ok");
+    assert.equal(chatplus.meta.referenceUsage.gemini.balance, 0);
   } finally {
     ChatplusClient.prototype.check = originalCheck;
   }
+});
+
+test("one chat model reaching zero does not block another model", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "chatplus",
+    concurrency: { chat: 3, drawingImage: 2, chatImage: 1 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        defaultModelId: 1,
+        defaultChatModel: "gemini",
+        chatModels: [
+          { key: "gpt", name: "GPT", enabled: true },
+          { key: "gemini", name: "Gemini", enabled: true, default: true }
+        ]
+      }
+    }],
+    accounts: [{
+      id: "chat-model-isolation",
+      channelId: "shareai",
+      name: "Chat Model Isolation",
+      username: "chat-model-isolation@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok" },
+          chatplus: {
+            status: "quota_empty",
+            quotaReason: "chat_usage_limit",
+            quotaModel: "gemini",
+            quotaConfirmedByUpstream: true,
+            quotaResetAt: "2099-01-02T03:04:05+08:00",
+            cooldownUntil: "2099-01-02T03:04:05+08:00",
+            meta: {
+              chatModel: "gemini",
+              referenceUsage: {
+                gpt: { quota: 220, used: 20, balance: 200, period: "12h" },
+                gemini: {
+                  quota: 70,
+                  used: 70,
+                  balance: 0,
+                  quotaResetAt: "2099-01-02T03:04:05+08:00",
+                  period: "24h"
+                }
+              }
+            }
+          }
+        }
+      }
+    }]
+  });
+
+  const gptAdmission = await reserveImageTaskAdmission({
+    channel: "chatplus",
+    accountId: "chat-model-isolation",
+    model: "gpt",
+    prompt: "gpt remains available"
+  });
+  try {
+    assert.equal(gptAdmission.target.account.id, "chat-model-isolation");
+    assert.equal(gptAdmission.modelKey, "gpt");
+  } finally {
+    gptAdmission.release();
+  }
+
+  await assert.rejects(
+    reserveImageTaskAdmission({
+      channel: "chatplus",
+      accountId: "chat-model-isolation",
+      model: "gemini",
+      prompt: "gemini remains paused"
+    }),
+    /额度|恢复|可用/
+  );
 });
 
 test("confirmed chat quota with a future reset blocks image admission", async () => {

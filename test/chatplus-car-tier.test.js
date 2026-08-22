@@ -485,7 +485,9 @@ test("a healthy reusable image car is kept for the next task", async () => {
 
 test("a car that recently produced an image is preferred when switching", async () => {
   const client = clientForGpt({ accountId: "account-recent-image-success" });
-  client.loginPortal = async () => {};
+  client.portalLoggedIn = true;
+  client.performEnterCar = async () => {};
+  client.createSubmitClient = () => client;
   client.conversationDetail = async () => ({ id: "finished-image" });
   client.imageUrlsFrom = async () => ["https://example.test/generated.png"];
   client.fetchCars = async () => [

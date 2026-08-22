@@ -723,12 +723,27 @@ test("wait image task returns upstream policy refusal without wrapping it as tim
           chatplus: { status: "ok", message: "聊天账号可用" }
         }
       }
+    }, {
+      id: "account-policy-unused",
+      channelId: "shareai",
+      name: "policy-unused@example.com",
+      username: "policy-unused@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
     }]
   });
 
-  const message = "We’re so sorry, but the image we created may violate our guardrails concerning similarity to third-party content. If you think we got it wrong, please retry or edit your prompt.";
+  const message = "We're so sorry, but the prompt may violate our content policies. If you think we got it wrong, please retry or edit your prompt.";
   const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let submissionCount = 0;
   ChatplusClient.prototype.createImageTask = async (input) => {
+    submissionCount += 1;
     await input.onSubmitted?.({
       externalId: "conversation-policy-wait",
       status: "processing",
@@ -755,14 +770,14 @@ test("wait image task returns upstream policy refusal without wrapping it as tim
         wait: true
       }),
       (error) => {
-        assert.match(error.message, /^上游生成失败：图片和生图要求已完整提交，但上游没有返回图片。/);
+        assert.equal(error.message, message);
         assert.equal(error.status, 400);
         assert.equal(error.code, "content_policy");
         assert.equal(error.task.status, "failed");
         assert.equal(error.task.responseJson.failureType, "upstream_no_image");
         assert.equal(error.task.responseJson.submissionConfirmed, true);
         assert.equal(error.task.responseJson.failureReason, message);
-        assert.match(error.task.responseJson.message, /^上游生成失败：/);
+        assert.equal(error.task.responseJson.message, message);
         assert.equal(error.task.responseJson.upstreamText, message);
         assert.deepEqual(
           error.task.submissionChannels.map((item) => [item.channelId, item.accountId]),
@@ -772,6 +787,7 @@ test("wait image task returns upstream policy refusal without wrapping it as tim
         return true;
       }
     );
+    assert.equal(submissionCount, 1);
   } finally {
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
   }
@@ -841,6 +857,98 @@ test("提交结果无法确认时不会换账号重发，并准确标记为未�
       }
     );
     assert.equal(submissionCount, 1);
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+    await saveConfig(config);
+  }
+});
+
+test("账户额度明确用完后切换账户，并在恢复时间前不再使用", async () => {
+  const config = await loadConfig();
+  const resetAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    imageStorage: { mode: "never", autoCleanup: false, retentionDays: 7 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        chatBaseUrl: "https://chat.example.test",
+        enabledAbilities: { drawing: false, chatplus: true },
+        defaultChatModel: "gemini"
+      }
+    }],
+    accounts: ["empty", "healthy"].map((name, index) => ({
+      id: `quota-switch-${name}`,
+      channelId: "shareai",
+      name: `Quota switch ${name}`,
+      username: `${name}@example.test`,
+      password: "test",
+      enabled: true,
+      priority: index + 1,
+      status: "ok",
+      meta: { abilities: { chatplus: { status: "ok", message: "聊天账号可用" } } }
+    }))
+  });
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  const calls = [];
+  ChatplusClient.prototype.createImageTask = async function createQuotaSwitchTask(input) {
+    calls.push(this.account.id);
+    if (this.account.id === "quota-switch-empty") {
+      const error = new Error("当前 Gemini 账号的使用次数已用完。");
+      error.status = 429;
+      error.code = "CHAT_USAGE_LIMIT";
+      error.quotaEmpty = true;
+      error.quotaReason = "chat_usage_limit";
+      error.quotaModel = "gemini";
+      error.quotaConfirmedByUpstream = true;
+      error.quotaResetAt = resetAt;
+      error.cooldownUntil = resetAt;
+      error.imageSubmissionAttempted = true;
+      error.imageSubmissionConfirmed = false;
+      throw error;
+    }
+    return {
+      externalId: `conversation-${calls.length}`,
+      status: "success",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: "gemini",
+      imageCount: 1,
+      imageUrls: [`https://images.example.test/quota-switch-${calls.length}.png`],
+      raw: {}
+    };
+  };
+
+  try {
+    const request = (prompt) => createImageTask({
+      input: { channel: "chatplus", model: "gemini", prompt },
+      files: [{ filename: "source.png", mimetype: "image/png" }],
+      wait: true
+    });
+    const first = await request("额度切换测试一");
+    const storedAfterFirst = await loadConfig();
+    const emptyStatus = storedAfterFirst.accounts
+      .find((account) => account.id === "quota-switch-empty")
+      .meta.abilities.chatplus;
+
+    assert.equal(first.status, "success");
+    assert.equal(first.accountId, "quota-switch-healthy");
+    assert.deepEqual(calls, ["quota-switch-empty", "quota-switch-healthy"]);
+    assert.equal(emptyStatus.status, "quota_empty");
+    assert.equal(emptyStatus.quotaConfirmedByUpstream, true);
+    assert.equal(emptyStatus.quotaResetAt, resetAt);
+    assert.equal(emptyStatus.cooldownUntil, resetAt);
+
+    calls.length = 0;
+    const second = await request("额度切换测试二");
+    assert.equal(second.status, "success");
+    assert.equal(second.accountId, "quota-switch-healthy");
+    assert.deepEqual(calls, ["quota-switch-healthy"]);
   } finally {
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
     await saveConfig(config);
