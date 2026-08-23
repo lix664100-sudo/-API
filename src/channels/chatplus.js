@@ -2497,6 +2497,7 @@ export class ChatplusClient {
       completed = this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}/async-status`, {
         ...requestOptions,
         method: "POST",
+        body: {},
         headers: {
           ...CONVERSATION_READ_HEADERS,
           ...(requestOptions.headers || {})

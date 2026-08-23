@@ -559,6 +559,7 @@ test("chatplus task refresh syncs a completed async image before reading the res
   assert.equal(requests.filter((item) => item.pathName.includes("/stream_status")).length, 1);
   const syncRequest = requests.find((item) => item.pathName.endsWith("/async-status"));
   assert.equal(syncRequest?.options?.method, "POST");
+  assert.deepEqual(syncRequest?.options?.body, {});
   assert.equal(
     requests.filter((item) => /^\/backend-api\/conversation\/conversation-async-complete\?_\=\d+$/.test(item.pathName)).length,
     2
