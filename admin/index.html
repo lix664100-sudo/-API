@@ -7729,7 +7729,7 @@
                   h("div", { className: "capacity-subtitle" }, "可用数量只统计状态正常的账号；任务完成或停止后会自动释放名额")
                 ]),
                 h(Tooltip, { title: "达到可用并发上限后，新任务会立即返回繁忙，不进入处理列表。" },
-                  h(Tag, { color: "blue" }, "满载自动排队")
+                  h(Tag, { color: "orange" }, "满载立即拒绝")
                 )
               ]),
               h("div", { className: "capacity-grid" }, [

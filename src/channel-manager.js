@@ -3722,7 +3722,7 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
   ));
 }
 
-export async function reserveImageTaskAdmission(input = {}) {
+export async function reserveImageTaskAdmission(input = {}, options = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
@@ -3738,13 +3738,54 @@ export async function reserveImageTaskAdmission(input = {}) {
       input
     });
   }
-  const reserved = await reserveFirstAvailableTarget(targets, "img2img", {
-    input
-  });
-  return {
-    ...reserved,
-    modelKey: targetImageModelKey(reserved.target, input)
-  };
+  if (options.verifyReady !== true) {
+    const reserved = await reserveFirstAvailableTarget(targets, "img2img", { input });
+    return {
+      ...reserved,
+      modelKey: targetImageModelKey(reserved.target, input)
+    };
+  }
+
+  let candidates = targets;
+  const readinessAttempts = [];
+  while (candidates.length) {
+    let reserved;
+    try {
+      reserved = await reserveFirstAvailableTarget(candidates, "img2img", { input });
+    } catch (error) {
+      if (readinessAttempts.length) {
+        error.attempts = [...readinessAttempts, ...(Array.isArray(error.attempts) ? error.attempts : [])];
+        if (error.code === "CONCURRENCY_LIMIT") {
+          const details = attemptErrorMessage(error.attempts);
+          error.message = details ? `并发上限：${details}` : "并发上限";
+        }
+      }
+      throw error;
+    }
+
+    const targetAttempts = [];
+    let ready = false;
+    try {
+      ready = await ensureTargetReady(config, reserved.target, "img2img", targetAttempts, { input });
+    } catch (error) {
+      reserved.release();
+      throw error;
+    }
+    if (ready) {
+      return {
+        ...reserved,
+        attempts: [...readinessAttempts, ...(reserved.attempts || [])],
+        modelKey: targetImageModelKey(reserved.target, input),
+        readyChecked: true
+      };
+    }
+
+    reserved.release();
+    readinessAttempts.push(...(reserved.attempts || []), ...targetAttempts);
+    candidates = candidates.filter((target) => !sameTarget(target, reserved.target));
+  }
+
+  throw targetsFailedError(readinessAttempts);
 }
 
 export function attachImageAdmissionToRequest(admission, request) {
@@ -4212,6 +4253,7 @@ function consumeAdmissionReservation(admission, targets, input = {}) {
     target,
     release: admission.release,
     handoff: admission.handoff,
+    readyChecked: admission.readyChecked === true,
     attempts: Array.isArray(admission.attempts) ? admission.attempts : [],
     orderedTargets: Array.isArray(admission.orderedTargets) ? admission.orderedTargets : []
   };
@@ -4992,7 +5034,8 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
       }
       let taskState = latestTask;
       try {
-        if (!(await ensureTargetReady(config, target, "img2img", attempts, {
+        const readyAtAdmission = usingReserved && taskReservation?.readyChecked === true;
+        if (!readyAtAdmission && !(await ensureTargetReady(config, target, "img2img", attempts, {
           skipQuotaRefresh: options.fastQuotaRefresh || options.noChatplusQueue,
           input
         }))) continue;
@@ -5229,16 +5272,15 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   const targets = await selectReadyTargets(config, requestedChannel, "text2img", { input });
   if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel, input });
 
-  const reserved = await tryReserveFirstAvailableTarget(targets, "text2img", { input });
-  const queueOrder = reserved?.orderedTargets || await orderTargetsByRoutingUsage(targets, "text2img", input);
-  const target = reserved?.target || queueOrder[0];
+  const reserved = await reserveFirstAvailableTarget(targets, "text2img", { input });
+  const target = reserved.target;
   const task = queuedTask({
     input,
     target,
     taskType: "text2img",
     requestMeta,
-    status: reserved ? "processing" : "queued",
-    raw: reserved ? {} : { waitingForSlot: true }
+    status: "processing",
+    raw: {}
   });
   try {
     await upsertTask(task);
@@ -5250,8 +5292,7 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   runInBackground(async () => {
     try {
       await runQueuedTextTask(task, input, reserved, {
-        waitForChatplusImages: true,
-        waitForSlot: !reserved
+        waitForChatplusImages: true
       });
     } finally {
       scheduledImageTasks.delete(task.id);
@@ -5287,16 +5328,15 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
     });
   }
 
-  const reserved = selection.reserved || await tryReserveFirstAvailableTarget(targets, "img2img", { input });
-  const queueOrder = reserved?.orderedTargets || await orderTargetsByRoutingUsage(targets, "img2img", input);
-  const target = reserved?.target || queueOrder[0];
+  const reserved = selection.reserved || await reserveFirstAvailableTarget(targets, "img2img", { input });
+  const target = reserved.target;
   const task = queuedTask({
     input: { ...input, files },
     target,
     taskType: "img2img",
     requestMeta,
-    status: reserved ? "processing" : "queued",
-    raw: reserved ? {} : { waitingForSlot: true }
+    status: "processing",
+    raw: {}
   });
   try {
     reserved?.handoff?.();
@@ -5309,8 +5349,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   runInBackground(async () => {
     try {
       await runQueuedImageTask(task, input, files, reserved, {
-        waitForChatplusImages: true,
-        waitForSlot: !reserved
+        waitForChatplusImages: true
       });
     } finally {
       scheduledImageTasks.delete(task.id);

@@ -8,7 +8,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-recovery-"));
 process.env.DATA_DIR = dataDir;
 
 const { closeStorage, getTask, listTasks, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
-const { createImageTask, getRuntimeStatus, imageTaskClientView, inspectUpstreamTask, queueImageTask, refreshProcessingTasks, refreshTask, reserveImageTaskAdmission } = await import("../src/channel-manager.js");
+const { createImageTask, getRuntimeStatus, imageTaskClientView, inspectUpstreamTask, queueImageTask, queueTextTask, refreshProcessingTasks, refreshTask, reserveImageTaskAdmission } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
@@ -2878,7 +2878,7 @@ test("聊天生图并发提交会共用一次已准备好的账号会话", async
   assert.equal(new Set(results.map((result) => result.externalId)).size, 3);
 });
 
-test("聊天生图等待上游任务会继续占用并发名额", async () => {
+test("聊天生图满载时立即拒绝，释放名额后才能重新提交", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -2969,12 +2969,20 @@ test("聊天生图等待上游任务会继续占用并发名额", async () => {
       tasks.find((task) => task.prompt === "job-1")?.raw?.stageTimings?.map((stage) => stage.id),
       ["stage-job-1"]
     );
-    const queuedSixth = await queueImageTask({
-      input: { channel: "chatplus", prompt: "job-6" },
-      files: [{ filename: "source-6.png", mimetype: "image/png", buffer: Buffer.from("x") }]
-    });
+    await assert.rejects(
+      queueImageTask({
+        input: { channel: "chatplus", prompt: "job-6" },
+        files: [{ filename: "source-6.png", mimetype: "image/png", buffer: Buffer.from("x") }]
+      }),
+      (error) => {
+        assert.equal(error.status, 429);
+        assert.equal(error.code, "CONCURRENCY_LIMIT");
+        return true;
+      }
+    );
 
-    assert.equal(queuedSixth.status, "queued");
+    tasks = await listTasks();
+    assert.equal(tasks.some((task) => task.prompt === "job-6"), false);
     assert.equal(submittedJobs.includes("job-6"), false);
 
     const completed = tasks.find((task) => task.prompt === "job-1");
@@ -2985,6 +2993,12 @@ test("聊天生图等待上游任务会继续占用并发名额", async () => {
       imageUrls: ["https://example.com/job-1.png"],
       completedAt: new Date().toISOString()
     });
+
+    const acceptedSixth = await queueImageTask({
+      input: { channel: "chatplus", prompt: "job-6" },
+      files: [{ filename: "source-6.png", mimetype: "image/png", buffer: Buffer.from("x") }]
+    });
+    assert.equal(acceptedSixth.status, "processing");
 
     for (let attempt = 0; attempt < 100; attempt += 1) {
       tasks = await listTasks();
@@ -2997,4 +3011,58 @@ test("聊天生图等待上游任务会继续占用并发名额", async () => {
   } finally {
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
   }
+});
+
+test("异步文字生图满载时也立即拒绝，不创建排队任务", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "text-image-no-queue",
+    concurrency: { chat: 3, drawingImage: 1, chatImage: 1 },
+    channels: [{
+      id: "text-image-no-queue",
+      type: "chatplus",
+      name: "Text Image No Queue",
+      enabled: true,
+      settings: {
+        baseUrl: "https://chat.example.test",
+        defaultChatModel: "gpt"
+      }
+    }],
+    accounts: [{
+      id: "text-image-no-queue-account",
+      channelId: "text-image-no-queue",
+      name: "Text Image No Queue Account",
+      username: "text-image-no-queue@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      concurrency: { chat: 3, drawingImage: 1, chatImage: 1 },
+      meta: { abilities: { chatplus: { status: "ok" } } }
+    }]
+  });
+  await upsertTask({
+    id: "text-image-no-queue-blocker",
+    externalId: "text-image-no-queue-upstream",
+    status: "waiting_upstream",
+    taskType: "text2img",
+    modelId: "gpt",
+    channelId: "text-image-no-queue",
+    channelName: "Text Image No Queue",
+    channelType: "chatplus",
+    accountId: "text-image-no-queue-account",
+    accountName: "Text Image No Queue Account",
+    raw: { submitted: true, chatModel: "gpt" },
+    createdAt: new Date().toISOString()
+  });
+
+  await assert.rejects(
+    queueTextTask({ channel: "text-image-no-queue", prompt: "must not queue" }),
+    (error) => {
+      assert.equal(error.status, 429);
+      assert.equal(error.code, "CONCURRENCY_LIMIT");
+      return true;
+    }
+  );
+  assert.equal((await listTasks()).some((task) => task.prompt === "must not queue"), false);
 });

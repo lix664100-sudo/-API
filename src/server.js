@@ -367,7 +367,10 @@ function imageAdmissionInput(request, requestMeta = {}, parsedInput = null) {
 }
 
 async function reserveImageRequestAdmission(request, requestMeta = {}, parsedInput = null) {
-  const admission = await reserveImageTaskAdmission(imageAdmissionInput(request, requestMeta, parsedInput));
+  const admission = await reserveImageTaskAdmission(
+    imageAdmissionInput(request, requestMeta, parsedInput),
+    { verifyReady: true }
+  );
   return attachImageAdmissionToRequest(admission, request);
 }
 
@@ -699,13 +702,18 @@ async function saveMessageImagePreviews(input = {}, {
   return previewFiles.map((file) => file.previewUrl).filter(Boolean);
 }
 
-async function readMultipartInput(request, { maxFiles, savePreview = false }) {
+async function readMultipartInput(request, { maxFiles, savePreview = false, beforeImageRead = null }) {
   const input = {};
   const files = [];
+  let imageReadStarted = false;
   for await (const part of request.parts()) {
     if (part.type === "file") {
       if (!isImageInputField(part.fieldname)) continue;
       if (!part.filename) continue;
+      if (!imageReadStarted) {
+        await beforeImageRead?.(normalizeFields(input));
+        imageReadStarted = true;
+      }
       const buffer = await part.toBuffer();
       await pushBufferedImage(files, buffer, part, { maxFiles, savePreview });
       continue;
@@ -718,6 +726,8 @@ async function readMultipartInput(request, { maxFiles, savePreview = false }) {
 async function readImageInput(request, options) {
   if (isMultipartRequest(request)) return readMultipartInput(request, options);
   const input = normalizeFields(request.body || {});
+  const hasImageInput = Object.keys(input).some((fieldname) => isImageInputField(fieldname));
+  if (hasImageInput) await options.beforeImageRead?.(input);
   return appendImageFields(input, [], options);
 }
 
@@ -1302,14 +1312,23 @@ app.post("/api/draw/edit", async (request, reply) => {
   let admission = null;
   let admissionTransferred = false;
   try {
-    const parsed = await readImageInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
+    const reserveBeforeImageRead = async (partialInput = {}) => {
+      if (admission) return;
+      requestMeta = mergeInputSourceTaskId(requestMeta, partialInput);
+      admission = await reserveImageRequestAdmission(request, requestMeta, partialInput);
+    };
+    const parsed = await readImageInput(request, {
+      maxFiles: MAX_INPUT_IMAGE_COUNT,
+      savePreview: true,
+      beforeImageRead: reserveBeforeImageRead
+    });
     input = parsed.input;
     files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest(`请上传 1 到 ${MAX_INPUT_IMAGE_COUNT} 张源图，字段名用 image。`);
+    await reserveBeforeImageRead(input);
     let task;
     if (request.query?.wait === "1") {
-      admission = await reserveImageRequestAdmission(request, requestMeta, input);
       task = await createImageTask({ input, files, wait: true, requestMeta, admission });
     } else {
       task = await queueImageTask({ input, files, requestMeta, admission });
@@ -1442,14 +1461,21 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
   let admission = null;
   let admissionTransferred = false;
   try {
-    const parsed = await readImageInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
+    const reserveBeforeImageRead = async (partialInput = {}) => {
+      if (admission) return;
+      requestMeta = mergeInputSourceTaskId(requestMeta, partialInput);
+      admission = await reserveImageRequestAdmission(request, requestMeta, partialInput);
+    };
+    const parsed = await readImageInput(request, {
+      maxFiles: MAX_INPUT_IMAGE_COUNT,
+      savePreview: true,
+      beforeImageRead: reserveBeforeImageRead
+    });
     input = parsed.input;
     files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest(`请上传 1 到 ${MAX_INPUT_IMAGE_COUNT} 张源图，字段名用 image。`);
-    if (request.query?.wait !== "0") {
-      admission = await reserveImageRequestAdmission(request, requestMeta, input);
-    }
+    await reserveBeforeImageRead(input);
     const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta, admission });
     admissionTransferred = true;
     if (task.status !== "success") reply.code(202);

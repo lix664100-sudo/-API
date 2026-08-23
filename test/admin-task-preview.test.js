@@ -280,7 +280,7 @@ test("处理中任务自动刷新只合并更新结果，不再重复下载整�
 });
 
 test("两个改图入口都会保存原图预览，并纳入现有图片清理目录", () => {
-  const previewEnabledReads = serverSource.match(/readImageInput\(request, \{ maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true \}\)/g) || [];
+  const previewEnabledReads = serverSource.match(/readImageInput\(request, \{\s*maxFiles: MAX_INPUT_IMAGE_COUNT,\s*savePreview: true,\s*beforeImageRead: reserveBeforeImageRead\s*\}\)/g) || [];
 
   assert.equal(previewEnabledReads.length, 2);
   assert.match(serverSource, /const previewDir = resultImageDir;/);
@@ -290,17 +290,17 @@ test("两个改图入口都会保存原图预览，并纳入现有图片清理�
   assert.match(serverSource, /filename\.startsWith\("preview-"\)/);
 });
 
-test("两个改图入口都会先读取完整任务，再按真实模型占用账号并发", () => {
+test("两个改图入口都会在读取图片前占住并发名额", () => {
   for (const route of ["/api/draw/edit", "/v1/images/edits"]) {
     const routeStart = serverSource.indexOf(`app.post("${route}"`);
     const routeEnd = serverSource.indexOf("\n});", routeStart);
     const routeSource = serverSource.slice(routeStart, routeEnd);
     const readAt = routeSource.indexOf("readImageInput(request");
-    const reserveAt = routeSource.indexOf("reserveImageRequestAdmission(request, requestMeta, input)");
+    const reserveAt = routeSource.indexOf("reserveImageRequestAdmission(request, requestMeta, partialInput)");
 
     assert.ok(routeStart >= 0 && routeEnd > routeStart, `${route} 必须存在`);
-    assert.ok(readAt >= 0, `${route} 必须读取完整任务`);
-    assert.ok(reserveAt > readAt, `${route} 必须在读取完整任务后再占用账号并发`);
+    assert.ok(reserveAt >= 0 && reserveAt < readAt, `${route} 必须先准备并发检查再读取图片`);
+    assert.match(routeSource, /beforeImageRead: reserveBeforeImageRead/);
   }
 });
 
@@ -544,9 +544,9 @@ test("账号忙碌时保留真正占用账号的任务信息", () => {
   );
 });
 
-test("账号满载后的任务明确显示为排队中", () => {
+test("并发面板明确显示满载立即拒绝，旧排队记录仍可查看", () => {
   assert.match(adminHtml, /queued: \["processing", "排队中"\]/);
   assert.match(adminHtml, /\{ label: "排队中", value: "queued" \}/);
-  assert.match(adminHtml, /满载自动排队/);
-  assert.doesNotMatch(adminHtml, /满载立即拒绝/);
+  assert.match(adminHtml, /满载立即拒绝/);
+  assert.doesNotMatch(adminHtml, /满载自动排队/);
 });

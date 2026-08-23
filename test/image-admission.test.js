@@ -219,6 +219,109 @@ test("image admission reservation blocks another request before task creation", 
   }
 });
 
+test("configured concurrency ten accepts ten tasks and rejects only the eleventh", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "ten-capacity",
+    concurrency: { chat: 3, drawingImage: 10, chatImage: 1 },
+    channels: [{
+      id: "ten-capacity",
+      type: "drawing",
+      name: "Ten Capacity",
+      enabled: true,
+      settings: { baseUrl: "https://drawing.example.test", defaultModelId: 1 }
+    }],
+    accounts: [{
+      id: "ten-capacity-account",
+      channelId: "ten-capacity",
+      name: "Ten Capacity Account",
+      username: "ten-capacity@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      concurrency: { chat: 1, drawingImage: 10, chatImage: 1 },
+      meta: { abilities: { drawing: { status: "ok", balance: 50 } } }
+    }]
+  });
+
+  const reservations = await Promise.all(Array.from({ length: 10 }, (_item, index) => (
+    reserveImageTaskAdmission({ channel: "ten-capacity", prompt: `accepted-${index + 1}` })
+  )));
+  let replacement = null;
+  try {
+    assert.equal((await getRuntimeStatus()).categories.image.running, 10);
+    await assert.rejects(
+      reserveImageTaskAdmission({ channel: "ten-capacity", prompt: "rejected-11" }),
+      (error) => {
+        assert.equal(error.status, 429);
+        assert.equal(error.code, "CONCURRENCY_LIMIT");
+        return true;
+      }
+    );
+
+    reservations[0].release();
+    replacement = await reserveImageTaskAdmission({ channel: "ten-capacity", prompt: "accepted-after-release" });
+    assert.equal((await getRuntimeStatus()).categories.image.running, 10);
+  } finally {
+    for (const reservation of reservations) reservation.release();
+    replacement?.release();
+  }
+  assert.equal((await getRuntimeStatus()).categories.image.running, 0);
+});
+
+test("verified image admission skips a broken route before the image is read", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "verified-admission",
+    concurrency: { chat: 3, drawingImage: 1, chatImage: 1 },
+    channels: [{
+      id: "verified-admission",
+      type: "drawing",
+      name: "Verified Admission",
+      enabled: true,
+      settings: { baseUrl: "https://drawing.example.test", defaultModelId: 1 }
+    }],
+    accounts: ["broken", "healthy"].map((kind) => ({
+      id: `verified-admission-${kind}`,
+      channelId: "verified-admission",
+      name: `Verified Admission ${kind}`,
+      username: `verified-admission-${kind}@example.test`,
+      password: "test",
+      enabled: true,
+      status: "ok",
+      priority: kind === "broken" ? 1 : 2,
+      concurrency: { chat: 1, drawingImage: 1, chatImage: 1 },
+      meta: { abilities: { drawing: { status: "ok", balance: 50 } } }
+    }))
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  const checkedAccounts = [];
+  DrawingClient.prototype.check = async function checkBeforeAdmission() {
+    checkedAccounts.push(this.account.id);
+    if (this.account.id.endsWith("-broken")) throw new Error("target unreachable");
+    return { status: "ok", quota: 50, balance: 50, message: "drawing ok" };
+  };
+
+  try {
+    const admission = await reserveImageTaskAdmission(
+      { channel: "verified-admission", prompt: "choose a healthy route" },
+      { verifyReady: true }
+    );
+    try {
+      assert.equal(admission.target.account.id, "verified-admission-healthy");
+      assert.equal(admission.readyChecked, true);
+      assert.deepEqual(checkedAccounts, ["verified-admission-broken", "verified-admission-healthy"]);
+    } finally {
+      admission.release();
+    }
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+  }
+});
+
 test("aborted image upload releases its reserved slot before task creation", async () => {
   const config = await loadConfig();
   await saveConfig({
