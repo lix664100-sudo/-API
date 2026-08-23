@@ -1077,6 +1077,7 @@ function imageSubmissionFailure(error) {
   failure.failureReason = report.failureReason;
   failure.failureStage = report.failureStage;
   failure.upstreamText = report.upstreamText;
+  failure.upstreamModel = error?.upstreamModel || "";
   failure.upstreamStatus = error?.upstreamStatus || "";
   failure.upstreamExplicitFailure = error?.upstreamExplicitFailure === true;
   failure.selectedCarId = error?.selectedCarId || "";
@@ -2718,6 +2719,12 @@ function wrapTask({ result, channel, account, attempts, requestJson = null, requ
   const sourceTaskId = meta.sourceTaskId || sourceTaskIdFrom(requestJson);
   const requestMetaPayload = sourceTaskId && !meta.sourceTaskId ? { ...meta, sourceTaskId } : meta;
   const requestPayload = attachSourceTaskId(requestJson, sourceTaskId);
+  const requestedModel = requestPayload?.model
+    || requestPayload?.chat_model
+    || requestPayload?.chatModel
+    || requestPayload?.model_id
+    || requestPayload?.modelId
+    || "";
   return {
     id: `task-${randomUUID()}`,
     ...(sourceTaskId ? { sourceTaskId } : {}),
@@ -2748,6 +2755,7 @@ function wrapTask({ result, channel, account, attempts, requestJson = null, requ
     }, sourceTaskId),
     completedAt: isFinishedTask(status) ? new Date().toISOString() : null,
     raw: {
+      ...(requestedModel !== "" ? { requestedModel } : {}),
       ...(result.raw || result),
       ...(failure ? imageFailureRawFields(failure) : {})
     }
@@ -3454,9 +3462,10 @@ function pushAttempt(attempts, target, message, extra = {}) {
 }
 
 function attemptMetadataForError(error) {
-  return isCarPoolUnavailableError(error)
-    ? { carPoolUnavailable: true }
-    : {};
+  return {
+    ...(isCarPoolUnavailableError(error) ? { carPoolUnavailable: true } : {}),
+    ...(error?.upstreamModel ? { upstreamModel: error.upstreamModel } : {})
+  };
 }
 
 async function updateTargetStatusForWork(target, patch) {
@@ -3831,6 +3840,7 @@ function targetsFailedError(attempts) {
   else if (carPoolUnavailable) message = "上游共享车位暂时不可用，任务未能提交。请稍后重试。";
   const error = new Error(message);
   error.attempts = attempts;
+  error.upstreamModel = [...attempts].reverse().find((item) => item.upstreamModel)?.upstreamModel || "";
   error.upstreamText = [...attempts].reverse().find((item) => compactFailureText(item.upstreamText))?.upstreamText || "";
   if (concurrencyLimited) {
     error.status = 429;
@@ -3972,6 +3982,7 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
   const sourceTaskId = meta.sourceTaskId || sourceTaskIdFrom(input);
   const requestMetaPayload = sourceTaskId && !meta.sourceTaskId ? { ...meta, sourceTaskId } : meta;
   const requestJson = attachSourceTaskId(taskRequestJson(input), sourceTaskId);
+  const requestedModel = input.model || input.chat_model || input.chatModel || input.model_id || input.modelId || "";
   return {
     id: `task-${randomUUID()}`,
     ...(sourceTaskId ? { sourceTaskId } : {}),
@@ -3998,6 +4009,7 @@ function queuedTask({ input, target, taskType, prompt, imageCount, inputImageUrl
     responseJson: null,
     raw: {
       queued: true,
+      ...(requestedModel !== "" ? { requestedModel } : {}),
       ...(taskType !== "chat"
         ? { modelFamily: targetImageModelKey(target, input) }
         : {}),
@@ -4166,6 +4178,7 @@ async function failQueuedTask(task, error, attempts = []) {
     },
     completedAt: new Date().toISOString(),
     raw: mergeTaskRaw(task.raw, {
+      ...(error?.upstreamModel ? { upstreamModel: error.upstreamModel } : {}),
       ...(error?.selectedCarId ? { selectedCarId: error.selectedCarId } : {}),
       ...(error?.selectedCarType ? { selectedCarType: error.selectedCarType } : {}),
       ...(Array.isArray(error?.carAttempts) && error.carAttempts.length
@@ -4417,7 +4430,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         latestTask = taskState;
         if (savedTaskExternalId(taskState)) {
           if (isTerminalTaskFailureError(error)) {
-            pushAttempt(attempts, target, error.message || "调用失败");
+            pushAttempt(attempts, target, error.message || "调用失败", attemptMetadataForError(error));
             return failQueuedTask(taskState, error, attempts);
           }
           return keepSubmittedTaskRecoverable(taskState, error, attempts);
@@ -4425,7 +4438,10 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         if (await skipAccountAfterConfirmedUsageLimit(target, error, attempts)) continue;
         if (error.imageSubmissionAttempted === true) {
           const failure = imageSubmissionFailure(error);
-          pushAttempt(attempts, target, failure.message, { upstreamText: failure.upstreamText || "" });
+          pushAttempt(attempts, target, failure.message, {
+            ...attemptMetadataForError(failure),
+            upstreamText: failure.upstreamText || ""
+          });
           if (failure.imageSubmissionConfirmed === true) {
             taskState = markTaskSubmissionAttempt(taskState, channel, account);
           }
@@ -4435,7 +4451,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           return failQueuedTask(taskState, failure, attempts);
         }
         if (isTerminalTaskFailureError(error)) {
-          pushAttempt(attempts, target, error.message || "调用失败");
+          pushAttempt(attempts, target, error.message || "调用失败", attemptMetadataForError(error));
           continue;
         }
         pushAttempt(attempts, target, error.message || "调用失败", {
@@ -4597,7 +4613,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         latestTask = taskState;
         if (savedTaskExternalId(taskState)) {
           if (isTerminalTaskFailureError(error)) {
-            pushAttempt(attempts, target, error.message || "调用失败");
+            pushAttempt(attempts, target, error.message || "调用失败", attemptMetadataForError(error));
             return failQueuedTask(taskState, error, attempts);
           }
           return keepSubmittedTaskRecoverable(taskState, error, attempts);
@@ -4605,7 +4621,10 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         if (await skipAccountAfterConfirmedUsageLimit(target, error, attempts)) continue;
         if (error.imageSubmissionAttempted === true) {
           const failure = imageSubmissionFailure(error);
-          pushAttempt(attempts, target, failure.message, { upstreamText: failure.upstreamText || "" });
+          pushAttempt(attempts, target, failure.message, {
+            ...attemptMetadataForError(failure),
+            upstreamText: failure.upstreamText || ""
+          });
           if (failure.imageSubmissionConfirmed === true) {
             taskState = markTaskSubmissionAttempt(taskState, channel, account);
           }
@@ -4615,7 +4634,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           return failQueuedTask(taskState, failure, attempts);
         }
         if (isTerminalTaskFailureError(error)) {
-          pushAttempt(attempts, target, error.message || "调用失败");
+          pushAttempt(attempts, target, error.message || "调用失败", attemptMetadataForError(error));
           continue;
         }
         pushAttempt(attempts, target, error.message || "调用失败", {
@@ -5592,7 +5611,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
         }
         if (error.imageSubmissionAttempted === true) throw imageSubmissionFailure(error);
         if (isTerminalTaskFailureError(error)) {
-          pushAttempt(attempts, target, error.message || "调用失败");
+          pushAttempt(attempts, target, error.message || "调用失败", attemptMetadataForError(error));
           continue;
         }
         pushAttempt(attempts, target, error.message || "调用失败", {

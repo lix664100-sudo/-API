@@ -663,7 +663,7 @@ test("绘图站无额度不会阻止同一账号使用聊天站生图", async ()
       modelId: "gemini",
       imageCount: 0,
       imageUrls: [],
-      raw: {}
+      raw: { upstreamModel: "gemini-3.1-pro" }
     };
   };
 
@@ -681,6 +681,8 @@ test("绘图站无额度不会阻止同一账号使用聊天站生图", async ()
 
     assert.equal(stored?.status, "success");
     assert.equal(stored?.channelType, "chatplus");
+    assert.equal(stored?.raw?.requestedModel, "gemini");
+    assert.equal(stored?.raw?.upstreamModel, "gemini-3.1-pro");
     assert.equal(drawingCheckCount, 0);
     assert.equal(chatSubmitCount, 1);
   } finally {

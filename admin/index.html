@@ -394,6 +394,38 @@
         font-weight: 650;
       }
 
+      .task-model-detail {
+        display: grid;
+        gap: 6px;
+        min-width: 0;
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      .task-model-line {
+        display: grid;
+        gap: 1px;
+        min-width: 0;
+      }
+
+      .task-model-label {
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .task-model-value {
+        color: var(--ink);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-weight: 650;
+        overflow-wrap: anywhere;
+      }
+
+      .task-model-value.is-missing {
+        color: var(--muted);
+        font-family: inherit;
+        font-weight: 500;
+      }
+
       .task-meta {
         display: flex;
         flex-wrap: wrap;
@@ -4415,21 +4447,53 @@
         return ["success", "failed", "cancelled", "interrupted"].includes(task.status) ? text : `已耗时 ${text}`;
       }
 
-      function taskModelText(row = {}) {
-        const rawModel = String(
-          row.channelType === "drawing" && row.modelId !== null && row.modelId !== undefined && row.modelId !== ""
-            ? row.modelId
-            : row.raw?.modelFamily || row.raw?.chatModel || row.modelId || ""
-        ).trim().toLowerCase();
-        if (["1", "gpt", "gpt-image-2", "chatgpt-image-2"].includes(rawModel)) {
-          return row.channelType === "drawing" ? "GPT / ChatGPT-Image-2" : "GPT";
-        }
-        if (["2", "nano-banana-pro"].includes(rawModel)) return "Gemini / Nano-Banana-Pro";
-        if (["3", "nano-banana"].includes(rawModel)) return "Gemini / Nano-Banana";
-        if (rawModel.includes("gemini")) return "Gemini";
-        if (rawModel.includes("grok")) return "Grok";
-        if (rawModel.includes("gpt")) return "GPT";
-        return rawModel || "-";
+      function taskModelCode(value) {
+        const rawModel = String(value ?? "").trim();
+        const normalizedModel = rawModel.toLowerCase();
+        if (["1", "chatgpt-image-2"].includes(normalizedModel)) return "gpt-image-2";
+        if (normalizedModel === "2") return "nano-banana-pro";
+        if (normalizedModel === "3") return "nano-banana";
+        return rawModel || "未记录";
+      }
+
+      function taskRequestedModel(row = {}) {
+        return row.raw?.requestedModel
+          || row.requestJson?.model
+          || row.requestJson?.chat_model
+          || row.requestJson?.chatModel
+          || row.requestJson?.model_id
+          || row.requestJson?.modelId
+          || row.modelId
+          || "";
+      }
+
+      function taskActualModel(row = {}) {
+        return row.raw?.upstreamModel
+          || row.responseJson?.raw?.upstreamModel
+          || row.responseJson?.upstreamModel
+          || (row.channelType === "drawing" ? row.modelId : "")
+          || "";
+      }
+
+      function taskModelInfo(row = {}) {
+        return {
+          requested: taskModelCode(taskRequestedModel(row)),
+          actual: taskModelCode(taskActualModel(row))
+        };
+      }
+
+      function taskModelCell(row = {}) {
+        const info = taskModelInfo(row);
+        return h("div", { className: "task-model-detail" }, [
+          ["调用模型", info.requested],
+          ["实际模型", info.actual]
+        ].map(([label, value]) => h("div", { className: "task-model-line", key: label, title: `${label}：${value}` }, [
+          h("span", { className: "task-model-label", key: "label" }, label),
+          h("span", {
+            className: `task-model-value${value === "未记录" ? " is-missing" : ""}`,
+            key: "value"
+          }, value)
+        ])));
       }
 
       function channelName(config, channelId) {
@@ -7002,7 +7066,7 @@
           },
           { title: "状态", dataIndex: "status", width: 90, render: (_, row) => taskStatusTag(row) },
           { title: "类型", dataIndex: "taskType", width: 90, render: taskTypeLabel },
-          { title: "模型", width: 150, render: (_, row) => taskModelText(row) },
+          { title: "模型", width: 220, render: (_, row) => taskModelCell(row) },
           { title: "渠道", width: 300, render: (_, row) => taskChannelFlow(row) },
           {
             title: "任务信息",
@@ -7017,7 +7081,7 @@
 
         const chatTaskColumns = [
           { title: "状态", dataIndex: "status", width: 90, render: (_, row) => taskStatusTag(row) },
-          { title: "模型", width: 150, render: (_, row) => taskModelText(row) },
+          { title: "模型", width: 220, render: (_, row) => taskModelCell(row) },
           { title: "渠道", width: 300, render: (_, row) => taskChannelFlow(row) },
           {
             title: "对话内容",
@@ -7154,7 +7218,7 @@
               dataSource: filteredTasks,
               loading: taskListLoading,
               tableLayout: "fixed",
-              scroll: { x: isChat ? 1610 : 1620 },
+              scroll: { x: isChat ? 1680 : 1690 },
               pagination: { pageSize: 8, showSizeChanger: false },
               locale: { emptyText: h(Empty, { description: `暂无${recordName}记录` }) }
             })

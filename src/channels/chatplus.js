@@ -27,6 +27,7 @@ const GEMINI_DEFAULT_BUILD_LABEL = "boq_assistant-bard-web-server_20260525.09_p0
 const GEMINI_DEFAULT_PUSH_ID = "feeds/mcudyrk2a4khkz";
 const GEMINI_FASTEST_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_DEFAULT_MODEL = "gemini-3.7-flash";
+const GEMINI_IMAGE_MODEL = "gemini-3.1-pro";
 const GEMINI_WEB_MODELS = Object.freeze({
   "gemini-3.5-flash-lite": Object.freeze({ hash: "8c46e95b1a07cecc", mode: 6 }),
   "gemini-3.7-flash": Object.freeze({ hash: "56fdd199312815e2", mode: 1 }),
@@ -2463,7 +2464,7 @@ export class ChatplusClient {
       const selection = geminiRequestSelection(input, resolvedRoute);
       resolvedRoute = {
         ...resolvedRoute,
-        model: selection.model,
+        model: input.imageGeneration === true ? GEMINI_IMAGE_MODEL : selection.model,
         thinkingLevel: selection.thinkingLevel,
         geminiRequestedModel: selection.requestedModel,
         geminiParameterFallback: selection.parameterFallback,
@@ -3752,6 +3753,7 @@ export class ChatplusClient {
           stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
         };
       } catch (error) {
+        if (activeRoute?.model) error.upstreamModel ||= activeRoute.model;
         lastError = error;
         lastUpstreamText = String(error?.upstreamText || error?.body || lastUpstreamText).trim();
         const carScopedFailure = error?.carPoolUnavailable === true
@@ -3810,6 +3812,7 @@ export class ChatplusClient {
             finalError.upstreamText = carAttempt.upstreamText || lastUpstreamText;
             finalError.selectedCarId = carId;
             finalError.selectedCarType = String(selected.carType || "").trim();
+            finalError.upstreamModel = error.upstreamModel || activeRoute?.model || "";
             finalError.carAttempts = unconfirmedCars;
             for (const key of [
               "quotaEmpty",
@@ -3872,6 +3875,7 @@ export class ChatplusClient {
     if (!imageCarQuotaErrors.length && errors.length && carPoolErrorCount === errors.length) {
       tagCarPoolUnavailable(error);
     }
+    error.upstreamModel = lastError?.upstreamModel || "";
     error.upstreamText = lastUpstreamText || String(lastError?.upstreamText || lastError?.body || "").trim();
     throw error;
   }
@@ -3880,12 +3884,15 @@ export class ChatplusClient {
     if (input.imageGeneration === true) {
       const ignoredCarIds = new Set();
       const quotaErrors = [];
+      let lastUpstreamModel = "";
       for (let attempt = 0; attempt < 5; attempt += 1) {
         let conversation = null;
         try {
           conversation = await this.sendConversation(prompt, input, ignoredCarIds);
+          lastUpstreamModel = conversation.upstreamModel || conversation.route?.model || lastUpstreamModel;
           return await work(conversation);
         } catch (error) {
+          if (conversation) error.upstreamModel ||= conversation.upstreamModel || conversation.route?.model || "";
           if (conversation?.selected && error.imageCarQuotaExhausted === true) {
             ignoredCarIds.add(conversation.selected.carId);
             await this.rememberImageFailedCar(conversation.selected, error);
@@ -3903,16 +3910,19 @@ export class ChatplusClient {
       error.imageCarQuotaExhausted = true;
       error.imageSubmissionAttempted = true;
       error.status = 429;
+      error.upstreamModel = lastUpstreamModel;
       throw error;
     }
     const ignoredCarIds = new Set();
     const quotaErrors = [];
     const textResponseErrors = [];
     for (let attempt = 0; attempt < 5; attempt += 1) {
+      let conversation = null;
       try {
-        const conversation = await this.sendConversation(prompt, input, ignoredCarIds);
+        conversation = await this.sendConversation(prompt, input, ignoredCarIds);
         return await work(conversation);
       } catch (error) {
+        if (conversation) error.upstreamModel ||= conversation.upstreamModel || conversation.route?.model || "";
         if (isConfirmedChatUsageLimitError(error)) throw error;
         if (error.retryableImageCar === true) {
           textResponseErrors.push(error);
@@ -3932,6 +3942,7 @@ export class ChatplusClient {
         `已自动尝试 ${attempted} 个 Gemini 生图车位，但都没有返回图片。最后一次上游回复：${lastError.message}`
       );
       error.upstreamText = lastError.upstreamText || lastError.message || "";
+      error.upstreamModel = lastError.upstreamModel || "";
       error.upstreamExplicitFailure = true;
       error.upstreamStatus = "failed";
       error.status = 400;
@@ -3940,7 +3951,9 @@ export class ChatplusClient {
     }
     const lastQuotaError = quotaErrors[quotaErrors.length - 1];
     if (lastQuotaError?.quotaReason === "chat_usage_limit") throw lastQuotaError;
-    throw imageQuotaError(`已自动尝试 ${quotaErrors.length} 个生图车位，但图片生成额度都已用完。`);
+    const error = imageQuotaError(`已自动尝试 ${quotaErrors.length} 个生图车位，但图片生成额度都已用完。`);
+    error.upstreamModel = lastQuotaError?.upstreamModel || "";
+    throw error;
   }
 
   async waitForConversationImages(events, conversationId, timeoutSec, options = {}) {

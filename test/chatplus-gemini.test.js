@@ -185,6 +185,23 @@ for (const modelCase of [
   });
 }
 
+test("Gemini 生图固定使用 3.1 Pro，普通文字聊天仍使用调用模型", () => {
+  const testClient = client();
+  const imageRoute = testClient.chatRouteForInput({
+    model: "gemini-3.7-flash",
+    thinking_level: "standard",
+    imageGeneration: true
+  });
+  const chatRoute = testClient.chatRouteForInput({
+    model: "gemini-3.7-flash",
+    thinking_level: "standard"
+  });
+
+  assert.equal(imageRoute.model, "gemini-3.1-pro");
+  assert.equal(imageRoute.geminiRequestedModel, "gemini-3.7-flash");
+  assert.equal(chatRoute.model, "gemini-3.7-flash");
+});
+
 for (const invalidInput of [
   { model: "gemini-model-written-wrong", thinking_level: "extended" },
   { model: "gemini-3.1-pro", thinking_level: "very-strong" }

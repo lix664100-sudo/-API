@@ -79,6 +79,16 @@ function loadChatTokenUsageHelper() {
   return context.helpers.chatTaskTokenUsage;
 }
 
+function loadTaskModelHelper() {
+  const start = adminHtml.indexOf("function taskModelCode");
+  const end = adminHtml.indexOf("function channelName", start);
+  assert.ok(start >= 0 && end > start, "任务模型展示逻辑必须存在");
+
+  const context = {};
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskModelInfo };`, context);
+  return context.helpers.taskModelInfo;
+}
+
 function loadTaskFailureHelpers() {
   const start = adminHtml.indexOf("function taskAttempts");
   const end = adminHtml.indexOf("function taskJsonPanel", start);
@@ -162,10 +172,43 @@ test("生图和对话记录独立展示，表格固定列宽避免长内容撑�
   assert.match(adminHtml, /taskRecordTabLabel\("image", "生图记录"/);
   assert.match(adminHtml, /taskRecordTabLabel\("chat", "对话记录"/);
   assert.match(adminHtml, /tableLayout: "fixed"/);
-  assert.match(adminHtml, /scroll: \{ x: isChat \? 1610 : 1620 \}/);
+  assert.match(adminHtml, /scroll: \{ x: isChat \? 1680 : 1690 \}/);
   assert.match(adminHtml, /\.task-copy-full[\s\S]*max-height: 320px/);
   assert.match(adminHtml, /\.task-copy-preview[\s\S]*-webkit-line-clamp: 5/);
   assert.doesNotMatch(adminHtml, /h\("div", \{ className: "task-response" \}, row\.responseText\)/);
+});
+
+test("任务记录分别显示调用模型和实际使用模型", () => {
+  const taskModelInfo = loadTaskModelHelper();
+
+  assert.deepEqual(localValue(taskModelInfo({
+    channelType: "chatplus",
+    modelId: "gemini",
+    raw: {
+      requestedModel: "gemini",
+      upstreamModel: "gemini-3.1-pro"
+    }
+  })), {
+    requested: "gemini",
+    actual: "gemini-3.1-pro"
+  });
+  assert.deepEqual(localValue(taskModelInfo({
+    channelType: "drawing",
+    modelId: 2,
+    raw: { requestedModel: "nano-banana" }
+  })), {
+    requested: "nano-banana",
+    actual: "nano-banana-pro"
+  });
+  assert.deepEqual(localValue(taskModelInfo({
+    channelType: "chatplus",
+    modelId: "gemini"
+  })), {
+    requested: "gemini",
+    actual: "未记录"
+  });
+  assert.match(adminHtml, /\["调用模型", info\.requested\]/);
+  assert.match(adminHtml, /\["实际模型", info\.actual\]/);
 });
 
 test("对话记录显示预计 TOKEN，并忽略旧记录里的占位零值", () => {
