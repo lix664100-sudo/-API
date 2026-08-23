@@ -25,7 +25,7 @@ function car(overrides = {}) {
 }
 
 function clientForGpt(options = {}) {
-  return new ChatplusClient({
+  const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
     channel: {
       id: "shareai:chatplus",
@@ -55,6 +55,8 @@ function clientForGpt(options = {}) {
     onProCarsAvailable: options.onProCarsAvailable,
     onImageCarCooldown: options.onImageCarCooldown
   });
+  client.ensureConversationUpdates = async () => null;
+  return client;
 }
 
 function clientForGemini(chatModel = {}) {

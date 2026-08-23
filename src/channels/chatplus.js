@@ -1,6 +1,12 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import {
+  chatplusConversationUpdates,
+  chatplusConversationUpdateVersion,
+  getChatplusConversationConnection,
+  waitForChatplusConversationUpdate
+} from "../chatplus-conversation-updates.js";
 import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "../image-limits.js";
 import { normalizeProxyUrl } from "../proxy.js";
 
@@ -1036,6 +1042,14 @@ function geminiRouteMetadata(route = {}) {
   };
 }
 
+function resultChannelMetadata(conversation = {}, route = {}) {
+  if (route.key !== "gpt") return {};
+  return {
+    resultChannelReady: conversation.resultChannelReady === true,
+    ...(conversation.resultChannelError ? { resultChannelError: conversation.resultChannelError } : {})
+  };
+}
+
 function submittedImageTask(conversation, input, prompt, taskType, sourceImageCount = 0) {
   const { events = [], conversationId, model, upstreamModel, route, selected } = conversation;
   const imageUrls = Array.isArray(conversation.imageUrls) ? conversation.imageUrls.filter(Boolean) : [];
@@ -1059,6 +1073,7 @@ function submittedImageTask(conversation, input, prompt, taskType, sourceImageCo
       selectedCarId: selected?.carId,
       selectedCarType: selected?.carType,
       strategy: selected?.strategy,
+      ...resultChannelMetadata(conversation, route),
       ...geminiRouteMetadata(route),
       stageTimings: Array.isArray(conversation.stageTimings) ? conversation.stageTimings : [],
       ...(imageUrls.length ? {
@@ -2468,6 +2483,53 @@ export class ChatplusClient {
     });
   }
 
+  conversationUpdateConnectionKey() {
+    return [
+      this.baseUrl,
+      this.account?.id || this.account?.username || "account",
+      this.carType || "chatgpt",
+      this.carId || ""
+    ].join("::");
+  }
+
+  async ensureConversationUpdates(options = {}) {
+    if (!this.carId || this.carType !== "chatgpt") return null;
+    const timeoutSec = Math.min(30, Math.max(5, Number(options.timeoutSec || DEFAULT_CONNECT_TIMEOUT_SEC)));
+    const getWebSocketUrl = async () => {
+      const readSocketUrl = async () => {
+        const payload = await this.json("/backend-api/celsius/ws/user", { timeoutSec });
+        const socketUrl = String(payload?.websocket_url || "").trim();
+        if (!socketUrl.startsWith("wss://")) {
+          const error = new Error("上游没有返回可用的结果通道。");
+          error.code = "CHATPLUS_RESULT_CHANNEL_UNAVAILABLE";
+          throw error;
+        }
+        return socketUrl;
+      };
+
+      try {
+        return await readSocketUrl();
+      } catch (error) {
+        if (!isAuthSessionError(error)) throw error;
+        const carId = this.carId;
+        const carType = this.carType;
+        await this.performPortalLogin({ timeoutSec });
+        this.carId = carId;
+        this.carType = carType;
+        await this.performEnterCar(carId, carType, { timeoutSec });
+        return readSocketUrl();
+      }
+    };
+    const connection = getChatplusConversationConnection({
+      key: this.conversationUpdateConnectionKey(),
+      getWebSocketUrl,
+      cookieHeader: this.cookieHeader(),
+      origin: this.baseUrl,
+      proxyUrl: proxyUrlFor(this.account)
+    });
+    return connection.ensureReady(timeoutSec * 1000);
+  }
+
   async conversationStreamStatus(conversationId, options = {}) {
     const { fresh = true, ...requestOptions } = options;
     const path = `/backend-api/conversation/${encodeURIComponent(conversationId)}/stream_status`;
@@ -2488,20 +2550,7 @@ export class ChatplusClient {
     if (!completed) {
       completed = (async () => {
         const streamStatus = await this.conversationStreamStatus(conversationId, options);
-        if (String(streamStatus?.status || "").trim().toUpperCase() !== "COMPLETE") return false;
-
-        const { fresh: _fresh, ...requestOptions } = options;
-        await this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}/async-status`, {
-          ...requestOptions,
-          method: "POST",
-          body: { status: null },
-          headers: {
-            ...CONVERSATION_READ_HEADERS,
-            referer: `${this.baseUrl}/c/${encodeURIComponent(conversationId)}`,
-            ...(requestOptions.headers || {})
-          }
-        });
-        return true;
+        return String(streamStatus?.status || "").trim().toUpperCase() === "COMPLETE";
       })();
       this.completedConversationSyncs.set(conversationId, completed);
     }
@@ -3936,6 +3985,17 @@ export class ChatplusClient {
             }, async () => runSubmitStep(() => submitClient.uploadChatImages(sourceFiles)))
           : [];
         const { body, messageId } = submitClient.buildConversationBody(prompt, model, imageAssets);
+        let resultChannelReady = false;
+        let resultChannelError = "";
+        if (requestInput.imageGeneration === true) {
+          void submitClient.ensureConversationUpdates({ timeoutSec: DEFAULT_CONNECT_TIMEOUT_SEC })
+            .then(() => {
+              resultChannelReady = true;
+            })
+            .catch((error) => {
+              resultChannelError = String(error?.message || "结果通道连接失败。");
+            });
+        }
 
         if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.started = true;
         const response = await measureTaskStage(requestInput.taskStageRecorder, {
@@ -3989,6 +4049,8 @@ export class ChatplusClient {
           route,
           selected,
           submissionConfirmed: true,
+          resultChannelReady,
+          resultChannelError,
           submitSessionSnapshot: submitClient.sessionSnapshot(),
           stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
         };
@@ -4239,7 +4301,26 @@ export class ChatplusClient {
     const timeoutMs = Math.max(5, Number(timeoutSec || this.config.waitTimeoutSec || DEFAULT_CHAT_HTTP_TIMEOUT_SEC)) * 1000;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      const observedUpdateVersion = chatplusConversationUpdateVersion(conversationId);
       try {
+        const pushedUpdates = chatplusConversationUpdates(conversationId);
+        if (pushedUpdates.length) {
+          imageUrls = await this.imageUrlsFrom(pushedUpdates, { generatedOnly: true });
+          if (imageUrls.length) return imageUrls;
+          throwIfImageGenerationLimit(pushedUpdates, { car: true });
+          const pushedState = imageAssistantResponseState(pushedUpdates);
+          if (!pushedState.inProgress) {
+            throwIfTerminalImageFailure(pushedState.content);
+            throwIfTextImageResponse(pushedState.content);
+          }
+          const pushedExplicitState = explicitConversationState(pushedUpdates);
+          if (pushedExplicitState) {
+            const error = new Error(pushedExplicitState.message);
+            error.upstreamExplicitFailure = true;
+            error.upstreamStatus = pushedExplicitState.status;
+            throw error;
+          }
+        }
         let detail = await this.conversationDetail(conversationId);
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
@@ -4267,7 +4348,11 @@ export class ChatplusClient {
         if (error.imageCarQuotaExhausted || error.imageQuotaExhausted || error.upstreamExplicitFailure) throw error;
         // Images can appear shortly after the streamed response finishes.
       }
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await waitForChatplusConversationUpdate(
+        conversationId,
+        observedUpdateVersion,
+        Math.min(5000, Math.max(1, deadline - Date.now()))
+      );
     }
     return [];
   }
@@ -4314,29 +4399,73 @@ export class ChatplusClient {
       return this;
     };
     let detail = null;
+    let taskReader = this;
+    let resultChannelReady = false;
+    let resultChannelError = "";
+    let resultChannelAttempt = 0;
+    const beginConversationUpdates = (reader) => {
+      if (geminiTask || typeof reader?.ensureConversationUpdates !== "function") return;
+      const attempt = ++resultChannelAttempt;
+      try {
+        void reader.ensureConversationUpdates(requestOptions)
+          .then((connection) => {
+            if (attempt !== resultChannelAttempt) return;
+            resultChannelReady = Boolean(connection);
+            resultChannelError = "";
+          })
+          .catch((error) => {
+            if (attempt !== resultChannelAttempt) return;
+            resultChannelError = String(error?.message || "结果通道连接失败。");
+          });
+      } catch (error) {
+        resultChannelError = String(error?.message || "结果通道连接失败。");
+      }
+    };
+    const readWith = async (reader) => {
+      taskReader = reader;
+      beginConversationUpdates(reader);
+      return readDetail(reader);
+    };
     if (taskCarId) {
       try {
-        detail = await readDetail(await restoreConversationSession(context.forceReconnect === true));
+        detail = await readWith(await restoreConversationSession(context.forceReconnect === true));
       } catch (directError) {
         if (!isAuthSessionError(directError)) throw directError;
-        detail = await readDetail(await restoreConversationSession(true));
+        detail = await readWith(await restoreConversationSession(true));
       }
     } else {
       await this.loginPortal(requestOptions);
       try {
-        detail = await readDetail();
+        detail = await readWith(this);
       } catch (directError) {
         const resetAfterDirectRead = isAuthSessionError(directError);
-        detail = await readDetail(await restoreConversationSession(resetAfterDirectRead));
+        detail = await readWith(await restoreConversationSession(resetAfterDirectRead));
       }
     }
-    let imageUrls = await this.imageUrlsFrom(detail, geminiTask
-      ? { geminiHistory: true }
-      : { generatedOnly: true });
-    if (!geminiTask && !imageUrls.length) {
-      detail = await this.refreshCompletedConversation(externalId, detail, requestOptions);
-      imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
+    const pushedUpdates = geminiTask ? [] : chatplusConversationUpdates(externalId);
+    const imageReader = typeof taskReader.imageUrlsFrom === "function" ? taskReader : this;
+    let imageUrls = pushedUpdates.length
+      ? await imageReader.imageUrlsFrom(pushedUpdates, { generatedOnly: true })
+      : [];
+    if (!imageUrls.length) {
+      imageUrls = await imageReader.imageUrlsFrom(detail, geminiTask
+        ? { geminiHistory: true }
+        : { generatedOnly: true });
     }
+    if (!geminiTask && !imageUrls.length) {
+      const refreshReader = typeof taskReader.refreshCompletedConversation === "function" ? taskReader : this;
+      detail = await refreshReader.refreshCompletedConversation(externalId, detail, requestOptions);
+      imageUrls = await imageReader.imageUrlsFrom(detail, { generatedOnly: true });
+    }
+    const resultState = pushedUpdates.length ? [detail, ...pushedUpdates] : detail;
+    const rawDetail = !geminiTask && (resultChannelReady || resultChannelError || pushedUpdates.length)
+      ? {
+          ...detail,
+          resultChannelReady,
+          resultChannelUpdateCount: pushedUpdates.length,
+          ...(resultChannelError ? { resultChannelError } : {})
+        }
+      : detail;
     if (imageUrls.length) {
       await this.rememberImageSuccessfulCar({
         carId: context.carId || this.carId,
@@ -4348,7 +4477,7 @@ export class ChatplusClient {
         imageCount: imageUrls.length,
         imageUrls,
         errorMessage: "",
-        raw: detail
+        raw: rawDetail
       };
     }
     if (geminiTask) {
@@ -4385,10 +4514,10 @@ export class ChatplusClient {
         }
       };
     }
-    const responseState = imageAssistantResponseState(detail);
+    const responseState = imageAssistantResponseState(resultState);
     const content = responseState.content;
     const intermediateResponse = isChatImageIntermediateResponse(content);
-    const quotaContent = imageGenerationLimitContent(detail);
+    const quotaContent = imageGenerationLimitContent(resultState);
     if (quotaContent) {
       const quotaError = imageCarQuotaError(quotaContent);
       await this.rememberImageFailedCar({
@@ -4402,7 +4531,7 @@ export class ChatplusClient {
         imageUrls: [],
         errorMessage: "当前车位图片生成次数已用完，系统已暂停使用该车位。",
         raw: {
-          ...detail,
+          ...rawDetail,
           imageCarQuotaExhausted: true,
           imageCarCooldownUntil: quotaError.quotaResetAt || ""
         }
@@ -4415,7 +4544,7 @@ export class ChatplusClient {
         imageCount: 0,
         imageUrls: [],
         errorMessage: content,
-        raw: detail
+        raw: rawDetail
       };
     }
     if (!intermediateResponse && content && !responseState.inProgress) {
@@ -4425,10 +4554,10 @@ export class ChatplusClient {
         imageCount: 0,
         imageUrls: [],
         errorMessage: content,
-        raw: detail
+        raw: rawDetail
       };
     }
-    const explicitState = explicitConversationState(detail);
+    const explicitState = explicitConversationState(resultState);
     if (explicitState) {
       return {
         externalId,
@@ -4436,7 +4565,7 @@ export class ChatplusClient {
         imageCount: 0,
         imageUrls: [],
         errorMessage: explicitState.message,
-        raw: detail
+        raw: rawDetail
       };
     }
     return {
@@ -4445,7 +4574,7 @@ export class ChatplusClient {
       imageCount: 0,
       imageUrls: [],
       errorMessage: "",
-      raw: detail
+      raw: rawDetail
     };
   }
 
@@ -4517,7 +4646,7 @@ export class ChatplusClient {
           carId: selected?.carId,
           carType: selected?.carType
         }),
-        raw: { conversationId, eventCount: events.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy, ...geminiRouteMetadata(route), stageTimings: taskStageSnapshot(taskStageRecorder) }
+        raw: { conversationId, eventCount: events.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy, ...resultChannelMetadata(result, route), ...geminiRouteMetadata(route), stageTimings: taskStageSnapshot(taskStageRecorder) }
       };
     });
   }
@@ -4594,7 +4723,7 @@ export class ChatplusClient {
           carId: selected?.carId,
           carType: selected?.carType
         }),
-        raw: { conversationId, eventCount: events.length, sourceImageCount: files.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy, ...geminiRouteMetadata(route), stageTimings: taskStageSnapshot(taskStageRecorder) }
+        raw: { conversationId, eventCount: events.length, sourceImageCount: files.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy, ...resultChannelMetadata(result, route), ...geminiRouteMetadata(route), stageTimings: taskStageSnapshot(taskStageRecorder) }
       };
     });
   }

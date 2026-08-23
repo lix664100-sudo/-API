@@ -10,9 +10,14 @@ process.env.DATA_DIR = dataDir;
 const { closeStorage, getTaskBySourceTaskId, listTasks, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
 const { createImageTask, getRuntimeStatus, refreshTask } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
+const {
+  recordChatplusConversationUpdate,
+  resetChatplusConversationUpdatesForTests
+} = await import("../src/chatplus-conversation-updates.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
+  resetChatplusConversationUpdatesForTests();
   await closeStorage();
   await rm(dataDir, { recursive: true, force: true });
 });
@@ -496,8 +501,10 @@ test("chatplus task refresh bypasses cached conversation results", async () => {
   assert.deepEqual(loginOptions, [{ timeoutSec: 30 }]);
 });
 
-test("chatplus task refresh syncs a completed async image before reading the result", async () => {
-  const resultUrl = "https://one.example.test/generated-after-async-sync.png";
+test("chatplus task refresh reads a completed image from the realtime result channel", async () => {
+  resetChatplusConversationUpdatesForTests();
+  const conversationId = "conversation-realtime-complete";
+  const resultUrl = "https://one.example.test/generated-from-realtime-channel.png";
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
     channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
@@ -507,68 +514,56 @@ test("chatplus task refresh syncs a completed async image before reading the res
   client.loginPortal = async () => {};
 
   const requests = [];
-  let synced = false;
   client.json = async (pathName, options = {}) => {
     requests.push({ pathName, options });
     if (pathName.includes("/stream_status")) return { status: "COMPLETE" };
-    if (pathName.endsWith("/async-status")) {
-      synced = true;
-      return { status: "OK" };
-    }
-    if (!synced) {
-      return {
-        async_status: 5,
-        current_node: "pending-tool",
-        mapping: {
-          "pending-tool": {
-            parent: null,
-            message: {
-              author: { role: "tool" },
-              content: { content_type: "multimodal_text", parts: [] },
-              metadata: { ghostrider: { status: "intermediate" } },
-              status: "finished_successfully"
-            }
-          }
-        }
-      };
-    }
     return {
-      async_status: null,
-      current_node: "final-image",
+      async_status: 5,
+      current_node: "pending-tool",
       mapping: {
-        "final-image": {
+        "pending-tool": {
           parent: null,
           message: {
             author: { role: "tool" },
-            content: {
-              content_type: "multimodal_text",
-              parts: [{ type: "image_url", image_url: resultUrl }]
-            },
-            metadata: { ghostrider: { status: "final" } },
+            content: { content_type: "multimodal_text", parts: [] },
+            metadata: { ghostrider: { status: "intermediate" } },
             status: "finished_successfully"
           }
         }
       }
     };
   };
+  recordChatplusConversationUpdate({
+    type: "conversation-update",
+    payload: {
+      conversation_id: conversationId,
+      update_type: "async-task-update-message",
+      update_content: {
+        message: {
+          author: { role: "tool" },
+          content: {
+            content_type: "multimodal_text",
+            parts: [{ type: "image_url", image_url: resultUrl }]
+          },
+          metadata: { ghostrider: { status: "final" } },
+          status: "finished_successfully"
+        }
+      }
+    }
+  });
 
-  const task = await client.getTask("conversation-async-complete", { timeoutSec: 30 });
+  const task = await client.getTask(conversationId, { timeoutSec: 30 });
 
   assert.equal(task.status, "success");
   assert.deepEqual(task.imageUrls, [resultUrl]);
-  assert.equal(requests.filter((item) => item.pathName.includes("/stream_status")).length, 1);
-  const syncRequest = requests.find((item) => item.pathName.endsWith("/async-status"));
-  assert.equal(syncRequest?.options?.method, "POST");
-  assert.deepEqual(syncRequest?.options?.body, { status: null });
-  assert.equal(syncRequest?.options?.headers?.referer, "https://one.example.test/c/conversation-async-complete");
-  assert.equal(
-    requests.filter((item) => /^\/backend-api\/conversation\/conversation-async-complete\?_\=\d+$/.test(item.pathName)).length,
-    2
-  );
+  assert.equal(requests.some((item) => item.pathName.endsWith("/async-status")), false);
+  assert.equal(task.raw.resultChannelUpdateCount, 1);
 });
 
-test("chatplus task refresh repeats an acknowledged async sync until the image is materialized", async () => {
-  const resultUrl = "https://one.example.test/generated-after-repeated-async-sync.png";
+test("chatplus task refresh picks up a later realtime result without resubmitting", async () => {
+  resetChatplusConversationUpdatesForTests();
+  const conversationId = "conversation-realtime-later";
+  const resultUrl = "https://one.example.test/generated-after-realtime-update.png";
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
     channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
@@ -577,45 +572,20 @@ test("chatplus task refresh repeats an acknowledged async sync until the image i
   });
   client.loginPortal = async () => {};
 
-  const syncBodies = [];
-  let syncCount = 0;
+  const requests = [];
   client.json = async (pathName, options = {}) => {
+    requests.push({ pathName, options });
     if (pathName.includes("/stream_status")) return { status: "COMPLETE" };
-    if (pathName.endsWith("/async-status")) {
-      syncCount += 1;
-      syncBodies.push(options.body);
-      return { status: "OK" };
-    }
-    if (syncCount < 2) {
-      return {
-        async_status: 5,
-        current_node: "pending-tool",
-        mapping: {
-          "pending-tool": {
-            parent: null,
-            message: {
-              author: { role: "tool" },
-              content: { content_type: "multimodal_text", parts: [] },
-              metadata: { ghostrider: { status: "intermediate" } },
-              status: "finished_successfully"
-            }
-          }
-        }
-      };
-    }
     return {
-      async_status: null,
-      current_node: "final-image",
+      async_status: 5,
+      current_node: "pending-tool",
       mapping: {
-        "final-image": {
+        "pending-tool": {
           parent: null,
           message: {
             author: { role: "tool" },
-            content: {
-              content_type: "multimodal_text",
-              parts: [{ type: "image_url", image_url: resultUrl }]
-            },
-            metadata: { ghostrider: { status: "final" } },
+            content: { content_type: "multimodal_text", parts: [] },
+            metadata: { ghostrider: { status: "intermediate" } },
             status: "finished_successfully"
           }
         }
@@ -623,18 +593,35 @@ test("chatplus task refresh repeats an acknowledged async sync until the image i
     };
   };
 
-  const first = await client.getTask("conversation-async-repeat", { timeoutSec: 30 });
-  const second = await client.getTask("conversation-async-repeat", { timeoutSec: 30 });
+  const first = await client.getTask(conversationId, { timeoutSec: 30 });
+  recordChatplusConversationUpdate({
+    type: "conversation-update",
+    payload: {
+      conversation_id: conversationId,
+      update_type: "async-task-completed",
+      update_content: {
+        message: {
+          author: { role: "tool" },
+          content: {
+            content_type: "multimodal_text",
+            parts: [{ type: "image_url", image_url: resultUrl }]
+          },
+          metadata: { ghostrider: { status: "final" } },
+          status: "finished_successfully"
+        }
+      }
+    }
+  });
+  const second = await client.getTask(conversationId, { timeoutSec: 30 });
 
   assert.equal(first.status, "waiting_upstream");
   assert.equal(second.status, "success");
   assert.deepEqual(second.imageUrls, [resultUrl]);
-  assert.equal(syncCount, 2);
-  assert.deepEqual(syncBodies, [{ status: null }, { status: null }]);
+  assert.equal(requests.some((item) => item.pathName.endsWith("/async-status")), false);
   assert.equal(client.completedConversationSyncs.size, 0);
 });
 
-test("chatplus async completion sync deduplicates simultaneous checks and releases its cache", async () => {
+test("chatplus completed stream checks deduplicate simultaneous reads and release their cache", async () => {
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
     channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
@@ -647,15 +634,10 @@ test("chatplus async completion sync deduplicates simultaneous checks and releas
     releaseStream = resolve;
   });
   let streamChecks = 0;
-  let syncRequests = 0;
   client.conversationStreamStatus = async () => {
     streamChecks += 1;
     await streamGate;
     return { status: "COMPLETE" };
-  };
-  client.json = async (pathName) => {
-    if (pathName.endsWith("/async-status")) syncRequests += 1;
-    return { status: "OK" };
   };
   client.conversationDetail = async () => ({ async_status: 5, mapping: {} });
 
@@ -666,7 +648,6 @@ test("chatplus async completion sync deduplicates simultaneous checks and releas
   await Promise.all([first, second]);
 
   assert.equal(streamChecks, 1);
-  assert.equal(syncRequests, 1);
   assert.equal(client.completedConversationSyncs.size, 0);
 });
 
