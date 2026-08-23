@@ -2475,6 +2475,7 @@ export class ChatplusClient {
       ...requestOptions,
       headers: {
         ...CONVERSATION_READ_HEADERS,
+        referer: `${this.baseUrl}/c/${encodeURIComponent(conversationId)}`,
         ...(requestOptions.headers || {})
       }
     });
@@ -2485,33 +2486,35 @@ export class ChatplusClient {
 
     let completed = this.completedConversationSyncs.get(conversationId);
     if (!completed) {
-      let streamStatus;
-      try {
-        streamStatus = await this.conversationStreamStatus(conversationId, options);
-      } catch {
-        return detail;
-      }
-      if (String(streamStatus?.status || "").trim().toUpperCase() !== "COMPLETE") return detail;
+      completed = (async () => {
+        const streamStatus = await this.conversationStreamStatus(conversationId, options);
+        if (String(streamStatus?.status || "").trim().toUpperCase() !== "COMPLETE") return false;
 
-      const { fresh: _fresh, ...requestOptions } = options;
-      completed = this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}/async-status`, {
-        ...requestOptions,
-        method: "POST",
-        body: {},
-        headers: {
-          ...CONVERSATION_READ_HEADERS,
-          ...(requestOptions.headers || {})
-        }
-      });
+        const { fresh: _fresh, ...requestOptions } = options;
+        await this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}/async-status`, {
+          ...requestOptions,
+          method: "POST",
+          body: { status: null },
+          headers: {
+            ...CONVERSATION_READ_HEADERS,
+            referer: `${this.baseUrl}/c/${encodeURIComponent(conversationId)}`,
+            ...(requestOptions.headers || {})
+          }
+        });
+        return true;
+      })();
       this.completedConversationSyncs.set(conversationId, completed);
     }
 
     try {
-      await completed;
+      if (!(await completed)) return detail;
       return await this.conversationDetail(conversationId, options);
     } catch {
-      this.completedConversationSyncs.delete(conversationId);
       return detail;
+    } finally {
+      if (this.completedConversationSyncs.get(conversationId) === completed) {
+        this.completedConversationSyncs.delete(conversationId);
+      }
     }
   }
 
