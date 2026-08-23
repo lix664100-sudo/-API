@@ -560,6 +560,129 @@ test("chatplus task refresh reads a completed image from the realtime result cha
   assert.equal(task.raw.resultChannelUpdateCount, 1);
 });
 
+test("chatplus task refresh recovers a stale conversation by its saved upstream task id", async () => {
+  const conversationId = "conversation-saved-upstream-task";
+  const upstreamTaskId = "upstream-task-saved";
+  const resultUrl = "https://one.example.test/generated-from-saved-task.png";
+  const staleDetail = { async_status: 5, mapping: {} };
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-saved-task-account", username: "saved-task@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.ensureConversationUpdates = async () => null;
+  client.conversationDetail = async () => staleDetail;
+  client.refreshCompletedConversation = async () => staleDetail;
+
+  const requests = [];
+  client.json = async (pathName) => {
+    requests.push(pathName);
+    assert.equal(pathName, `/backend-api/task/${upstreamTaskId}`);
+    return {
+      task_id: upstreamTaskId,
+      conversation_id: conversationId,
+      status: "completed",
+      image_gen_message: {
+        author: { role: "tool" },
+        content: {
+          content_type: "multimodal_text",
+          parts: [{ type: "image_url", image_url: resultUrl }]
+        }
+      }
+    };
+  };
+
+  const task = await client.getTask(conversationId, { upstreamTaskId, timeoutSec: 30 });
+
+  assert.equal(task.status, "success");
+  assert.deepEqual(task.imageUrls, [resultUrl]);
+  assert.equal(task.raw.upstreamTaskId, upstreamTaskId);
+  assert.deepEqual(requests, [`/backend-api/task/${upstreamTaskId}`]);
+});
+
+test("chatplus task refresh discovers the upstream task when the ordinary conversation stays stale", async () => {
+  const conversationId = "conversation-discovered-upstream-task";
+  const upstreamTaskId = "upstream-task-discovered";
+  const resultUrl = "https://one.example.test/generated-from-task-list.png";
+  const staleDetail = { async_status: 5, mapping: {} };
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-discovered-task-account", username: "discovered-task@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.ensureConversationUpdates = async () => null;
+  client.conversationDetail = async () => staleDetail;
+  client.refreshCompletedConversation = async () => staleDetail;
+
+  const requests = [];
+  client.json = async (pathName) => {
+    requests.push(pathName);
+    assert.equal(pathName, "/backend-api/tasks");
+    return {
+      cursor: null,
+      tasks: [{
+        task_id: upstreamTaskId,
+        conversation_id: conversationId,
+        status: "completed",
+        image_gen_message: {
+          author: { role: "tool" },
+          content: {
+            content_type: "multimodal_text",
+            parts: [{ type: "image_url", image_url: resultUrl }]
+          }
+        }
+      }]
+    };
+  };
+
+  const task = await client.getTask(conversationId, { timeoutSec: 30 });
+
+  assert.equal(task.status, "success");
+  assert.deepEqual(task.imageUrls, [resultUrl]);
+  assert.equal(task.raw.upstreamTaskId, upstreamTaskId);
+  assert.deepEqual(requests, ["/backend-api/tasks"]);
+});
+
+test("chatplus saves a discovered upstream task id before returning the submitted task", async () => {
+  const upstreamTaskId = "upstream-task-before-return";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-capture-task-account", username: "capture-task@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  client.discoverImageGenerationTask = async () => ({
+    taskId: upstreamTaskId,
+    task: null,
+    imageUrls: [],
+    failure: null
+  });
+  const submitted = [];
+  const conversation = {
+    conversationId: "conversation-capture-upstream-task",
+    events: [],
+    model: "gpt",
+    upstreamModel: "gpt-image-test",
+    route: { key: "gpt" },
+    selected: { carId: "car-capture", carType: "chatgpt" }
+  };
+
+  await client.captureImageTaskRegistration(
+    conversation,
+    { onSubmitted: async (value) => submitted.push(value) },
+    "生成一张测试图片",
+    "text2img"
+  );
+
+  assert.equal(conversation.upstreamTaskId, upstreamTaskId);
+  assert.equal(submitted.length, 1);
+  assert.equal(submitted[0].raw.upstreamTaskId, upstreamTaskId);
+});
+
 test("chatplus task refresh picks up a later realtime result without resubmitting", async () => {
   resetChatplusConversationUpdatesForTests();
   const conversationId = "conversation-realtime-later";

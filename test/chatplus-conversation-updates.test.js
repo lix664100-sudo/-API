@@ -242,7 +242,7 @@ test("结果通道在提交前启动，但连接慢时不阻塞上游编号", as
     return {
       status: 200,
       headers: {},
-      body: "data: {\"conversation_id\":\"conversation-submit\"}\n\ndata: [DONE]\n\n"
+      body: "data: {\"conversation_id\":\"conversation-submit\",\"task_id\":\"upstream-task-submit\"}\n\ndata: [DONE]\n\n"
     };
   };
   client.rememberReusableChatSession = () => {};
@@ -259,5 +259,6 @@ test("结果通道在提交前启动，但连接慢时不阻塞上游编号", as
   ]);
 
   assert.equal(result.conversationId, "conversation-submit");
+  assert.equal(result.upstreamTaskId, "upstream-task-submit");
   assert.deepEqual(events, ["result-channel", "submit"]);
 });

@@ -2579,6 +2579,7 @@ async function refreshTaskOnce(taskId, options = {}) {
     refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
       carId: task.raw?.selectedCarId,
       carType: task.raw?.selectedCarType,
+      upstreamTaskId: task.raw?.upstreamTaskId,
       timeoutSec: FAST_TASK_REFRESH_TIMEOUT_SEC,
       forceReconnect
     }));

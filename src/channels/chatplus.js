@@ -14,6 +14,9 @@ const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
 const ACCOUNT_CHECK_TIMEOUT_SEC = 20;
 const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 300;
 const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
+const IMAGE_TASK_LIST_CACHE_MS = 2_000;
+const IMAGE_TASK_LIST_CACHE_TTL_MS = 10 * 60 * 1000;
+const MAX_IMAGE_TASK_LIST_CACHES = 100;
 const CONVERSATION_READ_HEADERS = Object.freeze({
   "cache-control": "no-cache",
   pragma: "no-cache"
@@ -72,6 +75,7 @@ const GROK_STATSIG_SEED = Buffer.from(
 const GROK_STATSIG_FINGERPRINT = "3bab9506b851eb851eb840e8f5c28f5c28f80e8f5c28f5c28f806b851eb851eb8400";
 const badCarUntil = new Map();
 const recentImageCarSuccessAt = new Map();
+const imageTaskListCaches = new Map();
 
 function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
@@ -504,6 +508,80 @@ function parseSse(text) {
     }
   }
   return events;
+}
+
+function imageTaskConversationId(task = {}) {
+  return String(task.original_conversation_id || task.conversation_id || task.conversationId || "").trim();
+}
+
+function imageTaskMatchesConversation(task, conversationId) {
+  const expected = String(conversationId || "").trim();
+  const actual = imageTaskConversationId(task);
+  return Boolean(expected && actual && expected === actual);
+}
+
+function imageTaskIdFrom(value, conversationId = "", seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return "";
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const taskId = imageTaskIdFrom(item, conversationId, seen);
+      if (taskId) return taskId;
+    }
+    return "";
+  }
+
+  const taskId = String(value.task_id || value.taskId || "").trim();
+  const valueConversationId = imageTaskConversationId(value);
+  if (taskId && (!conversationId || !valueConversationId || valueConversationId === conversationId)) return taskId;
+  for (const item of Object.values(value)) {
+    const nestedTaskId = imageTaskIdFrom(item, conversationId, seen);
+    if (nestedTaskId) return nestedTaskId;
+  }
+  return "";
+}
+
+function hasAsyncImageTaskMarker(value, seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((item) => hasAsyncImageTaskMarker(item, seen));
+  if (
+    value.async_status !== null && value.async_status !== undefined
+    || value.image_gen_async === true
+    || value.metadata?.image_gen_async === true
+    || Boolean(value.async_source || value.metadata?.async_source)
+    || Boolean(value.ghostrider || value.metadata?.ghostrider)
+  ) return true;
+  return Object.values(value).some((item) => hasAsyncImageTaskMarker(item, seen));
+}
+
+function imageTaskFailure(task = {}) {
+  const status = String(task.status || task.task_status || task.state || "").trim().toLowerCase();
+  if (!["failed", "failure", "error", "cancelled", "canceled"].includes(status)) return null;
+  const message = String(
+    task.error_message
+      || task.errorMessage
+      || task.failure_reason
+      || task.failureReason
+      || task.error?.message
+      || ""
+  ).trim();
+  return {
+    status: ["cancelled", "canceled"].includes(status) ? "cancelled" : "failed",
+    message: message || (["cancelled", "canceled"].includes(status) ? "上游已取消任务。" : "上游明确返回任务失败。")
+  };
+}
+
+function pruneImageTaskListCaches(now = Date.now()) {
+  for (const [key, entry] of imageTaskListCaches) {
+    if (!entry.promise && now - entry.updatedAt > IMAGE_TASK_LIST_CACHE_TTL_MS) imageTaskListCaches.delete(key);
+  }
+  if (imageTaskListCaches.size <= MAX_IMAGE_TASK_LIST_CACHES) return;
+  const excess = [...imageTaskListCaches.entries()]
+    .filter(([, entry]) => !entry.promise)
+    .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
+    .slice(0, imageTaskListCaches.size - MAX_IMAGE_TASK_LIST_CACHES);
+  for (const [key] of excess) imageTaskListCaches.delete(key);
 }
 
 function parseJsonLines(text) {
@@ -1046,7 +1124,8 @@ function resultChannelMetadata(conversation = {}, route = {}) {
   if (route.key !== "gpt") return {};
   return {
     resultChannelReady: conversation.resultChannelReady === true,
-    ...(conversation.resultChannelError ? { resultChannelError: conversation.resultChannelError } : {})
+    ...(conversation.resultChannelError ? { resultChannelError: conversation.resultChannelError } : {}),
+    ...(conversation.upstreamTaskId ? { upstreamTaskId: conversation.upstreamTaskId } : {})
   };
 }
 
@@ -2263,6 +2342,7 @@ export class ChatplusClient {
     this.accountWorks = new Map();
     this.concurrentChatSessions = new Map();
     this.completedConversationSyncs = new Map();
+    this.imageTaskIds = new Map();
     this.sessionRevision = 0;
     this.proCarRestrictionSaved = savedProCarRestriction(account, channel);
     this.proCarsUnavailableUntil = savedProCarRestrictionUntil(account, channel);
@@ -2530,6 +2610,154 @@ export class ChatplusClient {
     return connection.ensureReady(timeoutSec * 1000);
   }
 
+  rememberImageTaskId(conversationId, taskId) {
+    const normalizedConversationId = String(conversationId || "").trim();
+    const normalizedTaskId = String(taskId || "").trim();
+    if (!normalizedConversationId || !normalizedTaskId) return "";
+    this.imageTaskIds.set(normalizedConversationId, normalizedTaskId);
+    while (this.imageTaskIds.size > 250) this.imageTaskIds.delete(this.imageTaskIds.keys().next().value);
+    return normalizedTaskId;
+  }
+
+  async imageGenerationTasks(options = {}) {
+    pruneImageTaskListCaches();
+    const key = this.conversationUpdateConnectionKey();
+    const now = Date.now();
+    let cache = imageTaskListCaches.get(key);
+    if (cache?.promise) return cache.promise;
+    if (options.fresh !== true && cache?.expiresAt > now) return cache.tasks;
+
+    cache = cache || { tasks: [], expiresAt: 0, updatedAt: now, promise: null };
+    const request = (async () => {
+      const tasks = [];
+      const seenCursors = new Set();
+      let cursor = "";
+      for (let page = 0; page < 5; page += 1) {
+        const suffix = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+        const payload = await this.json(`/backend-api/tasks${suffix}`, {
+          timeoutSec: options.timeoutSec
+        });
+        const pageTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+        tasks.push(...pageTasks);
+        const nextCursor = String(payload?.cursor || "").trim();
+        if (!nextCursor || seenCursors.has(nextCursor)) break;
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+      }
+      return tasks;
+    })();
+    cache.promise = request;
+    cache.updatedAt = now;
+    imageTaskListCaches.set(key, cache);
+    try {
+      cache.tasks = await request;
+      cache.expiresAt = Date.now() + IMAGE_TASK_LIST_CACHE_MS;
+      return cache.tasks;
+    } catch (error) {
+      imageTaskListCaches.delete(key);
+      throw error;
+    } finally {
+      cache.promise = null;
+      cache.updatedAt = Date.now();
+      pruneImageTaskListCaches();
+    }
+  }
+
+  async imageGenerationTaskState(conversationId, options = {}) {
+    const normalizedConversationId = String(conversationId || "").trim();
+    if (!normalizedConversationId) return null;
+    let taskId = this.rememberImageTaskId(
+      normalizedConversationId,
+      options.upstreamTaskId || this.imageTaskIds.get(normalizedConversationId)
+    );
+    let task = null;
+
+    if (taskId) {
+      try {
+        const payload = await this.json(`/backend-api/task/${encodeURIComponent(taskId)}`, {
+          timeoutSec: options.timeoutSec
+        });
+        const directTask = payload?.task && typeof payload.task === "object" ? payload.task : payload;
+        if (
+          directTask
+          && typeof directTask === "object"
+          && (!imageTaskConversationId(directTask) || imageTaskMatchesConversation(directTask, normalizedConversationId))
+        ) {
+          task = directTask;
+        }
+      } catch {
+        // Older upstream versions may not expose individual background tasks.
+      }
+    }
+
+    if (!task) {
+      try {
+        const tasks = await this.imageGenerationTasks(options);
+        task = tasks.find((item) => imageTaskMatchesConversation(item, normalizedConversationId)) || null;
+        if (task) taskId = this.rememberImageTaskId(normalizedConversationId, imageTaskIdFrom(task, normalizedConversationId));
+      } catch {
+        return taskId ? { taskId, task: null, imageUrls: [], failure: null } : null;
+      }
+    }
+    if (!task) return taskId ? { taskId, task: null, imageUrls: [], failure: null } : null;
+
+    taskId = this.rememberImageTaskId(normalizedConversationId, imageTaskIdFrom(task, normalizedConversationId) || taskId);
+    const imageUrls = await this.imageUrlsFrom(
+      task.image_gen_message || task.messages || task,
+      { generatedOnly: true }
+    );
+    return {
+      taskId,
+      task,
+      imageUrls,
+      failure: imageTaskFailure(task)
+    };
+  }
+
+  async discoverImageGenerationTask(conversationId, events = [], options = {}) {
+    const eventTaskId = imageTaskIdFrom(events, conversationId);
+    if (eventTaskId) {
+      this.rememberImageTaskId(conversationId, eventTaskId);
+      return { taskId: eventTaskId, task: null, imageUrls: [], failure: null };
+    }
+    const attempts = Math.min(4, Math.max(1, Number(options.attempts || 1)));
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (attempt) await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+      const state = await this.imageGenerationTaskState(conversationId, {
+        ...options,
+        fresh: true
+      });
+      if (state?.taskId) return state;
+    }
+    return null;
+  }
+
+  async captureImageTaskRegistration(conversation, input, prompt, taskType, sourceImageCount = 0) {
+    if (
+      conversation?.route?.key !== "gpt"
+      || conversation?.upstreamTaskId
+      || !conversation?.conversationId
+      || typeof input?.onSubmitted !== "function"
+    ) return null;
+    const reader = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
+    try {
+      const state = await reader.discoverImageGenerationTask(conversation.conversationId, conversation.events, {
+        attempts: 1,
+        timeoutSec: 5
+      });
+      if (!state?.taskId) return null;
+      conversation.upstreamTaskId = state.taskId;
+      await notifyImageSubmitted(
+        input,
+        submittedImageTask(conversation, input, prompt, taskType, sourceImageCount)
+      );
+      return state;
+    } catch {
+      // Realtime updates and conversation polling remain available when task registration is delayed.
+      return null;
+    }
+  }
+
   async conversationStreamStatus(conversationId, options = {}) {
     const { fresh = true, ...requestOptions } = options;
     const path = `/backend-api/conversation/${encodeURIComponent(conversationId)}/stream_status`;
@@ -2668,6 +2896,7 @@ export class ChatplusClient {
     };
     this.concurrentChatSessions.clear();
     this.completedConversationSyncs.clear();
+    this.imageTaskIds.clear();
   }
 
   sessionSnapshot() {
@@ -4039,6 +4268,9 @@ export class ChatplusClient {
           );
         }
         if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.confirmed = true;
+        const upstreamTaskId = requestInput.imageGeneration === true
+          ? submitClient.rememberImageTaskId(conversationId, imageTaskIdFrom(events, conversationId))
+          : "";
         this.rememberReusableChatSession(requestInput, session, submitClient);
         return {
           events,
@@ -4049,6 +4281,7 @@ export class ChatplusClient {
           route,
           selected,
           submissionConfirmed: true,
+          upstreamTaskId,
           resultChannelReady,
           resultChannelError,
           submitSessionSnapshot: submitClient.sessionSnapshot(),
@@ -4293,6 +4526,9 @@ export class ChatplusClient {
     }
     let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: options.generatedOnly });
     if (imageUrls.length || !conversationId) return imageUrls;
+    const initialTaskId = options.upstreamTaskId || imageTaskIdFrom(events, conversationId);
+    this.rememberImageTaskId(conversationId, initialTaskId);
+    let shouldCheckImageTasks = Boolean(initialTaskId) || hasAsyncImageTaskMarker(events);
     if (!initialIntermediateResponse && !initialResponse.inProgress) {
       throwIfTerminalImageFailure(initialContent);
       throwIfTextImageResponse(initialContent);
@@ -4305,6 +4541,7 @@ export class ChatplusClient {
       try {
         const pushedUpdates = chatplusConversationUpdates(conversationId);
         if (pushedUpdates.length) {
+          shouldCheckImageTasks ||= hasAsyncImageTaskMarker(pushedUpdates);
           imageUrls = await this.imageUrlsFrom(pushedUpdates, { generatedOnly: true });
           if (imageUrls.length) return imageUrls;
           throwIfImageGenerationLimit(pushedUpdates, { car: true });
@@ -4324,6 +4561,20 @@ export class ChatplusClient {
         let detail = await this.conversationDetail(conversationId);
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
+        shouldCheckImageTasks ||= hasAsyncImageTaskMarker(detail);
+        if (shouldCheckImageTasks) {
+          const imageTaskState = await this.imageGenerationTaskState(conversationId, {
+            upstreamTaskId: options.upstreamTaskId,
+            timeoutSec: Math.min(30, Math.max(5, Math.ceil((deadline - Date.now()) / 1000)))
+          });
+          if (imageTaskState?.imageUrls.length) return imageTaskState.imageUrls;
+          if (imageTaskState?.failure) {
+            const error = new Error(imageTaskState.failure.message);
+            error.upstreamExplicitFailure = true;
+            error.upstreamStatus = imageTaskState.failure.status;
+            throw error;
+          }
+        }
         detail = await this.refreshCompletedConversation(conversationId, detail);
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
@@ -4457,13 +4708,37 @@ export class ChatplusClient {
       detail = await refreshReader.refreshCompletedConversation(externalId, detail, requestOptions);
       imageUrls = await imageReader.imageUrlsFrom(detail, { generatedOnly: true });
     }
-    const resultState = pushedUpdates.length ? [detail, ...pushedUpdates] : detail;
-    const rawDetail = !geminiTask && (resultChannelReady || resultChannelError || pushedUpdates.length)
+    let imageTaskState = null;
+    const shouldCheckImageTasks = Boolean(context.upstreamTaskId)
+      || hasAsyncImageTaskMarker(detail)
+      || hasAsyncImageTaskMarker(pushedUpdates);
+    if (
+      !geminiTask
+      && !imageUrls.length
+      && shouldCheckImageTasks
+      && typeof taskReader.imageGenerationTaskState === "function"
+    ) {
+      imageTaskState = await taskReader.imageGenerationTaskState(externalId, {
+        ...requestOptions,
+        upstreamTaskId: context.upstreamTaskId
+      });
+      if (imageTaskState?.imageUrls.length) imageUrls = imageTaskState.imageUrls;
+    }
+    const resultParts = [detail, ...pushedUpdates, imageTaskState?.task].filter(Boolean);
+    const resultState = resultParts.length === 1 ? resultParts[0] : resultParts;
+    const upstreamTaskId = imageTaskState?.taskId || context.upstreamTaskId || "";
+    const rawDetail = !geminiTask && (
+      resultChannelReady
+      || resultChannelError
+      || pushedUpdates.length
+      || upstreamTaskId
+    )
       ? {
           ...detail,
           resultChannelReady,
           resultChannelUpdateCount: pushedUpdates.length,
-          ...(resultChannelError ? { resultChannelError } : {})
+          ...(resultChannelError ? { resultChannelError } : {}),
+          ...(upstreamTaskId ? { upstreamTaskId } : {})
         }
       : detail;
     if (imageUrls.length) {
@@ -4591,6 +4866,7 @@ export class ChatplusClient {
         requireConversationId: true
       }, async (conversation) => {
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
+        await this.captureImageTaskRegistration(conversation, input, prompt, "text2img");
         throwIfImageGenerationLimit(conversation.events, { car: true });
         if (conversation.route?.key === "gemini") {
           let imageUrls = conversation.imageUrls || [];
@@ -4625,8 +4901,14 @@ export class ChatplusClient {
           label: "等待图片完成",
           carId: conversation.selected?.carId,
           carType: conversation.selected?.carType
-        }, async () => waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec));
-        return { ...conversation, imageUrls };
+        }, async () => waitClient.waitForConversationImages(
+          conversation.events,
+          conversation.conversationId,
+          input.waitTimeoutSec,
+          { upstreamTaskId: conversation.upstreamTaskId }
+        ));
+        const upstreamTaskId = waitClient.imageTaskIds.get(conversation.conversationId) || conversation.upstreamTaskId || "";
+        return { ...conversation, imageUrls, upstreamTaskId };
       });
       const { events, conversationId, model, upstreamModel, route, selected, imageUrls } = result;
       const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
@@ -4668,6 +4950,7 @@ export class ChatplusClient {
         requireConversationId: true
       }, async (conversation) => {
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
+        await this.captureImageTaskRegistration(conversation, input, prompt, "img2img", files.length);
         throwIfImageGenerationLimit(conversation.events, { car: true });
         if (conversation.route?.key === "gemini") {
           let imageUrls = conversation.imageUrls || [];
@@ -4702,8 +4985,14 @@ export class ChatplusClient {
           label: "等待图片完成",
           carId: conversation.selected?.carId,
           carType: conversation.selected?.carType
-        }, async () => waitClient.waitForConversationImages(conversation.events, conversation.conversationId, input.waitTimeoutSec, { generatedOnly: true }));
-        return { ...conversation, imageUrls };
+        }, async () => waitClient.waitForConversationImages(
+          conversation.events,
+          conversation.conversationId,
+          input.waitTimeoutSec,
+          { generatedOnly: true, upstreamTaskId: conversation.upstreamTaskId }
+        ));
+        const upstreamTaskId = waitClient.imageTaskIds.get(conversation.conversationId) || conversation.upstreamTaskId || "";
+        return { ...conversation, imageUrls, upstreamTaskId };
       });
       const { events, conversationId, model, upstreamModel, route, selected, imageUrls } = result;
       const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
