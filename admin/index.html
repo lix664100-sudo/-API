@@ -1236,6 +1236,12 @@
         gap: 10px;
       }
 
+      .quota-protection-section {
+        margin-top: 4px;
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+
       .api-doc-title {
         margin: 0;
         font-size: 14px;
@@ -2071,8 +2077,16 @@
         return row?.raw?.submitted !== true && /^并发上限/.test(message);
       }
 
+      function isQuotaProtectedTask(row) {
+        if (String(row?.status || "").toLowerCase() !== "failed") return false;
+        const code = String(row?.responseJson?.code || row?.code || "").trim().toUpperCase();
+        return row?.raw?.submitted !== true && code === "QUOTA_PROTECTION";
+      }
+
       function taskPresentationStatus(row) {
-        return isConcurrencyLimitedTask(row) ? "concurrency_limited" : String(row?.status || "");
+        if (isConcurrencyLimitedTask(row)) return "concurrency_limited";
+        if (isQuotaProtectedTask(row)) return "quota_protected";
+        return String(row?.status || "");
       }
 
       function isChatTaskRow(row) {
@@ -3028,6 +3042,66 @@
         return account?.meta?.abilities?.[key] || {};
       }
 
+      function quotaProtectionSettings(value = {}) {
+        const percent = (input, fallback) => {
+          const number = Math.round(Number(input));
+          return Math.min(99, Math.max(1, Number.isFinite(number) ? number : fallback));
+        };
+        const first = percent(value.randomMinPercent, 1);
+        const second = percent(value.randomMaxPercent, 20);
+        return {
+          enabled: value.enabled === true,
+          mode: value.mode === "random" ? "random" : "fixed",
+          fixedPercent: percent(value.fixedPercent, 20),
+          randomMinPercent: Math.min(first, second),
+          randomMaxPercent: Math.max(first, second)
+        };
+      }
+
+      function quotaProtectionSettingsKey(value = {}) {
+        const settings = quotaProtectionSettings(value);
+        return settings.mode === "random"
+          ? `random:${settings.randomMinPercent}:${settings.randomMaxPercent}`
+          : `fixed:${settings.fixedPercent}`;
+      }
+
+      function quotaProtectionState(status = {}, key = "", channel = {}) {
+        const settings = quotaProtectionSettings(channel?.settings?.quotaProtection);
+        if (!settings.enabled) return null;
+        const state = status.meta?.quotaProtection?.states?.[key];
+        return state?.settingsKey === quotaProtectionSettingsKey(settings) ? state : null;
+      }
+
+      function accountQuotaProtectionItems(account, channel) {
+        if (channel?.type !== "shareai") return [];
+        const items = [];
+        if (channelAbilityEnabled(channel, "drawing")) {
+          const state = quotaProtectionState(abilityStatus(account, "drawing"), "drawing", channel);
+          if (state) items.push({ key: "drawing", label: "绘图", state });
+        }
+        if (channelAbilityEnabled(channel, "chatplus")) {
+          const chatplus = abilityStatus(account, "chatplus");
+          chatModelsForChannel(channel)
+            .filter((model) => model.enabled)
+            .forEach((model) => {
+              const state = quotaProtectionState(chatplus, model.key, channel);
+              if (state) items.push({ key: `chatplus-${model.key}`, label: model.name, state });
+            });
+        }
+        return items;
+      }
+
+      function quotaProtectionThresholdText(account, channel) {
+        const items = accountQuotaProtectionItems(account, channel);
+        if (!items.length) return "";
+        return `保护线：${items.map((item) => `${item.label} ${item.state.thresholdPercent}%`).join("｜")}`;
+      }
+
+      function quotaProtectionTooltip(item) {
+        const remaining = item.state.known ? `${item.state.remainingPercent}%` : "暂未获取";
+        return `${item.label}剩余 ${remaining}，保护线 ${item.state.thresholdPercent}%。达到保护线后仅暂停该项额度，其他可用能力不受影响。`;
+      }
+
       function quotaPairText(quota, balance) {
         if ([quota, balance].every((item) => item === null || item === undefined || item === "")) return "-";
         return `${valueText(quota)}/${valueText(balance)}`;
@@ -3206,6 +3280,7 @@
           success: ["success", "成功"],
           failed: ["error", "失败"],
           concurrency_limited: ["warning", "并发已满"],
+          quota_protected: ["warning", "额度保护"],
           cancelled: ["default", "已取消"],
           queued: ["processing", "排队中"],
           processing: ["processing", "处理中"],
@@ -4824,6 +4899,8 @@
         const editingChannelAbilities = Form.useWatch(["settings", "enabledAbilities"], channelForm) || {};
         const editingChannelDrawingEnabled = editingChannelAbilities.drawing !== false;
         const editingChannelChatEnabled = editingChannelAbilities.chatplus !== false;
+        const editingQuotaProtectionEnabled = Form.useWatch(["settings", "quotaProtection", "enabled"], channelForm) === true;
+        const editingQuotaProtectionMode = Form.useWatch(["settings", "quotaProtection", "mode"], channelForm) || "fixed";
         const selectedChatAccountValue = Form.useWatch("accountId", chatForm);
         const selectedEditAccountValue = Form.useWatch("accountId", editForm);
 
@@ -5690,6 +5767,7 @@
             settings: {
               ...(channel.settings || {}),
               enabledAbilities,
+              quotaProtection: quotaProtectionSettings(channel.settings?.quotaProtection),
               geminiDrawingModelId: [2, 3].includes(Number(channel.settings?.geminiDrawingModelId))
                 ? Number(channel.settings.geminiDrawingModelId)
                 : 2,
@@ -5707,6 +5785,7 @@
               enabledAbilities: { drawing: true, chatplus: true },
               defaultModelId: config?.defaultModelId || 1,
               geminiDrawingModelId: 2,
+              quotaProtection: quotaProtectionSettings(),
               defaultChatModel: "gpt",
               chatModels: chatModelDefaults
             }
@@ -5731,6 +5810,16 @@
             : 2;
           const drawingBaseUrl = String(payload.settings.drawingBaseUrl || "").trim();
           const chatBaseUrl = String(payload.settings.chatBaseUrl || "").trim();
+          const rawProtection = payload.settings.quotaProtection || {};
+          if (
+            rawProtection.enabled === true
+            && rawProtection.mode === "random"
+            && Number(rawProtection.randomMinPercent) > Number(rawProtection.randomMaxPercent)
+          ) {
+            message.error("随机范围的最小值不能大于最大值");
+            return null;
+          }
+          payload.settings.quotaProtection = quotaProtectionSettings(rawProtection);
 
           if (!enabledAbilities.drawing && !enabledAbilities.chatplus) {
             message.error("请至少启用绘图站或聊天站");
@@ -6832,10 +6921,12 @@
               if (row.enabled === false) return statusTag("disabled");
               const tags = [];
               const statusTimes = [];
+              const protectionItems = accountQuotaProtectionItems(row, rowChannel);
 
               if (rowChannel?.type === "shareai") {
                 if (channelAbilityEnabled(rowChannel, "drawing")) {
                   const drawing = abilityStatus(row, "drawing");
+                  const drawingProtection = protectionItems.find((item) => item.key === "drawing" && item.state.active);
                   if (drawing.lastCheckAt) statusTimes.push(drawing.lastCheckAt);
                   if (drawingAccountIsCooling(row)) {
                     const cooldown = drawingCooldownStatus(row);
@@ -6848,15 +6939,27 @@
                     tags.push(h(Tooltip, { key: "drawing-cooldown", title: tooltip },
                       h(Tag, { color: "orange" }, `${chatplusAvailable ? "仅绘图站冷却" : "绘图站冷却中"} · ${drawingCooldownText(row)}`)
                     ));
+                  } else if (drawingProtection) {
+                    tags.push(h(Tooltip, { key: "drawing-protection", title: quotaProtectionTooltip(drawingProtection) },
+                      h(Tag, { color: "orange" }, "绘图额度保护")
+                    ));
                   } else {
                     tags.push(labeledStatusTag("drawing", "绘图", drawingDisplayStatus(drawing)));
                   }
                 }
                 if (channelAbilityEnabled(rowChannel, "chatplus")) {
                   const chatplus = abilityStatus(row, "chatplus");
+                  const chatProtections = protectionItems.filter((item) => item.key.startsWith("chatplus-") && item.state.active);
                   if (chatplus.lastCheckAt) statusTimes.push(chatplus.lastCheckAt);
                   const chatStatus = accountCheckDisplayStatus(row, rowChannel) || chatDisplayStatus(chatplus);
-                  tags.push(labeledStatusTag("chatplus", checkedChatModelName(row, rowChannel), chatStatus));
+                  if (chatProtections.length) {
+                    chatProtections.forEach((item) => tags.push(h(Tooltip, {
+                      key: `${item.key}-protection`,
+                      title: quotaProtectionTooltip(item)
+                    }, h(Tag, { color: "orange" }, `${item.label}额度保护`))));
+                  } else {
+                    tags.push(labeledStatusTag("chatplus", checkedChatModelName(row, rowChannel), chatStatus));
+                  }
                 }
               } else {
                 tags.push(h("span", { key: "status" }, statusTag(displayStatus)));
@@ -6866,10 +6969,12 @@
               const updatedAt = statusTimes
                 .filter((value) => Number.isFinite(Date.parse(value)))
                 .sort((left, right) => Date.parse(right) - Date.parse(left))[0] || row.lastCheckAt || "";
+              const protectionText = quotaProtectionThresholdText(row, rowChannel);
               return h("div", { className: "account-status" }, [
                 h("div", { className: "account-status-tags", key: "tags" }, tags.length ? tags : [statusTag(displayStatus)]),
-                h("span", { className: "account-status-time", key: "time" }, updatedAt ? `状态更新 ${formatDateTime(updatedAt)}` : "尚未检测")
-              ]);
+                h("span", { className: "account-status-time", key: "time" }, updatedAt ? `状态更新 ${formatDateTime(updatedAt)}` : "尚未检测"),
+                protectionText ? h("span", { className: "account-status-time", key: "protection" }, protectionText) : null
+              ].filter(Boolean));
             }
           },
           {
@@ -7286,6 +7391,7 @@
                 { label: "成功", value: "success" },
                 { label: "失败", value: "failed" },
                 { label: "并发已满", value: "concurrency_limited" },
+                { label: "额度保护", value: "quota_protected" },
                 { label: "排队中", value: "queued" },
                 { label: "处理中", value: "processing" },
                 { label: "等待上游", value: "waiting_upstream" },
@@ -8097,6 +8203,73 @@
                   }, h(Input, { disabled: !editingChannelChatEnabled, placeholder: "https://www.chatplus.cc" }))
                 ])
               : h(Form.Item, { label: "网站地址", name: ["settings", "baseUrl"], rules: [{ required: true, message: "请输入网站地址" }] }, h(Input, { placeholder: "https://example.com" })),
+            editingChannelType === "shareai"
+              ? h("div", { className: "api-doc-section quota-protection-section" }, [
+                  h("h3", { className: "api-doc-title", key: "title" }, "额度保护"),
+                  h("p", { className: "api-doc-copy", key: "copy" }, "达到保护线后暂停对应额度；检测到套餐刷新或充值后自动恢复。"),
+                  h("div", { className: "form-grid", key: "controls" }, [
+                    h(Form.Item, {
+                      label: "启用额度保护",
+                      name: ["settings", "quotaProtection", "enabled"],
+                      valuePropName: "checked",
+                      initialValue: false
+                    }, h(Switch, { checkedChildren: "启用", unCheckedChildren: "关闭" })),
+                    editingQuotaProtectionEnabled
+                      ? h(Form.Item, {
+                          label: "保护方式",
+                          name: ["settings", "quotaProtection", "mode"],
+                          initialValue: "fixed"
+                        }, h(Select, {
+                          options: [
+                            { label: "固定百分比", value: "fixed" },
+                            { label: "随机范围", value: "random" }
+                          ]
+                        }))
+                      : null
+                  ].filter(Boolean)),
+                  editingQuotaProtectionEnabled && editingQuotaProtectionMode === "fixed"
+                    ? h(Form.Item, {
+                        label: "剩余额度保护线",
+                        name: ["settings", "quotaProtection", "fixedPercent"],
+                        extra: "剩余额度达到或低于此值时暂停。",
+                        rules: [{ required: true, message: "请输入剩余额度保护线" }]
+                      }, h(InputNumber, {
+                        min: 1,
+                        max: 99,
+                        precision: 0,
+                        addonAfter: "%",
+                        style: { width: "100%" }
+                      }))
+                    : null,
+                  editingQuotaProtectionEnabled && editingQuotaProtectionMode === "random"
+                    ? h("div", { className: "form-grid", key: "random-range" }, [
+                        h(Form.Item, {
+                          label: "随机范围最小值",
+                          name: ["settings", "quotaProtection", "randomMinPercent"],
+                          rules: [{ required: true, message: "请输入随机范围最小值" }]
+                        }, h(InputNumber, {
+                          min: 1,
+                          max: 99,
+                          precision: 0,
+                          addonAfter: "%",
+                          style: { width: "100%" }
+                        })),
+                        h(Form.Item, {
+                          label: "随机范围最大值",
+                          name: ["settings", "quotaProtection", "randomMaxPercent"],
+                          extra: "每个账号每次额度周期只抽取一次。",
+                          rules: [{ required: true, message: "请输入随机范围最大值" }]
+                        }, h(InputNumber, {
+                          min: 1,
+                          max: 99,
+                          precision: 0,
+                          addonAfter: "%",
+                          style: { width: "100%" }
+                        }))
+                      ])
+                    : null
+                ].filter(Boolean))
+              : null,
             (editingChannelType === "chatplus" || (editingChannelType === "shareai" && editingChannelChatEnabled))
               ? h("div", { className: "api-doc-section" }, [
                   h(Form.Item, { label: "默认对话模型", name: ["settings", "defaultChatModel"] }, h(Select, { options: chatModelDefaults.map((item) => ({ label: item.name, value: item.key })) })),

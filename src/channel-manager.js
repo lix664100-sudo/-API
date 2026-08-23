@@ -31,6 +31,14 @@ import {
   upsertTask
 } from "./storage.js";
 import { estimateChatTokenUsage } from "./token-usage.js";
+import {
+  applyQuotaProtectionStates,
+  normalizeQuotaProtectionSettings,
+  quotaProtectionBlocked,
+  quotaProtectionNearLimit,
+  quotaProtectionRecheckDue,
+  quotaProtectionStateFor
+} from "./quota-protection.js";
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
 const defaultTaskConcurrency = { chat: 3, drawingImage: 2, chatImage: 2 };
@@ -181,10 +189,12 @@ async function loadRuntimeConfig() {
   return config;
 }
 
-function taskSlotLimit(slot, target = {}) {
+function taskSlotLimit(slot, target = {}, input = {}) {
   const accountLimit = Number(target?.account?.concurrency?.[slot]);
-  if (Number.isFinite(accountLimit) && accountLimit > 0) return accountLimit;
-  return activeTaskConcurrency[slot] || defaultTaskConcurrency[slot] || 1;
+  const configured = Number.isFinite(accountLimit) && accountLimit > 0
+    ? accountLimit
+    : activeTaskConcurrency[slot] || defaultTaskConcurrency[slot] || 1;
+  return targetQuotaProtectionNearLimit(target, input) ? Math.min(1, configured) : configured;
 }
 
 function activeCountForSlot(slot) {
@@ -258,6 +268,7 @@ function targetRuntimeAvailable(target, taskType, input = {}) {
   ) {
     return false;
   }
+  if (targetQuotaProtectionBlocksTask(target, input)) return false;
   if (targetSubscriptionExpired(target, input)) return false;
   const confirmedQuotaBlocks = targetConfirmedQuotaBlocksTask(target, taskType, input);
   const quotaProbeReady = target?.channel?.type === "chatplus"
@@ -647,7 +658,7 @@ async function tryReserveTaskSlot(slot, target = {}, input = {}) {
   const durableState = await durableTaskSlotState(slot, target, input);
   const count = activeTaskCounts.get(key) || 0;
   const occupied = count + durableState.total - Math.min(durableState.active, count);
-  if (occupied >= taskSlotLimit(slot, target)) return null;
+  if (occupied >= taskSlotLimit(slot, target, input)) return null;
   activeTaskCounts.set(key, count + 1);
   const routingLoad = requestedRoutingLoad(slot, input);
   updateActiveRoutingLoad(slot, target, routingLoad);
@@ -941,6 +952,7 @@ function shareAIAbilityChannel(channel, ability) {
         defaultChatModel: settings.defaultChatModel || "gpt",
         chatModels: settings.chatModels || [],
         geminiDrawingModelId: Number(settings.geminiDrawingModelId || 2),
+        quotaProtection: normalizeQuotaProtectionSettings(settings.quotaProtection),
         autoCarSelection: true,
         autoCarSelectionMigrated: true
       }
@@ -956,7 +968,8 @@ function shareAIAbilityChannel(channel, ability) {
     settings: {
       baseUrl: settings.drawingBaseUrl || "https://drawing.aishare.icu",
       defaultModelId: Number(settings.defaultModelId || 1),
-      geminiDrawingModelId: Number(settings.geminiDrawingModelId || 2)
+      geminiDrawingModelId: Number(settings.geminiDrawingModelId || 2),
+      quotaProtection: normalizeQuotaProtectionSettings(settings.quotaProtection)
     }
   };
 }
@@ -2040,21 +2053,103 @@ async function skipAccountAfterConfirmedUsageLimit(target, error, attempts) {
 
 async function updateAccountAfterTask(account, channel, result = {}) {
   if (channel?.type === "chatplus") {
-    const config = await loadRuntimeConfig();
-    const currentAccount = config.accounts.find((item) => item.id === account.id) || account;
     const ability = channelAbilityKey(channel);
-    const currentStatus = ability
-      ? currentAccount.meta?.abilities?.[ability] || {}
-      : currentAccount;
-    if (
-      result.taskType === "chat"
-      && currentStatus.status === "quota_empty"
-      && currentStatus.quotaConfirmedByUpstream === true
-      && currentStatus.quotaReason === "image_quota"
-    ) {
+    const protectionSettings = normalizeQuotaProtectionSettings(channel?.settings?.quotaProtection);
+    if (!protectionSettings.enabled) {
+      const config = await loadRuntimeConfig();
+      const currentAccount = config.accounts.find((item) => item.id === account.id) || account;
+      const currentStatus = ability
+        ? currentAccount.meta?.abilities?.[ability] || {}
+        : currentAccount;
+      if (
+        result.taskType === "chat"
+        && currentStatus.status === "quota_empty"
+        && currentStatus.quotaConfirmedByUpstream === true
+        && currentStatus.quotaReason === "image_quota"
+      ) {
+        return false;
+      }
+      await markAccountAvailable(account.id, channel, storedTaskModelKey(result));
       return false;
     }
-    await markAccountAvailable(account.id, channel, storedTaskModelKey(result));
+    if (!ability) {
+      await markAccountAvailable(account.id, channel, storedTaskModelKey(result));
+      return false;
+    }
+
+    const modelKey = storedTaskModelKey(result);
+    const submitted = result.status === "success"
+      || result.raw?.submitted === true
+      || Boolean(savedTaskExternalId(result));
+    await updateAccountMeta(account.id, (accountMeta) => {
+      const abilities = { ...(accountMeta.abilities || {}) };
+      const currentStatus = abilities[ability] || {};
+      if (
+        result.taskType === "chat"
+        && currentStatus.status === "quota_empty"
+        && currentStatus.quotaConfirmedByUpstream === true
+        && currentStatus.quotaReason === "image_quota"
+      ) {
+        return accountMeta;
+      }
+
+      const currentMeta = { ...(currentStatus.meta || {}) };
+      const referenceUsage = { ...(currentMeta.referenceUsage || {}) };
+      const usage = modelKey ? referenceUsage[modelKey] : null;
+      const knownBalance = usage?.balance !== null
+        && usage?.balance !== undefined
+        && String(usage.balance).trim() !== ""
+        && Number.isFinite(Number(usage.balance));
+      const knownQuota = usage?.quota !== null
+        && usage?.quota !== undefined
+        && String(usage.quota).trim() !== ""
+        && Number.isFinite(Number(usage.quota));
+      const protectionUsages = {};
+      if (submitted && modelKey && knownBalance && knownQuota) {
+        const previousProtection = quotaProtectionStateFor(currentStatus, modelKey);
+        const previousProtectionMatches = quotaProtectionBlocked(
+          { ...(previousProtection || {}), active: true },
+          protectionSettings
+        );
+        const estimatedFrom = previousProtectionMatches && Number.isFinite(Number(previousProtection?.balance))
+          ? Math.min(Number(usage.balance), Number(previousProtection.balance))
+          : Number(usage.balance);
+        const balance = Math.max(0, estimatedFrom - 1);
+        protectionUsages[modelKey] = {
+          ...usage,
+          balance,
+          used: Math.max(0, Number(usage.quota) - balance)
+        };
+      }
+
+      const available = {
+        ...currentStatus,
+        status: "ok",
+        quota: null,
+        balance: null,
+        used: null,
+        quotaResetAt: "",
+        cooldownUntil: null,
+        quotaReason: "",
+        quotaConfirmedByUpstream: false,
+        period: "",
+        message: "最近调用成功",
+        lastCheckAt: new Date().toISOString(),
+        meta: {
+          ...currentMeta,
+          ...(modelKey ? { chatModel: modelKey } : {}),
+          referenceUsage
+        }
+      };
+      const nextStatus = applyQuotaProtectionStates(
+        available,
+        currentStatus,
+        protectionSettings,
+        protectionUsages
+      );
+      abilities[ability] = nextStatus;
+      return { ...accountMeta, abilities };
+    });
     return false;
   }
   if (channel?.type !== "drawing" || !isFinishedTask(result.status)) {
@@ -2829,6 +2924,72 @@ function targetQuotaStatus(target) {
   return abilityStatus && Object.keys(abilityStatus).length ? abilityStatus : target?.account || {};
 }
 
+function targetQuotaProtectionSettings(target = {}) {
+  return normalizeQuotaProtectionSettings(target?.channel?.settings?.quotaProtection);
+}
+
+function targetQuotaProtectionKey(target = {}, input = {}) {
+  return target?.channel?.type === "drawing"
+    ? "drawing"
+    : targetChatModelKey(target, input) || "gpt";
+}
+
+function statusQuotaProtectionState(target, status = {}, input = {}) {
+  return quotaProtectionStateFor(status, targetQuotaProtectionKey(target, input));
+}
+
+function statusQuotaProtectionBlocksTask(target, status = {}, input = {}) {
+  return quotaProtectionBlocked(
+    statusQuotaProtectionState(target, status, input),
+    targetQuotaProtectionSettings(target)
+  );
+}
+
+function targetQuotaProtectionBlocksTask(target, input = {}) {
+  return statusQuotaProtectionBlocksTask(target, targetQuotaStatusForTask(target, input), input);
+}
+
+function targetQuotaProtectionNearLimit(target, input = {}) {
+  const status = targetQuotaStatusForTask(target, input);
+  return quotaProtectionNearLimit(
+    statusQuotaProtectionState(target, status, input),
+    targetQuotaProtectionSettings(target)
+  );
+}
+
+function targetQuotaProtectionNeedsInitialCheck(target, input = {}) {
+  const settings = targetQuotaProtectionSettings(target);
+  if (!settings.enabled) return false;
+  const status = targetQuotaStatusForTask(target, input);
+  const state = statusQuotaProtectionState(target, status, input);
+  return !state
+    || state.known !== true
+    || !quotaProtectionBlocked({ ...state, active: true }, settings);
+}
+
+function targetQuotaProtectionRecoveryDue(target, input = {}, now = Date.now()) {
+  if (!targetQuotaProtectionBlocksTask(target, input)) return false;
+  return quotaProtectionRecheckDue(
+    statusQuotaProtectionState(target, targetQuotaStatusForTask(target, input), input),
+    now
+  );
+}
+
+function applyCheckedQuotaProtection(channel, account, status = {}, previousStatus = null, options = {}) {
+  const settings = normalizeQuotaProtectionSettings(channel?.settings?.quotaProtection);
+  const previous = previousStatus || targetQuotaStatus({ channel, account });
+  const usages = channel?.type === "drawing"
+    ? {
+        drawing: {
+          quota: status.quota,
+          balance: status.balance,
+          quotaResetAt: status.quotaResetAt || ""
+        }
+      }
+    : status.meta?.referenceUsage || {};
+  return applyQuotaProtectionStates(status, previous, settings, usages, options);
+}
+
 function knownChatUsageBalance(value) {
   return value !== null
     && value !== undefined
@@ -3066,6 +3227,7 @@ function confirmedQuotaBlockedError(target, input = {}) {
 function admissionTargets(targets, taskType, options = {}) {
   return targets.filter((target) => !(
     targetKnownUnavailable(target, options.input)
+      || targetQuotaProtectionBlocksTask(target, options.input)
       || (taskType !== "chat" && targetDrawingBalanceInsufficient(target))
       || (
         targetConfirmedQuotaBlocksTask(target, taskType, options.input)
@@ -3210,10 +3372,11 @@ function failedQuotaRefreshStatus(target, currentStatus = {}, errorStatus = {}, 
   };
 }
 
-function targetNeedsRecovery(target) {
+function targetNeedsRecovery(target, input = {}) {
   if (accountRecoveryTasks.has(targetRecoveryKey(target))) return true;
   const quotaStatus = targetQuotaStatus(target);
   const status = String(quotaStatus.status || "unknown").toLowerCase();
+  if (targetQuotaProtectionRecoveryDue(target, input)) return true;
   if (targetQuotaRefreshDue(target, quotaStatus)) return true;
   if (target?.channel?.type === "chatplus") {
     if (statusSubscriptionExpired(quotaStatus)) return true;
@@ -3235,7 +3398,7 @@ function targetNeedsRecovery(target) {
   return ["error", "failed", "disconnected", "subscription_expired"].includes(status);
 }
 
-async function recoverTarget(config, target) {
+async function recoverTarget(config, target, input = {}) {
   if (refreshTargetDisabled(target?.channel, target?.account)) return null;
   if (targetHasActiveWork(target)) return null;
   const key = targetRecoveryKey(target);
@@ -3271,6 +3434,7 @@ async function recoverTarget(config, target) {
       let status = target.channel.type === "chatplus"
         ? preserveConfirmedChatQuota(currentStatus, checked)
         : checked;
+      status = applyCheckedQuotaProtection(target.channel, target.account, status, currentStatus);
       if (quotaRefresh) status = completedQuotaRefreshStatus(target, status, currentStatus);
       await updateTargetAccountStatus(target.account.id, target.channel, {
         ...status,
@@ -3322,7 +3486,7 @@ export async function recoverUnavailableChatAccounts() {
   const recoveryTargets = [...new Map(
     targets
       .filter((target) => !busyAccountIds.has(String(target.account.id || "")))
-      .filter(targetNeedsRecovery)
+      .filter((target) => targetNeedsRecovery(target))
       .map((target) => [targetRecoveryKey(target), target])
   ).values()];
 
@@ -3360,18 +3524,21 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
   });
   const recoveryTargets = options.skipRecovery
     ? []
-    : targets.filter((target) => targetNeedsRecovery(target) && !ready.some((item) => sameTarget(item, target)));
+    : targets.filter((target) => targetNeedsRecovery(target, options.input) && !ready.some((item) => sameTarget(item, target)));
   if (!recoveryTargets.length) return ready;
 
-  const recoveries = recoveryTargets.map((target) => recoverTarget(config, target));
+  const recoveries = recoveryTargets.map((target) => recoverTarget(config, target, options.input));
   if (ready.length) {
     Promise.all(recoveries).catch((error) => console.error(error));
     return ready;
   }
   const recovered = await Promise.all(recoveries);
-  return recoveryTargets.filter((_target, index) => (
-    recovered[index]?.status === "ok"
-      || (taskType === "chat" && recovered[index]?.status === "quota_empty" && !statusAccountUsageEmpty(recovered[index]))
+  return recoveryTargets.filter((target, index) => (
+    (
+      recovered[index]?.status === "ok"
+        || (taskType === "chat" && recovered[index]?.status === "quota_empty" && !statusAccountUsageEmpty(recovered[index]))
+    )
+      && !statusQuotaProtectionBlocksTask(target, recovered[index], options.input)
   ));
 }
 
@@ -3458,6 +3625,21 @@ function noUsableTargetError(taskType, options = {}) {
     })
     : [];
   const chatTargets = allTargets.filter((target) => target.channel.type === "chatplus");
+  const protectionTargets = allTargets.filter((target) => targetQuotaProtectionBlocksTask(target, options.input));
+  if (allTargets.length && protectionTargets.length === allTargets.length) {
+    const state = statusQuotaProtectionState(
+      protectionTargets[0],
+      targetQuotaStatusForTask(protectionTargets[0], options.input),
+      options.input
+    );
+    const error = new Error(
+      `当前账号已达到额度保护线：剩余 ${state?.remainingPercent ?? "-"}%，保护线 ${state?.thresholdPercent ?? "-"}%。`
+    );
+    error.status = 429;
+    error.code = "QUOTA_PROTECTION";
+    error.quotaProtected = true;
+    return error;
+  }
   const chatUsageEmpty = chatTargets.length > 0
     && chatTargets.length === allTargets.length
     && chatTargets.every((target) => targetAccountUsageEmpty(target, options.input));
@@ -3485,8 +3667,11 @@ function noUsableTargetError(taskType, options = {}) {
   return error;
 }
 
-function shouldRefreshQuotaBeforeUse(target, taskType) {
-  if (target.channel.type === "chatplus") return false;
+function shouldRefreshQuotaBeforeUse(target, taskType, input = {}) {
+  if (target.channel.type === "chatplus") {
+    return targetQuotaProtectionNeedsInitialCheck(target, input)
+      || targetQuotaProtectionNearLimit(target, input);
+  }
   if (taskType === "chat") return false;
   return target.channel.type === "drawing" || targetQuotaStatus(target).status === "quota_empty";
 }
@@ -3516,10 +3701,18 @@ async function updateTargetStatusForWork(target, patch) {
     : update();
 }
 
-async function refreshQuotaBeforeUse(config, target, attempts) {
+async function refreshQuotaBeforeUse(config, target, attempts, input = {}) {
   try {
-    const status = await getWorkClient(config, target.channel, target.account).check();
     const previousStatus = targetQuotaStatus(target);
+    const rawStatus = await getWorkClient(config, target.channel, target.account).check(
+      target.channel.type === "chatplus"
+        ? { model: targetChatModelKey(target, input), quotaOnly: true }
+        : undefined
+    );
+    const checked = target.channel.type === "chatplus"
+      ? preserveConfirmedChatQuota(previousStatus, successfulChatAccountCheckStatus(previousStatus, rawStatus))
+      : successfulAccountCheckStatus(rawStatus);
+    const status = applyCheckedQuotaProtection(target.channel, target.account, checked, previousStatus);
     const expiredDrawingCooldown = target.channel.type === "drawing"
       && previousStatus.status === "cooldown"
       && !statusCooling(previousStatus);
@@ -3532,6 +3725,16 @@ async function refreshQuotaBeforeUse(config, target, attempts) {
     });
     if (status.status === "quota_empty") {
       pushAttempt(attempts, target, `${status.message || "额度不足"}，已自动刷新额度后跳过。`, { quotaEmpty: true });
+      return false;
+    }
+    if (statusQuotaProtectionBlocksTask(target, status, input)) {
+      const protection = statusQuotaProtectionState(target, status, input);
+      pushAttempt(
+        attempts,
+        target,
+        `额度保护已生效：剩余 ${protection.remainingPercent}%，保护线 ${protection.thresholdPercent}%。`,
+        { quotaEmpty: true, quotaProtected: true }
+      );
       return false;
     }
     return true;
@@ -3552,9 +3755,9 @@ async function refreshQuotaBeforeUse(config, target, attempts) {
   }
 }
 
-async function refreshQuotaBeforeUseFast(config, target, attempts, timeoutMs = FAST_QUOTA_REFRESH_TIMEOUT_MS) {
+async function refreshQuotaBeforeUseFast(config, target, attempts, input = {}, timeoutMs = FAST_QUOTA_REFRESH_TIMEOUT_MS) {
   const localAttempts = [];
-  const refresh = refreshQuotaBeforeUse(config, target, localAttempts)
+  const refresh = refreshQuotaBeforeUse(config, target, localAttempts, input)
     .then((ready) => ({ ready }))
     .catch((error) => ({ error }));
   const timeout = new Promise((resolve) => {
@@ -3575,11 +3778,17 @@ async function refreshDrawingQuota(account, channel) {
   if (channel.type !== "drawing") return;
   const config = await loadRuntimeConfig();
   const currentAccount = config.accounts.find((item) => item.id === account.id) || account;
-  const status = await getWorkClient(config, channel, currentAccount).check();
+  const rawStatus = await getWorkClient(config, channel, currentAccount).check();
   await withAccountAuthLock(account, async () => {
     const latestConfig = await loadRuntimeConfig();
     const latestAccount = latestConfig.accounts.find((item) => item.id === account.id) || account;
     const drawing = latestAccount.meta?.abilities?.drawing || {};
+    const status = applyCheckedQuotaProtection(
+      channel,
+      latestAccount,
+      successfulAccountCheckStatus(rawStatus),
+      drawing
+    );
     await updateTargetAccountStatus(account.id, channel, statusCooling(drawing)
       ? {
           ...status,
@@ -3751,11 +3960,11 @@ async function checkAccountProxy(account, channel, sharedChecks = null) {
 }
 
 async function ensureTargetReady(config, target, taskType, attempts, options = {}) {
-  if (!shouldRefreshQuotaBeforeUse(target, taskType)) return true;
+  if (!shouldRefreshQuotaBeforeUse(target, taskType, options.input)) return true;
   if (options.skipQuotaRefresh) {
-    return refreshQuotaBeforeUseFast(config, target, attempts);
+    return refreshQuotaBeforeUseFast(config, target, attempts, options.input);
   }
-  return refreshQuotaBeforeUse(config, target, attempts);
+  return refreshQuotaBeforeUse(config, target, attempts, options.input);
 }
 
 async function reserveFirstAvailableTarget(targets, taskType, options = {}) {
@@ -4187,7 +4396,7 @@ function imageFailureRawFields(report) {
 async function failQueuedTask(task, error, attempts = []) {
   const systemRejection = error?.busy === true
     || error?.quotaEmpty === true
-    || ["CONCURRENCY_LIMIT", "QUOTA_EXHAUSTED", "CHAT_USAGE_LIMIT"].includes(String(error?.code || ""));
+    || ["CONCURRENCY_LIMIT", "QUOTA_EXHAUSTED", "CHAT_USAGE_LIMIT", "QUOTA_PROTECTION"].includes(String(error?.code || ""));
   const failure = task.taskType !== "chat" && !systemRejection && !isCarPoolUnavailableError(error)
     ? imageFailureReport(task, error)
     : null;
@@ -4430,7 +4639,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
       let taskState = latestTask;
       try {
         const finishedTask = await runChatplusAccountWork(channel, account, async () => {
-          if (!(await ensureTargetReady(config, target, "text2img", attempts))) return null;
+          if (!(await ensureTargetReady(config, target, "text2img", attempts, { input }))) return null;
           const client = getWorkClient(config, channel, account);
           const onSubmitted = async (submittedResult) => {
             taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
@@ -4604,7 +4813,8 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
       let taskState = latestTask;
       try {
         if (!(await ensureTargetReady(config, target, "img2img", attempts, {
-          skipQuotaRefresh: options.fastQuotaRefresh || options.noChatplusQueue
+          skipQuotaRefresh: options.fastQuotaRefresh || options.noChatplusQueue,
+          input
         }))) continue;
         if (!release) {
           release = await tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target, input);
@@ -4759,7 +4969,7 @@ async function runChatCompletionTask(task, input) {
     const { channel, account } = target;
     try {
       const finished = await runChatplusAccountWork(channel, account, async () => {
-        if (!(await ensureTargetReady(config, target, "chat", attempts))) return null;
+        if (!(await ensureTargetReady(config, target, "chat", attempts, { input }))) return null;
         const client = getWorkClient(config, channel, account);
         if (typeof client.createChatCompletion !== "function") {
           throw new Error("这个渠道暂不支持对话。");
@@ -5211,9 +5421,10 @@ async function checkShareAIAbility(config, channel, account, ability) {
     : account.meta?.abilities?.drawing || {};
   try {
     const checked = await runChatplusAccountWork(abilityChannel, account, () => client.check());
-    const data = ability === "chatplus"
+    const checkedStatus = ability === "chatplus"
       ? preserveConfirmedChatQuota(currentStatus, successfulChatAccountCheckStatus(currentStatus, checked))
       : checked;
+    const data = applyCheckedQuotaProtection(abilityChannel, account, checkedStatus, currentStatus);
     return { ok: true, data };
   } catch (error) {
     if (ability === "chatplus" && isAccountCheckTimeoutError(error)) {
@@ -5441,9 +5652,10 @@ export async function checkAccount(accountId, options = {}) {
     const checked = channel.type === "chatplus"
       ? successfulChatAccountCheckStatus(account, rawStatus)
       : successfulAccountCheckStatus(rawStatus);
-    const status = channel.type === "chatplus"
+    const checkedStatus = channel.type === "chatplus"
       ? preserveConfirmedChatQuota(account, checked)
       : checked;
+    const status = applyCheckedQuotaProtection(channel, account, checkedStatus, account);
     const nextStatus = preserveAccountMetadata(account, withProxyCheckMeta({
       ...status,
       cooldownUntil: status.status === "ok" ? null : status.cooldownUntil
@@ -5613,7 +5825,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
       }
       try {
         const finishedTask = await runChatplusAccountWork(channel, account, async () => {
-          if (!(await ensureTargetReady(config, target, "text2img", attempts))) return null;
+          if (!(await ensureTargetReady(config, target, "text2img", attempts, { input }))) return null;
           const client = getWorkClient(config, channel, account);
           const chatplusConcurrentSubmit = wait && channel.type === "chatplus";
           let result = await client.createTextTask({

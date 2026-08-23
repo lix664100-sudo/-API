@@ -4,6 +4,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { normalizeProxyUrl, safeProxyEndpoint } from "./proxy.js";
+import { normalizeQuotaProtectionSettings } from "./quota-protection.js";
 
 const rootDir = process.cwd();
 const dataDir = path.resolve(rootDir, process.env.DATA_DIR || "data");
@@ -64,6 +65,7 @@ const defaultShareAISettings = {
   geminiDrawingModelId: 2,
   defaultChatModel: "gpt",
   chatModels: defaultChatModels,
+  quotaProtection: normalizeQuotaProtectionSettings(),
   autoCarSelection: true,
   autoCarSelectionMigrated: true
 };
@@ -506,6 +508,7 @@ function normalizeShareAIChannel(channels = []) {
   settings.defaultChatModel = settings.chatModels.find((item) => item.default && item.enabled)?.key || settings.chatModels[0]?.key || "gpt";
   settings.defaultModelId = Number(settings.defaultModelId || 1);
   settings.geminiDrawingModelId = normalizeGeminiDrawingModelId(settings.geminiDrawingModelId);
+  settings.quotaProtection = normalizeQuotaProtectionSettings(settings.quotaProtection);
   settings.autoCarSelection = true;
   settings.autoCarSelectionMigrated = true;
   settings.legacyChannelIds = {
@@ -550,6 +553,7 @@ function normalizeShareAISettings(channel = {}, legacy = {}) {
   settings.defaultChatModel = settings.chatModels.find((item) => item.default && item.enabled)?.key || settings.chatModels[0]?.key || "gpt";
   settings.defaultModelId = Number(settings.defaultModelId || 1);
   settings.geminiDrawingModelId = normalizeGeminiDrawingModelId(settings.geminiDrawingModelId);
+  settings.quotaProtection = normalizeQuotaProtectionSettings(settings.quotaProtection);
   settings.autoCarSelection = true;
   settings.autoCarSelectionMigrated = true;
   settings.enabledAbilities = {
@@ -1593,7 +1597,9 @@ function taskListStatus(task) {
   const code = String(task?.responseJson?.code || task?.code || "").trim().toUpperCase();
   const message = String(task?.errorMessage || task?.responseJson?.message || "").trim();
   const rejectedBeforeSubmission = task?.raw?.submitted !== true;
-  return rejectedBeforeSubmission && (code === "CONCURRENCY_LIMIT" || /^并发上限/.test(message))
+  if (!rejectedBeforeSubmission) return status;
+  if (code === "QUOTA_PROTECTION") return "quota_protected";
+  return code === "CONCURRENCY_LIMIT" || /^并发上限/.test(message)
     ? "concurrency_limited"
     : status;
 }
@@ -2067,7 +2073,7 @@ function taskStatDuration(task, status) {
 function taskWasSystemRejected(task, status) {
   if (status !== "failed" || task?.raw?.returnedError !== true || task?.raw?.submitted === true) return false;
   const code = String(task?.responseJson?.code || task?.code || "").trim().toUpperCase();
-  return code === "CONCURRENCY_LIMIT";
+  return ["CONCURRENCY_LIMIT", "QUOTA_PROTECTION"].includes(code);
 }
 
 function taskStatCount(record) {
