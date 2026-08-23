@@ -2040,7 +2040,15 @@
         if (value === null || value === undefined || value === "") return "";
         try {
           const parsed = typeof value === "string" ? JSON.parse(value) : value;
-          return JSON.stringify(parsed, null, 2);
+          return JSON.stringify(parsed, (_key, item) => {
+            if (typeof item === "string" && /data:image\/[a-z0-9.+-]+;base64,/i.test(item)) {
+              return item.replace(
+                /data:image\/[a-z0-9.+-]+;base64,(?:[a-z0-9+/=]+|\[omitted[^\]]*\])/gi,
+                (image) => `[图片内容已省略，原始长度 ${image.length.toLocaleString("zh-CN")} 字符]`
+              );
+            }
+            return item;
+          }, 2);
         } catch (_error) {
           return String(value);
         }
@@ -2293,7 +2301,7 @@
           .replace(/^自动刷新额度失败[：:]\s*/u, "");
         const model = text.match(/这个聊天模型没有配置[：:]\s*([^。；]+)/)?.[1];
         if (model) return `这个渠道未启用 ${model}。`;
-        if (/正在处理中/.test(text)) return "这个账号还有任务正在处理，请稍后再试。";
+        if (/正在处理中/.test(text)) return /占用任务/.test(text) ? text : "这个账号还有任务正在处理，请稍后再试。";
         if (/额度检测超时/.test(text)) return "额度检测超时，已跳过这个账号。";
         if (/聊天站响应慢|请求超时/.test(text)) return "聊天站响应慢，请稍后重试，或检查代理。";
         if (/暂时没有图片额度可用的 GPT 账号|图片生成额度都已用完|聊天图片额度不足/.test(text)) return "GPT 图片额度暂不可用。";
@@ -2458,15 +2466,24 @@
           : null;
       }
 
-      function taskJsonGrid(row) {
-        const panels = [
+      function TaskJsonGrid({ row }) {
+        const [open, setOpen] = useState(false);
+        const panels = open ? [
           taskJsonPanel("发送 JSON", row.requestJson),
           taskJsonPanel("返回 JSON", taskReturnJson(row))
-        ].filter(Boolean);
-        return panels.length ? h("details", { className: "task-json-detail" }, [
-          h("summary", null, "查看请求和返回 JSON"),
-          h("div", { className: "task-json-grid" }, panels)
-        ]) : null;
+        ].filter(Boolean) : [];
+        if (!row?.requestJson && !taskReturnJson(row)) return null;
+        return h("details", {
+          className: "task-json-detail",
+          onToggle: (event) => setOpen(event.currentTarget.open)
+        }, [
+          h("summary", { key: "summary" }, "查看请求和返回明细"),
+          open ? h("div", { className: "task-json-grid", key: "content" }, panels) : null
+        ]);
+      }
+
+      function taskJsonGrid(row) {
+        return h(TaskJsonGrid, { row });
       }
 
       function upstreamDetailContent(detail = {}) {
@@ -3630,29 +3647,47 @@
       }
 
       function taskTextLengthLabel(value) {
-        const length = String(value || "").trim().length;
+        const length = typeof value === "number" ? Math.max(0, value) : String(value || "").trim().length;
         if (length < 1000) return `${length} 字`;
         if (length < 10000) return `${(length / 1000).toFixed(1)} 千字`;
         return `${(length / 10000).toFixed(1)} 万字`;
       }
 
-      function taskCopyBlock(label, value, options = {}) {
-        const fullText = String(value || "").trim();
+      function taskReadableText(value) {
+        return String(value || "").replace(
+          /data:image\/[a-z0-9.+-]+;base64,(?:[a-z0-9+/=]+|\[omitted[^\]]*\])/gi,
+          "[图片内容已省略]"
+        );
+      }
+
+      function TaskCopyBlock({ label, value, options = {} }) {
+        const [open, setOpen] = useState(false);
+        const fullText = taskReadableText(value).trim();
         if (!fullText) return null;
         const limit = Number(options.limit) || 360;
         const preview = compactTaskText(fullText, limit);
-        const hasMore = fullText.length > limit || fullText.includes("\n") || /data:image\//i.test(fullText);
+        const fullLength = Math.max(fullText.length, Number(options.fullLength) || 0);
+        const hasMore = options.summaryOnly !== true
+          && (fullLength > limit || fullText.includes("\n"));
         return h("div", { className: "task-copy-block", key: options.key || label }, [
           h("div", { className: "task-copy-label", key: "label" }, label),
           h("div", {
             className: `task-copy-preview${options.answer ? " is-answer" : ""}`,
             key: "preview"
           }, preview),
-          hasMore ? h("details", { className: "task-copy-detail", key: "detail" }, [
-            h("summary", { key: "summary" }, `查看完整${label}（${taskTextLengthLabel(fullText)}）`),
-            h("pre", { className: "task-copy-full", key: "content" }, fullText)
+          hasMore ? h("details", {
+            className: "task-copy-detail",
+            key: "detail",
+            onToggle: (event) => setOpen(event.currentTarget.open)
+          }, [
+            h("summary", { key: "summary" }, `查看完整${label}（${taskTextLengthLabel(fullLength)}）`),
+            open ? h("pre", { className: "task-copy-full", key: "content" }, fullText) : null
           ]) : null
         ]);
+      }
+
+      function taskCopyBlock(label, value, options = {}) {
+        return h(TaskCopyBlock, { label, value, options, key: options.key || label });
       }
 
       function taskTypeLabel(type) {
@@ -4722,6 +4757,7 @@
         const [clearingCooldownAccountIds, setClearingCooldownAccountIds] = useState([]);
         const [updating, setUpdating] = useState(false);
         const [upstreamLoadingTaskId, setUpstreamLoadingTaskId] = useState("");
+        const [taskDetailLoadingId, setTaskDetailLoadingId] = useState("");
         const [retryingTaskId, setRetryingTaskId] = useState("");
         const [imageStorageStats, setImageStorageStats] = useState(null);
         const [runtimeStatus, setRuntimeStatus] = useState(null);
@@ -5239,7 +5275,7 @@
           const controller = new AbortController();
           if (!background && taskListRequestActive()) taskPageAbortRef.current.abort();
           taskPageAbortRef.current = controller;
-          const params = new URLSearchParams({ page: String(page), pageSize: "100" });
+          const params = new URLSearchParams({ page: String(page), pageSize: "30" });
           if (String(keyword || "").trim()) params.set("keyword", String(keyword).trim());
           if (accountId && accountId !== "all") params.set("accountId", accountId);
           if (sourceChannelId && sourceChannelId !== "all") params.set("sourceChannelId", sourceChannelId);
@@ -5298,6 +5334,59 @@
               : error.message || "读取上游详情失败。");
           } finally {
             setUpstreamLoadingTaskId("");
+          }
+        }
+
+        function mergeRefreshedTasks(results = []) {
+          const updates = new Map((Array.isArray(results) ? results : [])
+            .map((result) => result?.task)
+            .filter((task) => task?.id)
+            .map((task) => [String(task.id), task]));
+          if (!updates.size) return;
+          setTasks((current) => current.map((task) => updates.has(String(task.id))
+            ? { ...task, ...updates.get(String(task.id)) }
+            : task));
+        }
+
+        async function readFullTask(row) {
+          if (!row?.id) return null;
+          return api(`/api/tasks/${encodeURIComponent(row.id)}`, { timeoutMs: 30000 });
+        }
+
+        async function openTaskDetail(row) {
+          if (!row?.id || taskDetailLoadingId) return;
+          setTaskDetailLoadingId(row.id);
+          try {
+            const detail = await readFullTask(row);
+            if (!detail) throw new Error("没有找到这条任务记录。");
+            const isChat = taskRecordKind(detail) === "chat";
+            Modal.info({
+              title: isChat ? "对话记录详情" : "生图记录详情",
+              width: 960,
+              okText: "关闭",
+              content: h("div", { className: "task-record-detail" }, [
+                h("div", { className: "task-record-detail-model", key: "model" }, taskModelCell(detail)),
+                taskRecordContent(detail, { chat: isChat, detail: true })
+              ])
+            });
+          } catch (error) {
+            message.error(error?.code === "REQUEST_TIMEOUT" ? "读取任务详情超时，请稍后再试。" : error.message || "读取任务详情失败。");
+          } finally {
+            setTaskDetailLoadingId("");
+          }
+        }
+
+        async function openTaskPreview(row) {
+          if (!row?.id || taskDetailLoadingId) return;
+          setTaskDetailLoadingId(row.id);
+          try {
+            const detail = await readFullTask(row);
+            if (!detail) throw new Error("没有找到这条任务记录。");
+            setTaskPreview(detail);
+          } catch (error) {
+            message.error(error?.code === "REQUEST_TIMEOUT" ? "读取任务图片超时，请稍后再试。" : error.message || "读取任务图片失败。");
+          } finally {
+            setTaskDetailLoadingId("");
           }
         }
 
@@ -5528,12 +5617,13 @@
           const timer = setInterval(async () => {
             if (shouldPauseTaskAutoRefresh()) return;
             try {
-              await api("/api/tasks/refresh-processing", { method: "POST", body: {}, timeoutMs: 15000 }).catch(() => null);
+              const results = await api("/api/tasks/refresh-processing", { method: "POST", body: {}, timeoutMs: 15000 }).catch(() => null);
               if (shouldPauseTaskAutoRefresh()) return;
-              const [, nextConfig] = await Promise.all([
-                loadTaskPage({ page: 1, showLoading: false, background: true }),
-                api("/api/config").catch(() => null)
-              ]);
+              mergeRefreshedTasks(results);
+              if (taskStatusFilter !== "all") {
+                await loadTaskPage({ page: 1, showLoading: false, background: true });
+              }
+              const nextConfig = await api("/api/config").catch(() => null);
               if (nextConfig) setConfig(nextConfig);
               await refreshRuntimeStatus();
             } catch (_error) {
@@ -5541,7 +5631,7 @@
             }
           }, 5000);
           return () => clearInterval(timer);
-        }, [tasks, taskListLoading]);
+        }, [tasks, taskListLoading, taskStatusFilter]);
 
         useEffect(() => {
           if (numberValue(runtimeStatus?.running?.total) <= 0) return undefined;
@@ -6024,8 +6114,7 @@
           if (kind === taskKind) return;
           markTaskListInteraction();
           setTaskKind(kind);
-          setTasks([]);
-          setTaskTotal(0);
+          setTaskTotal(numberValue(taskKindTotals[kind]));
           setTaskPage(1);
           loadTaskPage({ page: 1, kind }).catch((error) => {
             const text = taskListErrorMessage(error, "切换任务记录失败");
@@ -6575,7 +6664,13 @@
             } catch (error) {
               refreshError = error;
             }
-            await refresh();
+            mergeRefreshedTasks(results);
+            await Promise.all([
+              loadTaskPage({ page: 1 }),
+              refreshAccountStatus().catch(() => null),
+              refreshRuntimeStatus().catch(() => null),
+              refreshStatsSummary().catch(() => null)
+            ]);
             if (refreshError) {
               message.warning(refreshError.message);
               return;
@@ -6988,26 +7083,45 @@
 
         function taskRecordContent(row, options = {}) {
           const inputImageUrls = taskInputImageUrls(row);
+          const inputImageCount = Math.max(inputImageUrls.length, numberValue(row?.inputImageCount), numberValue(row?.detail?.inputImageCount));
+          const summaryOnly = options.detail !== true;
           return h("div", { className: "task-copy-cell" }, [
             taskCopyBlock(options.chat ? "提问" : "任务描述", row.prompt || "-", {
               key: "prompt",
-              limit: options.chat ? 420 : 320
+              limit: options.chat ? 420 : 320,
+              fullLength: row?.detail?.promptLength,
+              summaryOnly
             }),
             options.chat && row.responseText
-              ? taskCopyBlock("回复", row.responseText, { key: "answer", limit: 420, answer: true })
+              ? taskCopyBlock("回复", row.responseText, {
+                  key: "answer",
+                  limit: 420,
+                  answer: true,
+                  fullLength: row?.detail?.responseTextLength,
+                  summaryOnly
+                })
               : null,
-            options.chat && inputImageUrls.length
+            options.chat && inputImageCount
               ? h(Button, {
                   key: "images",
                   type: "link",
                   size: "small",
                   className: "task-upstream-action",
                   icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null,
-                  onClick: () => setTaskPreview(row)
-                }, `查看对话图片（${inputImageUrls.length}）`)
+                  loading: summaryOnly && String(taskDetailLoadingId) === String(row.id),
+                  onClick: () => summaryOnly ? openTaskPreview(row) : setTaskPreview(row)
+                }, `查看对话图片（${inputImageCount}）`)
               : null,
             taskMetaLine(row, config, { onInspectUpstream: openTaskUpstreamDetail, upstreamLoadingTaskId }),
             taskTimingLine(row),
+            summaryOnly ? h(Button, {
+              key: "detail",
+              type: "link",
+              size: "small",
+              className: "task-upstream-action",
+              loading: String(taskDetailLoadingId) === String(row.id),
+              onClick: () => openTaskDetail(row)
+            }, "查看完整记录") : null,
             row.status === "interrupted"
               ? h("div", { className: "task-response", key: "interrupted" }, [
                   h("span", { key: "message" }, row.responseJson?.message || "服务重启时任务被中断，结果无法确认；此任务不计失败。"),
@@ -7026,10 +7140,16 @@
               : null,
             taskWaitingIssueText(row) ? h("div", { className: "task-response", key: "waiting" }, taskWaitingIssueText(row)) : null,
             !options.chat && row.responseText
-              ? taskCopyBlock("返回内容", row.responseText, { key: "response", limit: 260, answer: true })
+              ? taskCopyBlock("返回内容", row.responseText, {
+                  key: "response",
+                  limit: 260,
+                  answer: true,
+                  fullLength: row?.detail?.responseTextLength,
+                  summaryOnly
+                })
               : null,
             taskErrorDisplay(row),
-            taskJsonGrid(row),
+            options.detail ? taskJsonGrid(row) : null,
             taskRawErrorText(row) ? h("details", {
               className: isConcurrencyLimitedTask(row) ? "task-error-detail task-warning-detail" : "task-error-detail",
               key: "raw-error"
@@ -7054,7 +7174,7 @@
                     type: "button",
                     className: "task-preview-trigger",
                     "aria-label": "查看原图和生成结果",
-                    onClick: () => setTaskPreview(row)
+                    onClick: () => openTaskPreview(row)
                   }, h(Image, {
                     className: "task-thumb",
                     src: thumbnailUrl,
@@ -7109,7 +7229,7 @@
               h("div", { key: "copy" }, [
                 h("div", { className: "task-record-context-title", key: "title" }, `${recordName}记录`),
                 h("div", { className: "task-record-context-desc", key: "desc" }, isChat
-                  ? "提问与回复默认显示摘要，并记录文字的预计 TOKEN；完整内容可按需展开查看。"
+                  ? "提问与回复默认显示摘要，并记录文字的预计 TOKEN；完整内容和请求明细可按需查看。"
                   : "集中查看原图、生成结果、处理渠道、耗时和异常原因。")
               ]),
               h("div", { className: "toolbar-note", key: "total" }, `当前筛选 ${taskTotal.toLocaleString("zh-CN")} 条`)
@@ -7171,8 +7291,10 @@
                 { label: "等待上游", value: "waiting_upstream" },
                 { label: "结果待确认", value: "interrupted" }
               ] }),
-              h("div", { className: "toolbar-note" }, `已加载 ${tasks.length} / ${taskTotal} 条；任务明细保留近2天`),
-              tasks.length < taskTotal
+              h("div", { className: "toolbar-note" }, taskListLoading && !filteredTasks.length
+                ? "正在读取记录…"
+                : `已加载 ${filteredTasks.length} / ${taskTotal} 条；任务明细保留近2天`),
+              filteredTasks.length < taskTotal
                 ? h(Button, {
                     icon: Icon.DownOutlined ? h(Icon.DownOutlined) : null,
                     onClick: loadMoreTasks,

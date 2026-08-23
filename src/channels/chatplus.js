@@ -3859,7 +3859,7 @@ export class ChatplusClient {
           await this.rememberProCarsUnavailable(error);
           this.rememberAuthFailedCar(selected);
           await this.invalidatePreparedChatSession(preparedSession);
-          errors.push(error.message || "调用失败");
+          recordCarError(error.message || "调用失败");
           continue;
         }
         if (Number(error.status || error.statusCode || 0) === 400) throw error;

@@ -64,6 +64,7 @@ import {
   getTaskBySourceTaskId,
   importAccounts,
   listIntradayTaskStats,
+  taskListItem,
   listTaskPage,
   listTaskStats,
   listTaskStatsSummary,
@@ -1245,7 +1246,16 @@ app.get("/api/stats/intraday", async (request) => ({
 app.get("/api/admin/runtime", async () => ({ ok: true, data: await getRuntimeStatus() }));
 
 app.post("/api/tasks/refresh-processing", async () => {
-  return { ok: true, data: await runRefreshProcessingTasks() };
+  const results = await runRefreshProcessingTasks();
+  return {
+    ok: true,
+    data: results.map((result) => ({
+      id: result.id,
+      ok: result.ok,
+      ...(result.message ? { message: result.message } : {}),
+      ...(result.data ? { task: taskListItem(result.data) } : {})
+    }))
+  };
 });
 
 app.get("/api/tasks/page", async (request) => ({

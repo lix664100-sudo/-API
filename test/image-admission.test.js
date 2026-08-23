@@ -125,6 +125,13 @@ test("image admission rejects before upload when every image slot is occupied", 
       assert.equal(error.status, 429);
       assert.equal(error.code, "CONCURRENCY_LIMIT");
       assert.equal(error.attempts.length, 4);
+      const messages = error.attempts.map((attempt) => attempt.message).join("\n");
+      const blockingTaskIds = new Set(error.attempts.map((attempt) => attempt.blockingTaskId));
+      for (const taskId of ["drawing-a", "drawing-b", "chatplus-a", "chatplus-b"]) {
+        assert.match(messages, new RegExp(taskId));
+        assert.equal(blockingTaskIds.has(taskId), true);
+      }
+      assert.match(messages, /等待上游/);
       return true;
     }
   );

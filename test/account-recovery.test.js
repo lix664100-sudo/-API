@@ -270,6 +270,48 @@ test("共享车位全部认证失败时不会冒充账号掉线", async () => {
   assert.equal(selectedCount, 2);
 });
 
+test("上传原图时共享车位认证失败也不会冒充账号掉线", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-upload-car-pool", username: "upload-car-pool@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let attemptCount = 0;
+  client.prepareChatSession = async (_input, ignoredCarIds) => {
+    const carId = `upload-expired-car-${++attemptCount}`;
+    ignoredCarIds.add(carId);
+    return {
+      route: { key: "gpt", model: "gpt-test" },
+      init: { default_model_slug: "gpt-test" },
+      selected: { carId, carType: "chatgpt" },
+      revision: client.sessionRevision
+    };
+  };
+  client.uploadChatImages = async () => {
+    const error = new Error("认证失败，请重新登陆");
+    error.status = 401;
+    throw error;
+  };
+  client.rememberProCarsUnavailable = async () => {};
+  client.rememberAuthFailedCar = () => {};
+  client.invalidatePreparedChatSession = async () => {};
+
+  await assert.rejects(
+    client.sendConversation("测试上传原图", {
+      imageGeneration: true,
+      files: [{ filename: "source.png" }]
+    }),
+    (error) => {
+      assert.equal(error.code, "CHAT_CAR_POOL_UNAVAILABLE");
+      assert.equal(error.carPoolUnavailable, true);
+      assert.equal(error.authScope, "car");
+      return true;
+    }
+  );
+  assert.ok(attemptCount > 1);
+});
+
 test("自动换完车仍失败时会保留共享车位故障身份", async () => {
   const client = new ChatplusClient({
     config: {},

@@ -29,6 +29,16 @@ function loadTaskRouteHelpers() {
   return context.helpers;
 }
 
+function loadAttemptReasonHelper() {
+  const start = adminHtml.indexOf("function compactErrorText");
+  const end = adminHtml.indexOf("function taskAttemptTargetText", start);
+  assert.ok(start >= 0 && end > start, "任务尝试原因辅助逻辑必须存在");
+
+  const context = {};
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helper = cleanAttemptReason;`, context);
+  return context.helper;
+}
+
 function loadTaskTimingHelpers() {
   const start = adminHtml.indexOf("function taskStageTimings");
   const end = adminHtml.indexOf("function formatTaskStageDuration", start);
@@ -240,7 +250,7 @@ test("对话记录显示预计 TOKEN，并忽略旧记录里的占位零值", ()
   assert.match(adminHtml, /图片 \$\{usage\.imageCount\} 张未计入/);
 });
 
-test("对话摘要会隐藏图片数据并限制长度，完整内容仍可展开", () => {
+test("对话摘要会隐藏图片数据并限制长度，完整内容按需查看", () => {
   const { taskRecordKind, compactTaskText, taskTextLengthLabel } = loadTaskRecordHelpers();
   const withImage = `请看图片 data:image/jpeg;base64,${"A".repeat(240)} 并说明内容`;
 
@@ -251,6 +261,22 @@ test("对话摘要会隐藏图片数据并限制长度，完整内容仍可展�
   assert.equal(compactTaskText("A".repeat(200), 80).length, 81);
   assert.equal(taskTextLengthLabel("A".repeat(32000)), "3.2 万字");
   assert.match(adminHtml, /查看完整\$\{label\}/);
+});
+
+test("任务列表只加载轻量摘要，完整记录和 JSON 点击后再读取", () => {
+  assert.match(adminHtml, /pageSize: "30"/);
+  assert.match(adminHtml, /api\(`\/api\/tasks\/\$\{encodeURIComponent\(row\.id\)\}`/);
+  assert.match(adminHtml, /"查看完整记录"/);
+  assert.match(adminHtml, /options\.detail \? taskJsonGrid\(row\) : null/);
+  assert.match(adminHtml, /open \? h\("div", \{ className: "task-json-grid"/);
+  assert.match(adminHtml, /图片内容已省略/);
+  assert.doesNotMatch(adminHtml, /setTasks\(\[\]\);\s*setTaskTotal\(0\)/);
+});
+
+test("处理中任务自动刷新只合并更新结果，不再重复下载整页", () => {
+  assert.match(serverSource, /task: taskListItem\(result\.data\)/);
+  assert.match(adminHtml, /mergeRefreshedTasks\(results\)/);
+  assert.match(adminHtml, /if \(taskStatusFilter !== "all"\)/);
 });
 
 test("两个改图入口都会保存原图预览，并纳入现有图片清理目录", () => {
@@ -475,6 +501,17 @@ test("共享车位失效不会再显示为聊天账号掉线", () => {
   assert.equal(taskErrorText(currentTask), "上游共享车位暂时不可用，任务未能提交。请稍后重试。");
   assert.equal(taskErrorText(legacyTask), "上游共享车位暂时不可用，任务未能提交。请稍后重试。");
   assert.doesNotMatch(taskErrorText(legacyTask), /掉线/);
+});
+
+test("账号忙碌时保留真正占用账号的任务信息", () => {
+  const cleanAttemptReason = loadAttemptReasonHelper();
+  const detailed = "李想的聊天生图任务正在处理中。占用任务：task-running-001（等待上游，11:36）。请稍后再试。";
+
+  assert.equal(cleanAttemptReason(detailed), detailed);
+  assert.equal(
+    cleanAttemptReason("这个账号还有任务正在处理中"),
+    "这个账号还有任务正在处理，请稍后再试。"
+  );
 });
 
 test("账号满载后的任务明确显示为排队中", () => {

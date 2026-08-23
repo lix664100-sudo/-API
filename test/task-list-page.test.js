@@ -7,7 +7,7 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-list-page-"));
 process.env.DATA_DIR = dataDir;
 
-const { closeStorage, listTaskPage, upsertTask } = await import("../src/storage.js");
+const { closeStorage, getTask, listTaskPage, upsertTask } = await import("../src/storage.js");
 
 after(async () => {
   await closeStorage();
@@ -105,4 +105,56 @@ test("task pages return the newest matching records without returning the full h
   const chatTasks = await listTaskPage({ kind: "chat" });
   assert.equal(chatTasks.total, 1);
   assert.deepEqual(chatTasks.items.map((task) => task.id), ["task-middle-chat"]);
+});
+
+test("task pages return lightweight summaries and load large details only on demand", async () => {
+  const imageData = `data:image/png;base64,${"A".repeat(180_000)}`;
+  const longReply = `完整回复-${"回复内容".repeat(2000)}`;
+  await upsertTask({
+    id: "task-large-chat",
+    sourceTaskId: "large_chat_001",
+    status: "success",
+    taskType: "chat",
+    modelId: "gemini",
+    channelType: "chatplus",
+    channelId: "channel-google:chatplus",
+    accountId: "account-large",
+    prompt: `请分析这张图片 ${imageData}`,
+    responseText: longReply,
+    requestJson: {
+      model: "gemini-3.1-pro",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "帮我查找蓝色商品" },
+          { type: "image_url", image_url: { url: imageData } }
+        ]
+      }]
+    },
+    responseJson: {
+      upstreamModel: "gemini-3.1-pro",
+      usage: { estimated: true, prompt_tokens: 8, completion_tokens: 12, total_tokens: 20 },
+      raw: { fullPayload: "B".repeat(120_000) }
+    },
+    inputImageUrls: [imageData],
+    createdAt: new Date().toISOString()
+  });
+
+  const page = await listTaskPage({ accountId: "account-large", kind: "chat", pageSize: 30 });
+  assert.equal(page.total, 1);
+  assert.equal(page.items.length, 1);
+  assert.equal(page.items[0].requestJson.model, "gemini-3.1-pro");
+  assert.equal(page.items[0].responseJson.upstreamModel, "gemini-3.1-pro");
+  assert.equal(page.items[0].detail.inputImageCount, 1);
+  assert.equal(page.items[0].prompt.includes("data:image"), false);
+  assert.ok(page.items[0].prompt.length <= 1200);
+  assert.ok(page.items[0].responseText.length <= 1200);
+  assert.ok(JSON.stringify(page.items[0]).length < 10_000);
+
+  const searched = await listTaskPage({ keyword: "蓝色商品", kind: "chat" });
+  assert.equal(searched.items.some((task) => task.id === "task-large-chat"), true);
+
+  const detail = await getTask("task-large-chat");
+  assert.equal(detail.requestJson.messages[0].content[1].image_url.url, imageData);
+  assert.equal(detail.responseText, longReply);
 });

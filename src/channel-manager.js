@@ -22,7 +22,7 @@ import {
 } from "./proxy.js";
 import {
   getTask,
-  listTasks,
+  listActiveTasks,
   listTodayAccountRoutingUsage,
   loadConfig,
   recordTaskStat,
@@ -421,7 +421,7 @@ export async function getRuntimeStatus() {
   activeTaskConcurrency = concurrency;
   const configured = runtimeAccountConcurrency(config);
   const available = runtimeAccountConcurrency(config, true);
-  const tasks = await listTasks();
+  const tasks = await listActiveTasks();
   const enabledChannels = (config.channels || []).filter((channel) => channel.enabled !== false);
   const runtimeAccountIds = new Set((config.accounts || [])
     .filter((account) => account.enabled !== false)
@@ -579,9 +579,9 @@ function taskHoldsDurableSlot(task = {}) {
 
 async function durableTaskSlotState(slot, target = {}, input = {}) {
   const accountId = String(target?.account?.id || "").trim();
-  if (!accountId) return { total: 0, active: 0 };
+  if (!accountId) return { total: 0, active: 0, tasks: [] };
   const modelKey = ["chat", "chatImage"].includes(slot) ? targetChatModelKey(target, input) : "";
-  const tasks = await listTasks();
+  const tasks = await listActiveTasks();
   const holdingTasks = tasks.filter((task) =>
     String(task.accountId || "") === accountId
     && storedTaskSlot(task) === slot
@@ -590,7 +590,8 @@ async function durableTaskSlotState(slot, target = {}, input = {}) {
   );
   return {
     total: holdingTasks.length,
-    active: holdingTasks.filter((task) => activeSubmittedTaskIds.has(task.id)).length
+    active: holdingTasks.filter((task) => activeSubmittedTaskIds.has(task.id)).length,
+    tasks: holdingTasks
   };
 }
 
@@ -601,10 +602,43 @@ async function taskSlotOccupancy(slot, target = {}, input = {}) {
   return count + durableState.total - Math.min(durableState.active, count);
 }
 
-function busyTaskError(slot, target = {}) {
-  const error = new Error(`${taskSlotBusyLabel(slot, target)}任务正在处理中，请稍后再试。`);
+function busyTaskStatusLabel(status) {
+  return {
+    processing: "处理中",
+    queued: "排队中",
+    pending: "等待处理",
+    unknown: "状态待确认",
+    waiting_upstream: "等待上游"
+  }[String(status || "")] || "处理中";
+}
+
+function busyTaskTime(value) {
+  const time = Date.parse(value || "");
+  if (!Number.isFinite(time)) return "";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).format(time);
+}
+
+function busyTaskError(slot, target = {}, blockingTask = null) {
+  const blockingTaskId = String(blockingTask?.id || "").trim();
+  const blockingTime = busyTaskTime(blockingTask?.createdAt || blockingTask?.updatedAt);
+  const blockingDetail = blockingTaskId
+    ? `占用任务：${blockingTaskId}（${busyTaskStatusLabel(blockingTask.status)}${blockingTime ? `，${blockingTime}` : ""}）。`
+    : "";
+  const error = new Error(`${taskSlotBusyLabel(slot, target)}任务正在处理中。${blockingDetail}请稍后再试。`);
   error.status = 429;
   error.busy = true;
+  if (blockingTaskId) {
+    error.blockingTaskId = blockingTaskId;
+    error.blockingTaskStatus = String(blockingTask.status || "");
+    error.blockingTaskCreatedAt = blockingTask.createdAt || blockingTask.updatedAt || "";
+  }
   return error;
 }
 
@@ -2456,7 +2490,7 @@ async function interruptLostLocalImageTask(task) {
 }
 
 export async function refreshProcessingTasks() {
-  const tasks = await listTasks();
+  const tasks = await listActiveTasks();
   const results = [];
   for (const task of tasks.filter(needsTaskRefresh)) {
     try {
@@ -2770,15 +2804,22 @@ function sameTarget(left, right) {
   return left?.channel?.id === right?.channel?.id && left?.account?.id === right?.account?.id;
 }
 
-function targetBusyAttempt(target, taskType) {
+async function targetBusyAttempt(target, taskType, input = {}) {
   const slot = targetTaskSlot(target, taskType);
+  const durableState = await durableTaskSlotState(slot, target, input);
+  const error = busyTaskError(slot, target, durableState.tasks[0] || null);
   return {
     channelId: target.channel.id,
     channelName: target.channel.name,
     accountId: target.account.id,
     accountName: target.account.name,
-    message: busyTaskError(slot, target).message,
-    busy: true
+    message: error.message,
+    busy: true,
+    ...(error.blockingTaskId ? {
+      blockingTaskId: error.blockingTaskId,
+      blockingTaskStatus: error.blockingTaskStatus,
+      blockingTaskCreatedAt: error.blockingTaskCreatedAt
+    } : {})
   };
 }
 
@@ -3272,7 +3313,7 @@ async function recoverTarget(config, target) {
 
 export async function recoverUnavailableChatAccounts() {
   const config = await loadRuntimeConfig();
-  const tasks = await listTasks();
+  const tasks = await listActiveTasks();
   const busyAccountIds = new Set(tasks
     .filter(taskHoldsDurableSlot)
     .map((task) => String(task.accountId || ""))
@@ -3726,7 +3767,7 @@ async function reserveFirstAvailableTarget(targets, taskType, options = {}) {
       const slot = targetTaskSlot(target, taskType);
       const release = await tryReserveTaskSlot(slot, target, options.input || {});
       if (release) return { target, release, attempts, orderedTargets };
-      attempts.push(targetBusyAttempt(target, taskType));
+      attempts.push(await targetBusyAttempt(target, taskType, options.input || {}));
     }
     if (attempts.length && attempts.every((attempt) => attempt.quotaEmpty)) {
       throw targetsFailedError(attempts);
@@ -4382,7 +4423,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
       } else {
         release = await tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target, input);
         if (!release) {
-          attempts.push(targetBusyAttempt(target, "text2img"));
+          attempts.push(await targetBusyAttempt(target, "text2img", input));
           continue;
         }
       }
@@ -4568,7 +4609,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
         if (!release) {
           release = await tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target, input);
           if (!release) {
-            attempts.push(targetBusyAttempt(target, "img2img"));
+            attempts.push(await targetBusyAttempt(target, "img2img", input));
             continue;
           }
         }
@@ -5566,7 +5607,7 @@ export async function createTextTask(input = {}, wait = false, requestMeta = {})
       } else {
         release = await tryReserveTaskSlot(targetTaskSlot(target, "text2img"), target, input);
         if (!release) {
-          attempts.push(targetBusyAttempt(target, "text2img"));
+          attempts.push(await targetBusyAttempt(target, "text2img", input));
           continue;
         }
       }

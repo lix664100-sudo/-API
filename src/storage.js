@@ -34,9 +34,7 @@ let storageDatabase = null;
 let storageDatabasePromise = null;
 let tasksSnapshot = {
   ready: false,
-  tasks: [],
-  queryCache: new Map(),
-  searchTextCache: new WeakMap()
+  tasks: []
 };
 
 const defaultImageStorage = {
@@ -140,15 +138,24 @@ function writeTaskRow(database, task) {
     ...task,
     id: storageTaskId(task)
   };
+  const listColumns = taskListColumnValues(stored);
   database.prepare(`
     INSERT INTO tasks (
-      id, source_task_id, created_at, created_time, status, payload
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      id, source_task_id, created_at, created_time, status,
+      account_id, channel_id, channel_group, record_kind, list_status, search_text,
+      payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       source_task_id = excluded.source_task_id,
       created_at = excluded.created_at,
       created_time = excluded.created_time,
       status = excluded.status,
+      account_id = excluded.account_id,
+      channel_id = excluded.channel_id,
+      channel_group = excluded.channel_group,
+      record_kind = excluded.record_kind,
+      list_status = excluded.list_status,
+      search_text = excluded.search_text,
       payload = excluded.payload
   `).run(
     stored.id,
@@ -156,6 +163,12 @@ function writeTaskRow(database, task) {
     String(stored.createdAt || stored.updatedAt || new Date().toISOString()),
     taskHistoryTime(stored) ?? Date.now(),
     taskStatus(stored),
+    listColumns.accountId,
+    listColumns.channelId,
+    listColumns.channelGroup,
+    listColumns.recordKind,
+    listColumns.listStatus,
+    listColumns.searchText,
     JSON.stringify(stored)
   );
   return stored;
@@ -189,6 +202,53 @@ function removeTaskRows(database, tasks = []) {
   database.transaction((items) => {
     for (const task of items) remove.run(String(task.id || ""));
   })(tasks);
+}
+
+function ensureTaskListColumns(database) {
+  const existing = new Set(database.prepare("PRAGMA table_info(tasks)").all().map((column) => column.name));
+  const columns = [
+    ["account_id", "TEXT NOT NULL DEFAULT ''"],
+    ["channel_id", "TEXT NOT NULL DEFAULT ''"],
+    ["channel_group", "TEXT NOT NULL DEFAULT ''"],
+    ["record_kind", "TEXT NOT NULL DEFAULT ''"],
+    ["list_status", "TEXT NOT NULL DEFAULT ''"],
+    ["search_text", "TEXT NOT NULL DEFAULT ''"]
+  ];
+  for (const [name, definition] of columns) {
+    if (!existing.has(name)) database.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
+  }
+
+  const pending = database.prepare(`
+    SELECT id, payload
+    FROM tasks
+    WHERE record_kind = '' OR list_status = '' OR search_text = ''
+  `).all();
+  if (!pending.length) return;
+  const update = database.prepare(`
+    UPDATE tasks
+    SET account_id = ?, channel_id = ?, channel_group = ?, record_kind = ?, list_status = ?, search_text = ?
+    WHERE id = ?
+  `);
+  database.transaction((rows) => {
+    for (const row of rows) {
+      let task;
+      try {
+        task = JSON.parse(row.payload);
+      } catch {
+        continue;
+      }
+      const values = taskListColumnValues(task);
+      update.run(
+        values.accountId,
+        values.channelId,
+        values.channelGroup,
+        values.recordKind,
+        values.listStatus,
+        values.searchText,
+        row.id
+      );
+    }
+  })(pending);
 }
 
 function pruneTaskStatRows(database, now = Date.now()) {
@@ -247,6 +307,12 @@ async function openStorageDatabase() {
         created_at TEXT NOT NULL,
         created_time INTEGER NOT NULL,
         status TEXT NOT NULL DEFAULT '',
+        account_id TEXT NOT NULL DEFAULT '',
+        channel_id TEXT NOT NULL DEFAULT '',
+        channel_group TEXT NOT NULL DEFAULT '',
+        record_kind TEXT NOT NULL DEFAULT '',
+        list_status TEXT NOT NULL DEFAULT '',
+        search_text TEXT NOT NULL DEFAULT '',
         payload TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS tasks_source_task_id_idx
@@ -255,7 +321,6 @@ async function openStorageDatabase() {
         ON tasks(created_time DESC);
       CREATE INDEX IF NOT EXISTS tasks_status_idx
         ON tasks(status);
-
       CREATE TABLE IF NOT EXISTS task_stats (
         task_id TEXT PRIMARY KEY,
         time INTEGER NOT NULL,
@@ -268,6 +333,19 @@ async function openStorageDatabase() {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+    `);
+    ensureTaskListColumns(database);
+    database.exec(`
+      CREATE INDEX IF NOT EXISTS tasks_record_kind_time_idx
+        ON tasks(record_kind, created_time DESC);
+      CREATE INDEX IF NOT EXISTS tasks_account_time_idx
+        ON tasks(account_id, created_time DESC);
+      CREATE INDEX IF NOT EXISTS tasks_channel_time_idx
+        ON tasks(channel_id, created_time DESC);
+      CREATE INDEX IF NOT EXISTS tasks_channel_group_time_idx
+        ON tasks(channel_group, created_time DESC);
+      CREATE INDEX IF NOT EXISTS tasks_list_status_time_idx
+        ON tasks(list_status, created_time DESC);
     `);
     await migrateLegacyStorage(database);
     return database;
@@ -313,9 +391,7 @@ export async function closeStorage() {
   todayAccountRoutingUsageCache = null;
   tasksSnapshot = {
     ready: false,
-    tasks: [],
-    queryCache: new Map(),
-    searchTextCache: new WeakMap()
+    tasks: []
   };
 }
 
@@ -1437,9 +1513,7 @@ function limitTasks(tasks) {
 function setTasksSnapshot(tasks) {
   tasksSnapshot = {
     ready: true,
-    tasks,
-    queryCache: new Map(),
-    searchTextCache: new WeakMap()
+    tasks
   };
   return tasks;
 }
@@ -1475,6 +1549,24 @@ async function loadTasks({ waitForWrites = true } = {}) {
 
 export async function listTasks() {
   return loadTasks();
+}
+
+export async function listActiveTasks() {
+  await tasksWriteQueue.catch(() => {});
+  const database = await getStorageDatabase();
+  const statuses = ["processing", "queued", "pending", "unknown", "waiting_upstream"];
+  return database.prepare(`
+    SELECT payload
+    FROM tasks
+    WHERE status IN (${statuses.map(() => "?").join(", ")})
+    ORDER BY created_time DESC
+  `).all(...statuses).flatMap((row) => {
+    try {
+      return [JSON.parse(row.payload)];
+    } catch {
+      return [];
+    }
+  });
 }
 
 const durableFinalTaskStatuses = new Set(["success", "failed"]);
@@ -1522,42 +1614,252 @@ function normalizeTaskSearchKeyword(value) {
     .replace(/\s+/g, " ");
 }
 
-function taskSearchHaystack(task = {}, searchTextCache = null) {
-  if (searchTextCache?.has(task)) return searchTextCache.get(task);
-  const request = task.requestJson || {};
-  const response = task.responseJson || {};
-  const haystack = [
-    task.id,
-    task.externalId,
-    taskSourceTaskId(task),
-    task.prompt,
-    task.accountName,
-    task.channelName,
-    JSON.stringify(task.submissionChannels || []),
-    JSON.stringify(task.generationChannels || []),
-    task.errorMessage,
-    response.message,
-    JSON.stringify(request)
-  ].filter(Boolean).join(" ").toLowerCase();
-  if (searchTextCache) searchTextCache.set(task, haystack);
-  return haystack;
-}
-
-function taskMatchesSearch(task, value, searchTextCache = null) {
-  const keyword = normalizeTaskSearchKeyword(value);
-  if (!keyword) return true;
-  const haystack = taskSearchHaystack(task, searchTextCache);
-  if (haystack.includes(keyword)) return true;
-  const parts = keyword
+function taskSearchParts(value) {
+  return normalizeTaskSearchKeyword(value)
     .split(/(?:\.{2,}|…|⋯|[\s,，;；:：]+)+/)
     .map((part) => part.trim())
     .filter((part) => part.length >= 4 && (part.length >= 8 || /[_-]|\d/.test(part)));
-  return parts.length > 0 && parts.every((part) => haystack.includes(part));
+}
+
+function stripTaskImageData(value) {
+  return String(value || "").replace(
+    /data:image\/[a-z0-9.+-]+;base64,(?:[a-z0-9+/=]+|\[omitted[^\]]*\])/gi,
+    "[图片]"
+  );
+}
+
+function taskRequestSearchText(request = {}) {
+  const values = [request.prompt, request.content, request.input, request.question];
+  for (const message of Array.isArray(request.messages) ? request.messages : []) {
+    if (typeof message?.content === "string") values.push(message.content);
+    if (!Array.isArray(message?.content)) continue;
+    for (const part of message.content) {
+      if (!part || typeof part !== "object" || /image/i.test(String(part.type || ""))) continue;
+      values.push(part.text, part.content);
+    }
+  }
+  return values.filter(Boolean).map(stripTaskImageData).join(" ");
+}
+
+function taskListSearchText(task = {}) {
+  const request = task.requestJson || {};
+  const response = task.responseJson || {};
+  return normalizeTaskSearchKeyword([
+    task.id,
+    task.externalId,
+    taskSourceTaskId(task),
+    stripTaskImageData(task.prompt),
+    stripTaskImageData(task.responseText),
+    task.accountName,
+    task.channelName,
+    ...(task.submissionChannels || []).flatMap((item) => [item?.channelName, item?.accountName]),
+    ...(task.generationChannels || []).flatMap((item) => [item?.channelName, item?.accountName]),
+    task.errorMessage,
+    task.upstreamText,
+    response.message,
+    taskRequestSearchText(request)
+  ].filter(Boolean).join(" ").slice(0, 24000));
+}
+
+function taskListColumnValues(task = {}) {
+  return {
+    accountId: String(task.accountId || "").trim(),
+    channelId: String(task.channelId || "").trim(),
+    channelGroup: taskStatChannelGroup(task),
+    recordKind: taskRecordKind(task),
+    listStatus: taskListStatus(task),
+    searchText: taskListSearchText(task)
+  };
+}
+
+function taskListPreviewText(value, limit = 1200) {
+  const text = stripTaskImageData(value);
+  return text.length > limit ? text.slice(0, limit) : text;
+}
+
+function safeTaskListImageUrls(value) {
+  const urls = Array.isArray(value) ? value : [];
+  return [...new Set(urls
+    .map((item) => typeof item === "string" ? item.trim() : "")
+    .filter((item) => item && !/^data:/i.test(item) && item.length <= 4096))]
+    .slice(0, 4);
+}
+
+function taskInputImageCount(task = {}) {
+  const request = task.requestJson || {};
+  const messages = Array.isArray(request.messages) ? request.messages : [];
+  const messageImages = messages.reduce((total, message) => total + (
+    Array.isArray(message?.content)
+      ? message.content.filter((part) => part?.image_url || /image/i.test(String(part?.type || ""))).length
+      : 0
+  ), 0);
+  return Math.max(
+    Number(request.received_image_count) || 0,
+    Array.isArray(request.files) ? request.files.length : 0,
+    Array.isArray(task.inputImageUrls) ? task.inputImageUrls.length : 0,
+    messageImages
+  );
+}
+
+function taskListAttempts(value) {
+  return (Array.isArray(value) ? value : []).slice(0, 20).map((item) => ({
+    channelId: String(item?.channelId || ""),
+    channelName: String(item?.channelName || ""),
+    accountId: String(item?.accountId || ""),
+    accountName: String(item?.accountName || ""),
+    message: taskListPreviewText(item?.message, 600),
+    busy: item?.busy === true,
+    carPoolUnavailable: item?.carPoolUnavailable === true,
+    blockingTaskId: String(item?.blockingTaskId || ""),
+    blockingTaskStatus: String(item?.blockingTaskStatus || ""),
+    blockingTaskCreatedAt: String(item?.blockingTaskCreatedAt || "")
+  }));
+}
+
+function taskListRequestSummary(request = {}) {
+  const keys = ["model", "chat_model", "chatModel", "model_id", "modelId"];
+  return Object.fromEntries(keys
+    .filter((key) => request?.[key] !== undefined)
+    .map((key) => [key, request[key]]));
+}
+
+function taskListResponseSummary(response = {}) {
+  const summary = {
+    code: response?.code,
+    message: taskListPreviewText(response?.message, 1200),
+    failureType: response?.failureType,
+    conversationId: response?.conversationId || response?.conversation_id,
+    externalId: response?.externalId,
+    selectedCarId: response?.selectedCarId,
+    title: response?.title,
+    upstreamModel: response?.upstreamModel,
+    sourceTaskId: response?.sourceTaskId,
+    usage: response?.usage,
+    raw: {
+      chatModel: response?.raw?.chatModel,
+      upstreamModel: response?.raw?.upstreamModel,
+      stageTimings: Array.isArray(response?.raw?.stageTimings) ? response.raw.stageTimings.slice(-30) : undefined
+    }
+  };
+  return JSON.parse(JSON.stringify(summary));
+}
+
+function taskListRawSummary(raw = {}) {
+  const summary = {
+    endpoint: raw?.endpoint,
+    submitted: raw?.submitted,
+    queued: raw?.queued,
+    requestedModel: raw?.requestedModel,
+    upstreamModel: raw?.upstreamModel,
+    chatModel: raw?.chatModel,
+    modelFamily: raw?.modelFamily,
+    conversationId: raw?.conversationId || raw?.conversation_id,
+    selectedCarId: raw?.selectedCarId,
+    title: raw?.title,
+    created_at: raw?.created_at,
+    failureType: raw?.failureType,
+    stageTimings: Array.isArray(raw?.stageTimings) ? raw.stageTimings.slice(-30) : undefined,
+    imageMirrorPending: raw?.imageMirrorPending,
+    resultSaveError: raw?.resultSaveError,
+    refreshErrorMessage: taskListPreviewText(raw?.refreshErrorMessage, 800),
+    manualRefreshAvailable: raw?.manualRefreshAvailable,
+    upstreamWaitExpired: raw?.upstreamWaitExpired
+  };
+  return JSON.parse(JSON.stringify(summary));
+}
+
+function taskListSummary(task = {}) {
+  const prompt = String(task.prompt || "");
+  const responseText = String(task.responseText || "");
+  const inputImageCount = taskInputImageCount(task);
+  return {
+    id: task.id,
+    sourceTaskId: taskSourceTaskId(task),
+    externalId: task.externalId,
+    taskNo: task.taskNo,
+    status: task.status,
+    code: task.code,
+    taskType: task.taskType,
+    modelId: task.modelId,
+    ratio: task.ratio,
+    imageCount: task.imageCount,
+    imageUrls: safeTaskListImageUrls(task.imageUrls),
+    inputImageUrls: safeTaskListImageUrls(task.inputImageUrls),
+    inputImageCount,
+    prompt: taskListPreviewText(prompt),
+    responseText: taskListPreviewText(responseText),
+    upstreamText: taskListPreviewText(task.upstreamText, 1200),
+    errorMessage: taskListPreviewText(task.errorMessage, 1200),
+    channelId: task.channelId,
+    channelName: task.channelName,
+    channelType: task.channelType,
+    accountId: task.accountId,
+    accountName: task.accountName,
+    submissionChannels: Array.isArray(task.submissionChannels) ? task.submissionChannels.slice(0, 20) : [],
+    generationChannels: Array.isArray(task.generationChannels) ? task.generationChannels.slice(0, 20) : [],
+    requestMeta: task.requestMeta,
+    network: task.network,
+    attempts: taskListAttempts(task.attempts || task.responseJson?.attempts),
+    requestJson: taskListRequestSummary(task.requestJson),
+    responseJson: taskListResponseSummary(task.responseJson),
+    raw: taskListRawSummary(task.raw),
+    completedAt: task.completedAt,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    detail: {
+      promptLength: stripTaskImageData(prompt).length,
+      responseTextLength: stripTaskImageData(responseText).length,
+      inputImageCount,
+      hasRequest: Boolean(task.requestJson),
+      hasResponse: Boolean(task.responseJson || task.responseText || task.errorMessage)
+    }
+  };
+}
+
+export function taskListItem(task = {}) {
+  return taskListSummary(task);
+}
+
+function taskPageWhere({ keyword, accountId, sourceChannelId, channel, status, kind }, includeKind = true) {
+  const clauses = [];
+  const params = [];
+  if (accountId && accountId !== "all") {
+    clauses.push("account_id = ?");
+    params.push(accountId);
+  }
+  if (sourceChannelId && sourceChannelId !== "all") {
+    clauses.push("(channel_id = ? OR substr(channel_id, 1, length(?) + 1) = ? || ':')");
+    params.push(sourceChannelId, sourceChannelId, sourceChannelId);
+  }
+  if (channel && channel !== "all") {
+    clauses.push("channel_group = ?");
+    params.push(channel);
+  }
+  if (status && status !== "all") {
+    clauses.push("list_status = ?");
+    params.push(status);
+  }
+  if (keyword) {
+    const parts = taskSearchParts(keyword);
+    const partSql = parts.length
+      ? ` OR (${parts.map(() => "instr(search_text, ?) > 0").join(" AND ")})`
+      : "";
+    clauses.push(`(instr(search_text, ?) > 0${partSql})`);
+    params.push(keyword, ...parts);
+  }
+  if (includeKind && kind) {
+    clauses.push("record_kind = ?");
+    params.push(kind);
+  }
+  return {
+    sql: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "",
+    params
+  };
 }
 
 export async function listTaskPage({
   page = 1,
-  pageSize = 100,
+  pageSize = 30,
   keyword = "",
   accountId = "",
   sourceChannelId = "",
@@ -1566,58 +1868,76 @@ export async function listTaskPage({
   kind = ""
 } = {}) {
   const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
-  const normalizedPageSize = Math.min(500, Math.max(1, Math.floor(Number(pageSize) || 100)));
+  const normalizedPageSize = Math.min(100, Math.max(1, Math.floor(Number(pageSize) || 30)));
   const normalizedKeyword = normalizeTaskSearchKeyword(keyword);
-  const normalizedAccountId = String(accountId || "").trim();
-  const normalizedSourceChannelId = String(sourceChannelId || "").trim();
-  const normalizedChannel = String(channel || "").trim().toLowerCase();
-  const normalizedStatus = String(status || "").trim().toLowerCase();
+  const filters = {
+    keyword: normalizedKeyword,
+    accountId: String(accountId || "").trim(),
+    sourceChannelId: String(sourceChannelId || "").trim(),
+    channel: String(channel || "").trim().toLowerCase(),
+    status: String(status || "").trim().toLowerCase(),
+    kind: ""
+  };
   const normalizedKind = ["image", "chat"].includes(String(kind || "").trim().toLowerCase())
     ? String(kind).trim().toLowerCase()
     : "";
+  filters.kind = normalizedKind;
 
-  const tasks = await loadTasks({ waitForWrites: false });
-  const cacheKey = [
-    normalizedKeyword,
-    normalizedAccountId,
-    normalizedSourceChannelId,
-    normalizedChannel,
-    normalizedStatus
-  ].join("\u0000");
-  let matched = tasksSnapshot.queryCache.get(cacheKey);
-  if (!matched) {
-    matched = tasks.filter((task) => {
-      if (normalizedAccountId && normalizedAccountId !== "all" && String(task.accountId || "") !== normalizedAccountId) return false;
-      if (normalizedSourceChannelId && normalizedSourceChannelId !== "all") {
-        const taskChannelId = String(task.channelId || "").trim();
-        if (taskChannelId !== normalizedSourceChannelId && !taskChannelId.startsWith(`${normalizedSourceChannelId}:`)) return false;
-      }
-      if (normalizedChannel && normalizedChannel !== "all" && taskStatChannelGroup(task) !== normalizedChannel) return false;
-      if (normalizedStatus && normalizedStatus !== "all" && taskListStatus(task) !== normalizedStatus) return false;
-      return taskMatchesSearch(task, normalizedKeyword, tasksSnapshot.searchTextCache);
-    });
-    tasksSnapshot.queryCache.set(cacheKey, matched);
-  }
-  const kindTotals = matched.reduce((totals, task) => {
-    totals[taskRecordKind(task)] += 1;
+  const database = await getStorageDatabase();
+  const cutoff = Date.now() - taskHistoryDays * 24 * 60 * 60 * 1000;
+  const activeStatuses = ["processing", "queued", "pending", "unknown", "waiting_upstream"];
+  const eligibleSql = `
+    SELECT id, account_id, channel_id, channel_group, record_kind, list_status, search_text, created_time, payload
+    FROM tasks
+    WHERE created_time >= ? OR status IN (${activeStatuses.map(() => "?").join(", ")})
+    ORDER BY created_time DESC
+    LIMIT ?
+  `;
+  const eligibleParams = [cutoff, ...activeStatuses, taskHistoryLimit];
+  const baseWhere = taskPageWhere(filters, false);
+  const pageWhere = taskPageWhere(filters, true);
+  const withEligible = (sql) => `WITH eligible AS (${eligibleSql}) ${sql}`;
+  const allTotal = Number(database.prepare(withEligible("SELECT COUNT(*) FROM eligible")).pluck().get(...eligibleParams) || 0);
+  const kindTotals = database.prepare(withEligible(`
+    SELECT record_kind AS kind, COUNT(*) AS total
+    FROM eligible
+    ${baseWhere.sql}
+    GROUP BY record_kind
+  `)).all(...eligibleParams, ...baseWhere.params).reduce((totals, row) => {
+    if (row.kind === "image" || row.kind === "chat") totals[row.kind] = Number(row.total || 0);
     return totals;
   }, { image: 0, chat: 0 });
-  const filtered = normalizedKind
-    ? matched.filter((task) => taskRecordKind(task) === normalizedKind)
-    : matched;
-  const total = filtered.length;
+  const total = Number(database.prepare(withEligible(`
+    SELECT COUNT(*)
+    FROM eligible
+    ${pageWhere.sql}
+  `)).pluck().get(...eligibleParams, ...pageWhere.params) || 0);
   const pageCount = Math.ceil(total / normalizedPageSize);
   const normalizedPage = Math.min(requestedPage, Math.max(1, pageCount));
   const start = (normalizedPage - 1) * normalizedPageSize;
+  const rows = database.prepare(withEligible(`
+    SELECT payload
+    FROM eligible
+    ${pageWhere.sql}
+    ORDER BY created_time DESC
+    LIMIT ? OFFSET ?
+  `)).all(...eligibleParams, ...pageWhere.params, normalizedPageSize, start);
+  const items = rows.flatMap((row) => {
+    try {
+      return [taskListSummary(JSON.parse(row.payload))];
+    } catch {
+      return [];
+    }
+  });
 
   return {
-    items: filtered.slice(start, start + normalizedPageSize),
+    items,
     total,
     page: normalizedPage,
     pageSize: normalizedPageSize,
     pageCount,
     hasMore: start + normalizedPageSize < total,
-    allTotal: tasks.length,
+    allTotal,
     kindTotals
   };
 }
@@ -1673,15 +1993,30 @@ export async function upsertTask(task) {
 }
 
 export async function getTask(id) {
-  const tasks = await loadTasks();
-  return tasks.find((task) => String(task.id) === String(id)) || null;
+  await tasksWriteQueue.catch(() => {});
+  const database = await getStorageDatabase();
+  const payload = database.prepare("SELECT payload FROM tasks WHERE id = ?").pluck().get(String(id || ""));
+  if (!payload) return null;
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
 }
 
 export async function getTaskBySourceTaskId(sourceTaskId) {
   const normalized = String(sourceTaskId || "").trim();
   if (!normalized) return null;
-  const tasks = await loadTasks();
-  return tasks.find((task) => taskSourceTaskId(task) === normalized) || null;
+  await tasksWriteQueue.catch(() => {});
+  const database = await getStorageDatabase();
+  const payload = database.prepare("SELECT payload FROM tasks WHERE source_task_id = ? ORDER BY created_time DESC LIMIT 1")
+    .pluck().get(normalized);
+  if (!payload) return null;
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
 }
 
 function finalStatStatus(status) {
