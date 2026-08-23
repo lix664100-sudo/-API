@@ -5,8 +5,8 @@ import { ProxyAgent } from "proxy-agent";
 const CONVERSATIONS_TOPIC = "conversations";
 const UPDATE_TTL_MS = 60 * 60 * 1000;
 const CONNECTION_IDLE_MS = 35 * 60 * 1000;
-const MAX_CONVERSATION_UPDATES = 64;
-const MAX_CACHED_CONVERSATIONS = 1000;
+const MAX_CONVERSATION_UPDATES = 16;
+const MAX_CACHED_CONVERSATIONS = 250;
 const MAX_SOCKET_PAYLOAD_BYTES = 32 * 1024 * 1024;
 
 const connections = new Map();
