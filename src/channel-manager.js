@@ -46,6 +46,7 @@ const scheduledChatTasks = new Set();
 const scheduledImageTasks = new Set();
 const activeTaskCounts = new Map();
 const activeRoutingLoads = new Map();
+const routingBalanceWindows = new Map();
 const activeDrawingModelCounts = new Map();
 const activeSubmittedTaskIds = new Set();
 const activeAccountAuthTasks = new Map();
@@ -426,13 +427,107 @@ function runtimeCategory(configured, available, running, slots) {
   };
 }
 
+function routingUnavailableReason(target, taskType, input = {}) {
+  if (target?.channel?.enabled === false || target?.account?.enabled === false) return "已停用";
+  if (targetQuotaProtectionBlocksTask(target, input)) return "额度保护";
+  if (targetSubscriptionExpired(target, input)) return "套餐已过期";
+  const status = targetQuotaStatusForTask(target, input);
+  if (
+    target?.channel?.type === "drawing"
+    && String(status.status || "").toLowerCase() === "ok"
+    && drawingBalanceInsufficient(status.balance)
+  ) {
+    return "额度不足";
+  }
+  if (targetConfirmedQuotaBlocksTask(target, taskType, input)) return "额度不足";
+  if (targetAccountCoolingBlocksTask(target, input) || statusCooling(status)) return "暂停中";
+  const value = String(status.status || "unknown").toLowerCase();
+  if (value === "activation_required") return "未激活";
+  if (value === "disconnected") return "自动换线中";
+  if (["error", "failed"].includes(value)) return "异常";
+  if (value === "disabled") return "已停用";
+  if (value === "unknown") return "尚未检测";
+  return "暂不可用";
+}
+
+function runtimeRoutingStatus(config, usage) {
+  const routeSets = [
+    { taskType: "text2img", input: {}, channelType: "drawing" },
+    { taskType: "text2img", input: {}, channelType: "chatplus" },
+    { taskType: "chat", input: {}, channelType: "chatplus" }
+  ];
+  const entries = routeSets.flatMap(({ taskType, input, channelType }) => (
+    selectTargets(config, "auto", taskType, { includeCooling: true, input })
+      .filter((target) => target.channel.type === channelType)
+      .map((target) => {
+        const slot = targetTaskSlot(target, taskType);
+        const modelKey = ["chat", "chatImage"].includes(slot)
+          ? targetChatModelKey(target, input) || "gpt"
+          : "";
+        return {
+          target,
+          taskType,
+          input,
+          slot,
+          modelKey,
+          groupKey: routingGroupKey(target, taskType, input),
+          available: targetRuntimeAvailable(target, taskType, input)
+        };
+      })
+  ));
+  const uniqueEntries = [...new Map(entries.map((entry) => [
+    `${entry.target.account.id}:${entry.groupKey}`,
+    entry
+  ])).values()];
+  const groups = new Map();
+  for (const entry of uniqueEntries) {
+    const group = groups.get(entry.groupKey) || [];
+    group.push(entry);
+    groups.set(entry.groupKey, group);
+  }
+  const accounts = {};
+  for (const entry of uniqueEntries) {
+    const accountId = String(entry.target.account.id || "");
+    const group = groups.get(entry.groupKey) || [];
+    const availableGroup = group.filter((item) => item.available);
+    const totalWeight = availableGroup.reduce(
+      (total, item) => total + accountRoutingWeight(item.target.account),
+      0
+    );
+    const targetPercent = entry.available && totalWeight
+      ? Math.round((accountRoutingWeight(entry.target.account) / totalWeight) * 100)
+      : 0;
+    const slotUsage = usage?.accounts?.[accountId]?.routing?.[entry.slot] || {};
+    const submitted = entry.modelKey
+      ? slotUsage.models?.[entry.modelKey] || { auto: 0, explicit: 0 }
+      : { auto: Number(slotUsage.auto || 0), explicit: Number(slotUsage.explicit || 0) };
+    const accountRouting = accounts[accountId] || { slots: {} };
+    accountRouting.slots[entry.slot] = {
+      available: entry.available,
+      reason: entry.available ? "" : routingUnavailableReason(entry.target, entry.taskType, entry.input),
+      targetPercent,
+      weight: accountRoutingWeight(entry.target.account),
+      modelKey: entry.modelKey,
+      submitted: {
+        auto: Number(submitted.auto || 0),
+        explicit: Number(submitted.explicit || 0)
+      }
+    };
+    accounts[accountId] = accountRouting;
+  }
+  return { day: usage?.day || "", accounts };
+}
+
 export async function getRuntimeStatus() {
   const config = await loadConfig();
   const concurrency = normalizeTaskConcurrency(config.concurrency);
   activeTaskConcurrency = concurrency;
   const configured = runtimeAccountConcurrency(config);
   const available = runtimeAccountConcurrency(config, true);
-  const tasks = await listActiveTasks();
+  const [tasks, routingUsage] = await Promise.all([
+    listActiveTasks(),
+    listTodayAccountRoutingUsage()
+  ]);
   const enabledChannels = (config.channels || []).filter((channel) => channel.enabled !== false);
   const runtimeAccountIds = new Set((config.accounts || [])
     .filter((account) => account.enabled !== false)
@@ -479,7 +574,8 @@ export async function getRuntimeStatus() {
       chat: runtimeCategory(configured, available, running, ["chat"])
     },
     models,
-    waiting
+    waiting,
+    routing: runtimeRoutingStatus(config, routingUsage)
   };
 }
 
@@ -544,8 +640,9 @@ function taskSlotKey(slot, target = {}, input = {}) {
   return [slot, modelKey, accountId].filter(Boolean).join(":") || slot;
 }
 
-function routingLoadKey(slot, target = {}) {
-  return `${slot}:${String(target?.account?.id || "").trim()}`;
+function routingLoadKey(slot, target = {}, input = {}) {
+  const modelKey = ["chat", "chatImage"].includes(slot) ? targetChatModelKey(target, input) : "";
+  return [slot, modelKey, String(target?.account?.id || "").trim()].filter(Boolean).join(":");
 }
 
 function requestedRoutingLoad(slot, input = {}) {
@@ -554,12 +651,12 @@ function requestedRoutingLoad(slot, input = {}) {
   return Math.min(100, Math.max(1, Number.isFinite(requested) ? requested : 1));
 }
 
-function activeRoutingLoad(slot, target = {}) {
-  return activeRoutingLoads.get(routingLoadKey(slot, target)) || 0;
+function activeRoutingLoad(slot, target = {}, input = {}) {
+  return activeRoutingLoads.get(routingLoadKey(slot, target, input)) || 0;
 }
 
-function updateActiveRoutingLoad(slot, target, difference) {
-  const key = routingLoadKey(slot, target);
+function updateActiveRoutingLoad(slot, target, input, difference) {
+  const key = routingLoadKey(slot, target, input);
   const next = Math.max(0, (activeRoutingLoads.get(key) || 0) + difference);
   if (next) activeRoutingLoads.set(key, next);
   else activeRoutingLoads.delete(key);
@@ -661,7 +758,7 @@ async function tryReserveTaskSlot(slot, target = {}, input = {}) {
   if (occupied >= taskSlotLimit(slot, target, input)) return null;
   activeTaskCounts.set(key, count + 1);
   const routingLoad = requestedRoutingLoad(slot, input);
-  updateActiveRoutingLoad(slot, target, routingLoad);
+  updateActiveRoutingLoad(slot, target, input, routingLoad);
   const drawingModelKey = slot === "drawingImage" ? targetImageModelKey(target, input) : "";
   if (drawingModelKey) {
     activeDrawingModelCounts.set(
@@ -676,7 +773,7 @@ async function tryReserveTaskSlot(slot, target = {}, input = {}) {
     const next = Math.max(0, (activeTaskCounts.get(key) || 0) - 1);
     if (next) activeTaskCounts.set(key, next);
     else activeTaskCounts.delete(key);
-    updateActiveRoutingLoad(slot, target, -routingLoad);
+    updateActiveRoutingLoad(slot, target, input, -routingLoad);
     if (drawingModelKey) {
       const nextModelCount = Math.max(0, activeCountForDrawingModel(drawingModelKey) - 1);
       if (nextModelCount) activeDrawingModelCounts.set(drawingModelKey, nextModelCount);
@@ -1381,28 +1478,50 @@ function taskExternalId(task) {
   return savedTaskExternalId(task) || task.id;
 }
 
-function taskConversationId(task) {
-  const confirmedId = task.raw?.conversationId
-    || task.raw?.conversation_id
-    || task.responseJson?.conversationId
-    || task.responseJson?.conversation_id
-    || "";
-  if (confirmedId) return confirmedId;
-  const externalId = String(task.externalId || "").trim();
-  const chatModel = String(
+function taskChatModel(task) {
+  return String(
     task.raw?.chatModel
       || task.responseJson?.raw?.chatModel
       || task.responseJson?.chatModel
       || task.modelId
       || ""
   ).trim().toLowerCase();
-  if (chatModel === "gemini" && !externalId.startsWith("c_")) return "";
-  return externalId;
 }
 
-function upstreamConversationUrl(channel, conversationId) {
+function taskUsesGemini(task) {
+  const model = taskChatModel(task);
+  return model === "gemini" || model.startsWith("gemini-");
+}
+
+function validGeminiConversationId(value) {
+  return /^c_[a-z0-9_-]{6,128}$/i.test(String(value || "").trim());
+}
+
+function taskConversationId(task) {
+  const candidates = [
+    task.raw?.conversationId,
+    task.raw?.conversation_id,
+    task.responseJson?.conversationId,
+    task.responseJson?.conversation_id,
+    task.externalId
+  ];
+  for (const candidate of candidates) {
+    const id = String(candidate || "").trim();
+    if (!id) continue;
+    if (taskUsesGemini(task) && !validGeminiConversationId(id)) continue;
+    return id;
+  }
+  return "";
+}
+
+function upstreamConversationUrl(channel, conversationId, options = {}) {
   const baseUrl = String(channel?.settings?.baseUrl || "https://www.chatplus.cc").trim().replace(/\/+$/, "");
-  return baseUrl && conversationId ? `${baseUrl}/c/${encodeURIComponent(conversationId)}` : "";
+  if (!baseUrl || !conversationId) return "";
+  if (options.gemini === true) {
+    const routeId = String(conversationId).replace(/^c_/i, "");
+    return `${baseUrl}/app/${encodeURIComponent(routeId)}`;
+  }
+  return `${baseUrl}/c/${encodeURIComponent(conversationId)}`;
 }
 
 function upstreamDetailTitle(raw = {}) {
@@ -1426,6 +1545,31 @@ export async function inspectUpstreamTask(taskId) {
     const error = new Error("这个任务还没有保存上游对话编号。");
     error.status = 400;
     throw error;
+  }
+
+  if (taskUsesGemini(task)) {
+    const imageUrls = Array.isArray(task.imageUrls) ? task.imageUrls.filter(Boolean) : [];
+    return {
+      taskId: task.id,
+      sourceTaskId: task.sourceTaskId || task.requestMeta?.sourceTaskId || "",
+      externalId,
+      conversationId: externalId,
+      conversationUrl: upstreamConversationUrl(channel, externalId, { gemini: true }),
+      title: upstreamDetailTitle(task.raw || {}),
+      status: task.status || "",
+      imageCount: Number(task.imageCount || imageUrls.length),
+      imageUrls,
+      errorMessage: task.status === "success"
+        ? ""
+        : task.errorMessage || task.responseJson?.message || task.upstreamText || "",
+      channelId: channel.id,
+      channelName: channel.name,
+      accountId: account.id,
+      accountName: account.name,
+      carId: String(task.raw?.selectedCarId || "").trim(),
+      carType: String(task.raw?.selectedCarType || "gemini").trim(),
+      detailSource: "stored"
+    };
   }
 
   const client = getWorkClient(config, channel, account);
@@ -1461,6 +1605,7 @@ export async function inspectUpstreamTask(taskId) {
     accountName: account.name,
     carId: String(task.raw?.selectedCarId || raw.selectedCarId || "").trim(),
     carType: String(task.raw?.selectedCarType || raw.selectedCarType || "").trim(),
+    detailSource: "upstream",
     raw
   };
 }
@@ -2727,34 +2872,59 @@ function accountRoutingWeight(account) {
   return Math.min(100, Math.max(1, Number.isFinite(weight) ? weight : 1));
 }
 
-function completedRoutingLoad(usage, target, slot) {
-  const account = usage?.accounts?.[target?.account?.id] || {};
-  if (slot === "drawingImage") return Number(account.drawingImages || 0);
-  if (slot === "chatImage") return Number(account.chatImages || 0);
-  return Number(account.chats || 0);
+function completedRoutingLoad(usage, target, slot, input = {}) {
+  const slotUsage = usage?.accounts?.[target?.account?.id]?.routing?.[slot] || {};
+  if (!["chat", "chatImage"].includes(slot)) return Number(slotUsage.auto || 0);
+  const modelKey = targetChatModelKey(target, input) || "gpt";
+  return Number(slotUsage.models?.[modelKey]?.auto || 0);
 }
 
-function routingGroupKey(target, taskType) {
-  return `${target?.channel?.id || "channel"}:${targetTaskSlot(target, taskType)}`;
+function routingGroupKey(target, taskType, input = {}) {
+  const slot = targetTaskSlot(target, taskType);
+  const modelKey = ["chat", "chatImage"].includes(slot) ? targetChatModelKey(target, input) || "gpt" : "";
+  return [target?.channel?.id || "channel", slot, modelKey].filter(Boolean).join(":");
+}
+
+function routingBalanceWindow(groupKey, group, usage, taskType, input = {}) {
+  const signature = group
+    .map((item) => `${item.target.account.id}:${accountRoutingWeight(item.target.account)}`)
+    .sort()
+    .join("|");
+  let window = routingBalanceWindows.get(groupKey);
+  if (!window || window.day !== usage.day || window.signature !== signature) {
+    window = {
+      day: usage.day,
+      signature,
+      baseline: Object.fromEntries(group.map((item) => {
+        const slot = targetTaskSlot(item.target, taskType);
+        return [item.target.account.id, completedRoutingLoad(usage, item.target, slot, input)];
+      }))
+    };
+    routingBalanceWindows.set(groupKey, window);
+  }
+  return window;
 }
 
 async function orderTargetsByRoutingUsage(targets, taskType, input = {}) {
-  if (targets.length < 2) return targets;
+  if (!targets.length) return targets;
   const usage = await listTodayAccountRoutingUsage();
   const groups = new Map();
 
   targets.forEach((target, index) => {
-    const key = routingGroupKey(target, taskType);
+    const key = routingGroupKey(target, taskType, input);
     const group = groups.get(key) || [];
     group.push({ target, index });
     groups.set(key, group);
   });
 
-  const ordered = [...groups.values()].flatMap((group) => group
-    .map((item) => {
+  const ordered = [...groups.entries()].flatMap(([groupKey, group]) => {
+    const window = routingBalanceWindow(groupKey, group, usage, taskType, input);
+    return group.map((item) => {
       const slot = targetTaskSlot(item.target, taskType);
-      const load = completedRoutingLoad(usage, item.target, slot)
-        + activeRoutingLoad(slot, item.target)
+      const completed = completedRoutingLoad(usage, item.target, slot, input);
+      const baseline = Number(window.baseline[item.target.account.id] || 0);
+      const load = Math.max(0, completed - baseline)
+        + activeRoutingLoad(slot, item.target, input)
         + requestedRoutingLoad(slot, input);
       return {
         ...item,
@@ -2766,7 +2936,8 @@ async function orderTargetsByRoutingUsage(targets, taskType, input = {}) {
       left.load * right.weight - right.load * left.weight
       || left.index - right.index
     ))
-    .map((item) => item.target));
+    .map((item) => item.target);
+  });
   const preferredAccountId = requestedAccountIdForInput(input);
   const preferred = preferredAccountId
     ? ordered.find((target) => target.account.id === preferredAccountId)

@@ -50,12 +50,12 @@ function loadTaskTimingHelpers() {
 }
 
 function loadTaskIdentityHelpers() {
-  const start = adminHtml.indexOf("function taskConversationId");
+  const start = adminHtml.indexOf("function trimUrl");
   const end = adminHtml.indexOf("function taskUpstreamTitle", start);
   assert.ok(start >= 0 && end > start, "任务上游编号辅助逻辑必须存在");
 
   const context = {};
-  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskConversationId, taskCarId };`, context);
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskConversationId, taskConversationUrl, taskUpstreamTaskId, taskCarId };`, context);
   return context.helpers;
 }
 
@@ -376,7 +376,7 @@ test("任务耗时会合并重复记录并准确计算换车次数", () => {
 });
 
 test("Gemini 只有真实上游编号才显示为上游对话", () => {
-  const { taskConversationId } = loadTaskIdentityHelpers();
+  const { taskConversationId, taskConversationUrl, taskUpstreamTaskId } = loadTaskIdentityHelpers();
 
   assert.equal(taskConversationId({
     channelType: "chatplus",
@@ -392,8 +392,38 @@ test("Gemini 只有真实上游编号才显示为上游对话", () => {
     channelType: "chatplus",
     modelId: "gemini",
     externalId: "local-fallback",
-    raw: { conversationId: "confirmed-upstream-id" }
-  }), "confirmed-upstream-id");
+    raw: { chatModel: "gemini", conversationId: "c_confirmed_upstream_id" }
+  }), "c_confirmed_upstream_id");
+  assert.equal(taskConversationId({
+    channelType: "chatplus",
+    modelId: "gemini",
+    raw: {
+      chatModel: "gemini",
+      conversationId: "**Refine Brush Details** I'm now zeroing in on the product details."
+    }
+  }), "");
+  assert.equal(taskConversationUrl({
+    channelId: "google:chatplus",
+    channelType: "chatplus",
+    modelId: "gemini",
+    raw: { chatModel: "gemini", conversationId: "c_ce144bba99281e12" }
+  }, {
+    channels: [{
+      id: "google",
+      type: "shareai",
+      settings: { chatBaseUrl: "https://cloudlian.cn/" }
+    }]
+  }), "https://cloudlian.cn/app/ce144bba99281e12");
+  assert.equal(taskConversationId({
+    channelType: "drawing",
+    modelId: "gemini",
+    raw: { conversationId: "125461" }
+  }), "");
+  assert.equal(taskUpstreamTaskId({
+    channelType: "drawing",
+    modelId: "gemini",
+    raw: { conversationId: "125461" }
+  }), "125461");
 });
 
 test("失败任务会从处理记录中显示实际车位", () => {

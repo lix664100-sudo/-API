@@ -44,8 +44,8 @@ function client() {
 function geminiResponse({ text = "", imageUrl = "", error = "" } = {}) {
   const content = [text, imageUrl, error].filter(Boolean).join(" ");
   const responsePart = [
-    "conversation-test",
-    ["conversation-test", "response-test", "choice-test"],
+    "c_conversation_test",
+    ["c_conversation_test", "response-test", "choice-test"],
     null,
     null,
     [[null, content]]
@@ -115,7 +115,7 @@ test("Gemini 文字请求会提交网页协议并返回文字", async () => {
   );
 
   assert.equal(result.directContent, "Gemini 返回成功");
-  assert.equal(result.conversationId, "conversation-test");
+  assert.equal(result.conversationId, "c_conversation_test");
   assert.match(request.path, /^\/_\/BardChatUi\/data\/assistant\.lamda\.BardFrontendService\/StreamGenerate\?/);
   assert.match(request.path, /bl=boq_assistant-bard-web-server_test/);
   assert.match(request.path, /f\.sid=123456/);
@@ -123,6 +123,41 @@ test("Gemini 文字请求会提交网页协议并返回文字", async () => {
   assert.match(decodedBody, /token-at/);
   assert.match(decodedBody, /请回复测试成功/);
   assert.equal(request.options.headers["content-type"], "application/x-www-form-urlencoded;charset=UTF-8");
+});
+
+test("Gemini 回复文字不能覆盖真实上游会话编号", async () => {
+  const testClient = client();
+  const thought = "**Refine Brush Details** I'm now zeroing in on the product details.";
+  const conversationPart = [
+    "c_real_conversation",
+    ["c_real_conversation", "response-test", "choice-test"],
+    null,
+    null,
+    [[null, "{image}"]]
+  ];
+  const thoughtPart = [
+    null,
+    [thought],
+    null,
+    null,
+    [[null, thought]]
+  ];
+  testClient.geminiSession.bl = "boq_assistant-bard-web-server_test";
+  testClient.uploadGeminiImages = async () => [];
+  testClient.http = async () => ({
+    status: 200,
+    headers: {},
+    body: JSON.stringify([["wrb.fr", "StreamGenerate", JSON.stringify([conversationPart, thoughtPart]), null, null]])
+  });
+
+  const result = await testClient.sendGeminiConversation(
+    "会话编号识别测试",
+    { files: [] },
+    { key: "gemini", strategy: "thinking", model: "" },
+    { carId: "car-test", carType: "gemini" }
+  );
+
+  assert.equal(result.conversationId, "c_real_conversation");
 });
 
 for (const modelCase of [

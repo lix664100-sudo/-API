@@ -2417,6 +2417,94 @@ test("Gemini 本地备用编号不会被当成真实上游对话", async () => {
       /还没有保存上游对话编号/
     );
     assert.equal(queriedUpstream, false);
+
+    await upsertTask({
+      id: "task-gemini-local-id",
+      raw: {
+        chatModel: "gemini",
+        conversationId: "**Refine Brush Details** I'm now zeroing in on the product details."
+      }
+    });
+    await assert.rejects(
+      () => inspectUpstreamTask("task-gemini-local-id"),
+      /还没有保存上游对话编号/
+    );
+    assert.equal(queriedUpstream, false);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    await saveConfig(originalConfig);
+  }
+});
+
+test("Gemini 真实会话详情使用已保存结果和正确打开地址", async () => {
+  const originalConfig = await loadConfig();
+  const shareAIChannel = {
+    id: "gemini-detail-channel",
+    name: "Gemini详情测试渠道",
+    type: "shareai",
+    enabled: true,
+    settings: {
+      chatBaseUrl: "https://cloudlian.cn",
+      defaultChatModel: "gemini",
+      chatModels: [{ key: "gemini", name: "Gemini", enabled: true, default: true }]
+    }
+  };
+  await saveConfig({
+    ...originalConfig,
+    channels: [
+      shareAIChannel,
+      ...originalConfig.channels.filter((item) => item.id !== shareAIChannel.id)
+    ],
+    accounts: [
+      ...originalConfig.accounts.filter((item) => item.id !== "account-gemini-detail"),
+      {
+        id: "account-gemini-detail",
+        channelId: shareAIChannel.id,
+        name: "Gemini详情测试账号",
+        username: "gemini-detail@example.com",
+        password: "test",
+        enabled: true,
+        status: "ok"
+      }
+    ]
+  });
+  await upsertTask({
+    id: "task-gemini-detail",
+    externalId: "c_ce144bba99281e12",
+    status: "success",
+    taskType: "img2img",
+    modelId: "gemini",
+    channelId: `${shareAIChannel.id}:chatplus`,
+    channelName: `${shareAIChannel.name}/聊天生图`,
+    channelType: "chatplus",
+    accountId: "account-gemini-detail",
+    accountName: "Gemini详情测试账号",
+    imageCount: 1,
+    imageUrls: ["https://example.test/gemini-result.png"],
+    raw: {
+      chatModel: "gemini",
+      conversationId: "c_ce144bba99281e12",
+      selectedCarId: "gemini-car",
+      selectedCarType: "gemini"
+    },
+    createdAt: new Date().toISOString(),
+    completedAt: new Date().toISOString()
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  let queriedUpstream = false;
+  ChatplusClient.prototype.getTask = async () => {
+    queriedUpstream = true;
+    throw new Error("不应调用 GPT 会话详情接口");
+  };
+
+  try {
+    const detail = await inspectUpstreamTask("task-gemini-detail");
+    assert.equal(queriedUpstream, false);
+    assert.equal(detail.detailSource, "stored");
+    assert.equal(detail.conversationId, "c_ce144bba99281e12");
+    assert.equal(detail.conversationUrl, "https://cloudlian.cn/app/ce144bba99281e12");
+    assert.deepEqual(detail.imageUrls, ["https://example.test/gemini-result.png"]);
   } finally {
     ChatplusClient.prototype.getTask = originalGetTask;
     await saveConfig(originalConfig);

@@ -394,6 +394,14 @@
         font-weight: 650;
       }
 
+      .task-channel-mode {
+        flex: 0 0 auto;
+      }
+
+      .task-channel-mode .ant-tag {
+        margin-inline-end: 0;
+      }
+
       .task-model-detail {
         display: grid;
         gap: 6px;
@@ -626,6 +634,18 @@
         font-size: 12px;
       }
 
+      .account-usage-detail {
+        display: grid;
+        gap: 2px;
+        padding-bottom: 3px;
+        border-bottom: 1px solid #f0f2f5;
+      }
+
+      .account-usage-detail:last-child {
+        padding-bottom: 0;
+        border-bottom: 0;
+      }
+
       .quota-reset-list {
         display: flex;
         flex-direction: column;
@@ -722,8 +742,8 @@
 
       .routing-share {
         display: grid;
-        gap: 5px;
-        width: 132px;
+        gap: 6px;
+        width: 190px;
       }
 
       .routing-share-meta {
@@ -1125,6 +1145,26 @@
         color: #344054;
         font-size: 13px;
         font-weight: 650;
+      }
+
+      .routing-target-list {
+        display: grid;
+        gap: 3px;
+      }
+
+      .routing-target-line {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .routing-target-line.is-active {
+        color: var(--ink);
+        font-weight: 600;
+      }
+
+      .routing-target-reason {
+        color: #b54708;
       }
 
       .field-help {
@@ -2294,13 +2334,23 @@
         return routes.length ? routes.map(taskRouteLabel).join(" / ") : "未成功";
       }
 
+      function taskRoutingMode(row = {}) {
+        if (row.routingMode) return row.routingMode;
+        const request = row.requestJson || {};
+        const accountId = String(request.accountId || request.account_id || "").trim();
+        return accountId && accountId.toLowerCase() !== "auto" ? "explicit" : "auto";
+      }
+
       function taskChannelFlow(row) {
         const submitted = taskSubmissionRouteText(row);
         const generated = taskGenerationRouteText(row);
         return h("div", { className: "task-channel-flow" }, [
           h("div", { className: "task-channel-line", key: "submitted", title: `提交：${submitted}` }, [
             h("span", { className: "task-channel-label", key: "label" }, "提交："),
-            h("span", { className: "task-channel-value", key: "value" }, submitted)
+            h("span", { className: "task-channel-value", key: "value" }, submitted),
+            taskRoutingMode(row) === "explicit"
+              ? h("span", { className: "task-channel-mode", key: "mode" }, h(Tag, { color: "blue" }, "指定账号"))
+              : null
           ]),
           h("div", { className: "task-channel-line", key: "generated", title: `生成：${generated}` }, [
             h("span", { className: "task-channel-label", key: "label" }, "生成："),
@@ -2519,7 +2569,9 @@
             key: "notice",
             type: "info",
             showIcon: true,
-            message: "已通过服务器保存的账号读取上游会话，不依赖当前浏览器登录状态。"
+            message: detail.detailSource === "stored"
+              ? "Gemini 任务显示提交时已保存的上游结果。"
+              : "已通过服务器保存的账号读取上游会话，不依赖当前浏览器登录状态。"
           }),
           h("div", { className: "upstream-detail-grid", key: "grid" }, items.map(([label, value]) =>
             h("div", { className: "upstream-detail-item", key: label }, [
@@ -2636,23 +2688,72 @@
       }
 
       function taskConversationId(row) {
-        const rawId = row?.raw?.conversationId
-          || row?.raw?.conversation_id
-          || row?.responseJson?.conversationId
-          || row?.responseJson?.conversation_id;
-        if (rawId) return String(rawId).trim();
+        if (!isChatplusTaskRow(row)) return "";
+        for (const candidate of taskConversationCandidates(row)) {
+          const id = String(candidate || "").trim();
+          if (!id) continue;
+          if (taskUsesGemini(row) && !validGeminiConversationId(id)) continue;
+          return id;
+        }
+        return "";
+      }
+
+      function taskConversationCandidates(row) {
+        return [
+          row?.raw?.conversationId,
+          row?.raw?.conversation_id,
+          row?.responseJson?.conversationId,
+          row?.responseJson?.conversation_id,
+          row?.externalId,
+          row?.responseJson?.externalId
+        ];
+      }
+
+      function isChatplusTaskRow(row) {
         const channelText = `${row?.channelId || ""} ${row?.channelType || ""} ${row?.channelName || ""}`;
-        if (!/chatplus|聊天生图/.test(channelText)) return "";
-        const externalId = String(row?.externalId || row?.responseJson?.externalId || "").trim();
-        const chatModel = String(
+        return /chatplus|聊天生图/.test(channelText);
+      }
+
+      function taskChatModel(row) {
+        return String(
           row?.raw?.chatModel
             || row?.responseJson?.raw?.chatModel
             || row?.responseJson?.chatModel
             || row?.modelId
             || ""
         ).trim().toLowerCase();
-        if (chatModel === "gemini" && !externalId.startsWith("c_")) return "";
-        return externalId;
+      }
+
+      function taskUsesGemini(row) {
+        const model = taskChatModel(row);
+        return model === "gemini" || model.startsWith("gemini-");
+      }
+
+      function validGeminiConversationId(value) {
+        return /^c_[a-z0-9_-]{6,128}$/i.test(String(value || "").trim());
+      }
+
+      function taskConversationUnavailable(row) {
+        return isChatplusTaskRow(row)
+          && taskUsesGemini(row)
+          && taskConversationCandidates(row).some((value) => String(value || "").trim())
+          && !taskConversationId(row);
+      }
+
+      function taskUpstreamTaskId(row) {
+        if (isChatplusTaskRow(row)) return "";
+        const candidates = [
+          row?.externalId,
+          row?.responseJson?.externalId,
+          row?.raw?.taskId,
+          row?.raw?.task_id,
+          row?.taskNo,
+          row?.raw?.taskNo,
+          row?.raw?.task_no,
+          row?.raw?.conversationId,
+          row?.raw?.conversation_id
+        ];
+        return String(candidates.find((value) => String(value || "").trim()) || "").trim();
       }
 
       function taskChatBaseUrl(row, config) {
@@ -2671,7 +2772,11 @@
       function taskConversationUrl(row, config) {
         const id = taskConversationId(row);
         const baseUrl = trimUrl(taskChatBaseUrl(row, config));
-        return id && baseUrl ? `${baseUrl}/c/${encodeURIComponent(id)}` : "";
+        if (!id || !baseUrl) return "";
+        if (taskUsesGemini(row)) {
+          return `${baseUrl}/app/${encodeURIComponent(id.replace(/^c_/i, ""))}`;
+        }
+        return `${baseUrl}/c/${encodeURIComponent(id)}`;
       }
 
       function taskCarId(row) {
@@ -2786,10 +2891,13 @@
       function taskMetaLine(row, config, options = {}) {
         const meta = row?.requestMeta || {};
         const conversationAction = taskConversationAction(row, config, options);
+        const upstreamTaskId = taskUpstreamTaskId(row);
         const upstreamTitle = taskUpstreamTitle(row);
         const carId = taskCarId(row);
         const items = [
           conversationAction ? ["上游对话", conversationAction] : null,
+          !conversationAction && taskConversationUnavailable(row) ? ["上游对话", "未返回有效编号"] : null,
+          upstreamTaskId ? ["上游任务ID", upstreamTaskId] : null,
           upstreamTitle ? ["上游标题", upstreamTitle] : null,
           carId ? ["车位ID", carId] : null,
           ...taskIdentityItems(row),
@@ -5296,10 +5404,43 @@
           return usage;
         }, [statRecords]);
 
-        function todayUsageText(label, value, total, unit) {
-          const count = numberValue(value);
-          const percent = total > 0 ? Math.round((count / total) * 100) : 0;
-          return `${label} ${count} ${unit} · ${percent}%`;
+        function accountRoutingSlot(accountId, slot) {
+          return runtimeStatus?.routing?.accounts?.[accountId]?.slots?.[slot] || null;
+        }
+
+        function routingTargetLine(label, state, account, key) {
+          const available = account.enabled !== false && state?.available === true;
+          if (available) {
+            return h("div", { className: "routing-target-line is-active", key }, `${label} 当前 ${numberValue(state.targetPercent)}%`);
+          }
+          const reason = account.enabled === false ? "已停用" : state?.reason || "状态待确认";
+          return h("div", { className: "routing-target-line", key }, [
+            h("span", { key: "label" }, `${label} 当前不参与 · `),
+            h("span", { className: "routing-target-reason", key: "reason" }, reason)
+          ]);
+        }
+
+        function routingSubmittedPercent(slot, state) {
+          if (!state) return 0;
+          const modelKey = state.modelKey || "";
+          const total = selectedAccounts.reduce((sum, account) => {
+            const accountState = accountRoutingSlot(account.id, slot);
+            if (!accountState || (modelKey && accountState.modelKey !== modelKey)) return sum;
+            return sum + numberValue(accountState.submitted?.auto);
+          }, 0);
+          const current = numberValue(state.submitted?.auto);
+          return total > 0 ? Math.round((current / total) * 100) : 0;
+        }
+
+        function routingSubmittedItem(label, slot, state, successCount, unit, key) {
+          const automatic = numberValue(state?.submitted?.auto);
+          const explicit = numberValue(state?.submitted?.explicit);
+          const detail = [`成功 ${numberValue(successCount)} ${unit}`];
+          if (explicit > 0) detail.push(`指定账号 ${explicit} ${unit}`);
+          return h("div", { className: "account-usage-detail", key }, [
+            h("strong", { key: "automatic" }, `${label} 自动提交 ${automatic} ${unit} · ${routingSubmittedPercent(slot, state)}%`),
+            h("span", { key: "detail" }, detail.join("｜"))
+          ]);
         }
 
         function markTaskListInteraction() {
@@ -6903,7 +7044,7 @@
 
         const accountColumns = [
           { title: "账号名称", dataIndex: "name", width: 130 },
-          { title: "登录账号", dataIndex: "username", ellipsis: true },
+          { title: "登录账号", dataIndex: "username", width: 210, ellipsis: true },
           {
             title: "代理",
             dataIndex: "proxyUrl",
@@ -6978,51 +7119,68 @@
             }
           },
           {
-            title: h(Tooltip, { title: "这里是目标比例；系统会根据今日实际使用量自动追平。" }, h("span", null, "分流目标")),
+            title: h(Tooltip, {
+              title: "当前有效目标只按该能力当前可用的账号计算；套餐过期、额度不足、暂停或额度保护中的账号不参与。"
+            }, h("span", null, "当前有效目标")),
             dataIndex: "routingWeight",
-            width: 160,
+            width: 220,
             render: (_, row) => {
-              const enabledAccounts = selectedAccounts.filter((account) => account.enabled !== false);
-              const totalWeight = enabledAccounts.reduce((total, account) => total + routingWeightValue(account.routingWeight), 0);
               const weight = routingWeightValue(row.routingWeight);
-              const percent = row.enabled === false || !totalWeight ? 0 : Math.round((weight / totalWeight) * 100);
+              const rowChannel = channels.find((item) => item.id === row.channelId);
+              const items = [];
+              if (channelAbilityEnabled(rowChannel, "drawing")) {
+                items.push(routingTargetLine("绘图站", accountRoutingSlot(row.id, "drawingImage"), row, "drawing"));
+              }
+              if (channelAbilityEnabled(rowChannel, "chatplus")) {
+                items.push(routingTargetLine("聊天生图", accountRoutingSlot(row.id, "chatImage"), row, "chatImage"));
+                items.push(routingTargetLine("对话", accountRoutingSlot(row.id, "chat"), row, "chat"));
+              }
               return h("div", { className: "routing-share" }, [
                 h("div", { className: "routing-share-meta", key: "meta" }, [
                   h("span", { className: "routing-share-weight", key: "weight" }, `${weight} 份`),
-                  h("span", { key: "percent" }, row.enabled === false ? "已停用" : `目标 ${percent}%`)
+                  h("span", { key: "note" }, "设置比例")
                 ]),
-                h(Progress, {
-                  key: "progress",
-                  percent,
-                  showInfo: false,
-                  strokeWidth: 5,
-                  strokeColor: row.enabled === false ? "#d0d5dd" : "#1677ff",
-                  trailColor: "#eef2f6",
-                  style: { margin: 0, lineHeight: 1 }
-                })
+                h("div", { className: "routing-target-list", key: "targets" }, items.length ? items : "-")
               ]);
             }
           },
           {
-            title: h(Tooltip, { title: "百分比按当前渠道今日实际成功完成的数量计算。" }, h("span", null, "今日实际")),
-            width: 190,
+            title: h(Tooltip, {
+              title: "比例只统计系统自动分配且已提交给上游的任务。指定账号的任务单独显示，不参与自动分流。"
+            }, h("span", null, "今日分流")),
+            width: 235,
             render: (_, row) => {
+              if (!runtimeStatus?.routing) return "统计加载中";
               const usage = accountTodayUsage.get(row.id) || {};
               const rowChannel = channels.find((item) => item.id === row.channelId);
-              const totals = selectedAccounts.reduce((current, account) => {
-                const accountUsage = accountTodayUsage.get(account.id) || {};
-                current.drawingImages += numberValue(accountUsage.drawingImages);
-                current.chatImages += numberValue(accountUsage.chatImages);
-                current.chats += numberValue(accountUsage.chats);
-                return current;
-              }, { drawingImages: 0, chatImages: 0, chats: 0 });
               const items = [];
               if (channelAbilityEnabled(rowChannel, "drawing")) {
-                items.push(h("strong", { key: "drawing" }, todayUsageText("绘图站", usage.drawingImages, totals.drawingImages, "张")));
+                items.push(routingSubmittedItem(
+                  "绘图站",
+                  "drawingImage",
+                  accountRoutingSlot(row.id, "drawingImage"),
+                  usage.drawingImages,
+                  "张",
+                  "drawing"
+                ));
               }
               if (channelAbilityEnabled(rowChannel, "chatplus")) {
-                items.push(h(items.length ? "span" : "strong", { key: "chatImage" }, todayUsageText("聊天生图", usage.chatImages, totals.chatImages, "张")));
-                items.push(h("span", { key: "dialogs" }, todayUsageText("对话", usage.chats, totals.chats, "次")));
+                items.push(routingSubmittedItem(
+                  "聊天生图",
+                  "chatImage",
+                  accountRoutingSlot(row.id, "chatImage"),
+                  usage.chatImages,
+                  "张",
+                  "chatImage"
+                ));
+                items.push(routingSubmittedItem(
+                  "对话",
+                  "chat",
+                  accountRoutingSlot(row.id, "chat"),
+                  usage.chats,
+                  "次",
+                  "chat"
+                ));
               }
               return h("div", { className: "account-usage" }, items.length ? items : "-");
             }
@@ -7706,7 +7864,7 @@
                         columns: accountColumns,
                         dataSource: selectedAccounts,
                         pagination: selectedAccounts.length > 5 ? { pageSize: 5 } : false,
-                        scroll: { x: 1910 },
+                        scroll: { x: 2440 },
                         size: "small",
                         locale: { emptyText: "这个渠道还没有绑定账号" }
                       })

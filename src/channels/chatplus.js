@@ -784,12 +784,20 @@ function extractGeminiText(events) {
   return candidates.sort((a, b) => b.length - a.length)[0] || "";
 }
 
+function normalizeGeminiConversationId(value) {
+  const id = String(value || "").trim();
+  return /^c_[a-z0-9_-]{6,128}$/i.test(id) ? id : "";
+}
+
 function extractGeminiConversationId(events) {
   const ids = [];
   for (const value of nestedGeminiJson(events)) {
     for (const part of geminiResponseParts(value)) {
-      const conversationId = Array.isArray(part?.[1]) ? part[1][0] : "";
-      if (conversationId) ids.push(String(conversationId));
+      const candidates = [part?.[0], Array.isArray(part?.[1]) ? part[1][0] : ""];
+      for (const candidate of candidates) {
+        const conversationId = normalizeGeminiConversationId(candidate);
+        if (conversationId) ids.push(conversationId);
+      }
     }
   }
   return ids[ids.length - 1] || "";

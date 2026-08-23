@@ -8,7 +8,14 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-image-admission-"));
 process.env.DATA_DIR = dataDir;
 
-const { closeStorage, loadConfig, recordTaskStat, saveConfig, upsertTask } = await import("../src/storage.js");
+const {
+  closeStorage,
+  listTodayAccountRoutingUsage,
+  loadConfig,
+  recordTaskStat,
+  saveConfig,
+  upsertTask
+} = await import("../src/storage.js");
 const {
   assertImageTaskAdmission,
   attachImageAdmissionToRequest,
@@ -25,7 +32,8 @@ async function recordSuccessfulImages({
   channelId,
   channelType = "drawing",
   imageCount = 1,
-  taskType = "img2img"
+  taskType = "img2img",
+  requestedAccountId = ""
 }) {
   const completedAt = new Date().toISOString();
   const task = await upsertTask({
@@ -39,6 +47,7 @@ async function recordSuccessfulImages({
     channelType,
     imageCount,
     imageUrls: Array.from({ length: imageCount }, (_item, index) => `https://images.example.test/${id}-${index}.png`),
+    requestJson: requestedAccountId ? { accountId: requestedAccountId } : {},
     raw: { submitted: true },
     createdAt: completedAt,
     completedAt
@@ -1034,7 +1043,7 @@ test("Gemini image admission uses drawing when chat image is disabled", async ()
   }
 });
 
-test("image admission catches up the account with fewer successful images and preserves explicit account selection", async () => {
+test("image admission balances new automatic submissions and preserves explicit account selection", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -1070,6 +1079,12 @@ test("image admission catches up the account with fewer successful images and pr
       }
     }))
   });
+
+  const baseline = await reserveImageTaskAdmission({
+    channel: "chatplus",
+    prompt: "start a fresh balance window"
+  });
+  baseline.release();
 
   await recordSuccessfulImages({
     id: "balanced-history-a",
@@ -1114,6 +1129,119 @@ test("image admission catches up the account with fewer successful images and pr
   } finally {
     explicit.release();
   }
+});
+
+test("explicit account submissions are recorded separately from automatic routing", async () => {
+  const automatic = await recordSuccessfulImages({
+    id: "routing-auto-submission",
+    accountId: "routing-auto-account",
+    accountName: "Routing Auto Account",
+    channelId: "routing-events:chatplus",
+    channelType: "chatplus",
+    imageCount: 2
+  });
+  const explicit = await recordSuccessfulImages({
+    id: "routing-explicit-submission",
+    accountId: "routing-explicit-account",
+    accountName: "Routing Explicit Account",
+    channelId: "routing-events:chatplus",
+    channelType: "chatplus",
+    imageCount: 3,
+    requestedAccountId: "routing-explicit-account"
+  });
+  assert.equal(automatic.raw.submitted, true);
+  assert.equal(explicit.raw.submitted, true);
+
+  const usage = await listTodayAccountRoutingUsage();
+  assert.deepEqual(usage.accounts["routing-auto-account"].routing.chatImage, {
+    auto: 2,
+    explicit: 0,
+    models: { gpt: { auto: 2, explicit: 0 } }
+  });
+  assert.deepEqual(usage.accounts["routing-explicit-account"].routing.chatImage, {
+    auto: 0,
+    explicit: 3,
+    models: { gpt: { auto: 0, explicit: 3 } }
+  });
+});
+
+test("runtime routing targets exclude expired and quota-empty abilities", async () => {
+  const config = await loadConfig();
+  const channel = {
+    id: "runtime-routing-targets",
+    type: "shareai",
+    name: "Runtime Routing Targets",
+    enabled: true,
+    settings: {
+      drawingBaseUrl: "https://drawing.example.test",
+      chatBaseUrl: "https://chat.example.test",
+      enabledAbilities: { drawing: true, chatplus: true },
+      defaultChatModel: "gpt"
+    }
+  };
+  await saveConfig({
+    ...config,
+    defaultChannel: channel.id,
+    channels: [channel],
+    accounts: [
+      {
+        id: "runtime-routing-a",
+        channelId: channel.id,
+        name: "Runtime Routing A",
+        username: "runtime-routing-a@example.test",
+        enabled: true,
+        routingWeight: 1,
+        status: "ok",
+        meta: {
+          abilities: {
+            drawing: { status: "ok", balance: 100 },
+            chatplus: { status: "ok", meta: { chatModel: "gpt" } }
+          }
+        }
+      },
+      {
+        id: "runtime-routing-b",
+        channelId: channel.id,
+        name: "Runtime Routing B",
+        username: "runtime-routing-b@example.test",
+        enabled: true,
+        routingWeight: 1,
+        status: "ok",
+        meta: {
+          abilities: {
+            drawing: { status: "ok", balance: 0 },
+            chatplus: { status: "ok", meta: { chatModel: "gpt" } }
+          }
+        }
+      },
+      {
+        id: "runtime-routing-c",
+        channelId: channel.id,
+        name: "Runtime Routing C",
+        username: "runtime-routing-c@example.test",
+        enabled: true,
+        routingWeight: 1,
+        status: "subscription_expired",
+        meta: {
+          abilities: {
+            drawing: { status: "subscription_expired" },
+            chatplus: { status: "subscription_expired", meta: { chatModel: "gpt" } }
+          }
+        }
+      }
+    ]
+  });
+
+  const runtime = await getRuntimeStatus();
+  const routing = runtime.routing.accounts;
+  assert.equal(routing["runtime-routing-a"].slots.drawingImage.targetPercent, 100);
+  assert.equal(routing["runtime-routing-b"].slots.drawingImage.available, false);
+  assert.equal(routing["runtime-routing-b"].slots.drawingImage.reason, "额度不足");
+  assert.equal(routing["runtime-routing-c"].slots.drawingImage.reason, "套餐已过期");
+  assert.equal(routing["runtime-routing-a"].slots.chatImage.targetPercent, 50);
+  assert.equal(routing["runtime-routing-b"].slots.chatImage.targetPercent, 50);
+  assert.equal(routing["runtime-routing-c"].slots.chatImage.targetPercent, 0);
+  assert.equal(routing["runtime-routing-c"].slots.chatImage.reason, "套餐已过期");
 });
 
 test("simultaneous image admissions spread across accounts before either task finishes", async () => {
@@ -1166,7 +1294,7 @@ test("simultaneous image admissions spread across accounts before either task fi
   }
 });
 
-test("a cooling account is skipped and catches up after it becomes available", async () => {
+test("a recovered account rejoins from a fresh balance window", async () => {
   const config = await loadConfig();
   const channel = {
     id: "balanced-recovery",
@@ -1194,8 +1322,8 @@ test("a cooling account is skipped and catches up after it becomes available", a
       meta: {
         abilities: {
           drawing: {
-            status: "cooldown",
-            cooldownUntil: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+            status: "ok",
+            cooldownUntil: null
           },
           chatplus: { status: "ok" }
         }
@@ -1226,6 +1354,33 @@ test("a cooling account is skipped and catches up after it becomes available", a
     channels: [channel],
     accounts
   });
+
+  const beforeCooling = await reserveImageTaskAdmission({ channel: "drawing", prompt: "open full balance window" });
+  beforeCooling.release();
+
+  await saveConfig({
+    ...await loadConfig(),
+    accounts: accounts.map((account) => account.id === "balanced-recovery-a"
+      ? {
+          ...account,
+          meta: {
+            ...account.meta,
+            abilities: {
+              ...account.meta.abilities,
+              drawing: {
+                status: "cooldown",
+                cooldownUntil: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+              }
+            }
+          }
+        }
+      : account)
+  });
+
+  const whileCooling = await reserveImageTaskAdmission({ channel: "drawing", prompt: "skip cooling" });
+  assert.equal(whileCooling.target.account.id, "balanced-recovery-b");
+  whileCooling.release();
+
   await recordSuccessfulImages({
     id: "balanced-recovery-history-b",
     accountId: "balanced-recovery-b",
@@ -1233,10 +1388,6 @@ test("a cooling account is skipped and catches up after it becomes available", a
     channelId: "balanced-recovery:drawing",
     imageCount: 4
   });
-
-  const whileCooling = await reserveImageTaskAdmission({ channel: "drawing", prompt: "skip cooling" });
-  assert.equal(whileCooling.target.account.id, "balanced-recovery-b");
-  whileCooling.release();
 
   await saveConfig({
     ...await loadConfig(),
@@ -1259,6 +1410,20 @@ test("a cooling account is skipped and catches up after it becomes available", a
     assert.equal(afterRecovery.target.account.id, "balanced-recovery-a");
   } finally {
     afterRecovery.release();
+  }
+
+  await recordSuccessfulImages({
+    id: "balanced-recovery-new-a",
+    accountId: "balanced-recovery-a",
+    accountName: "Balanced Recovery A",
+    channelId: "balanced-recovery:drawing",
+    imageCount: 1
+  });
+  const nextBalanced = await reserveImageTaskAdmission({ channel: "drawing", prompt: "continue balanced after recovery" });
+  try {
+    assert.equal(nextBalanced.target.account.id, "balanced-recovery-b");
+  } finally {
+    nextBalanced.release();
   }
 });
 

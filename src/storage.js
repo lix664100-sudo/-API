@@ -19,6 +19,8 @@ const statRecordDays = 31;
 const dailyStatDays = 30;
 const imageTaskTypes = new Set(["text2img", "img2img"]);
 const statRecordLimit = 50000;
+const routingEventDays = 31;
+const routingEventLimit = 50000;
 const intradayIntervalMinutes = 30;
 const accountImportLimit = 500;
 const proxyBatchLimit = 500;
@@ -27,6 +29,8 @@ let runtimeStatsWriteQueue = Promise.resolve();
 let tasksWriteQueue = Promise.resolve();
 let configWriteQueue = Promise.resolve();
 let statsRevision = 0;
+let routingRevision = 0;
+let routingPruneAt = 0;
 let statsSnapshot = null;
 const intradayStatsCache = new Map();
 let todayAccountRoutingUsageCache = null;
@@ -186,6 +190,89 @@ function writeTaskStatRow(database, record) {
   `).run(record.taskId, Number(record.time || Date.now()), JSON.stringify(record));
 }
 
+function taskRoutingMode(task = {}) {
+  const request = task.requestJson || {};
+  const requestedAccountId = String(request.accountId || request.account_id || "").trim();
+  return requestedAccountId && requestedAccountId.toLowerCase() !== "auto" ? "explicit" : "auto";
+}
+
+function routingModelKey(task = {}) {
+  const request = task.requestJson || {};
+  const values = [
+    task.raw?.modelFamily,
+    task.raw?.chatModel,
+    task.raw?.requestedModel,
+    task.modelId,
+    request.model,
+    request.chat_model,
+    request.chatModel,
+    request.model_id,
+    request.modelId
+  ];
+  const text = values.map((value) => String(value || "").trim().toLowerCase()).find(Boolean) || "gpt";
+  if (text.includes("gemini")) return "gemini";
+  if (text.includes("grok")) return "grok";
+  return "gpt";
+}
+
+function taskRoutingSlot(task = {}) {
+  if (task.taskType === "chat") return "chat";
+  if (!imageTaskTypes.has(task.taskType)) return "";
+  const channelGroup = taskStatChannelGroup(task);
+  if (channelGroup === "chatplus") return "chatImage";
+  if (channelGroup === "drawing") return "drawingImage";
+  return "";
+}
+
+function taskWasSubmittedUpstream(task = {}) {
+  return task.raw?.submitted === true
+    || (Array.isArray(task.submissionChannels) && task.submissionChannels.length > 0)
+    || Boolean(task.externalId || task.responseJson?.externalId);
+}
+
+function taskRoutingLoad(task = {}) {
+  if (task.taskType === "chat") return 1;
+  const request = task.requestJson || {};
+  const requested = Number(request.image_count ?? request.n ?? task.imageCount ?? 1);
+  return Math.max(1, Number.isFinite(requested) ? Math.floor(requested) : 1);
+}
+
+function writeTaskRoutingEvent(database, task = {}) {
+  const slot = taskRoutingSlot(task);
+  const accountId = String(task.accountId || "").trim();
+  if (!slot || !accountId || !taskWasSubmittedUpstream(task)) return false;
+  const submittedAt = Date.parse(task.raw?.submittedAt || task.createdAt || task.updatedAt || "");
+  const result = database.prepare(`
+    INSERT OR IGNORE INTO routing_events (
+      task_id, time, account_id, channel_id, slot, model_key, route_mode, load
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    String(task.id || ""),
+    Number.isFinite(submittedAt) ? submittedAt : Date.now(),
+    accountId,
+    String(task.channelId || ""),
+    slot,
+    slot === "drawingImage" ? "" : routingModelKey(task),
+    taskRoutingMode(task),
+    taskRoutingLoad(task)
+  );
+  return Number(result.changes || 0) > 0;
+}
+
+function pruneRoutingEvents(database, now = Date.now()) {
+  const cutoff = now - routingEventDays * 24 * 60 * 60 * 1000;
+  database.prepare("DELETE FROM routing_events WHERE time < ?").run(cutoff);
+  database.prepare(`
+    DELETE FROM routing_events
+    WHERE task_id NOT IN (
+      SELECT task_id
+      FROM routing_events
+      ORDER BY time DESC
+      LIMIT ?
+    )
+  `).run(routingEventLimit);
+}
+
 function setStorageMeta(database, key, value) {
   database.prepare(`
     INSERT INTO storage_meta (key, value)
@@ -331,6 +418,21 @@ async function openStorageDatabase() {
       CREATE INDEX IF NOT EXISTS task_stats_time_idx
         ON task_stats(time DESC);
 
+      CREATE TABLE IF NOT EXISTS routing_events (
+        task_id TEXT PRIMARY KEY,
+        time INTEGER NOT NULL,
+        account_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL DEFAULT '',
+        slot TEXT NOT NULL,
+        model_key TEXT NOT NULL DEFAULT '',
+        route_mode TEXT NOT NULL,
+        load INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE INDEX IF NOT EXISTS routing_events_time_idx
+        ON routing_events(time DESC);
+      CREATE INDEX IF NOT EXISTS routing_events_account_slot_time_idx
+        ON routing_events(account_id, slot, time DESC);
+
       CREATE TABLE IF NOT EXISTS storage_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -389,6 +491,8 @@ export async function closeStorage() {
   storageDatabasePromise = null;
   tasksLoadPromise = null;
   statsSnapshot = null;
+  routingRevision = 0;
+  routingPruneAt = 0;
   intradayStatsCache.clear();
   todayAccountRoutingUsageCache = null;
   tasksSnapshot = {
@@ -1801,6 +1905,7 @@ function taskListSummary(task = {}) {
     channelType: task.channelType,
     accountId: task.accountId,
     accountName: task.accountName,
+    routingMode: taskRoutingMode(task),
     submissionChannels: Array.isArray(task.submissionChannels) ? task.submissionChannels.slice(0, 20) : [],
     generationChannels: Array.isArray(task.generationChannels) ? task.generationChannels.slice(0, 20) : [],
     requestMeta: task.requestMeta,
@@ -1984,6 +2089,14 @@ export async function upsertTask(task) {
     const limited = limitTasks(tasks);
     const database = await getStorageDatabase();
     writeTaskRow(database, stored);
+    if (writeTaskRoutingEvent(database, stored)) {
+      if (Date.now() >= routingPruneAt) {
+        pruneRoutingEvents(database);
+        routingPruneAt = Date.now() + 60 * 60 * 1000;
+      }
+      routingRevision += 1;
+      todayAccountRoutingUsageCache = null;
+    }
     if (limited.length !== tasks.length) {
       const retainedIds = new Set(limited.map((item) => String(item.id || "")));
       removeTaskRows(
@@ -2497,11 +2610,11 @@ export async function recordTaskStat(task) {
 }
 
 export async function listTodayAccountRoutingUsage(now = Date.now()) {
-  await statsWriteQueue.catch(() => {});
+  await tasksWriteQueue.catch(() => {});
   const day = dateKeyInShanghai(now);
   if (
     todayAccountRoutingUsageCache?.day === day
-    && todayAccountRoutingUsageCache.revision === statsRevision
+    && todayAccountRoutingUsageCache.revision === routingRevision
   ) {
     return todayAccountRoutingUsageCache.value;
   }
@@ -2510,33 +2623,35 @@ export async function listTodayAccountRoutingUsage(now = Date.now()) {
   const end = start + 24 * 60 * 60 * 1000;
   const database = await getStorageDatabase();
   const records = database.prepare(`
-    SELECT payload
-    FROM task_stats
+    SELECT account_id, slot, model_key, route_mode, SUM(load) AS load
+    FROM routing_events
     WHERE time >= ? AND time < ?
-  `).all(start, end).map((row) => JSON.parse(row.payload));
+    GROUP BY account_id, slot, model_key, route_mode
+  `).all(start, end);
   const accounts = {};
 
   for (const record of records) {
-    const accountId = String(record?.accountId || "").trim();
+    const accountId = String(record?.account_id || "").trim();
     if (!accountId) continue;
-    const current = accounts[accountId] || {
-      drawingImages: 0,
-      chatImages: 0,
-      chats: 0
-    };
-    if (record?.taskType === "chat") {
-      current.chats += taskStatCount(record);
-    } else if (imageTaskTypes.has(record?.taskType)) {
-      const images = taskStatValue(record, "successImages");
-      const channelGroup = String(record?.channelGroup || "").toLowerCase();
-      if (channelGroup === "chatplus") current.chatImages += images;
-      else if (channelGroup === "drawing") current.drawingImages += images;
+    const current = accounts[accountId] || { routing: {} };
+    const slot = String(record?.slot || "");
+    if (!slot) continue;
+    const routeMode = record?.route_mode === "explicit" ? "explicit" : "auto";
+    const load = Math.max(0, Number(record?.load || 0));
+    const slotUsage = current.routing[slot] || { auto: 0, explicit: 0, models: {} };
+    slotUsage[routeMode] += load;
+    const modelKey = String(record?.model_key || "").trim();
+    if (modelKey) {
+      const modelUsage = slotUsage.models[modelKey] || { auto: 0, explicit: 0 };
+      modelUsage[routeMode] += load;
+      slotUsage.models[modelKey] = modelUsage;
     }
+    current.routing[slot] = slotUsage;
     accounts[accountId] = current;
   }
 
   const value = { day, accounts };
-  todayAccountRoutingUsageCache = { day, revision: statsRevision, value };
+  todayAccountRoutingUsageCache = { day, revision: routingRevision, value };
   return value;
 }
 
