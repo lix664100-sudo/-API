@@ -910,7 +910,7 @@ test("chatplus policy refusal is returned as a failed task with the original mes
   assert.equal(result.errorMessage, message);
 });
 
-test("wait image task returns upstream policy refusal without wrapping it as timeout", async () => {
+test("submitted relay policy refusal is returned as content policy without retrying another account", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -944,26 +944,17 @@ test("wait image task returns upstream policy refusal without wrapping it as tim
     }]
   });
 
-  const message = "We're so sorry, but the prompt may violate our content policies. If you think we got it wrong, please retry or edit your prompt.";
+  const policyMessage = "We're so sorry, but the prompt may violate our content policies. If you think we got it wrong, please retry or edit your prompt.";
+  const message = `中转服务返回错误: ${policyMessage}`;
   const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
   let submissionCount = 0;
-  ChatplusClient.prototype.createImageTask = async (input) => {
+  ChatplusClient.prototype.createImageTask = async () => {
     submissionCount += 1;
-    await input.onSubmitted?.({
-      externalId: "conversation-policy-wait",
-      status: "processing",
-      taskType: "img2img",
-      prompt: input.prompt,
-      imageCount: 0,
-      imageUrls: [],
-      raw: { conversationId: "conversation-policy-wait" }
-    });
     const error = new Error(message);
-    error.upstreamExplicitFailure = true;
-    error.upstreamStatus = "failed";
+    error.imageSubmissionAttempted = true;
+    error.imageSubmissionConfirmed = true;
     error.upstreamText = message;
-    error.status = 400;
-    error.code = "content_policy";
+    error.status = 502;
     throw error;
   };
 

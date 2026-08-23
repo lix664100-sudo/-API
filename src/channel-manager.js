@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { ChatplusClient, isChatImageIntermediateResponse } from "./channels/chatplus.js";
+import { ChatplusClient, isChatImageIntermediateResponse, isImagePolicyFailureMessage } from "./channels/chatplus.js";
 import {
   DrawingClient,
   drawingBalanceInsufficient,
@@ -1209,12 +1209,17 @@ function isTerminalTaskFailureError(error) {
 
 function imageSubmissionFailure(error) {
   if (error?.imageSubmissionAttempted !== true) return error;
+  const policyFailure = isImagePolicyFailureMessage(
+    error?.failureReason || error?.upstreamText || error?.body || error?.message
+  );
   const report = imageFailureReport({}, error, {
     submitted: error?.imageSubmissionConfirmed === true
   });
-  const failure = new Error(report.message);
-  failure.status = Number(error?.status || error?.statusCode || 0) || 502;
-  failure.code = error?.code || (report.submissionConfirmed ? "UPSTREAM_NO_IMAGE" : "IMAGE_SUBMISSION_NOT_CONFIRMED");
+  const failure = new Error(policyFailure ? report.failureReason : report.message);
+  failure.status = policyFailure ? 400 : Number(error?.status || error?.statusCode || 0) || 502;
+  failure.code = policyFailure
+    ? "content_policy"
+    : error?.code || (report.submissionConfirmed ? "UPSTREAM_NO_IMAGE" : "IMAGE_SUBMISSION_NOT_CONFIRMED");
   failure.imageSubmissionAttempted = true;
   failure.imageSubmissionConfirmed = report.submissionConfirmed;
   failure.failureType = report.failureType;
@@ -1223,7 +1228,7 @@ function imageSubmissionFailure(error) {
   failure.upstreamText = report.upstreamText;
   failure.upstreamModel = error?.upstreamModel || "";
   failure.upstreamStatus = error?.upstreamStatus || "";
-  failure.upstreamExplicitFailure = error?.upstreamExplicitFailure === true;
+  failure.upstreamExplicitFailure = policyFailure || error?.upstreamExplicitFailure === true;
   failure.selectedCarId = error?.selectedCarId || "";
   failure.selectedCarType = error?.selectedCarType || "";
   failure.carAttempts = Array.isArray(error?.carAttempts) ? error.carAttempts : [];

@@ -1172,7 +1172,7 @@ function imageQuotaError(message = "图片生成额度已用完。") {
   return error;
 }
 
-function isImagePolicyFailureMessage(content) {
+export function isImagePolicyFailureMessage(content) {
   const text = String(content || "").replace(/\s+/g, " ").trim();
   if (!text) return false;
   return /(?:violate|violates|violating).{0,160}(?:guardrails|policy|policies|content)/i.test(text)
