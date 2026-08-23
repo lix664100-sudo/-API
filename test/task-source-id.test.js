@@ -489,7 +489,7 @@ test("chatplus task refresh bypasses cached conversation results", async () => {
   const task = await client.getTask("conversation-no-cache", { timeoutSec: 30 });
 
   assert.equal(task.status, "waiting_upstream");
-  assert.equal(detailRequest.pathName, "/backend-api/conversation/conversation-no-cache");
+  assert.match(detailRequest.pathName, /^\/backend-api\/conversation\/conversation-no-cache\?_\=\d+$/);
   assert.equal(detailRequest.options.timeoutSec, 30);
   assert.equal(detailRequest.options.headers["cache-control"], "no-cache");
   assert.equal(detailRequest.options.headers.pragma, "no-cache");

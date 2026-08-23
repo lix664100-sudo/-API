@@ -22,6 +22,8 @@ const RECENT_IMAGE_SUCCESS_TTL_MS = 6 * 60 * 60 * 1000;
 const GEMINI_REQUEST_PATH = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
 const GEMINI_UPLOAD_PREFLIGHT_PATH = "/_/BardChatUi/data/batchexecute";
 const GEMINI_UPLOAD_PREFLIGHT_RPC_ID = "ESY5D";
+const GEMINI_CONVERSATION_RPC_ID = "hNvQHb";
+const GEMINI_CONVERSATION_RELOAD_LIMIT = 3;
 const GEMINI_UPLOAD_START_PATH = "/gemini/push/upload/";
 const GEMINI_DEFAULT_BUILD_LABEL = "boq_assistant-bard-web-server_20260525.09_p0";
 const GEMINI_DEFAULT_PUSH_ID = "feeds/mcudyrk2a4khkz";
@@ -861,6 +863,96 @@ function extractGeminiImageUrls(events, baseUrl) {
     }
   }
   return [...urls].filter(Boolean);
+}
+
+function parseGeminiBatchPayloads(text, targetRpcId) {
+  const source = String(text || "").replace(/^\)\]\}'\r?\n/, "");
+  const lines = source.split(/\r?\n/).filter((line) => line.trim());
+  const payloads = [];
+  for (let index = 0; index < lines.length;) {
+    const length = Number.parseInt(lines[index], 10);
+    const line = Number.isFinite(length) ? lines[index + 1] : lines[index];
+    index += Number.isFinite(length) ? 2 : 1;
+    let entries = null;
+    try {
+      entries = JSON.parse(line || "");
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (!Array.isArray(entry) || entry[0] !== "wrb.fr" || entry[1] !== targetRpcId) continue;
+      if (typeof entry[2] !== "string") continue;
+      try {
+        payloads.push(JSON.parse(entry[2]));
+      } catch {
+        // Ignore an incomplete batch item and keep any complete payloads.
+      }
+    }
+  }
+  return payloads;
+}
+
+function addGeminiHistoryImageUrl(output, value, baseUrl) {
+  const normalized = normalizeGeminiImageUrl(value, baseUrl);
+  if (normalized) output.add(normalized);
+}
+
+function scanGeminiHistoryImageRefs(value, baseUrl, output) {
+  if (typeof value === "string") {
+    const direct = value.match(/https?:\/\/[^\s"'<>\\]+/gi) || [];
+    direct.forEach((url) => addGeminiHistoryImageUrl(output, url, baseUrl));
+    const local = value.match(/\/gemini\/images\/gg(?:-dl)?\/[A-Za-z0-9._~+/=-]+/g) || [];
+    local.forEach((url) => addGeminiHistoryImageUrl(output, url, baseUrl));
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => scanGeminiHistoryImageRefs(item, baseUrl, output));
+    return;
+  }
+  if (value && typeof value === "object") {
+    Object.values(value).forEach((item) => scanGeminiHistoryImageRefs(item, baseUrl, output));
+  }
+}
+
+function extractGeminiHistoryImageUrls(payloads, baseUrl) {
+  const output = new Set();
+  const visit = (value) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      const richContent = value[12];
+      if (Array.isArray(richContent) && Array.isArray(richContent[7])) {
+        scanGeminiHistoryImageRefs(richContent[7], baseUrl, output);
+      }
+      value.forEach(visit);
+      return;
+    }
+    Object.values(value).forEach(visit);
+  };
+  visit(payloads);
+  return [...output];
+}
+
+function extractGeminiHistoryText(payloads) {
+  const output = [];
+  const visit = (value) => {
+    if (!Array.isArray(value)) {
+      if (value && typeof value === "object") Object.values(value).forEach(visit);
+      return;
+    }
+    if (
+      typeof value[0] === "string"
+      && value[0].startsWith("rc_")
+      && Array.isArray(value[1])
+      && typeof value[1][0] === "string"
+      && value[1][0].trim()
+    ) {
+      output.push(value[1][0].trim());
+    }
+    value.forEach(visit);
+  };
+  visit(payloads);
+  return output[output.length - 1] || "";
 }
 
 function extractGeminiErrorText(events) {
@@ -2364,13 +2456,100 @@ export class ChatplusClient {
   }
 
   async conversationDetail(conversationId, options = {}) {
-    return this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
-      ...options,
+    const { fresh = true, ...requestOptions } = options;
+    const path = `/backend-api/conversation/${encodeURIComponent(conversationId)}`;
+    return this.json(fresh ? `${path}?_=${Date.now()}` : path, {
+      ...requestOptions,
       headers: {
         ...CONVERSATION_READ_HEADERS,
-        ...(options.headers || {})
+        ...(requestOptions.headers || {})
       }
     });
+  }
+
+  async geminiConversationDetail(conversationId, options = {}) {
+    const normalizedId = normalizeGeminiConversationId(conversationId);
+    if (!normalizedId) {
+      const error = new Error("Gemini 上游对话编号无效。");
+      error.code = "INVALID_UPSTREAM_CONVERSATION_ID";
+      throw error;
+    }
+
+    const routeId = normalizedId.replace(/^c_/i, "");
+    const sourcePath = `/app/${encodeURIComponent(routeId)}`;
+    for (let attempt = 0; attempt < GEMINI_CONVERSATION_RELOAD_LIMIT; attempt += 1) {
+      const page = await this.http(`${sourcePath}?_=${Date.now()}-${attempt}`, {
+        followRedirect: true,
+        timeoutSec: options.timeoutSec,
+        headers: {
+          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          ...CONVERSATION_READ_HEADERS
+        }
+      });
+      if (page.status < 200 || page.status >= 300) {
+        const error = new Error(`Gemini 会话页面读取失败：${page.status}`);
+        error.status = page.status;
+        throw error;
+      }
+      this.geminiSession = geminiSessionFromPage(page.body, this.geminiSession);
+
+      const params = new URLSearchParams({
+        rpcids: GEMINI_CONVERSATION_RPC_ID,
+        "source-path": sourcePath,
+        hl: "zh-CN",
+        rt: "c"
+      });
+      const requestPayload = JSON.stringify([[[
+        GEMINI_CONVERSATION_RPC_ID,
+        JSON.stringify([normalizedId, 1000, null, 1, [1], [4], null, 1]),
+        null,
+        "generic"
+      ]]]);
+      const form = new URLSearchParams({ "f.req": requestPayload });
+      if (this.geminiSession.at) form.set("at", this.geminiSession.at);
+      const response = await this.http(`${GEMINI_UPLOAD_PREFLIGHT_PATH}?${params.toString()}`, {
+        method: "POST",
+        body: `${form.toString()}&`,
+        rawBody: true,
+        timeoutSec: options.timeoutSec,
+        headers: {
+          accept: "*/*",
+          "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+          "x-same-domain": "1",
+          referer: `${this.baseUrl}${sourcePath}`,
+          ...CONVERSATION_READ_HEADERS
+        }
+      });
+
+      let directError = "";
+      try {
+        directError = JSON.parse(response.body || "")?.error || "";
+      } catch {
+        directError = "";
+      }
+      if (directError === "need_reload") continue;
+      if (response.status < 200 || response.status >= 300) {
+        const error = new Error(`Gemini 会话详情读取失败：${response.status}`);
+        error.status = response.status;
+        error.body = response.body;
+        throw error;
+      }
+      const payloads = parseGeminiBatchPayloads(response.body, GEMINI_CONVERSATION_RPC_ID);
+      if (!payloads.length) {
+        const error = new Error("Gemini 上游暂时没有返回有效会话内容。");
+        error.code = "UPSTREAM_TASK_STATE_UNAVAILABLE";
+        throw error;
+      }
+      return {
+        conversationId: normalizedId,
+        sourcePath,
+        payloads
+      };
+    }
+
+    const error = new Error("Gemini 会话暂时位于其他上游节点，重新连接后仍未读到结果。");
+    error.code = "UPSTREAM_TASK_STATE_UNAVAILABLE";
+    throw error;
   }
 
   resetSession() {
@@ -3106,6 +3285,7 @@ export class ChatplusClient {
   }
 
   async imageUrlsFrom(value, options = {}) {
+    if (options.geminiHistory) return extractGeminiHistoryImageUrls(value?.payloads || value, this.baseUrl);
     if (options.gemini) return extractGeminiImageUrls(value, this.baseUrl);
     const refs = options.generatedOnly
       ? scanForVisibleGeneratedImageRefs(value, this.baseUrl)
@@ -3964,6 +4144,32 @@ export class ChatplusClient {
     throw error;
   }
 
+  async waitForGeminiConversationImages(conversation, timeoutSec) {
+    let imageUrls = Array.isArray(conversation?.imageUrls) ? conversation.imageUrls.filter(Boolean) : [];
+    const conversationId = normalizeGeminiConversationId(conversation?.conversationId);
+    if (imageUrls.length || !conversationId) return imageUrls;
+
+    const timeoutMs = Math.max(5, Number(timeoutSec || this.config.waitTimeoutSec || DEFAULT_CHAT_HTTP_TIMEOUT_SEC)) * 1000;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const detail = await this.geminiConversationDetail(conversationId, {
+          timeoutSec: Math.min(30, Math.max(5, Math.ceil((deadline - Date.now()) / 1000)))
+        });
+        imageUrls = await this.imageUrlsFrom(detail, { geminiHistory: true });
+        if (imageUrls.length) return imageUrls;
+        const content = extractGeminiHistoryText(detail.payloads);
+        throwIfImageGenerationLimit(content, { car: true });
+        throwIfTerminalImageFailure(content);
+      } catch (error) {
+        if (error.imageCarQuotaExhausted || error.imageQuotaExhausted || error.upstreamExplicitFailure) throw error;
+        // Gemini can move a conversation between upstream nodes while the image is finishing.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+    return [];
+  }
+
   async waitForConversationImages(events, conversationId, timeoutSec, options = {}) {
     const initialResponse = imageAssistantResponseState(events);
     const initialContent = initialResponse.content;
@@ -4017,8 +4223,11 @@ export class ChatplusClient {
     const requestOptions = timeoutSec > 0 ? { timeoutSec } : {};
     const taskCarId = String(context.carId || "").trim();
     const taskCarType = String(context.carType || "chatgpt").trim() || "chatgpt";
+    const geminiTask = taskCarType === "gemini" || Boolean(normalizeGeminiConversationId(externalId));
     const readDetail = async (reader = this) => {
-      const payload = await reader.conversationDetail(externalId, requestOptions);
+      const payload = geminiTask
+        ? await reader.geminiConversationDetail(externalId, requestOptions)
+        : await reader.conversationDetail(externalId, requestOptions);
       if (!payload || typeof payload !== "object") {
         const error = new Error("上游暂时没有返回有效任务状态。");
         error.code = "UPSTREAM_TASK_STATE_UNAVAILABLE";
@@ -4052,7 +4261,7 @@ export class ChatplusClient {
     let detail = null;
     if (taskCarId) {
       try {
-        detail = await readDetail(await restoreConversationSession());
+        detail = await readDetail(await restoreConversationSession(context.forceReconnect === true));
       } catch (directError) {
         if (!isAuthSessionError(directError)) throw directError;
         detail = await readDetail(await restoreConversationSession(true));
@@ -4066,7 +4275,9 @@ export class ChatplusClient {
         detail = await readDetail(await restoreConversationSession(resetAfterDirectRead));
       }
     }
-    const imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
+    const imageUrls = await this.imageUrlsFrom(detail, geminiTask
+      ? { geminiHistory: true }
+      : { generatedOnly: true });
     if (imageUrls.length) {
       await this.rememberImageSuccessfulCar({
         carId: context.carId || this.carId,
@@ -4079,6 +4290,40 @@ export class ChatplusClient {
         imageUrls,
         errorMessage: "",
         raw: detail
+      };
+    }
+    if (geminiTask) {
+      const content = extractGeminiHistoryText(detail.payloads);
+      if (isImageGenerationLimitMessage(content)) {
+        return {
+          externalId,
+          status: "failed",
+          imageCount: 0,
+          imageUrls: [],
+          errorMessage: content || "当前 Gemini 车位图片生成次数已用完。",
+          raw: detail
+        };
+      }
+      if (isTerminalImageFailureMessage(content)) {
+        return {
+          externalId,
+          status: "failed",
+          imageCount: 0,
+          imageUrls: [],
+          errorMessage: content,
+          raw: detail
+        };
+      }
+      return {
+        externalId,
+        status: "waiting_upstream",
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: "",
+        raw: {
+          ...detail,
+          ...(content ? { upstreamText: content } : {})
+        }
       };
     }
     const responseState = imageAssistantResponseState(detail);
@@ -4159,15 +4404,30 @@ export class ChatplusClient {
       }, async (conversation) => {
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
         throwIfImageGenerationLimit(conversation.events, { car: true });
-        if (["gemini", "grok"].includes(conversation.route?.key)) {
-          const imageUrls = conversation.imageUrls || [];
+        if (conversation.route?.key === "gemini") {
+          let imageUrls = conversation.imageUrls || [];
           if (!imageUrls.length) {
-            if (conversation.route?.key === "gemini") {
-              throwIfTerminalImageFailure(conversation.directContent, { policyOnly: true });
-              await this.rememberImageFailedCar(conversation.selected);
+            try {
+              throwIfTerminalImageFailure(conversation.directContent);
+            } catch (error) {
+              await this.rememberImageFailedCar(conversation.selected, error);
+              throw error;
             }
-            throwIfTextImageResponse(conversation.directContent, { requireResult: true });
+            if (input.waitForImages !== false) {
+              const waitClient = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
+              imageUrls = await measureTaskStage(taskStageRecorder, {
+                key: "result_wait",
+                label: "等待图片完成",
+                carId: conversation.selected?.carId,
+                carType: conversation.selected?.carType
+              }, async () => waitClient.waitForGeminiConversationImages(conversation, input.waitTimeoutSec));
+            }
           }
+          return { ...conversation, imageUrls };
+        }
+        if (conversation.route?.key === "grok") {
+          const imageUrls = conversation.imageUrls || [];
+          if (!imageUrls.length) throwIfTextImageResponse(conversation.directContent, { requireResult: true });
           return { ...conversation, imageUrls };
         }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };
@@ -4221,15 +4481,30 @@ export class ChatplusClient {
       }, async (conversation) => {
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
         throwIfImageGenerationLimit(conversation.events, { car: true });
-        if (["gemini", "grok"].includes(conversation.route?.key)) {
-          const imageUrls = conversation.imageUrls || [];
+        if (conversation.route?.key === "gemini") {
+          let imageUrls = conversation.imageUrls || [];
           if (!imageUrls.length) {
-            if (conversation.route?.key === "gemini") {
-              throwIfTerminalImageFailure(conversation.directContent, { policyOnly: true });
-              await this.rememberImageFailedCar(conversation.selected);
+            try {
+              throwIfTerminalImageFailure(conversation.directContent);
+            } catch (error) {
+              await this.rememberImageFailedCar(conversation.selected, error);
+              throw error;
             }
-            throwIfTextImageResponse(conversation.directContent, { requireResult: true });
+            if (input.waitForImages !== false) {
+              const waitClient = conversation.submitSessionSnapshot ? this.createSubmitClient(conversation) : this;
+              imageUrls = await measureTaskStage(taskStageRecorder, {
+                key: "result_wait",
+                label: "等待图片完成",
+                carId: conversation.selected?.carId,
+                carType: conversation.selected?.carType
+              }, async () => waitClient.waitForGeminiConversationImages(conversation, input.waitTimeoutSec));
+            }
           }
+          return { ...conversation, imageUrls };
+        }
+        if (conversation.route?.key === "grok") {
+          const imageUrls = conversation.imageUrls || [];
+          if (!imageUrls.length) throwIfTextImageResponse(conversation.directContent, { requireResult: true });
           return { ...conversation, imageUrls };
         }
         if (input.waitForImages === false) return { ...conversation, imageUrls: [] };

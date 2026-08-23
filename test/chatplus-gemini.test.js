@@ -53,6 +53,17 @@ function geminiResponse({ text = "", imageUrl = "", error = "" } = {}) {
   return JSON.stringify([["wrb.fr", "StreamGenerate", JSON.stringify(responsePart), null, null]]);
 }
 
+function geminiHistoryResponse({ text = "", generatedUrl = "", sourceUrl = "" } = {}) {
+  const candidate = Array(13).fill(null);
+  candidate[0] = "rc_history_result";
+  candidate[1] = [text];
+  candidate[12] = Array(8).fill(null);
+  candidate[12][7] = [[[null, 1, "generated.jpg", generatedUrl]]];
+  const payload = [candidate, [null, 1, "source.jpg", sourceUrl]];
+  const batch = JSON.stringify([["wrb.fr", "hNvQHb", JSON.stringify(payload), null, null]]);
+  return `)]}'\n\n${batch.length}\n${batch}\n`;
+}
+
 function fakeImageFile() {
   return {
     filename: "source.png",
@@ -568,7 +579,84 @@ test("Gemini 同时返回原图和生成图时只保留生成图", async () => {
   ]);
 });
 
-test("Gemini 没有生成图也没有文字时只提交一次", async () => {
+test("Gemini 会话换节点后会刷新重读，并且只取生成结果", async () => {
+  const testClient = client();
+  const pageRequests = [];
+  const detailRequests = [];
+  testClient.http = async (requestPath, options = {}) => {
+    if (requestPath.startsWith("/app/ce144bba99281e12?_=")) {
+      pageRequests.push(requestPath);
+      return { status: 200, headers: {}, body: '"SNlM0e":"history-token"' };
+    }
+    detailRequests.push({ requestPath, options });
+    if (detailRequests.length === 1) {
+      return { status: 200, headers: {}, body: JSON.stringify({ error: "need_reload" }) };
+    }
+    return {
+      status: 200,
+      headers: {},
+      body: geminiHistoryResponse({
+        text: "{image}",
+        sourceUrl: "/gemini/images/gg/source-image",
+        generatedUrl: "/gemini/images/gg/generated-image"
+      })
+    };
+  };
+
+  const detail = await testClient.geminiConversationDetail("c_ce144bba99281e12");
+  const imageUrls = await testClient.imageUrlsFrom(detail, { geminiHistory: true });
+
+  assert.equal(pageRequests.length, 2);
+  assert.equal(detailRequests.length, 2);
+  assert.match(detailRequests[0].requestPath, /^\/_\/BardChatUi\/data\/batchexecute\?/);
+  assert.match(detailRequests[0].requestPath, /rpcids=hNvQHb/);
+  assert.match(detailRequests[0].requestPath, /source-path=%2Fapp%2Fce144bba99281e12/);
+  assert.equal(detailRequests[0].options.method, "POST");
+  assert.deepEqual(imageUrls, [
+    "https://claude.midjourneye.com/gemini/images/gg/generated-image"
+  ]);
+});
+
+test("Gemini 先返回处理说明、稍后返回图片时不会提前结束或重复提交", async () => {
+  const testClient = client();
+  const submitted = [];
+  let submissionCount = 0;
+  let historyReadCount = 0;
+  testClient.withImageQuotaFallback = async (_prompt, _input, work) => {
+    submissionCount += 1;
+    return work({
+      events: [],
+      conversationId: "c_delayed_image_result",
+      model: "gemini",
+      upstreamModel: "gemini-3.1-pro",
+      route: { key: "gemini" },
+      selected: { carId: "gemini-car", carType: "gemini" },
+      submissionConfirmed: true,
+      directContent: "**Refine Brush Details** I'm now zeroing in on the product details.",
+      imageUrls: []
+    });
+  };
+  testClient.waitForGeminiConversationImages = async () => {
+    historyReadCount += 1;
+    return ["https://example.test/delayed-generated-image.png"];
+  };
+  testClient.rememberImageSuccessfulCar = async () => {};
+
+  const result = await testClient.createImageTask({
+    prompt: "替换背景并保持产品一致",
+    model: "gemini",
+    files: [fakeImageFile()],
+    onSubmitted: async (value) => submitted.push(value)
+  });
+
+  assert.equal(submissionCount, 1);
+  assert.equal(submitted.length, 1);
+  assert.equal(historyReadCount, 1);
+  assert.equal(result.status, "success");
+  assert.deepEqual(result.imageUrls, ["https://example.test/delayed-generated-image.png"]);
+});
+
+test("Gemini 没有立即返回结果时只提交一次并进入等待", async () => {
   const testClient = client();
   const cars = ["source-only-car", "image-car"];
   const selectedCars = [];
@@ -597,18 +685,18 @@ test("Gemini 没有生成图也没有文字时只提交一次", async () => {
     };
   };
 
-  await assert.rejects(
-    () => testClient.createImageTask({
-      prompt: "只返回图片",
-      model: "gemini",
-      files: [fakeImageFile()],
-      onSubmitted: async (value) => submitted.push(value)
-    }),
-    (error) => error.code === "upstream_text_response"
-  );
+  const result = await testClient.createImageTask({
+    prompt: "只返回图片",
+    model: "gemini",
+    files: [fakeImageFile()],
+    waitForImages: false,
+    onSubmitted: async (value) => submitted.push(value)
+  });
 
   assert.deepEqual(selectedCars, ["source-only-car"]);
   assert.equal(submitted.length, 1);
+  assert.equal(result.status, "waiting_upstream");
+  assert.deepEqual(result.imageUrls, []);
 });
 
 test("Gemini 只返回文字时停止当前任务并让该车位冷却", async () => {

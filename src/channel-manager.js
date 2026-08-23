@@ -1529,7 +1529,7 @@ function upstreamDetailTitle(raw = {}) {
 }
 
 export async function inspectUpstreamTask(taskId) {
-  const task = await getTask(taskId);
+  let task = await getTask(taskId);
   if (!task) throw new Error("任务不存在。");
 
   const config = await loadRuntimeConfig();
@@ -1547,65 +1547,40 @@ export async function inspectUpstreamTask(taskId) {
     throw error;
   }
 
-  if (taskUsesGemini(task)) {
-    const imageUrls = Array.isArray(task.imageUrls) ? task.imageUrls.filter(Boolean) : [];
-    return {
-      taskId: task.id,
-      sourceTaskId: task.sourceTaskId || task.requestMeta?.sourceTaskId || "",
-      externalId,
-      conversationId: externalId,
-      conversationUrl: upstreamConversationUrl(channel, externalId, { gemini: true }),
-      title: upstreamDetailTitle(task.raw || {}),
-      status: task.status || "",
-      imageCount: Number(task.imageCount || imageUrls.length),
-      imageUrls,
-      errorMessage: task.status === "success"
-        ? ""
-        : task.errorMessage || task.responseJson?.message || task.upstreamText || "",
-      channelId: channel.id,
-      channelName: channel.name,
-      accountId: account.id,
-      accountName: account.name,
-      carId: String(task.raw?.selectedCarId || "").trim(),
-      carType: String(task.raw?.selectedCarType || "gemini").trim(),
-      detailSource: "stored"
-    };
-  }
+  const storedImages = Array.isArray(task.imageUrls) ? task.imageUrls.filter(Boolean) : [];
+  const useStoredResult = task.status === "success" && storedImages.length > 0;
+  if (!useStoredResult) task = await refreshTask(task.id, { force: true });
 
-  const client = getWorkClient(config, channel, account);
-  if (typeof client.getTask !== "function") {
-    const error = new Error("当前上游不支持读取会话详情。");
-    error.status = 400;
-    throw error;
-  }
-
-  const result = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
-    carId: task.raw?.selectedCarId,
-    carType: task.raw?.selectedCarType
-  }));
-  const raw = result.raw || {};
+  const raw = task.raw || {};
   const conversationId = String(raw.conversationId || raw.conversation_id || externalId).trim();
+  const imageUrls = Array.isArray(task.imageUrls) ? task.imageUrls.filter(Boolean) : [];
+  const gemini = taskUsesGemini(task);
 
   return {
     taskId: task.id,
     sourceTaskId: task.sourceTaskId || task.requestMeta?.sourceTaskId || "",
     externalId,
     conversationId,
-    conversationUrl: upstreamConversationUrl(channel, conversationId),
-    title: upstreamDetailTitle(raw) || upstreamDetailTitle(task.raw || {}),
-    status: result.status || task.status || "",
-    imageCount: Number(result.imageCount || 0),
-    imageUrls: result.imageUrls || [],
-    errorMessage: result.status === "success"
+    conversationUrl: upstreamConversationUrl(channel, conversationId, { gemini }),
+    title: upstreamDetailTitle(raw),
+    status: task.status || "",
+    imageCount: Number(task.imageCount || imageUrls.length),
+    imageUrls,
+    errorMessage: task.status === "success"
       ? ""
-      : result.errorMessage || task.errorMessage || task.responseJson?.message || "",
+      : task.upstreamText
+        || raw.upstreamText
+        || raw.refreshErrorMessage
+        || task.errorMessage
+        || task.responseJson?.message
+        || "",
     channelId: channel.id,
     channelName: channel.name,
     accountId: account.id,
     accountName: account.name,
-    carId: String(task.raw?.selectedCarId || raw.selectedCarId || "").trim(),
-    carType: String(task.raw?.selectedCarType || raw.selectedCarType || "").trim(),
-    detailSource: "upstream",
+    carId: String(raw.selectedCarId || "").trim(),
+    carType: String(raw.selectedCarType || (gemini ? "gemini" : "")).trim(),
+    detailSource: useStoredResult ? "stored" : "upstream",
     raw
   };
 }
@@ -1648,8 +1623,21 @@ function isTerminalRefreshError(error) {
   return error?.code === "INVALID_UPSTREAM_RESPONSE";
 }
 
-function checkedRefreshResult(result = {}) {
+function upstreamResultFingerprint(result = {}) {
+  return JSON.stringify({
+    status: result.status || "unknown",
+    imageUrls: usableImageResultUrls(result.imageUrls),
+    errorMessage: String(result.errorMessage || "").trim(),
+    upstreamText: resultUpstreamText(result)
+  });
+}
+
+function checkedRefreshResult(result = {}, task = {}, options = {}) {
   const checkedAt = new Date().toISOString();
+  const fingerprint = upstreamResultFingerprint(result);
+  const unchangedChecks = fingerprint === task.raw?.lastUpstreamFingerprint
+    ? Number(task.raw?.unchangedUpstreamChecks || 0) + 1
+    : 0;
   return {
     ...result,
     raw: {
@@ -1662,9 +1650,19 @@ function checkedRefreshResult(result = {}) {
       refreshErrorCode: "",
       refreshErrorStatus: "",
       lastUpstreamCheckAt: checkedAt,
-      lastUpstreamCheckStatus: result.status || "unknown"
+      lastUpstreamCheckStatus: result.status || "unknown",
+      lastUpstreamFingerprint: fingerprint,
+      unchangedUpstreamChecks: unchangedChecks,
+      ...(options.reconnected ? { lastUpstreamReconnectAt: checkedAt } : {})
     }
   };
+}
+
+function upstreamReconnectDue(task = {}, finalCheck = false, now = Date.now()) {
+  if (finalCheck) return true;
+  if (Number(task.raw?.unchangedUpstreamChecks || 0) < 3) return false;
+  const lastReconnectAt = Date.parse(task.raw?.lastUpstreamReconnectAt || "");
+  return !Number.isFinite(lastReconnectAt) || now - lastReconnectAt >= 60_000;
 }
 
 function upstreamWaitStartedAt(task = {}) {
@@ -2491,11 +2489,11 @@ async function interruptUnrecoverableGeminiTask(task) {
   return interruptedTask;
 }
 
-async function refreshTaskOnce(taskId) {
+async function refreshTaskOnce(taskId, options = {}) {
   const task = await getTask(taskId);
   if (!task) throw new Error("任务不存在。");
   const manualRetry = retryableInterruptedUpstreamTask(task);
-  if (!needsTaskRefresh(task) && !manualRetry) return task;
+  if (!needsTaskRefresh(task) && !manualRetry && options.force !== true) return task;
 
   const config = await loadRuntimeConfig();
   let channel;
@@ -2562,6 +2560,7 @@ async function refreshTaskOnce(taskId) {
     !storedMirrorError
     && storedTaskModelKey(task) === "gemini"
     && task.raw?.submitted === true
+    && !validGeminiConversationId(externalId)
   ) {
     if (taskStillActive) return task;
     return interruptUnrecoverableGeminiTask(task);
@@ -2569,11 +2568,14 @@ async function refreshTaskOnce(taskId) {
 
   let refreshedResult;
   let refreshReadSucceeded = false;
+  const finalCheck = upstreamResultWaitExpired(task);
+  const forceReconnect = upstreamReconnectDue(task, finalCheck);
   try {
     refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
       carId: task.raw?.selectedCarId,
       carType: task.raw?.selectedCarType,
-      timeoutSec: FAST_TASK_REFRESH_TIMEOUT_SEC
+      timeoutSec: FAST_TASK_REFRESH_TIMEOUT_SEC,
+      forceReconnect
     }));
     refreshReadSucceeded = true;
   } catch (error) {
@@ -2585,7 +2587,9 @@ async function refreshTaskOnce(taskId) {
     }
     refreshedResult = failedRefreshResult(task, externalId, error);
   }
-  if (refreshReadSucceeded) refreshedResult = checkedRefreshResult(refreshedResult);
+  if (refreshReadSucceeded) {
+    refreshedResult = checkedRefreshResult(refreshedResult, task, { reconnected: forceReconnect });
+  }
   if (manualRetry && !isFinishedTask(refreshedResult?.status)) {
     return keepInterruptedAfterManualRefresh(task, refreshedResult, channel, account);
   }
@@ -2654,11 +2658,11 @@ async function refreshTaskOnce(taskId) {
   return nextTask;
 }
 
-export async function refreshTask(taskId) {
+export async function refreshTask(taskId, options = {}) {
   const key = String(taskId || "");
   const active = activeTaskRefreshes.get(key);
   if (active) return active;
-  const refresh = refreshTaskOnce(taskId).finally(() => {
+  const refresh = refreshTaskOnce(taskId, options).finally(() => {
     if (activeTaskRefreshes.get(key) === refresh) activeTaskRefreshes.delete(key);
   });
   activeTaskRefreshes.set(key, refresh);

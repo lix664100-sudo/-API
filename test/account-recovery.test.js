@@ -754,7 +754,7 @@ test("读取旧任务遇到登录失效会重新登录并回到原车位", async
   };
   client.createSubmitClient = () => client;
   client.json = async (pathName) => {
-    assert.equal(pathName, "/backend-api/conversation/conversation-session-recovery");
+    assert.match(pathName, /^\/backend-api\/conversation\/conversation-session-recovery\?_\=\d+$/);
     detailReadCount += 1;
     if (detailReadCount === 1) {
       const error = new Error("身份验证失败，请重新登录");

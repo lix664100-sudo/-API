@@ -2035,7 +2035,7 @@ test("旧任务重试次数耗尽后仍可恢复被临时地址挡住的真实�
   }
 });
 
-test("没有保存结果的旧 Gemini 任务会停止而不是永久处理中", async () => {
+test("没有真实上游编号的旧 Gemini 任务会停止而不是永久处理中", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -2058,7 +2058,7 @@ test("没有保存结果的旧 Gemini 任务会停止而不是永久处理中", 
   const id = "task-old-gemini-without-result";
   await upsertTask({
     id,
-    externalId: "c_old_gemini_without_result",
+    externalId: "old-gemini-without-conversation-id",
     status: "processing",
     taskType: "img2img",
     modelId: "gemini",
@@ -2097,6 +2097,116 @@ test("没有保存结果的旧 Gemini 任务会停止而不是永久处理中", 
   } finally {
     ChatplusClient.prototype.getTask = originalGetTask;
     await saveConfig(config);
+  }
+});
+
+test("Gemini 已生成图片但本地漏收时，查看详情会补回并保存结果", async () => {
+  const originalConfig = await loadConfig();
+  const channel = {
+    id: "gemini-history-recovery",
+    name: "Gemini补图测试渠道",
+    type: "shareai",
+    enabled: true,
+    settings: {
+      chatBaseUrl: "https://cloudlian.cn",
+      defaultChatModel: "gemini",
+      chatModels: [{ key: "gemini", name: "Gemini", carType: "gemini", enabled: true, default: true }]
+    }
+  };
+  const account = {
+    id: "account-gemini-history-recovery",
+    channelId: channel.id,
+    name: "Gemini补图测试账号",
+    username: "gemini-history-recovery@example.com",
+    password: "test",
+    enabled: true,
+    status: "ok"
+  };
+  await saveConfig({
+    ...originalConfig,
+    imageStorage: { ...(originalConfig.imageStorage || {}), mode: "smart" },
+    channels: [channel, ...originalConfig.channels.filter((item) => item.id !== channel.id)],
+    accounts: [account, ...originalConfig.accounts.filter((item) => item.id !== account.id)]
+  });
+
+  const id = "task-gemini-history-recovery";
+  const generatedUrl = "https://cloudlian.cn/gemini/images/gg/generated-after-text";
+  await upsertTask({
+    id,
+    externalId: "c_ce144bba99281e12",
+    status: "failed",
+    taskType: "img2img",
+    modelId: "gemini",
+    prompt: "恢复上游已经生成的图片",
+    channelId: `${channel.id}:chatplus`,
+    channelName: `${channel.name}/聊天生图`,
+    channelType: "chatplus",
+    accountId: account.id,
+    accountName: account.name,
+    imageCount: 0,
+    imageUrls: [],
+    errorMessage: "**Refine Brush Details** I'm now zeroing in on the product details.",
+    raw: {
+      submitted: true,
+      conversationId: "c_ce144bba99281e12",
+      chatModel: "gemini",
+      selectedCarId: "gemini-car",
+      selectedCarType: "gemini"
+    },
+    createdAt: new Date().toISOString(),
+    completedAt: new Date().toISOString()
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  const originalDownloadResultImage = ChatplusClient.prototype.downloadResultImage;
+  let queried = null;
+  let downloadedUrl = "";
+  let localFilename = "";
+  ChatplusClient.prototype.getTask = async function getTaskFromHistory(externalId, context) {
+    queried = { externalId, context, baseUrl: this.baseUrl };
+    return {
+      externalId,
+      status: "success",
+      imageCount: 1,
+      imageUrls: [generatedUrl],
+      errorMessage: "",
+      raw: {
+        conversationId: externalId,
+        selectedCarId: context.carId,
+        selectedCarType: context.carType
+      }
+    };
+  };
+  ChatplusClient.prototype.downloadResultImage = async (url) => {
+    downloadedUrl = url;
+    return {
+      buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]),
+      contentType: "image/png"
+    };
+  };
+
+  try {
+    const detail = await inspectUpstreamTask(id);
+    const saved = await getTask(id);
+
+    assert.equal(queried.externalId, "c_ce144bba99281e12");
+    assert.equal(queried.context.carId, "gemini-car");
+    assert.equal(queried.context.carType, "gemini");
+    assert.equal(queried.baseUrl, "https://cloudlian.cn");
+    assert.equal(downloadedUrl, generatedUrl);
+    assert.equal(detail.status, "success");
+    assert.equal(detail.detailSource, "upstream");
+    assert.equal(detail.imageUrls.length, 1);
+    assert.equal(saved.status, "success");
+    assert.deepEqual(saved.imageUrls, detail.imageUrls);
+    localFilename = path.basename(detail.imageUrls[0]);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    ChatplusClient.prototype.downloadResultImage = originalDownloadResultImage;
+    await saveConfig(originalConfig);
+    if (localFilename) {
+      await rm(path.join(process.cwd(), "outputs", "results", localFilename), { force: true });
+    }
   }
 });
 
