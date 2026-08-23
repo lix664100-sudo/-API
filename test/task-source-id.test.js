@@ -496,6 +496,111 @@ test("chatplus task refresh bypasses cached conversation results", async () => {
   assert.deepEqual(loginOptions, [{ timeoutSec: 30 }]);
 });
 
+test("chatplus task refresh syncs a completed async image before reading the result", async () => {
+  const resultUrl = "https://one.example.test/generated-after-async-sync.png";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-async-sync-account", username: "async-sync@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+
+  const requests = [];
+  let synced = false;
+  client.json = async (pathName, options = {}) => {
+    requests.push({ pathName, options });
+    if (pathName.includes("/stream_status")) return { status: "COMPLETE" };
+    if (pathName.endsWith("/async-status")) {
+      synced = true;
+      return { status: "OK" };
+    }
+    if (!synced) {
+      return {
+        async_status: 5,
+        current_node: "pending-tool",
+        mapping: {
+          "pending-tool": {
+            parent: null,
+            message: {
+              author: { role: "tool" },
+              content: { content_type: "multimodal_text", parts: [] },
+              metadata: { ghostrider: { status: "intermediate" } },
+              status: "finished_successfully"
+            }
+          }
+        }
+      };
+    }
+    return {
+      async_status: null,
+      current_node: "final-image",
+      mapping: {
+        "final-image": {
+          parent: null,
+          message: {
+            author: { role: "tool" },
+            content: {
+              content_type: "multimodal_text",
+              parts: [{ type: "image_url", image_url: resultUrl }]
+            },
+            metadata: { ghostrider: { status: "final" } },
+            status: "finished_successfully"
+          }
+        }
+      }
+    };
+  };
+
+  const task = await client.getTask("conversation-async-complete", { timeoutSec: 30 });
+
+  assert.equal(task.status, "success");
+  assert.deepEqual(task.imageUrls, [resultUrl]);
+  assert.equal(requests.filter((item) => item.pathName.includes("/stream_status")).length, 1);
+  const syncRequest = requests.find((item) => item.pathName.endsWith("/async-status"));
+  assert.equal(syncRequest?.options?.method, "POST");
+  assert.equal(
+    requests.filter((item) => /^\/backend-api\/conversation\/conversation-async-complete\?_\=\d+$/.test(item.pathName)).length,
+    2
+  );
+});
+
+test("chatplus task refresh does not sync an async image that is still running", async () => {
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-async-running-account", username: "async-running@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+
+  const requests = [];
+  client.json = async (pathName, options = {}) => {
+    requests.push({ pathName, options });
+    if (pathName.includes("/stream_status")) return { status: "IN_PROGRESS" };
+    return {
+      async_status: 5,
+      current_node: "pending-tool",
+      mapping: {
+        "pending-tool": {
+          parent: null,
+          message: {
+            author: { role: "tool" },
+            content: { content_type: "multimodal_text", parts: [] },
+            metadata: { ghostrider: { status: "intermediate" } },
+            status: "finished_successfully"
+          }
+        }
+      }
+    };
+  };
+
+  const task = await client.getTask("conversation-async-running", { timeoutSec: 30 });
+
+  assert.equal(task.status, "waiting_upstream");
+  assert.equal(requests.some((item) => item.pathName.endsWith("/async-status")), false);
+});
+
 test("chatplus task refresh keeps image parameters in progress until the image appears", async () => {
   const imageParameters = JSON.stringify({
     prompt: null,

@@ -2247,6 +2247,7 @@ export class ChatplusClient {
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWorks = new Map();
     this.concurrentChatSessions = new Map();
+    this.completedConversationSyncs = new Map();
     this.sessionRevision = 0;
     this.proCarRestrictionSaved = savedProCarRestriction(account, channel);
     this.proCarsUnavailableUntil = savedProCarRestrictionUntil(account, channel);
@@ -2467,6 +2468,52 @@ export class ChatplusClient {
     });
   }
 
+  async conversationStreamStatus(conversationId, options = {}) {
+    const { fresh = true, ...requestOptions } = options;
+    const path = `/backend-api/conversation/${encodeURIComponent(conversationId)}/stream_status`;
+    return this.json(fresh ? `${path}?_=${Date.now()}` : path, {
+      ...requestOptions,
+      headers: {
+        ...CONVERSATION_READ_HEADERS,
+        ...(requestOptions.headers || {})
+      }
+    });
+  }
+
+  async refreshCompletedConversation(conversationId, detail, options = {}) {
+    if (!conversationId || detail?.async_status === null || detail?.async_status === undefined) return detail;
+
+    let completed = this.completedConversationSyncs.get(conversationId);
+    if (!completed) {
+      let streamStatus;
+      try {
+        streamStatus = await this.conversationStreamStatus(conversationId, options);
+      } catch {
+        return detail;
+      }
+      if (String(streamStatus?.status || "").trim().toUpperCase() !== "COMPLETE") return detail;
+
+      const { fresh: _fresh, ...requestOptions } = options;
+      completed = this.json(`/backend-api/conversation/${encodeURIComponent(conversationId)}/async-status`, {
+        ...requestOptions,
+        method: "POST",
+        headers: {
+          ...CONVERSATION_READ_HEADERS,
+          ...(requestOptions.headers || {})
+        }
+      });
+      this.completedConversationSyncs.set(conversationId, completed);
+    }
+
+    try {
+      await completed;
+      return await this.conversationDetail(conversationId, options);
+    } catch {
+      this.completedConversationSyncs.delete(conversationId);
+      return detail;
+    }
+  }
+
   async geminiConversationDetail(conversationId, options = {}) {
     const normalizedId = normalizeGeminiConversationId(conversationId);
     if (!normalizedId) {
@@ -2567,6 +2614,7 @@ export class ChatplusClient {
       sourcePath: "/app"
     };
     this.concurrentChatSessions.clear();
+    this.completedConversationSyncs.clear();
   }
 
   sessionSnapshot() {
@@ -4188,15 +4236,18 @@ export class ChatplusClient {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
-        const detail = await this.conversationDetail(conversationId);
+        let detail = await this.conversationDetail(conversationId);
+        imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
+        if (imageUrls.length) return imageUrls;
+        detail = await this.refreshCompletedConversation(conversationId, detail);
+        imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
+        if (imageUrls.length) return imageUrls;
         const responseState = imageAssistantResponseState(detail);
         const content = responseState.content;
         const intermediateResponse = isChatImageIntermediateResponse(content);
         if (!intermediateResponse || imageGenerationLimitContent(detail)) {
           throwIfImageGenerationLimit(detail, { car: true });
         }
-        imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
-        if (imageUrls.length) return imageUrls;
         if (!intermediateResponse && !responseState.inProgress) {
           throwIfTerminalImageFailure(content);
           throwIfTextImageResponse(content);
@@ -4275,9 +4326,13 @@ export class ChatplusClient {
         detail = await readDetail(await restoreConversationSession(resetAfterDirectRead));
       }
     }
-    const imageUrls = await this.imageUrlsFrom(detail, geminiTask
+    let imageUrls = await this.imageUrlsFrom(detail, geminiTask
       ? { geminiHistory: true }
       : { generatedOnly: true });
+    if (!geminiTask && !imageUrls.length) {
+      detail = await this.refreshCompletedConversation(externalId, detail, requestOptions);
+      imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
+    }
     if (imageUrls.length) {
       await this.rememberImageSuccessfulCar({
         carId: context.carId || this.carId,
