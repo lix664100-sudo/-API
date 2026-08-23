@@ -647,6 +647,18 @@
         border-radius: 50%;
       }
 
+      .quota-reset-tag.is-failed {
+        color: #b42318;
+        background: #fef3f2;
+        border-color: #fecdca;
+      }
+
+      .quota-reset-tag.is-waiting {
+        color: #475467;
+        background: #f9fafb;
+        border-color: #eaecf0;
+      }
+
       .quota-reset-note {
         color: #667085;
         font-size: 11px;
@@ -2500,7 +2512,7 @@
         if (!Number.isFinite(resetAt)) return "";
         const currentTime = Number.isFinite(Number(now)) ? Number(now) : Date.now();
         const remainingMs = resetAt - currentTime;
-        if (remainingMs <= 0) return "正在刷新额度…";
+        if (remainingMs <= 0) return "";
         if (remainingMs < 60_000) return "不到1分钟后重置";
 
         const totalMinutes = Math.floor(remainingMs / 60_000);
@@ -2512,6 +2524,29 @@
           hours ? `${hours}小时` : "",
           minutes ? `${minutes}${days || hours ? "分" : "分钟"}` : ""
         ].filter(Boolean).join("")}后重置`;
+      }
+
+      function quotaResetTimeText(value, status = {}, now = Date.now(), options = {}) {
+        const refresh = status.meta?.quotaRefresh || {};
+        const modelKey = chatModelKey(options.modelKey || "");
+        const refreshModelKey = chatModelKey(refresh.modelKey || "");
+        const appliesToModel = !modelKey || !refreshModelKey || modelKey === refreshModelKey;
+        if (appliesToModel) {
+          const startedAt = Date.parse(refresh.startedAt || "");
+          if (refresh.status === "refreshing") {
+            return Number.isFinite(startedAt) && Number(now) - startedAt >= 2 * 60 * 1000
+              ? "检测中断，等待重试"
+              : "正在刷新额度…";
+          }
+          if (refresh.status === "failed") return "检测失败，稍后重试";
+          if (refresh.status === "waiting") return "尚未恢复，稍后复查";
+        }
+
+        const resetAt = Date.parse(value || "");
+        if (Number.isFinite(resetAt) && resetAt <= Number(now)) return "等待自动核验";
+        const remainingText = formatRemainingTime(value, now);
+        if (remainingText) return options.estimated === true ? `预计 ${remainingText}` : remainingText;
+        return options.missingText || "";
       }
 
       function formatClock(value) {
@@ -2777,20 +2812,22 @@
           const separatorAt = line.indexOf(" ");
           const label = separatorAt > 0 ? line.slice(0, separatorAt) : "额度";
           const rawValue = separatorAt > 0 ? line.slice(separatorAt + 1) : line;
-          const waitingNote = "（正在确认准确时间）";
+          const waitingNote = "（具体时间待确认）";
           const waiting = rawValue.endsWith(waitingNote);
           const value = waiting ? rawValue.slice(0, -waitingNote.length) : rawValue;
           const refreshing = value === "正在刷新额度…";
+          const failed = value.startsWith("检测失败") || value.startsWith("检测中断");
+          const pending = waiting || value.includes("待") || value.includes("稍后复查") || value.includes("未提供");
           return h(Tag, {
             bordered: false,
-            className: `quota-reset-tag${refreshing ? " is-refreshing" : ""}${waiting ? " is-waiting" : ""}`,
+            className: `quota-reset-tag${refreshing ? " is-refreshing" : ""}${failed ? " is-failed" : ""}${pending ? " is-waiting" : ""}`,
             key: `${label}-${index}`,
-            title: `${label} ${value}${waiting ? "，正在确认准确时间" : ""}`
+            title: `${label} ${value}${waiting ? "，具体时间待确认" : ""}`
           }, [
             h("span", { className: "quota-reset-label", key: "label" }, label),
             h("span", { className: "quota-reset-divider", "aria-hidden": true, key: "divider" }),
             h("span", { className: "quota-reset-value", key: "value" }, value),
-            waiting ? h("span", { className: "quota-reset-note", key: "note" }, "· 正在确认准确时间") : null
+            waiting ? h("span", { className: "quota-reset-note", key: "note" }, "· 具体时间待确认") : null
           ].filter(Boolean));
         }));
       }
@@ -2799,7 +2836,13 @@
         if (channel?.type === "shareai") {
           const drawing = abilityStatus(account, "drawing");
           const chatplus = abilityStatus(account, "chatplus");
-          const drawingResetText = formatRemainingTime(drawing.quotaResetAt, now);
+          const drawingResetText = drawing.status === "subscription_expired"
+            ? "套餐已过期"
+            : quotaResetTimeText(drawing.quotaResetAt, drawing, now, {
+              missingText: ["ok", "quota_empty"].includes(drawing.status)
+                ? "上游未提供重置时间"
+                : ""
+            });
           const parts = [
             channelAbilityEnabled(channel, "drawing") && drawingResetText
               ? `绘图 ${drawingResetText}`
@@ -2812,7 +2855,12 @@
           const parts = chatQuotaResetTexts(channel, account, now);
           return parts.length ? parts.join("｜") : "-";
         }
-        return account.quotaResetAt ? formatRemainingTime(account.quotaResetAt, now) || "-" : "-";
+        if (account.status === "subscription_expired") return "套餐已过期";
+        return quotaResetTimeText(account.quotaResetAt, account, now, {
+          missingText: ["ok", "quota_empty"].includes(account.status)
+            ? "上游未提供重置时间"
+            : ""
+        }) || "-";
       }
 
       function accountExpireText(account, channel) {
@@ -2965,12 +3013,14 @@
             return values.every(Boolean) && new Set(values).size === 1 ? values[0] : "";
           };
           const expireAt = commonValue("expireAt");
+          const quotaResetSource = commonValue("quotaResetSource");
           referenceUsage[modelKey] = {
             quota,
             balance,
             used: Math.max(0, quota - balance),
             quotaResetAt: commonValue("quotaResetAt"),
             period: commonValue("period"),
+            ...(quotaResetSource ? { quotaResetSource } : {}),
             ...(expireAt ? { expireAt } : {})
           };
         });
@@ -3016,21 +3066,30 @@
           .filter((item) => item.enabled)
           .map((item) => {
             const usage = status.meta?.referenceUsage?.[item.key] || {};
+            const activeModelKey = chatModelKey(status.quotaModel || status.meta?.chatModel);
+            if (chatSubscriptionExpired(status) && (!activeModelKey || activeModelKey === item.key)) {
+              return `${item.name} 套餐已过期`;
+            }
             const confirmedResetAt = confirmedChatQuotaEmpty(status)
-              && chatModelKey(status.quotaModel || status.meta?.chatModel) === item.key
+              && activeModelKey === item.key
               ? status.quotaResetAt
               : "";
             const quotaResetAt = confirmedResetAt || usage.quotaResetAt;
             if (quotaResetAt) {
-              const remainingText = formatRemainingTime(quotaResetAt, now);
+              const remainingText = quotaResetTimeText(quotaResetAt, status, now, {
+                modelKey: item.key,
+                estimated: usage.quotaResetSource === "estimated"
+              });
               return remainingText ? `${item.name} ${remainingText}` : "";
             }
+            const refreshText = quotaResetTimeText("", status, now, { modelKey: item.key });
+            if (refreshText) return `${item.name} ${refreshText}`;
             if (usage.period) {
               const period = String(usage.period).trim()
                 .replace(/^(\d+(?:\.\d+)?)\s*h$/i, "$1小时")
                 .replace(/^(\d+(?:\.\d+)?)\s*d$/i, "$1天")
                 .replace(/^(\d+(?:\.\d+)?)\s*m$/i, "$1分钟");
-              return `${item.name} 每${period}重置（正在确认准确时间）`;
+              return `${item.name} 每${period}重置（具体时间待确认）`;
             }
             return "";
           })

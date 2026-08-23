@@ -54,6 +54,7 @@ const taskSlotWaiters = new Set();
 const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
 const CHAT_USAGE_RECOVERY_CHECK_MS = 60 * 60 * 1000;
 const CHAT_USAGE_OBSERVATION_MS = 5 * 60 * 1000;
+const DRAWING_QUOTA_RECOVERY_CHECK_MS = 60 * 60 * 1000;
 const DRAWING_FAILURE_LIMIT = 3;
 const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
 const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
@@ -3015,16 +3016,141 @@ function targetRecoveryKey(target) {
   return `${target?.channel?.id || "channel"}:${target?.account?.id || "account"}`;
 }
 
-function targetNeedsRecovery(target) {
-  const quotaStatus = targetQuotaStatus(target);
-  const status = String(quotaStatus.status || "unknown").toLowerCase();
+function targetHasActiveWork(target) {
+  return ["chat", "drawingImage", "chatImage"]
+    .some((slot) => activeCountForAccountSlot(slot, target?.account?.id) > 0);
+}
+
+function quotaRefreshState(status = {}) {
+  const state = status.meta?.quotaRefresh;
+  return state && typeof state === "object" ? state : {};
+}
+
+function targetQuotaRefreshDue(target, status = targetQuotaStatus(target), now = Date.now()) {
+  const refresh = quotaRefreshState(status);
+  const retryAt = Date.parse(refresh.retryAt || "");
+  if (["failed", "waiting"].includes(refresh.status) && Number.isFinite(retryAt) && retryAt > now) {
+    return false;
+  }
+  const startedAt = Date.parse(refresh.startedAt || "");
+  if (refresh.status === "refreshing" && Number.isFinite(startedAt) && now - startedAt < 2 * 60 * 1000) {
+    return false;
+  }
+
   if (target?.channel?.type === "chatplus") {
-    if (statusSubscriptionExpired(quotaStatus)) return true;
-    if (status === "quota_empty") {
-      const recoveryInput = quotaStatus.quotaModel ? { model: quotaStatus.quotaModel } : {};
+    if (statusSubscriptionExpired(status)) return false;
+    if (String(status.status || "").toLowerCase() === "quota_empty") {
+      const recoveryInput = status.quotaModel ? { model: status.quotaModel } : {};
       return targetQuotaEmpty(target) && targetConfirmedQuotaRetryDue(target, recoveryInput);
     }
-    if (chatUsageRefreshDue(target, quotaStatus)) return true;
+    return chatUsageRefreshDue(target, status, now);
+  }
+
+  const statusName = String(status.status || "").toLowerCase();
+  if (!["ok", "quota_empty"].includes(statusName)) return false;
+  if (Number.isFinite(retryAt)) return retryAt <= now;
+  const resetAt = Date.parse(status.quotaResetAt || "");
+  return Number.isFinite(resetAt) && resetAt <= now;
+}
+
+async function updateTargetQuotaRefreshState(target, state) {
+  const ability = channelAbilityKey(target?.channel);
+  await updateAccountMeta(target.account.id, (accountMeta) => {
+    if (!ability) {
+      return {
+        ...accountMeta,
+        quotaRefresh: state
+      };
+    }
+    const abilities = { ...(accountMeta.abilities || {}) };
+    const abilityStatus = { ...(abilities[ability] || {}) };
+    abilities[ability] = {
+      ...abilityStatus,
+      meta: {
+        ...(abilityStatus.meta || {}),
+        quotaRefresh: state
+      }
+    };
+    return { ...accountMeta, abilities };
+  });
+}
+
+function quotaRefreshModelKey(target, status = {}) {
+  return target?.channel?.type === "chatplus"
+    ? modelRequestKey(status.quotaModel || status.meta?.chatModel)
+    : "";
+}
+
+function completedQuotaRefreshStatus(target, status = {}, currentStatus = {}) {
+  const now = Date.now();
+  const modelKey = quotaRefreshModelKey(target, status) || quotaRefreshModelKey(target, currentStatus);
+  let nextStatus = { ...status };
+  let resetAt = Date.parse(nextStatus.quotaResetAt || "");
+
+  if (target?.channel?.type === "drawing") {
+    if (!Number.isFinite(resetAt) || resetAt <= now) {
+      nextStatus = {
+        ...nextStatus,
+        quotaResetAt: "",
+        quotaResetSource: ""
+      };
+      resetAt = Number.NaN;
+    } else {
+      nextStatus.quotaResetSource = "upstream";
+    }
+  }
+
+  const waiting = target?.channel?.type === "drawing"
+    && String(nextStatus.status || "").toLowerCase() === "quota_empty"
+    && !Number.isFinite(resetAt);
+  const missingResetTime = target?.channel?.type === "drawing" && !Number.isFinite(resetAt);
+  const refresh = {
+    status: waiting ? "waiting" : "success",
+    finishedAt: new Date(now).toISOString(),
+    retryAt: missingResetTime ? new Date(now + DRAWING_QUOTA_RECOVERY_CHECK_MS).toISOString() : "",
+    modelKey,
+    message: waiting
+      ? "额度尚未恢复，系统稍后会自动复查。"
+      : Number.isFinite(resetAt) || target?.channel?.type === "chatplus"
+        ? "额度已更新。"
+        : "额度已更新，但上游未提供新的重置时间。"
+  };
+  return {
+    ...nextStatus,
+    meta: {
+      ...(nextStatus.meta || {}),
+      quotaRefresh: refresh
+    }
+  };
+}
+
+function failedQuotaRefreshStatus(target, currentStatus = {}, errorStatus = {}, error) {
+  const terminal = ["subscription_expired", "disconnected"].includes(String(errorStatus.status || "").toLowerCase());
+  const base = terminal ? { ...currentStatus, ...errorStatus } : { ...currentStatus };
+  const now = Date.now();
+  return {
+    ...base,
+    meta: {
+      ...(base.meta || {}),
+      quotaRefresh: {
+        status: "failed",
+        finishedAt: new Date(now).toISOString(),
+        retryAt: new Date(now + ACCOUNT_RECOVERY_RETRY_MS).toISOString(),
+        modelKey: quotaRefreshModelKey(target, currentStatus),
+        message: String(error?.message || errorStatus.message || "检测失败").replace(/\s+/g, " ").trim().slice(0, 300)
+      }
+    }
+  };
+}
+
+function targetNeedsRecovery(target) {
+  if (accountRecoveryTasks.has(targetRecoveryKey(target))) return true;
+  const quotaStatus = targetQuotaStatus(target);
+  const status = String(quotaStatus.status || "unknown").toLowerCase();
+  if (targetQuotaRefreshDue(target, quotaStatus)) return true;
+  if (target?.channel?.type === "chatplus") {
+    if (statusSubscriptionExpired(quotaStatus)) return true;
+    if (status === "quota_empty") return false;
     return (
       accountCooling(target.account)
       || ["error", "failed", "disconnected"].includes(status)
@@ -3044,6 +3170,7 @@ function targetNeedsRecovery(target) {
 
 async function recoverTarget(config, target) {
   if (refreshTargetDisabled(target?.channel, target?.account)) return null;
+  if (targetHasActiveWork(target)) return null;
   const key = targetRecoveryKey(target);
   const active = accountRecoveryTasks.get(key);
   if (active) return active;
@@ -3051,6 +3178,16 @@ async function recoverTarget(config, target) {
 
   const recovery = (async () => {
     const currentStatus = targetQuotaStatus(target);
+    const quotaRefresh = targetQuotaRefreshDue(target, currentStatus);
+    if (quotaRefresh) {
+      await updateTargetQuotaRefreshState(target, {
+        status: "refreshing",
+        startedAt: new Date().toISOString(),
+        retryAt: "",
+        modelKey: quotaRefreshModelKey(target, currentStatus),
+        message: "正在向上游核对额度。"
+      });
+    }
     try {
       const rawStatus = await runChatplusAccountWork(
         target.channel,
@@ -3064,9 +3201,10 @@ async function recoverTarget(config, target) {
       const checked = target.channel.type === "chatplus"
         ? successfulChatAccountCheckStatus(currentStatus, rawStatus)
         : successfulAccountCheckStatus(rawStatus);
-      const status = target.channel.type === "chatplus"
+      let status = target.channel.type === "chatplus"
         ? preserveConfirmedChatQuota(currentStatus, checked)
         : checked;
+      if (quotaRefresh) status = completedQuotaRefreshStatus(target, status, currentStatus);
       await updateTargetAccountStatus(target.account.id, target.channel, {
         ...status,
         cooldownUntil: status.status === "ok" ? null : status.cooldownUntil
@@ -3085,9 +3223,10 @@ async function recoverTarget(config, target) {
       const errorStatus = accountStatusFromError(error, {
         explicitChatQuotaOnly: target.channel.type === "chatplus"
       });
-      const status = target.channel.type === "chatplus"
+      let status = target.channel.type === "chatplus"
         ? preserveConfirmedChatQuota(currentStatus, errorStatus)
         : errorStatus;
+      if (quotaRefresh) status = failedQuotaRefreshStatus(target, currentStatus, status, error);
       await updateTargetAccountStatus(target.account.id, target.channel, status);
       const proxyRetryAt = Date.parse(error?.proxyCooldownUntil || "");
       accountRecoveryRetryAt.set(
@@ -3107,9 +3246,15 @@ async function recoverTarget(config, target) {
 
 export async function recoverUnavailableChatAccounts() {
   const config = await loadRuntimeConfig();
+  const tasks = await listTasks();
+  const busyAccountIds = new Set(tasks
+    .filter(taskHoldsDurableSlot)
+    .map((task) => String(task.accountId || ""))
+    .filter(Boolean));
   const targets = selectTargets(config, "auto", "img2img", { includeCooling: true });
   const recoveryTargets = [...new Map(
     targets
+      .filter((target) => !busyAccountIds.has(String(target.account.id || "")))
       .filter(targetNeedsRecovery)
       .map((target) => [targetRecoveryKey(target), target])
   ).values()];
@@ -4898,23 +5043,29 @@ function reconcileChatUsageResetTimes(currentStatus = {}, nextStatus = {}) {
       return [key, {
         ...usage,
         quotaResetAt: new Date(now + periodMs).toISOString(),
+        quotaResetSource: "estimated",
         quotaResetObservedAt: new Date(now).toISOString()
       }];
     }
     if (periodMs && hasPositiveBalance && Number.isFinite(upstreamResetTime) && upstreamResetTime <= now) {
       return [key, {
         ...usage,
-        quotaResetAt: nextPeriodicResetAt(upstreamResetAt, periodMs, now)
+        quotaResetAt: nextPeriodicResetAt(upstreamResetAt, periodMs, now),
+        quotaResetSource: "estimated"
       }];
     }
     if (periodMs && !upstreamResetAt && previous.quotaResetObservedAt && previous.quotaResetAt) {
       return [key, {
         ...usage,
         quotaResetAt: nextPeriodicResetAt(previous.quotaResetAt, periodMs, now),
+        quotaResetSource: "estimated",
         quotaResetObservedAt: previous.quotaResetObservedAt
       }];
     }
-    return [key, usage];
+    return [key, {
+      ...usage,
+      quotaResetSource: Number.isFinite(upstreamResetTime) ? "upstream" : ""
+    }];
   }));
 
   return {

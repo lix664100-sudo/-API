@@ -7,17 +7,34 @@ const adminHtml = await readFile(new URL("../admin/index.html", import.meta.url)
 const fixedNow = Date.parse("2026-08-23T00:00:00+08:00");
 
 const remainingTimeFunctionMatch = adminHtml.match(
-  /function formatRemainingTime\(value, now = Date\.now\(\)\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function formatClock/
+  /function formatRemainingTime\(value, now = Date\.now\(\)\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function quotaResetTimeText/
 );
 
 assert.ok(remainingTimeFunctionMatch, "管理后台中应存在额度剩余时间显示方法");
 
 const remainingTimeFunctionSource = remainingTimeFunctionMatch[0].replace(
-  /\r?\n\r?\n      function formatClock$/,
+  /\r?\n\r?\n      function quotaResetTimeText$/,
   ""
 );
 const formatRemainingTime = vm.runInNewContext(
   `(${remainingTimeFunctionSource.replace(/^function /, "function ")})`
+);
+const resetTimeTextFunctionMatch = adminHtml.match(
+  /function quotaResetTimeText\(value, status = \{\}, now = Date\.now\(\), options = \{\}\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function formatClock/
+);
+
+assert.ok(resetTimeTextFunctionMatch, "管理后台中应存在额度刷新状态显示方法");
+
+const resetTimeTextFunctionSource = resetTimeTextFunctionMatch[0].replace(
+  /\r?\n\r?\n      function formatClock$/,
+  ""
+);
+const quotaResetTimeText = vm.runInNewContext(
+  `(${resetTimeTextFunctionSource.replace(/^function /, "function ")})`,
+  {
+    chatModelKey: (value) => String(value || "").trim().toLowerCase(),
+    formatRemainingTime
+  }
 );
 const confirmedQuotaFunctionMatch = adminHtml.match(
   /function confirmedChatQuotaEmpty\(status = \{\}\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function chatSubscriptionExpired/
@@ -103,7 +120,8 @@ const chatQuotaResetTexts = vm.runInNewContext(
     confirmedChatQuotaEmpty: (status = {}) => (
       status.status === "quota_empty" && status.quotaConfirmedByUpstream === true
     ),
-    formatRemainingTime
+    chatSubscriptionExpired: (status = {}) => status.status === "subscription_expired",
+    quotaResetTimeText
   }
 );
 
@@ -123,7 +141,7 @@ const accountQuotaResetText = vm.runInNewContext(
     abilityStatus: (account, key) => account?.meta?.abilities?.[key] || {},
     channelAbilityEnabled: (channel, ability) => channel?.settings?.enabledAbilities?.[ability] !== false,
     chatQuotaResetTexts,
-    formatRemainingTime
+    quotaResetTimeText
   }
 );
 
@@ -429,8 +447,31 @@ test("额度重置时间覆盖未来、临近和已到时间", () => {
   assert.equal(formatRemainingTime("2026-08-23T10:49:30+08:00", fixedNow), "10小时49分后重置");
   assert.equal(formatRemainingTime("2026-08-24T02:03:00+08:00", fixedNow), "1天2小时3分后重置");
   assert.equal(formatRemainingTime("2026-08-23T00:00:59+08:00", fixedNow), "不到1分钟后重置");
-  assert.equal(formatRemainingTime("2026-08-22T23:59:59+08:00", fixedNow), "正在刷新额度…");
+  assert.equal(formatRemainingTime("2026-08-22T23:59:59+08:00", fixedNow), "");
   assert.equal(formatRemainingTime("错误时间", fixedNow), "");
+});
+
+test("只有真实刷新请求进行中才显示正在刷新", () => {
+  assert.equal(
+    quotaResetTimeText("2026-08-22T23:59:59+08:00", {}, fixedNow),
+    "等待自动核验"
+  );
+  assert.equal(
+    quotaResetTimeText("", {
+      meta: { quotaRefresh: { status: "refreshing", startedAt: "2026-08-22T23:59:30+08:00" } }
+    }, fixedNow),
+    "正在刷新额度…"
+  );
+  assert.equal(
+    quotaResetTimeText("", {
+      meta: { quotaRefresh: { status: "failed" } }
+    }, fixedNow),
+    "检测失败，稍后重试"
+  );
+  assert.equal(
+    quotaResetTimeText("2026-08-23T02:30:00+08:00", {}, fixedNow, { estimated: true }),
+    "预计 2小时30分后重置"
+  );
 });
 
 test("GPT 已明确用完时优先显示准确倒计时", () => {
@@ -502,8 +543,36 @@ test("GPT 恢复后没有准确时间时才显示额度周期", () => {
 
   assert.deepEqual(
     structuredClone(chatQuotaResetTexts({}, status, fixedNow)),
-    ["GPT 每12小时重置（正在确认准确时间）"]
+    ["GPT 每12小时重置（具体时间待确认）"]
   );
+});
+
+test("账号额度时间会显示核验失败和套餐过期", () => {
+  const channel = {
+    type: "shareai",
+    settings: { enabledAbilities: { drawing: true, chatplus: false } }
+  };
+  const failed = {
+    meta: {
+      abilities: {
+        drawing: {
+          status: "ok",
+          quotaResetAt: "2026-08-22T23:59:59+08:00",
+          meta: { quotaRefresh: { status: "failed" } }
+        }
+      }
+    }
+  };
+  assert.equal(accountQuotaResetText(failed, channel, fixedNow), "绘图 检测失败，稍后重试");
+
+  const expired = {
+    meta: {
+      abilities: {
+        drawing: { status: "subscription_expired" }
+      }
+    }
+  };
+  assert.equal(accountQuotaResetText(expired, channel, fixedNow), "绘图 套餐已过期");
 });
 
 test("账号表格使用额度重置时间列名", () => {

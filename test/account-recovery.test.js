@@ -8,7 +8,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-account-recovery-"
 process.env.DATA_DIR = dataDir;
 const activeSubscriptionExpireAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
-const { closeStorage, loadConfig, saveConfig } = await import("../src/storage.js");
+const { closeStorage, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
 const { checkAccount, clearAccountCooldown, createChatCompletion, createImageTask, createTextTask, getRuntimeStatus, recoverUnavailableChatAccounts } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient, drawingSevereFailureReason, normalizeDrawingTask } = await import("../src/channels/drawing.js");
@@ -2679,6 +2679,290 @@ test("绘图状态误标为可用且余额不足时仍会后台恢复", async ()
     assert.equal(results[0].recovered, true);
     assert.equal(drawing.status, "ok");
     assert.equal(drawing.balance, 100);
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+  }
+});
+
+test("绘图仍有余额但重置时间已到也会向上游更新", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-background-drawing-positive-balance",
+      channelId: "shareai",
+      name: "Drawing Positive Balance",
+      username: "drawing-positive-balance@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: {
+            status: "ok",
+            quota: 100,
+            balance: 6,
+            quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+            message: "drawing ok"
+          },
+          chatplus: { status: "ok", message: "chat ok" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  const nextResetAt = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+  let checkCount = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 100,
+      balance: 14,
+      quotaResetAt: nextResetAt,
+      message: "drawing ok"
+    };
+  };
+
+  try {
+    const firstResults = await recoverUnavailableChatAccounts();
+    const secondResults = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const drawing = stored.accounts[0].meta.abilities.drawing;
+
+    assert.equal(checkCount, 1);
+    assert.equal(firstResults[0].recovered, true);
+    assert.equal(secondResults.length, 0);
+    assert.equal(drawing.balance, 14);
+    assert.equal(drawing.quotaResetAt, nextResetAt);
+    assert.equal(drawing.quotaResetSource, "upstream");
+    assert.equal(drawing.meta.quotaRefresh.status, "success");
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+  }
+});
+
+test("绘图额度核验失败会保留现有额度并延后重试", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-background-drawing-refresh-failed",
+      channelId: "shareai",
+      name: "Drawing Refresh Failed",
+      username: "drawing-refresh-failed@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: {
+            status: "ok",
+            quota: 100,
+            balance: 6,
+            quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+            message: "drawing ok"
+          },
+          chatplus: { status: "ok", message: "chat ok" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  let checkCount = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    throw new Error("upstream temporarily unavailable");
+  };
+
+  try {
+    await recoverUnavailableChatAccounts();
+    const secondResults = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const drawing = stored.accounts[0].meta.abilities.drawing;
+
+    assert.equal(checkCount, 1);
+    assert.equal(secondResults.length, 0);
+    assert.equal(drawing.status, "ok");
+    assert.equal(drawing.balance, 6);
+    assert.equal(drawing.meta.quotaRefresh.status, "failed");
+    assert.ok(Date.parse(drawing.meta.quotaRefresh.retryAt) > Date.now());
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+  }
+});
+
+test("绘图仍未恢复且上游没给新时间时会稍后复查", async () => {
+  const config = await loadConfig();
+  const pastResetAt = new Date(Date.now() - 1000).toISOString();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-background-drawing-still-empty",
+      channelId: "shareai",
+      name: "Drawing Still Empty",
+      username: "drawing-still-empty@example.com",
+      password: "test",
+      enabled: true,
+      status: "quota_empty",
+      meta: {
+        abilities: {
+          drawing: {
+            status: "quota_empty",
+            quota: 100,
+            balance: 0,
+            quotaResetAt: pastResetAt,
+            message: "drawing quota empty"
+          },
+          chatplus: { status: "ok", message: "chat ok" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  let checkCount = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "quota_empty",
+      quota: 100,
+      balance: 0,
+      quotaResetAt: pastResetAt,
+      message: "drawing quota empty"
+    };
+  };
+
+  try {
+    await recoverUnavailableChatAccounts();
+    const secondResults = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const drawing = stored.accounts[0].meta.abilities.drawing;
+
+    assert.equal(checkCount, 1);
+    assert.equal(secondResults.length, 0);
+    assert.equal(drawing.quotaResetAt, "");
+    assert.equal(drawing.meta.quotaRefresh.status, "waiting");
+    assert.ok(Date.parse(drawing.meta.quotaRefresh.retryAt) > Date.now());
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+  }
+});
+
+test("绘图有额度但上游没给新时间时也会定期重新核验", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-background-drawing-missing-reset-time",
+      channelId: "shareai",
+      name: "Drawing Missing Reset Time",
+      username: "drawing-missing-reset-time@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: {
+            status: "ok",
+            quota: 100,
+            balance: 6,
+            quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+            message: "drawing ok"
+          },
+          chatplus: { status: "ok", message: "chat ok" }
+        }
+      }
+    }]
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  let checkCount = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    return {
+      status: "ok",
+      quota: 100,
+      balance: 14,
+      quotaResetAt: "",
+      message: "drawing ok"
+    };
+  };
+
+  try {
+    await recoverUnavailableChatAccounts();
+    const secondResults = await recoverUnavailableChatAccounts();
+    const stored = await loadConfig();
+    const drawing = stored.accounts[0].meta.abilities.drawing;
+
+    assert.equal(checkCount, 1);
+    assert.equal(secondResults.length, 0);
+    assert.equal(drawing.status, "ok");
+    assert.equal(drawing.balance, 14);
+    assert.equal(drawing.quotaResetAt, "");
+    assert.equal(drawing.meta.quotaRefresh.status, "success");
+    assert.ok(Date.parse(drawing.meta.quotaRefresh.retryAt) > Date.now());
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
+  }
+});
+
+test("账号有上游任务在处理时不会刷新额度", async () => {
+  const config = await loadConfig();
+  const accountId = "account-background-drawing-busy";
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: accountId,
+      channelId: "shareai",
+      name: "Drawing Busy",
+      username: "drawing-busy@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: {
+            status: "ok",
+            quota: 100,
+            balance: 6,
+            quotaResetAt: new Date(Date.now() - 1000).toISOString(),
+            message: "drawing ok"
+          },
+          chatplus: { status: "ok", message: "chat ok" }
+        }
+      }
+    }]
+  });
+  await upsertTask({
+    id: "busy-drawing-quota-refresh-task",
+    externalId: "upstream-busy-drawing-task",
+    accountId,
+    channelId: "shareai:drawing",
+    channelType: "drawing",
+    taskType: "text2img",
+    status: "waiting_upstream",
+    raw: { submitted: true }
+  });
+
+  const originalCheck = DrawingClient.prototype.check;
+  let checkCount = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCount += 1;
+    throw new Error("busy account should not refresh");
+  };
+
+  try {
+    const results = await recoverUnavailableChatAccounts();
+    assert.equal(checkCount, 0);
+    assert.equal(results.length, 0);
   } finally {
     DrawingClient.prototype.check = originalCheck;
   }
