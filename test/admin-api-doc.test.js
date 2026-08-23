@@ -33,6 +33,12 @@ test("API 调用页写清 Gemini 模型、强度和自动处理规则", () => {
   }
 });
 
+test("后台手动对话测试会锁定所选账号，普通 API 调用保留自动换号", () => {
+  assert.match(adminHtml, /form\.append\("strict_account", "true"\)/);
+  assert.match(adminHtml, /strict_account: true/);
+  assert.match(adminHtml, /只把账号作为首选，额度用完会自动换到其他可用账号/);
+});
+
 test("模型列表公开三个可直接调用的 Gemini 模型", () => {
   for (const model of [
     "gemini-3.5-flash-lite",

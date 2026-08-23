@@ -2079,6 +2079,7 @@ test("聊天生图等待接口按配置并发提交，超过配置才提示上�
 
   const originalDrawingCheck = DrawingClient.prototype.check;
   const originalChatCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let drawingCheckCount = 0;
   let releaseActiveTasks;
   let markAllTasksStarted;
   let activeCount = 0;
@@ -2087,12 +2088,10 @@ test("聊天生图等待接口按配置并发提交，超过配置才提示上�
   const allTasksStarted = new Promise((resolve) => { markAllTasksStarted = resolve; });
   const holdActiveTasks = new Promise((resolve) => { releaseActiveTasks = resolve; });
 
-  DrawingClient.prototype.check = async () => ({
-    status: "quota_empty",
-    quota: 50,
-    balance: 0,
-    message: "绘图积分不足"
-  });
+  DrawingClient.prototype.check = async () => {
+    drawingCheckCount += 1;
+    throw new Error("已知无额度的绘图站不应该再次检测");
+  };
   ChatplusClient.prototype.createImageTask = async (input) => {
     activeCount += 1;
     maxActiveCount = Math.max(maxActiveCount, activeCount);
@@ -2137,11 +2136,12 @@ test("聊天生图等待接口按配置并发提交，超过配置才提示上�
       (error) => {
         assert.equal(error?.status, 429);
         assert.match(error?.message || "", /^并发上限/);
-        assert.match(error?.message || "", /绘图积分不足/);
+        assert.match(error?.message || "", /任务正在处理中/);
         assert.ok(Date.now() - startedAt < 1000);
         return true;
       }
     );
+    assert.equal(drawingCheckCount, 0);
   } finally {
     releaseActiveTasks();
     await Promise.all(activeTasks);

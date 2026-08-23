@@ -6423,7 +6423,10 @@
                   const form = new FormData();
                   form.append("message", text);
                   form.append("channel", target.channel);
-                  if (target.accountId) form.append("accountId", target.accountId);
+                  if (target.accountId) {
+                    form.append("accountId", target.accountId);
+                    form.append("strict_account", "true");
+                  }
                   if (values.model) form.append("model", values.model);
                   chatFileList.forEach((file) => form.append("image", file.originFileObj));
                   return form;
@@ -6431,7 +6434,7 @@
               : {
                   message: text,
                   channel: target.channel,
-                  ...(target.accountId ? { accountId: target.accountId } : {}),
+                  ...(target.accountId ? { accountId: target.accountId, strict_account: true } : {}),
                   ...(values.model ? { model: values.model } : {})
                 };
             const result = await api("/v1/chat/completions?wait=0", { method: "POST", headers, body });
@@ -7588,7 +7591,7 @@
                     label: "对话测试",
                     children: h("div", { className: "operation-body" }, [
                       h(Form, { layout: "vertical", form: chatForm, onFinish: submitChat }, [
-                        h(Alert, { type: "info", showIcon: true, message: "选择具体账号时，只使用该账号和所选模型；失败会直接显示原因，不会自动切换到其他模型。", style: { marginBottom: 14 } }),
+                        h(Alert, { type: "info", showIcon: true, message: "选择具体账号时，只使用该账号和所选模型；失败会直接显示原因，不会切换账号或模型。", style: { marginBottom: 14 } }),
                         chatSubmitBlocked
                           ? h(Alert, { type: "warning", showIcon: true, message: `聊天账号冷却中，约 ${accountCooldownText(coolingChatAccount)} 后再试。`, style: { marginBottom: 14 } })
                           : null,
@@ -7726,6 +7729,7 @@
                             h("li", null, [h(Typography.Text, { code: true }, "stream=true"), " 返回兼容 OpenAI 的流式内容。"]),
                             h("li", null, [h(Typography.Text, { code: true }, "reasoning_effort"), " 也可设置强度：low、medium 对应普通思考，high、xhigh 对应深度思考。"]),
                             h("li", null, [h(Typography.Text, { code: true }, "channel=auto"), " 自动选择可用渠道；不填写也会自动选择。"]),
+                            h("li", null, [h(Typography.Text, { code: true }, "accountId"), " 只把账号作为首选，额度用完会自动换到其他可用账号；仅排查单个账号时再传 ", h(Typography.Text, { code: true }, "strict_account=true"), "。"]),
                             h("li", null, ["图片修改可传 ", h(Typography.Text, { code: true }, "ratio_label"), " 和 ", h(Typography.Text, { code: true }, "image_count"), "；也兼容 ratio 和 n。"]),
                             h("li", null, ["使用 ", h(Typography.Text, { code: true }, "GET /v1/models"), " 查询模型；错误信息可从 ", h(Typography.Text, { code: true }, "error.message"), " 读取。"]),
                             h("li", null, ["在地址后加 ", h(Typography.Text, { code: true }, "?wait=0"), " 可先创建任务，再按任务编号查询结果。"])

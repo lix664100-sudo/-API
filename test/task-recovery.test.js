@@ -487,6 +487,209 @@ test("preferred chat image failure falls back to drawing before an upstream task
   }
 });
 
+test("后台生图重试会跳过已知无额度的绘图账号", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "drawing",
+    imageSourcePriority: "drawing",
+    imageStorage: { mode: "never", autoCleanup: false, retentionDays: 7 },
+    channels: [{
+      id: "known-empty-retry",
+      type: "shareai",
+      name: "Known Empty Retry",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        enabledAbilities: { drawing: true, chatplus: false },
+        defaultModelId: 1
+      }
+    }],
+    accounts: [
+      {
+        id: "known-empty-retry-empty",
+        channelId: "known-empty-retry",
+        name: "Known Empty",
+        username: "known-empty@example.test",
+        password: "test",
+        enabled: true,
+        status: "quota_empty",
+        meta: {
+          abilities: {
+            drawing: {
+              status: "quota_empty",
+              quota: 100,
+              balance: 0,
+              quotaResetAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+              message: "绘图积分不足"
+            }
+          }
+        }
+      },
+      {
+        id: "known-empty-retry-healthy",
+        channelId: "known-empty-retry",
+        name: "Healthy",
+        username: "healthy@example.test",
+        password: "test",
+        enabled: true,
+        status: "ok",
+        meta: {
+          abilities: {
+            drawing: { status: "ok", quota: 100, balance: 10, message: "绘图账号可用" }
+          }
+        }
+      }
+    ]
+  });
+
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  const originalDrawingUploadImage = DrawingClient.prototype.uploadImage;
+  const originalDrawingCreateImageTask = DrawingClient.prototype.createImageTask;
+  const checkedAccounts = [];
+  const uploadedAccounts = [];
+  const submittedAccounts = [];
+
+  DrawingClient.prototype.check = async function checkDrawingAccount() {
+    checkedAccounts.push(this.account.id);
+    if (this.account.id === "known-empty-retry-empty") {
+      throw new Error("已知无额度账号不应该再次检测");
+    }
+    return { status: "ok", quota: 100, balance: 10, message: "绘图账号可用" };
+  };
+  DrawingClient.prototype.uploadImage = async function uploadDrawingImage() {
+    uploadedAccounts.push(this.account.id);
+    return { uploadId: 1, upload: { id: 1 } };
+  };
+  DrawingClient.prototype.createImageTask = async function createDrawingImage(input) {
+    submittedAccounts.push(this.account.id);
+    return {
+      externalId: "known-empty-retry-result",
+      status: "success",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: 1,
+      imageCount: 0,
+      imageUrls: [],
+      raw: {}
+    };
+  };
+
+  try {
+    const queued = await queueImageTask({
+      input: { channel: "drawing", prompt: "同一下游任务再次提交" },
+      file: { filename: "source.png", mimetype: "image/png", buffer: Buffer.from("image") }
+    });
+    let stored = null;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      stored = await getTask(queued.id);
+      if (["success", "failed"].includes(stored?.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(stored?.status, "success");
+    assert.equal(checkedAccounts.includes("known-empty-retry-empty"), false);
+    assert.deepEqual(new Set(uploadedAccounts), new Set(["known-empty-retry-healthy"]));
+    assert.deepEqual(submittedAccounts, ["known-empty-retry-healthy"]);
+  } finally {
+    DrawingClient.prototype.check = originalDrawingCheck;
+    DrawingClient.prototype.uploadImage = originalDrawingUploadImage;
+    DrawingClient.prototype.createImageTask = originalDrawingCreateImageTask;
+    await saveConfig(config);
+  }
+});
+
+test("绘图站无额度不会阻止同一账号使用聊天站生图", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "auto",
+    imageSourcePriority: "drawing",
+    imageStorage: { mode: "never", autoCleanup: false, retentionDays: 7 },
+    channels: [{
+      id: "ability-isolation-retry",
+      type: "shareai",
+      name: "Ability Isolation Retry",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        chatBaseUrl: "https://chat.example.test",
+        enabledAbilities: { drawing: true, chatplus: true },
+        defaultModelId: 1,
+        defaultChatModel: "gemini",
+        chatModels: [{ key: "gemini", name: "Gemini", enabled: true, default: true }]
+      }
+    }],
+    accounts: [{
+      id: "ability-isolation-account",
+      channelId: "ability-isolation-retry",
+      name: "Ability Isolation",
+      username: "ability-isolation@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: {
+            status: "quota_empty",
+            quota: 100,
+            balance: 0,
+            quotaResetAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+            message: "绘图积分不足"
+          },
+          chatplus: { status: "ok", message: "聊天生图可用" }
+        }
+      }
+    }]
+  });
+
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  const originalChatCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let drawingCheckCount = 0;
+  let chatSubmitCount = 0;
+
+  DrawingClient.prototype.check = async () => {
+    drawingCheckCount += 1;
+    throw new Error("绘图站无额度时不应该再次检测");
+  };
+  ChatplusClient.prototype.createImageTask = async function createChatImage(input) {
+    chatSubmitCount += 1;
+    return {
+      externalId: "ability-isolation-chat-result",
+      status: "success",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: "gemini",
+      imageCount: 0,
+      imageUrls: [],
+      raw: {}
+    };
+  };
+
+  try {
+    const queued = await queueImageTask({
+      input: { model: "gemini", prompt: "绘图不可用时改走聊天生图" },
+      file: { filename: "source.png", mimetype: "image/png", buffer: Buffer.from("image") }
+    });
+    let stored = null;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      stored = await getTask(queued.id);
+      if (["success", "failed"].includes(stored?.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    assert.equal(stored?.status, "success");
+    assert.equal(stored?.channelType, "chatplus");
+    assert.equal(drawingCheckCount, 0);
+    assert.equal(chatSubmitCount, 1);
+  } finally {
+    DrawingClient.prototype.check = originalDrawingCheck;
+    ChatplusClient.prototype.createImageTask = originalChatCreateImageTask;
+    await saveConfig(config);
+  }
+});
+
 test("multipart admission releases the provisional model slot after the real model is parsed", async () => {
   const config = await loadConfig();
   await saveConfig({
@@ -1039,10 +1242,10 @@ test("fast drawing quota check waits long enough for normal account checks", asy
       username: "fast-drawing-quota@example.com",
       password: "test",
       enabled: true,
-      status: "quota_empty",
+      status: "ok",
       meta: {
         abilities: {
-          drawing: { status: "quota_empty", balance: 0, message: "needs refresh" },
+          drawing: { status: "ok", balance: 2, message: "ready for preflight refresh" },
           chatplus: { status: "quota_empty", balance: 0, message: "skip chatplus" }
         }
       }

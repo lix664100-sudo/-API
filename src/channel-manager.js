@@ -2555,6 +2555,19 @@ function requestedChannelForInput(config, input = {}) {
   return requestedModelLock(input).type === "auto" ? config.defaultChannel || "auto" : "auto";
 }
 
+function requestedAccountIdForInput(input = {}) {
+  return String(input.accountId || input.account_id || "").trim();
+}
+
+function strictAccountRequested(input = {}) {
+  const value = input.strict_account ?? input.strictAccount;
+  return value === true || value === 1 || /^(?:true|1)$/i.test(String(value || "").trim());
+}
+
+function strictAccountIdForInput(input = {}) {
+  return strictAccountRequested(input) ? requestedAccountIdForInput(input) : "";
+}
+
 function targetMatchesRequestedModel(target, taskType, input = {}) {
   const lock = requestedModelLock(input);
   if (taskType === "chat") {
@@ -2607,7 +2620,7 @@ async function orderTargetsByRoutingUsage(targets, taskType, input = {}) {
     groups.set(key, group);
   });
 
-  return [...groups.values()].flatMap((group) => group
+  const ordered = [...groups.values()].flatMap((group) => group
     .map((item) => {
       const slot = targetTaskSlot(item.target, taskType);
       const load = completedRoutingLoad(usage, item.target, slot)
@@ -2624,6 +2637,13 @@ async function orderTargetsByRoutingUsage(targets, taskType, input = {}) {
       || left.index - right.index
     ))
     .map((item) => item.target));
+  const preferredAccountId = requestedAccountIdForInput(input);
+  const preferred = preferredAccountId
+    ? ordered.find((target) => target.account.id === preferredAccountId)
+    : null;
+  return preferred
+    ? [preferred, ...ordered.filter((target) => !sameTarget(target, preferred))]
+    : ordered;
 }
 
 function withRoutingReservationLock(work) {
@@ -2995,7 +3015,6 @@ function confirmedQuotaBlockedError(target, input = {}) {
 }
 
 function admissionTargets(targets, taskType, options = {}) {
-  const skipKnownQuotaEmpty = options.skipKnownQuotaEmpty === true;
   return targets.filter((target) => !(
     targetKnownUnavailable(target, options.input)
       || (taskType !== "chat" && targetDrawingBalanceInsufficient(target))
@@ -3004,8 +3023,7 @@ function admissionTargets(targets, taskType, options = {}) {
         && !targetConfirmedQuotaRetryDue(target, options.input)
       )
       || (
-        skipKnownQuotaEmpty
-        && taskType !== "chat"
+        taskType !== "chat"
         && target.channel.type !== "chatplus"
         && targetQuotaEmpty(target)
       )
@@ -3314,7 +3332,6 @@ export async function reserveImageTaskAdmission(input = {}) {
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
   const targets = await selectReadyTargets(config, requestedChannel, "img2img", {
     accountId: requestedAccountId,
-    skipKnownQuotaEmpty: true,
     input
   });
   if (!targets.length) {
@@ -4661,10 +4678,13 @@ async function finishChatTask(task, result, channel, account, attempts, response
 async function runChatCompletionTask(task, input) {
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
-  const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, input });
+  const requestedAccountId = requestedAccountIdForInput(input);
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", {
+    accountId: strictAccountIdForInput(input),
+    input
+  });
   const preferredTarget = requestedAccountId
-    ? null
+    ? targets.find((target) => target.account.id === requestedAccountId)
     : targets.find((target) => target.account.id === task.accountId && target.channel.id === task.channelId);
   const orderedChatTargets = preferredTarget
     ? [preferredTarget, ...targets.filter((target) => !sameTarget(target, preferredTarget))]
@@ -4854,13 +4874,13 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
 
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
-  const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, input });
+  const strictAccountId = strictAccountIdForInput(input);
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: strictAccountId, input });
   if (!targets.length) {
     throw noUsableTargetError("chat", {
       config,
       requestedChannel,
-      accountId: requestedAccountId,
+      accountId: strictAccountId,
       input
     });
   }
@@ -5467,13 +5487,13 @@ export async function createChatCompletion(input = {}, requestMeta = {}, taskOpt
 
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
-  const requestedAccountId = String(input.accountId || input.account_id || "").trim();
-  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: requestedAccountId, input });
+  const strictAccountId = strictAccountIdForInput(input);
+  const targets = await selectReadyTargets(config, requestedChannel, "chat", { accountId: strictAccountId, input });
   if (!targets.length) {
     throw noUsableTargetError("chat", {
       config,
       requestedChannel,
-      accountId: requestedAccountId,
+      accountId: strictAccountId,
       input
     });
   }
@@ -5613,7 +5633,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
     requestedAccountId,
     input,
     admission,
-    { skipRecovery: true }
+    { skipRecovery: Boolean(admission) }
   );
   const targets = selection.targets;
   if (!targets.length) {
