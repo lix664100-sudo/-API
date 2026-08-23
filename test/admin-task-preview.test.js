@@ -221,6 +221,20 @@ test("两个改图入口都会保存原图预览，并纳入现有图片清理�
   assert.match(serverSource, /filename\.startsWith\("preview-"\)/);
 });
 
+test("两个改图入口都会先读取完整任务，再按真实模型占用账号并发", () => {
+  for (const route of ["/api/draw/edit", "/v1/images/edits"]) {
+    const routeStart = serverSource.indexOf(`app.post("${route}"`);
+    const routeEnd = serverSource.indexOf("\n});", routeStart);
+    const routeSource = serverSource.slice(routeStart, routeEnd);
+    const readAt = routeSource.indexOf("readImageInput(request");
+    const reserveAt = routeSource.indexOf("reserveImageRequestAdmission(request, requestMeta, input)");
+
+    assert.ok(routeStart >= 0 && routeEnd > routeStart, `${route} 必须存在`);
+    assert.ok(readAt >= 0, `${route} 必须读取完整任务`);
+    assert.ok(reserveAt > readAt, `${route} 必须在读取完整任务后再占用账号并发`);
+  }
+});
+
 test("任务渠道按首次提交和全部成功渠道显示，并自动去重", () => {
   const { taskSubmissionRouteText, taskGenerationRouteText } = loadTaskRouteHelpers();
   const row = {

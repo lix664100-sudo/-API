@@ -167,6 +167,21 @@ const accountEffectiveStatus = vm.runInNewContext(
   }
 );
 
+const channelStatusFunctionMatch = adminHtml.match(
+  /function getChannelStatus\(channel, relatedAccounts\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function chatDisplayStatus/
+);
+
+assert.ok(channelStatusFunctionMatch, "管理后台中应存在渠道状态汇总方法");
+
+const channelStatusFunctionSource = channelStatusFunctionMatch[0].replace(
+  /\r?\n\r?\n      function chatDisplayStatus$/,
+  ""
+);
+const getChannelStatus = vm.runInNewContext(
+  `(${channelStatusFunctionSource.replace(/^function /, "function ")})`,
+  { accountEffectiveStatus }
+);
+
 const aggregateStatusFunctionMatch = adminHtml.match(
   /function aggregateChatStatus\(accounts, channel\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function accountEffectiveStatus/
 );
@@ -352,7 +367,7 @@ test("绘图余额小于两点时不能显示可用", () => {
   assert.equal(drawingDisplayStatus({ status: "ok", balance: 2 }), "ok");
 });
 
-test("渠道汇总中 GPT 套餐过期优先于其他账号可用", () => {
+test("渠道汇总中仍有 GPT 账号可用时优先显示可用", () => {
   const available = shareAIAccount({
     referenceUsage: {
       gpt: { quota: 220, balance: 76, expireAt: "2026-08-20T00:00:00+08:00" }
@@ -367,11 +382,47 @@ test("渠道汇总中 GPT 套餐过期优先于其他账号可用", () => {
 
   const status = aggregateChatStatus([available, expired], { type: "shareai" });
 
-  assert.equal(status.status, "subscription_expired");
+  assert.equal(status.status, "ok");
+  assert.deepEqual(structuredClone(status.meta.referenceUsage.gpt), {
+    quota: 220,
+    balance: 76,
+    used: 144,
+    quotaResetAt: "",
+    period: "",
+    expireAt: "2026-08-20T00:00:00+08:00"
+  });
   assert.equal(
     aggregateChatReferenceUsage([expired], "shareai", ["gpt"]).gpt.expireAt,
     "2026-08-10T00:00:00+08:00"
   );
+});
+
+test("渠道里仍有可用账号时不会被另一个过期账号覆盖", () => {
+  const available = {
+    enabled: true,
+    meta: {
+      abilities: {
+        drawing: { status: "quota_empty", balance: 0 },
+        chatplus: { status: "ok" }
+      }
+    }
+  };
+  const expired = {
+    enabled: true,
+    meta: {
+      abilities: {
+        drawing: { status: "quota_empty", balance: 0 },
+        chatplus: { status: "subscription_expired" }
+      }
+    }
+  };
+  const channel = {
+    enabled: true,
+    type: "shareai",
+    settings: { enabledAbilities: { drawing: true, chatplus: true } }
+  };
+
+  assert.equal(getChannelStatus(channel, [available, expired]), "ok");
 });
 
 test("额度重置时间覆盖未来、临近和已到时间", () => {

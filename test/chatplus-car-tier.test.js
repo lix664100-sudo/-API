@@ -52,6 +52,7 @@ function clientForGpt(options = {}) {
     },
     sessionLock: async (work) => work(),
     onProCarsUnavailable: options.onProCarsUnavailable,
+    onProCarsAvailable: options.onProCarsAvailable,
     onImageCarCooldown: options.onImageCarCooldown
   });
 }
@@ -345,7 +346,7 @@ test("saved image car cooldowns are restored after a client restart", async () =
   assert.equal(selected.carId, "restored-fallback-car");
 });
 
-test("saved plan mismatch restriction continues to skip PRO cars", async () => {
+test("legacy permanent PRO restriction is retried after the update", async () => {
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
     channel: { id: "shareai:chatplus", ability: "chatplus", settings: {} },
@@ -379,7 +380,112 @@ test("saved plan mismatch restriction continues to skip PRO cars", async () => {
     carTier: "auto"
   });
 
+  assert.equal(selected.carId, "pro-car");
+});
+
+test("active PRO restriction still uses a regular car for normal tasks", async () => {
+  const client = clientForGpt({
+    accountId: "account-active-plus-restriction",
+    account: {
+      meta: {
+        abilities: {
+          chatplus: {
+            meta: {
+              proCarsUnavailable: true,
+              proCarsUnavailableReason: "plan_mismatch",
+              proCarsUnavailableUntil: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+            }
+          }
+        }
+      }
+    }
+  });
+  client.fetchCars = async () => [
+    car({ id: "pro-car", label: "PRO", isPro: true, count: 0 }),
+    car({ id: "regular-car", label: "PLUS", count: 20 })
+  ];
+
+  const selected = await client.selectCar({
+    key: "gpt",
+    name: "GPT",
+    carType: "chatgpt",
+    strategy: "speed",
+    carTier: "auto"
+  });
+
   assert.equal(selected.carId, "regular-car");
+});
+
+test("manual account check retries PRO immediately and clears the old restriction after success", async () => {
+  let cleared = 0;
+  const entered = [];
+  const client = clientForGpt({
+    accountId: "account-upgraded-to-pro",
+    account: {
+      meta: {
+        abilities: {
+          chatplus: {
+            meta: {
+              proCarsUnavailable: true,
+              proCarsUnavailableReason: "plan_mismatch",
+              proCarsUnavailableUntil: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+            }
+          }
+        }
+      }
+    },
+    onProCarsAvailable: async () => {
+      cleared += 1;
+    }
+  });
+  client.loadAccountUsages = async () => ({
+    gpt: { quota: 220, balance: 195, expireAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() }
+  });
+  client.fetchCars = async () => [
+    car({ id: "pro-car", label: "PRO", isPro: true, count: 0 }),
+    car({ id: "regular-car", label: "PLUS", count: 20 })
+  ];
+  client.enterCar = async (carId) => {
+    entered.push(carId);
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-test" });
+
+  const status = await client.check();
+
+  assert.equal(status.status, "ok");
+  assert.deepEqual(entered, ["pro-car"]);
+  assert.equal(cleared, 1);
+  assert.equal(client.proCarsUnavailableUntil, 0);
+});
+
+test("manual account check falls back to a regular car after a fresh PRO rejection", async () => {
+  let restricted = 0;
+  const entered = [];
+  const client = clientForGpt({
+    accountId: "account-new-plus-mismatch",
+    onProCarsUnavailable: async () => {
+      restricted += 1;
+    }
+  });
+  client.loadAccountUsages = async () => ({
+    gpt: { quota: 220, balance: 195, expireAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() }
+  });
+  client.fetchCars = async () => [
+    car({ id: "pro-car", label: "PRO", isPro: true, count: 0 }),
+    car({ id: "regular-car", label: "PLUS", count: 20 })
+  ];
+  client.enterCar = async (carId) => {
+    entered.push(carId);
+    if (carId === "pro-car") throw new Error("您不是Pro用户，请升级后使用该车。");
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-test" });
+
+  const status = await client.check();
+
+  assert.equal(status.status, "ok");
+  assert.deepEqual(entered, ["pro-car", "regular-car"]);
+  assert.equal(restricted, 1);
+  assert.equal(status.meta.proCarRestriction.active, true);
 });
 
 test("legacy image-limit restriction is rechecked instead of permanently skipping PRO cars", async () => {

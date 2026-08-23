@@ -353,9 +353,11 @@ function apiRequestMeta(request) {
   };
 }
 
-function imageAdmissionInput(request, requestMeta = {}) {
+function imageAdmissionInput(request, requestMeta = {}, parsedInput = null) {
   const queryInput = normalizeFields(request.query || {});
-  const bodyInput = isMultipartRequest(request) ? {} : normalizeFields(request.body || {});
+  const bodyInput = parsedInput
+    ? normalizeFields(parsedInput)
+    : isMultipartRequest(request) ? {} : normalizeFields(request.body || {});
   return {
     ...queryInput,
     ...bodyInput,
@@ -363,8 +365,8 @@ function imageAdmissionInput(request, requestMeta = {}) {
   };
 }
 
-async function reserveImageRequestAdmission(request, requestMeta = {}) {
-  const admission = await reserveImageTaskAdmission(imageAdmissionInput(request, requestMeta));
+async function reserveImageRequestAdmission(request, requestMeta = {}, parsedInput = null) {
+  const admission = await reserveImageTaskAdmission(imageAdmissionInput(request, requestMeta, parsedInput));
   return attachImageAdmissionToRequest(admission, request);
 }
 
@@ -1290,9 +1292,6 @@ app.post("/api/draw/edit", async (request, reply) => {
   let admission = null;
   let admissionTransferred = false;
   try {
-    if (request.query?.wait === "1") {
-      admission = await reserveImageRequestAdmission(request, requestMeta);
-    }
     const parsed = await readImageInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
     input = parsed.input;
     files = parsed.files;
@@ -1300,6 +1299,7 @@ app.post("/api/draw/edit", async (request, reply) => {
     if (!files.length) throw badRequest(`请上传 1 到 ${MAX_INPUT_IMAGE_COUNT} 张源图，字段名用 image。`);
     let task;
     if (request.query?.wait === "1") {
+      admission = await reserveImageRequestAdmission(request, requestMeta, input);
       task = await createImageTask({ input, files, wait: true, requestMeta, admission });
     } else {
       task = await queueImageTask({ input, files, requestMeta, admission });
@@ -1432,14 +1432,14 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
   let admission = null;
   let admissionTransferred = false;
   try {
-    if (request.query?.wait !== "0") {
-      admission = await reserveImageRequestAdmission(request, requestMeta);
-    }
     const parsed = await readImageInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
     input = parsed.input;
     files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest(`请上传 1 到 ${MAX_INPUT_IMAGE_COUNT} 张源图，字段名用 image。`);
+    if (request.query?.wait !== "0") {
+      admission = await reserveImageRequestAdmission(request, requestMeta, input);
+    }
     const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta, admission });
     admissionTransferred = true;
     if (task.status !== "success") reply.code(202);

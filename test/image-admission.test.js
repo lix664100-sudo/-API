@@ -1254,3 +1254,111 @@ test("a cooling account is skipped and catches up after it becomes available", a
     afterRecovery.release();
   }
 });
+
+test("an expired account is excluded even when its drawing ability still has an old available status", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "drawing",
+    channels: [{
+      id: "expired-account-filter",
+      type: "shareai",
+      name: "Expired Account Filter",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        enabledAbilities: { drawing: true, chatplus: false },
+        defaultModelId: 1
+      }
+    }],
+    accounts: [
+      {
+        id: "expired-account-filter-expired",
+        channelId: "expired-account-filter",
+        name: "Expired Account",
+        username: "expired-account@example.test",
+        password: "test",
+        enabled: true,
+        priority: 1,
+        status: "subscription_expired",
+        meta: {
+          abilities: {
+            drawing: { status: "ok", balance: 50 },
+            chatplus: { status: "subscription_expired" }
+          }
+        }
+      },
+      {
+        id: "expired-account-filter-healthy",
+        channelId: "expired-account-filter",
+        name: "Healthy Account",
+        username: "healthy-account@example.test",
+        password: "test",
+        enabled: true,
+        priority: 1,
+        status: "ok",
+        meta: {
+          abilities: {
+            drawing: { status: "ok", balance: 50 },
+            chatplus: { status: "ok" }
+          }
+        }
+      }
+    ]
+  });
+
+  const admitted = await reserveImageTaskAdmission({ channel: "drawing", prompt: "skip expired account" });
+  try {
+    assert.equal(admitted.target.account.id, "expired-account-filter-healthy");
+  } finally {
+    admitted.release();
+  }
+});
+
+test("dashboard running count includes submitted tasks that still occupy account concurrency", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "chatplus",
+    channels: [{
+      id: "durable-runtime-count",
+      type: "shareai",
+      name: "Durable Runtime Count",
+      enabled: true,
+      settings: {
+        chatBaseUrl: "https://chat.example.test",
+        enabledAbilities: { drawing: false, chatplus: true },
+        defaultChatModel: "gpt"
+      }
+    }],
+    accounts: [{
+      id: "durable-runtime-account",
+      channelId: "durable-runtime-count",
+      name: "Durable Runtime Account",
+      username: "durable-runtime@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      concurrency: { chat: 3, drawingImage: 2, chatImage: 3 },
+      meta: { abilities: { chatplus: { status: "ok" } } }
+    }]
+  });
+  await upsertTask({
+    id: "durable-runtime-waiting-task",
+    externalId: "conversation-durable-runtime",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    modelId: "gpt",
+    channelId: "durable-runtime-count:chatplus",
+    channelType: "chatplus",
+    accountId: "durable-runtime-account",
+    accountName: "Durable Runtime Account",
+    raw: { submitted: true, chatModel: "gpt" },
+    createdAt: new Date().toISOString()
+  });
+
+  const runtime = await getRuntimeStatus();
+  assert.equal(runtime.running.chatImage, 1);
+  assert.equal(runtime.running.total, 1);
+  assert.equal(runtime.models.gpt.categories.image.running, 1);
+});

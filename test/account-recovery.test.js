@@ -355,6 +355,74 @@ test("检测账号时共享车位不可用只标记线路异常", async () => {
   }
 });
 
+test("手动检测确认 PRO 可用后会彻底清除旧限制", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-pro-recovered",
+      channelId: "shareai",
+      name: "PRO 恢复账号",
+      username: "pro-recovered@example.com",
+      password: "test",
+      enabled: true,
+      status: "error",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", quota: 100, balance: 0, message: "绘图积分不足" },
+          chatplus: {
+            status: "error",
+            message: "PRO 暂不可用",
+            meta: {
+              proCarsUnavailable: true,
+              proCarsUnavailableReason: "plan_mismatch",
+              proCarsUnavailableUntil: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+            }
+          }
+        }
+      }
+    }]
+  });
+
+  const originalChatCheck = ChatplusClient.prototype.check;
+  const originalDrawingCheck = DrawingClient.prototype.check;
+  DrawingClient.prototype.check = async () => ({
+    status: "quota_empty",
+    quota: 100,
+    balance: 0,
+    message: "绘图积分不足"
+  });
+  ChatplusClient.prototype.check = async () => ({
+    status: "ok",
+    expireAt: activeSubscriptionExpireAt,
+    message: "聊天账号可用",
+    meta: {
+      chatModel: "gpt",
+      proCarRestriction: { active: false, until: "" },
+      referenceUsage: {
+        gpt: { quota: 220, balance: 195, expireAt: activeSubscriptionExpireAt }
+      }
+    }
+  });
+
+  try {
+    const result = await checkAccount("account-pro-recovered");
+    const stored = await loadConfig();
+    const chatMeta = stored.accounts.find((item) => item.id === "account-pro-recovered")
+      .meta.abilities.chatplus.meta;
+
+    assert.equal(result.status, "ok");
+    assert.equal(chatMeta.proCarsUnavailable, undefined);
+    assert.equal(chatMeta.proCarsUnavailableReason, undefined);
+    assert.equal(chatMeta.proCarsUnavailableUntil, undefined);
+    assert.equal(chatMeta.proCarRestriction, undefined);
+  } finally {
+    ChatplusClient.prototype.check = originalChatCheck;
+    DrawingClient.prototype.check = originalDrawingCheck;
+  }
+});
+
 test("检测账号时门户认证失败仍然标记为掉线", async () => {
   const config = await loadConfig();
   await saveConfig({

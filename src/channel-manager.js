@@ -208,6 +208,27 @@ function activeCountForDrawingModel(modelKey) {
   return activeDrawingModelCounts.get(modelRequestKey(modelKey)) || 0;
 }
 
+function durableRunningCount(tasks, slot, modelKey = "") {
+  const requestedModelKey = modelRequestKey(modelKey);
+  return tasks.filter((task) => (
+    taskHoldsDurableSlot(task)
+    && !activeSubmittedTaskIds.has(task.id)
+    && storedTaskSlot(task) === slot
+    && (!requestedModelKey || storedTaskModelKey(task) === requestedModelKey)
+  )).length;
+}
+
+function runningCountForSlot(tasks, slot) {
+  return activeCountForSlot(slot) + durableRunningCount(tasks, slot);
+}
+
+function runningCountForModelSlot(tasks, slot, modelKey) {
+  const active = slot === "drawingImage"
+    ? activeCountForDrawingModel(modelKey)
+    : activeCountForModelSlot(slot, modelKey);
+  return active + durableRunningCount(tasks, slot, modelKey);
+}
+
 function activeCountForAccountSlot(slot, accountId) {
   const prefix = `${slot}:`;
   const suffix = `:${accountId}`;
@@ -329,8 +350,8 @@ function runtimeChatModelKeys(config) {
   return [...keys];
 }
 
-function runtimeModelConcurrency(config, availableOnly = false) {
-  const sharedDrawingRunning = activeCountForSlot("drawingImage");
+function runtimeModelConcurrency(config, availableOnly = false, tasks = []) {
+  const sharedDrawingRunning = runningCountForSlot(tasks, "drawingImage");
   return Object.fromEntries(runtimeChatModelKeys(config).map((modelKey) => {
     const configured = {
       chat: runtimeSlotCapacity(config, "chat", "chatplus", "chat", availableOnly, modelKey),
@@ -345,9 +366,9 @@ function runtimeModelConcurrency(config, availableOnly = false) {
           chatImage: runtimeSlotCapacity(config, "text2img", "chatplus", "chatImage", true, modelKey)
         };
     const running = {
-      chat: activeCountForModelSlot("chat", modelKey),
-      drawingImage: activeCountForDrawingModel(modelKey),
-      chatImage: activeCountForModelSlot("chatImage", modelKey)
+      chat: runningCountForModelSlot(tasks, "chat", modelKey),
+      drawingImage: runningCountForModelSlot(tasks, "drawingImage", modelKey),
+      chatImage: runningCountForModelSlot(tasks, "chatImage", modelKey)
     };
     const configuredImage = configured.drawingImage + configured.chatImage;
     const availableImage = available.drawingImage + available.chatImage;
@@ -399,13 +420,19 @@ export async function getRuntimeStatus() {
   activeTaskConcurrency = concurrency;
   const configured = runtimeAccountConcurrency(config);
   const available = runtimeAccountConcurrency(config, true);
-  const models = runtimeModelConcurrency(config);
-  const running = {
-    chat: activeCountForSlot("chat"),
-    drawingImage: activeCountForSlot("drawingImage"),
-    chatImage: activeCountForSlot("chatImage")
-  };
   const tasks = await listTasks();
+  const enabledChannels = (config.channels || []).filter((channel) => channel.enabled !== false);
+  const runtimeAccountIds = new Set((config.accounts || [])
+    .filter((account) => account.enabled !== false)
+    .filter((account) => enabledChannels.some((channel) => accountMatchesChannel(account, channel)))
+    .map((account) => String(account.id || "")));
+  const runtimeTasks = tasks.filter((task) => runtimeAccountIds.has(String(task.accountId || "")));
+  const models = runtimeModelConcurrency(config, false, runtimeTasks);
+  const running = {
+    chat: runningCountForSlot(runtimeTasks, "chat"),
+    drawingImage: runningCountForSlot(runtimeTasks, "drawingImage"),
+    chatImage: runningCountForSlot(runtimeTasks, "chatImage")
+  };
   const waiting = {
     image: tasks.filter((task) => task.status === "waiting_upstream" && task.taskType !== "chat").length,
     chat: tasks.filter((task) => task.status === "waiting_upstream" && task.taskType === "chat").length
@@ -710,28 +737,53 @@ function clientCacheKey(channel, account) {
   ].join("::");
 }
 
-async function persistProCarRestriction(channel, account) {
-  const config = await loadRuntimeConfig();
-  const current = config.accounts.find((item) => item.id === account.id);
-  if (!current) return;
+async function persistProCarRestriction(channel, account, restriction = {}) {
+  if (!account?.id) return;
   const ability = channelAbilityKey(channel);
-  if (ability) {
-    const abilityStatus = current.meta?.abilities?.[ability] || {};
-    await updateTargetAccountStatus(account.id, channel, {
-      meta: {
-        ...(abilityStatus.meta || {}),
-        proCarsUnavailable: true,
-        proCarsUnavailableReason: "plan_mismatch"
-      }
-    });
-    return;
-  }
-  await updateAccountStatus(account.id, {
-    meta: {
-      ...(current.meta || {}),
-      chatplusProCarsUnavailable: true,
-      chatplusProCarsUnavailableReason: "plan_mismatch"
+  const until = String(restriction.until || "").trim();
+  await updateAccountMeta(account.id, (accountMeta) => {
+    if (ability) {
+      const abilities = { ...(accountMeta.abilities || {}) };
+      const abilityStatus = { ...(abilities[ability] || {}) };
+      abilities[ability] = {
+        ...abilityStatus,
+        meta: {
+          ...(abilityStatus.meta || {}),
+          proCarsUnavailable: true,
+          proCarsUnavailableReason: "plan_mismatch",
+          proCarsUnavailableUntil: until
+        }
+      };
+      return { ...accountMeta, abilities };
     }
+    return {
+      ...accountMeta,
+      chatplusProCarsUnavailable: true,
+      chatplusProCarsUnavailableReason: "plan_mismatch",
+      chatplusProCarsUnavailableUntil: until
+    };
+  });
+}
+
+async function clearProCarRestriction(channel, account) {
+  if (!account?.id) return;
+  const ability = channelAbilityKey(channel);
+  await updateAccountMeta(account.id, (accountMeta) => {
+    if (ability) {
+      const abilities = { ...(accountMeta.abilities || {}) };
+      const abilityStatus = { ...(abilities[ability] || {}) };
+      const abilityMeta = { ...(abilityStatus.meta || {}) };
+      delete abilityMeta.proCarsUnavailable;
+      delete abilityMeta.proCarsUnavailableReason;
+      delete abilityMeta.proCarsUnavailableUntil;
+      abilities[ability] = { ...abilityStatus, meta: abilityMeta };
+      return { ...accountMeta, abilities };
+    }
+    const nextMeta = { ...accountMeta };
+    delete nextMeta.chatplusProCarsUnavailable;
+    delete nextMeta.chatplusProCarsUnavailableReason;
+    delete nextMeta.chatplusProCarsUnavailableUntil;
+    return nextMeta;
   });
 }
 
@@ -803,7 +855,8 @@ function clientContext(config, channel, account) {
     channel,
     account,
     sessionLock: (work) => withAccountAuthLock(account, work),
-    onProCarsUnavailable: () => persistProCarRestriction(channel, account),
+    onProCarsUnavailable: (restriction) => persistProCarRestriction(channel, account, restriction),
+    onProCarsAvailable: () => clearProCarRestriction(channel, account),
     onImageCarCooldown: (cooldown) => persistImageCarCooldown(channel, account, cooldown)
   };
 }
@@ -2885,6 +2938,7 @@ function statusSubscriptionExpired(status = {}) {
 }
 
 function targetSubscriptionExpired(target, input = {}) {
+  if (statusSubscriptionExpired(target?.account || {})) return true;
   return target?.channel?.type === "chatplus"
     && statusSubscriptionExpired(targetQuotaStatusForTask(target, input));
 }
@@ -4874,7 +4928,22 @@ function reconcileChatUsageResetTimes(currentStatus = {}, nextStatus = {}) {
 }
 
 function successfulChatAccountCheckStatus(currentStatus = {}, status = {}) {
-  return reconcileChatUsageResetTimes(currentStatus, successfulAccountCheckStatus(status));
+  const nextStatus = reconcileChatUsageResetTimes(currentStatus, successfulAccountCheckStatus(status));
+  const restriction = status.meta?.proCarRestriction;
+  if (!restriction || typeof restriction !== "object") return nextStatus;
+
+  const meta = { ...(nextStatus.meta || {}) };
+  delete meta.proCarRestriction;
+  if (restriction.active === true && Date.parse(restriction.until || "") > Date.now()) {
+    meta.proCarsUnavailable = true;
+    meta.proCarsUnavailableReason = "plan_mismatch";
+    meta.proCarsUnavailableUntil = restriction.until;
+  } else {
+    delete meta.proCarsUnavailable;
+    delete meta.proCarsUnavailableReason;
+    delete meta.proCarsUnavailableUntil;
+  }
+  return { ...nextStatus, meta };
 }
 
 function accountCheckTimeoutStatus(currentStatus = {}, error) {

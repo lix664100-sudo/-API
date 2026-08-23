@@ -14,6 +14,7 @@ const CONVERSATION_READ_HEADERS = Object.freeze({
 });
 const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
+const PRO_CAR_RECHECK_MS = 6 * 60 * 60 * 1000;
 const UNCONFIRMED_CAR_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_UNCONFIRMED_CAR_ATTEMPTS = 2;
 const IMAGE_CAR_RECHECK_MS = 5 * 60 * 1000;
@@ -2019,6 +2020,18 @@ function savedProCarRestriction(account = {}, channel = {}) {
   );
 }
 
+function savedProCarRestrictionUntil(account = {}, channel = {}) {
+  if (!savedProCarRestriction(account, channel)) return 0;
+  const ability = String(channel?.ability || "");
+  const abilityMeta = ability ? account.meta?.abilities?.[ability]?.meta : null;
+  const until = Date.parse(
+    abilityMeta?.proCarsUnavailableUntil
+      || account.meta?.chatplusProCarsUnavailableUntil
+      || ""
+  );
+  return Number.isFinite(until) && until > Date.now() ? until : 0;
+}
+
 function savedImageCarCooldowns(account = {}, channel = {}) {
   const ability = String(channel?.ability || "");
   const abilityCooldowns = ability
@@ -2108,7 +2121,7 @@ async function measureTaskStage(recorder, stage, work) {
 }
 
 export class ChatplusClient {
-  constructor({ config, channel, account, sessionLock, onProCarsUnavailable, onImageCarCooldown }) {
+  constructor({ config, channel, account, sessionLock, onProCarsUnavailable, onProCarsAvailable, onImageCarCooldown }) {
     this.config = config;
     this.channel = channel;
     this.account = account;
@@ -2128,12 +2141,14 @@ export class ChatplusClient {
     };
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     this.onProCarsUnavailable = typeof onProCarsUnavailable === "function" ? onProCarsUnavailable : null;
+    this.onProCarsAvailable = typeof onProCarsAvailable === "function" ? onProCarsAvailable : null;
     this.onImageCarCooldown = typeof onImageCarCooldown === "function" ? onImageCarCooldown : null;
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWorks = new Map();
     this.concurrentChatSessions = new Map();
     this.sessionRevision = 0;
-    this.proCarsUnavailableUntil = savedProCarRestriction(account, channel) ? Infinity : 0;
+    this.proCarRestrictionSaved = savedProCarRestriction(account, channel);
+    this.proCarsUnavailableUntil = savedProCarRestrictionUntil(account, channel);
     restoreSavedImageCarCooldowns(account, channel);
   }
 
@@ -2146,7 +2161,7 @@ export class ChatplusClient {
     ].join("::");
   }
 
-  updateContext({ config, channel, account, sessionLock, onProCarsUnavailable, onImageCarCooldown }) {
+  updateContext({ config, channel, account, sessionLock, onProCarsUnavailable, onProCarsAvailable, onImageCarCooldown }) {
     const nextSignature = this.makeContextSignature({ channel, account });
     const changed = nextSignature !== this.contextSignature;
     this.config = config;
@@ -2155,14 +2170,17 @@ export class ChatplusClient {
     this.baseUrl = trimSlash(channel?.settings?.baseUrl || "https://www.chatplus.cc");
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     this.onProCarsUnavailable = typeof onProCarsUnavailable === "function" ? onProCarsUnavailable : null;
+    this.onProCarsAvailable = typeof onProCarsAvailable === "function" ? onProCarsAvailable : null;
     this.onImageCarCooldown = typeof onImageCarCooldown === "function" ? onImageCarCooldown : null;
     restoreSavedImageCarCooldowns(account, channel);
     if (changed) {
       this.contextSignature = nextSignature;
-      this.proCarsUnavailableUntil = savedProCarRestriction(account, channel) ? Infinity : 0;
+      this.proCarRestrictionSaved = savedProCarRestriction(account, channel);
+      this.proCarsUnavailableUntil = savedProCarRestrictionUntil(account, channel);
       this.resetSession();
-    } else if (savedProCarRestriction(account, channel)) {
-      this.proCarsUnavailableUntil = Infinity;
+    } else {
+      this.proCarRestrictionSaved = savedProCarRestriction(account, channel);
+      this.proCarsUnavailableUntil = savedProCarRestrictionUntil(account, channel);
     }
   }
 
@@ -2679,18 +2697,28 @@ export class ChatplusClient {
       accountId: this.account?.id,
       carType: route.carType
     };
+    const proCarsUnavailable = this.proCarsUnavailableUntil > Date.now();
+    if (!proCarsUnavailable && this.proCarsUnavailableUntil) this.proCarsUnavailableUntil = 0;
+    const recheckProCars = proCarsUnavailable && options.recheckProCars === true;
     const candidates = rankedCars(cars, selectionStrategy, selectionContext)
       .map((car) => ({ car, carId: concreteCarId(car, selectionContext) }))
       .filter((item) => !ignoredCarIds.has(item.carId))
-      .filter((item) => !isBadCar(this.account?.id, route.carType, item.carId));
+      .filter((item) => (
+        recheckProCars && (item.car.isPro || item.car.isUltra)
+          ? true
+          : !isBadCar(this.account?.id, route.carType, item.carId)
+      ));
     if (!candidates.length) throw new Error(`${route.name} 暂时没有可用车辆。`);
     const tierCandidates = candidates.filter((item) => carMatchesTier(item.car, tier));
     if (!tierCandidates.length) throw new Error(`${route.name} 暂时没有可用的${carTierDisplayName(tier)}车位。`);
-    const proCarsUnavailable = this.proCarsUnavailableUntil > Date.now();
-    if (!proCarsUnavailable && this.proCarsUnavailableUntil) this.proCarsUnavailableUntil = 0;
-    const usableCars = proCarsUnavailable
-      ? tierCandidates.filter((item) => !item.car.isPro && !item.car.isUltra)
-      : tierCandidates;
+    const usableCars = recheckProCars
+      ? [
+          ...tierCandidates.filter((item) => item.car.isPro || item.car.isUltra),
+          ...tierCandidates.filter((item) => !item.car.isPro && !item.car.isUltra)
+        ]
+      : proCarsUnavailable
+        ? tierCandidates.filter((item) => !item.car.isPro && !item.car.isUltra)
+        : tierCandidates;
     if (!usableCars.length) {
       throw new Error(`${route.name} 当前账号不能使用 PRO 车位，普通车位也暂时不可用。`);
     }
@@ -2767,12 +2795,28 @@ export class ChatplusClient {
     }
   }
 
-  rememberProCarsUnavailable(error) {
+  async rememberProCarsUnavailable(error) {
     if (isProCarPlanMismatchError(error)) {
-      this.proCarsUnavailableUntil = Infinity;
-      Promise.resolve(this.onProCarsUnavailable?.()).catch((persistError) => {
+      this.proCarRestrictionSaved = true;
+      this.proCarsUnavailableUntil = Date.now() + PRO_CAR_RECHECK_MS;
+      try {
+        await this.onProCarsUnavailable?.({
+          until: new Date(this.proCarsUnavailableUntil).toISOString()
+        });
+      } catch (persistError) {
         console.error("保存账号车位等级失败：", persistError);
-      });
+      }
+    }
+  }
+
+  async rememberProCarsAvailable() {
+    if (!this.proCarRestrictionSaved) return;
+    this.proCarRestrictionSaved = false;
+    this.proCarsUnavailableUntil = 0;
+    try {
+      await this.onProCarsAvailable?.();
+    } catch (persistError) {
+      console.error("清除账号车位等级失败：", persistError);
     }
   }
 
@@ -2785,8 +2829,14 @@ export class ChatplusClient {
     };
     const errors = [];
     let subscriptionExpiredAttempts = 0;
+    let recheckProCars = input.recheckProCars === true;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const selected = await this.selectCar(route, ignoredCarIds, requestOptions);
+      const selected = await this.selectCar(route, ignoredCarIds, {
+        ...requestOptions,
+        recheckProCars
+      });
+      const selectedProCar = selected.car?.isPro === true || selected.car?.isUltra === true;
+      if (recheckProCars && selectedProCar) recheckProCars = false;
       ignoredCarIds.add(selected.carId);
       this.carId = selected.carId;
       this.carType = selected.carType;
@@ -2805,6 +2855,9 @@ export class ChatplusClient {
               carType: selected.carType
             }, async () => this.loadInit(requestOptions))
           : {};
+        if (this.proCarRestrictionSaved && selectedProCar) {
+          await this.rememberProCarsAvailable();
+        }
         return { route, selected, init, revision: this.sessionRevision };
       } catch (error) {
         if (route.key === "gpt" && isChatSubscriptionExpiredText(`${error?.message || ""} ${error?.body || ""}`)) {
@@ -2812,7 +2865,7 @@ export class ChatplusClient {
         }
         const retryableCarError = isAuthSessionError(error) || isCarPlanMismatchError(error);
         if (retryableCarError) {
-          this.rememberProCarsUnavailable(error);
+          await this.rememberProCarsUnavailable(error);
           this.rememberAuthFailedCar(selected);
           await this.sessionLock(async () => this.resetSession());
         }
@@ -2901,6 +2954,7 @@ export class ChatplusClient {
         () => this.prepareChatSession({
           model: usageRoute.key,
           preferImageCar: true,
+          recheckProCars: true,
           checkTimeoutSec: ACCOUNT_CHECK_TIMEOUT_SEC
         }, new Set(), 5)
       );
@@ -2921,6 +2975,12 @@ export class ChatplusClient {
           chatModel: route.key,
           selectedCarId: selected.carId,
           strategy: selected.strategy,
+          proCarRestriction: {
+            active: this.proCarRestrictionSaved && this.proCarsUnavailableUntil > Date.now(),
+            until: this.proCarsUnavailableUntil > Date.now()
+              ? new Date(this.proCarsUnavailableUntil).toISOString()
+              : ""
+          },
           recoveryUsage: usage,
           referenceUsage
         }
@@ -3793,7 +3853,7 @@ export class ChatplusClient {
         }
         const retryableCarError = selected && (isAuthSessionError(error) || isCarPlanMismatchError(error));
         if (retryableCarError) {
-          this.rememberProCarsUnavailable(error);
+          await this.rememberProCarsUnavailable(error);
           this.rememberAuthFailedCar(selected);
           await this.invalidatePreparedChatSession(preparedSession);
           errors.push(error.message || "调用失败");

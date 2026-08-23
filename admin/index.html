@@ -4383,10 +4383,10 @@
         const statuses = relatedAccounts
           .filter((item) => item.enabled !== false)
           .map((item) => accountEffectiveStatus(item, channel));
+        if (statuses.some((status) => status === "ok")) return "ok";
         if (statuses.some((status) => status === "subscription_expired")) return "subscription_expired";
         if (statuses.some((status) => status === "disconnected")) return "disconnected";
         if (statuses.some((status) => status === "error" || status === "failed")) return "error";
-        if (statuses.some((status) => status === "ok")) return "ok";
         if (statuses.some((status) => status === "quota_empty")) return "quota_empty";
         if (statuses.some((status) => status === "activation_required")) return "activation_required";
         return "unknown";
@@ -4410,12 +4410,15 @@
       }
 
       function aggregateChatStatus(accounts, channel) {
-        const statuses = accounts
-          .filter((item) => item.enabled !== false)
-          .map((item) => channel?.type === "shareai" ? abilityStatus(item, "chatplus") : item);
+        const enabledAccounts = accounts.filter((item) => item.enabled !== false);
+        const statusFor = (account) => channel?.type === "shareai" ? abilityStatus(account, "chatplus") : account;
+        const statuses = enabledAccounts.map(statusFor);
         if (!statuses.length) return { status: "unknown" };
+        const quotaAccounts = enabledAccounts.filter((account) => (
+          ["ok", "quota_empty"].includes(chatDisplayStatus(statusFor(account)))
+        ));
         const referenceUsage = aggregateChatReferenceUsage(
-          accounts,
+          quotaAccounts.length ? quotaAccounts : enabledAccounts,
           channel?.type,
           chatModelsForChannel(channel).filter((item) => item.enabled).map((item) => item.key)
         );
@@ -4426,10 +4429,10 @@
             referenceUsage
           }
         });
-        const expired = statuses.find((item) => chatDisplayStatus(item) === "subscription_expired");
-        if (expired) return withReferenceUsage({ ...expired, status: "subscription_expired" });
         const available = statuses.find((item) => chatDisplayStatus(item) === "ok");
         if (available) return withReferenceUsage({ ...available, status: "ok", quotaConfirmedByUpstream: false });
+        const expired = statuses.find((item) => chatDisplayStatus(item) === "subscription_expired");
+        if (expired) return withReferenceUsage({ ...expired, status: "subscription_expired" });
         const explicitEmpty = statuses.find(confirmedChatQuotaEmpty);
         if (explicitEmpty && statuses.every((item) => confirmedChatQuotaEmpty(item))) return withReferenceUsage(explicitEmpty);
         const unavailable = statuses.find((item) => ["subscription_expired", "activation_required", "error", "failed", "disconnected", "disabled"].includes(chatDisplayStatus(item)));
