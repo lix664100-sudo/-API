@@ -4541,6 +4541,7 @@ export class ChatplusClient {
       try {
         const pushedUpdates = chatplusConversationUpdates(conversationId);
         if (pushedUpdates.length) {
+          this.rememberImageTaskId(conversationId, imageTaskIdFrom(pushedUpdates, conversationId));
           shouldCheckImageTasks ||= hasAsyncImageTaskMarker(pushedUpdates);
           imageUrls = await this.imageUrlsFrom(pushedUpdates, { generatedOnly: true });
           if (imageUrls.length) return imageUrls;
@@ -4559,12 +4560,13 @@ export class ChatplusClient {
           }
         }
         let detail = await this.conversationDetail(conversationId);
+        this.rememberImageTaskId(conversationId, imageTaskIdFrom(detail, conversationId));
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
         shouldCheckImageTasks ||= hasAsyncImageTaskMarker(detail);
         if (shouldCheckImageTasks) {
           const imageTaskState = await this.imageGenerationTaskState(conversationId, {
-            upstreamTaskId: options.upstreamTaskId,
+            upstreamTaskId: options.upstreamTaskId || this.imageTaskIds.get(conversationId),
             timeoutSec: Math.min(30, Math.max(5, Math.ceil((deadline - Date.now()) / 1000)))
           });
           if (imageTaskState?.imageUrls.length) return imageTaskState.imageUrls;
@@ -4694,6 +4696,12 @@ export class ChatplusClient {
       }
     }
     const pushedUpdates = geminiTask ? [] : chatplusConversationUpdates(externalId);
+    const observedTaskId = geminiTask || typeof taskReader.rememberImageTaskId !== "function"
+      ? ""
+      : taskReader.rememberImageTaskId(
+          externalId,
+          imageTaskIdFrom([detail, ...pushedUpdates], externalId)
+        );
     const imageReader = typeof taskReader.imageUrlsFrom === "function" ? taskReader : this;
     let imageUrls = pushedUpdates.length
       ? await imageReader.imageUrlsFrom(pushedUpdates, { generatedOnly: true })
@@ -4709,7 +4717,7 @@ export class ChatplusClient {
       imageUrls = await imageReader.imageUrlsFrom(detail, { generatedOnly: true });
     }
     let imageTaskState = null;
-    const shouldCheckImageTasks = Boolean(context.upstreamTaskId)
+    const shouldCheckImageTasks = Boolean(context.upstreamTaskId || observedTaskId)
       || hasAsyncImageTaskMarker(detail)
       || hasAsyncImageTaskMarker(pushedUpdates);
     if (
@@ -4720,13 +4728,13 @@ export class ChatplusClient {
     ) {
       imageTaskState = await taskReader.imageGenerationTaskState(externalId, {
         ...requestOptions,
-        upstreamTaskId: context.upstreamTaskId
+        upstreamTaskId: context.upstreamTaskId || observedTaskId
       });
       if (imageTaskState?.imageUrls.length) imageUrls = imageTaskState.imageUrls;
     }
     const resultParts = [detail, ...pushedUpdates, imageTaskState?.task].filter(Boolean);
     const resultState = resultParts.length === 1 ? resultParts[0] : resultParts;
-    const upstreamTaskId = imageTaskState?.taskId || context.upstreamTaskId || "";
+    const upstreamTaskId = imageTaskState?.taskId || context.upstreamTaskId || observedTaskId || "";
     const rawDetail = !geminiTask && (
       resultChannelReady
       || resultChannelError

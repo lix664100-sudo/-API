@@ -537,6 +537,7 @@ test("chatplus task refresh reads a completed image from the realtime result cha
     type: "conversation-update",
     payload: {
       conversation_id: conversationId,
+      task_id: "upstream-task-from-realtime",
       update_type: "async-task-update-message",
       update_content: {
         message: {
@@ -558,6 +559,7 @@ test("chatplus task refresh reads a completed image from the realtime result cha
   assert.deepEqual(task.imageUrls, [resultUrl]);
   assert.equal(requests.some((item) => item.pathName.endsWith("/async-status")), false);
   assert.equal(task.raw.resultChannelUpdateCount, 1);
+  assert.equal(task.raw.upstreamTaskId, "upstream-task-from-realtime");
 });
 
 test("chatplus task refresh recovers a stale conversation by its saved upstream task id", async () => {
