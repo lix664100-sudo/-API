@@ -1,4 +1,4 @@
-import { randomBytes, randomInt, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomInt, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -24,13 +24,19 @@ const routingEventLimit = 50000;
 const intradayIntervalMinutes = 30;
 const accountImportLimit = 500;
 const proxyBatchLimit = 500;
+const chatplusUpdateTtlMs = 60 * 60 * 1000;
+const chatplusUpdatesPerConversation = 16;
+const chatplusUpdateLimit = 2000;
+const maxChatplusUpdateBytes = 512 * 1024;
 let statsWriteQueue = Promise.resolve();
 let runtimeStatsWriteQueue = Promise.resolve();
 let tasksWriteQueue = Promise.resolve();
 let configWriteQueue = Promise.resolve();
+let chatplusUpdatesWriteQueue = Promise.resolve();
 let statsRevision = 0;
 let routingRevision = 0;
 let routingPruneAt = 0;
+let chatplusUpdatesPruneAt = 0;
 let statsSnapshot = null;
 const intradayStatsCache = new Map();
 let todayAccountRoutingUsageCache = null;
@@ -433,6 +439,16 @@ async function openStorageDatabase() {
       CREATE INDEX IF NOT EXISTS routing_events_account_slot_time_idx
         ON routing_events(account_id, slot, time DESC);
 
+      CREATE TABLE IF NOT EXISTS chatplus_conversation_updates (
+        conversation_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        updated_time INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY(conversation_id, fingerprint)
+      );
+      CREATE INDEX IF NOT EXISTS chatplus_conversation_updates_time_idx
+        ON chatplus_conversation_updates(updated_time DESC);
+
       CREATE TABLE IF NOT EXISTS storage_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -479,7 +495,8 @@ export async function closeStorage() {
     configWriteQueue.catch(() => {}),
     tasksWriteQueue.catch(() => {}),
     statsWriteQueue.catch(() => {}),
-    runtimeStatsWriteQueue.catch(() => {})
+    runtimeStatsWriteQueue.catch(() => {}),
+    chatplusUpdatesWriteQueue.catch(() => {})
   ]);
 
   const database = storageDatabase || await storageDatabasePromise?.catch(() => null);
@@ -493,6 +510,7 @@ export async function closeStorage() {
   statsSnapshot = null;
   routingRevision = 0;
   routingPruneAt = 0;
+  chatplusUpdatesPruneAt = 0;
   intradayStatsCache.clear();
   todayAccountRoutingUsageCache = null;
   tasksSnapshot = {
@@ -2121,6 +2139,83 @@ export async function getTask(id) {
   } catch {
     return null;
   }
+}
+
+export async function storeChatplusConversationUpdate(conversationId, fingerprint, payload) {
+  const normalizedConversationId = String(conversationId || "").trim().slice(0, 200);
+  if (!normalizedConversationId || !payload || typeof payload !== "object") return false;
+  let serialized = "";
+  try {
+    serialized = JSON.stringify(payload);
+  } catch {
+    return false;
+  }
+  if (!serialized || Buffer.byteLength(serialized, "utf8") > maxChatplusUpdateBytes) return false;
+  const normalizedFingerprint = String(fingerprint || "").trim()
+    || createHash("sha256").update(serialized).digest("hex");
+  const write = chatplusUpdatesWriteQueue.catch(() => {}).then(async () => {
+    const database = await getStorageDatabase();
+    const now = Date.now();
+    const transaction = database.transaction(() => {
+      database.prepare(`
+        INSERT INTO chatplus_conversation_updates (
+          conversation_id, fingerprint, updated_time, payload
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(conversation_id, fingerprint) DO UPDATE SET
+          updated_time = excluded.updated_time,
+          payload = excluded.payload
+      `).run(normalizedConversationId, normalizedFingerprint.slice(0, 200), now, serialized);
+      database.prepare(`
+        DELETE FROM chatplus_conversation_updates
+        WHERE rowid IN (
+          SELECT rowid
+          FROM chatplus_conversation_updates
+          WHERE conversation_id = ?
+          ORDER BY updated_time DESC
+          LIMIT -1 OFFSET ?
+        )
+      `).run(normalizedConversationId, chatplusUpdatesPerConversation);
+      if (now >= chatplusUpdatesPruneAt) {
+        database.prepare("DELETE FROM chatplus_conversation_updates WHERE updated_time < ?")
+          .run(now - chatplusUpdateTtlMs);
+        database.prepare(`
+          DELETE FROM chatplus_conversation_updates
+          WHERE rowid IN (
+            SELECT rowid
+            FROM chatplus_conversation_updates
+            ORDER BY updated_time DESC
+            LIMIT -1 OFFSET ?
+          )
+        `).run(chatplusUpdateLimit);
+        chatplusUpdatesPruneAt = now + 10 * 60 * 1000;
+      }
+    });
+    transaction();
+    return true;
+  });
+  chatplusUpdatesWriteQueue = write.catch(() => {});
+  return write;
+}
+
+export async function listChatplusConversationUpdates(conversationId) {
+  const normalizedConversationId = String(conversationId || "").trim().slice(0, 200);
+  if (!normalizedConversationId) return [];
+  await chatplusUpdatesWriteQueue.catch(() => {});
+  const database = await getStorageDatabase();
+  const rows = database.prepare(`
+    SELECT payload
+    FROM chatplus_conversation_updates
+    WHERE conversation_id = ? AND updated_time >= ?
+    ORDER BY updated_time ASC
+    LIMIT ?
+  `).all(normalizedConversationId, Date.now() - chatplusUpdateTtlMs, chatplusUpdatesPerConversation);
+  return rows.flatMap((row) => {
+    try {
+      return [JSON.parse(row.payload)];
+    } catch {
+      return [];
+    }
+  });
 }
 
 export async function getTaskBySourceTaskId(sourceTaskId) {

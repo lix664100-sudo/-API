@@ -4695,7 +4695,12 @@ export class ChatplusClient {
         detail = await readWith(await restoreConversationSession(resetAfterDirectRead));
       }
     }
-    const pushedUpdates = geminiTask ? [] : chatplusConversationUpdates(externalId);
+    const persistedUpdates = Array.isArray(context.persistedUpdates)
+      ? context.persistedUpdates.filter((item) => item && typeof item === "object")
+      : [];
+    const pushedUpdates = geminiTask
+      ? []
+      : [...persistedUpdates, ...chatplusConversationUpdates(externalId)].slice(-32);
     const observedTaskId = geminiTask || typeof taskReader.rememberImageTaskId !== "function"
       ? ""
       : taskReader.rememberImageTaskId(

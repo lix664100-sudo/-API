@@ -12,6 +12,7 @@ const MAX_SOCKET_PAYLOAD_BYTES = 32 * 1024 * 1024;
 const connections = new Map();
 const conversationUpdates = new Map();
 const conversationWaiters = new Map();
+const conversationUpdateListeners = new Set();
 let updateVersion = 0;
 
 function parseJson(value) {
@@ -76,6 +77,22 @@ function notifyConversationWaiters(conversationId, version) {
   if (!waiters.size) conversationWaiters.delete(conversationId);
 }
 
+function notifyConversationUpdateListeners(update) {
+  for (const listener of conversationUpdateListeners) {
+    try {
+      Promise.resolve(listener(update)).catch(() => {});
+    } catch {
+      // A storage listener must never interrupt the live result connection.
+    }
+  }
+}
+
+export function subscribeChatplusConversationUpdates(listener) {
+  if (typeof listener !== "function") throw new TypeError("listener must be a function");
+  conversationUpdateListeners.add(listener);
+  return () => conversationUpdateListeners.delete(listener);
+}
+
 export function recordChatplusConversationUpdate(value, offset = "") {
   const normalized = normalizedConversationUpdate(value);
   if (!normalized) return null;
@@ -100,6 +117,7 @@ export function recordChatplusConversationUpdate(value, offset = "") {
   current.version = ++updateVersion;
   current.updatedAt = Date.now();
   conversationUpdates.set(conversationId, current);
+  notifyConversationUpdateListeners({ conversationId, payload, fingerprint, updatedAt: current.updatedAt });
   notifyConversationWaiters(conversationId, current.version);
   return current.version;
 }

@@ -7,7 +7,15 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-source-id-"));
 process.env.DATA_DIR = dataDir;
 
-const { closeStorage, getTaskBySourceTaskId, listTasks, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
+const {
+  closeStorage,
+  getTaskBySourceTaskId,
+  listChatplusConversationUpdates,
+  listTasks,
+  loadConfig,
+  saveConfig,
+  upsertTask
+} = await import("../src/storage.js");
 const { createImageTask, getRuntimeStatus, refreshTask } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const {
@@ -560,6 +568,49 @@ test("chatplus task refresh reads a completed image from the realtime result cha
   assert.equal(requests.some((item) => item.pathName.endsWith("/async-status")), false);
   assert.equal(task.raw.resultChannelUpdateCount, 1);
   assert.equal(task.raw.upstreamTaskId, "upstream-task-from-realtime");
+});
+
+test("chatplus task refresh recovers a realtime image after the memory cache is reset", async () => {
+  resetChatplusConversationUpdatesForTests();
+  const conversationId = "conversation-durable-realtime-complete";
+  const resultUrl = "https://one.example.test/generated-from-durable-realtime.png";
+  recordChatplusConversationUpdate({
+    type: "conversation-update",
+    payload: {
+      conversation_id: conversationId,
+      update_type: "async-task-completed",
+      update_content: {
+        message: {
+          author: { role: "tool" },
+          content: {
+            content_type: "multimodal_text",
+            parts: [{ type: "image_url", image_url: resultUrl }]
+          },
+          status: "finished_successfully"
+        }
+      }
+    }
+  });
+  const persistedUpdates = await listChatplusConversationUpdates(conversationId);
+  resetChatplusConversationUpdatesForTests();
+
+  const staleDetail = { async_status: 5, mapping: {} };
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-durable-update-account", username: "durable-update@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.ensureConversationUpdates = async () => null;
+  client.conversationDetail = async () => staleDetail;
+  client.refreshCompletedConversation = async () => staleDetail;
+
+  const task = await client.getTask(conversationId, { persistedUpdates, timeoutSec: 30 });
+
+  assert.equal(persistedUpdates.length, 1);
+  assert.equal(task.status, "success");
+  assert.deepEqual(task.imageUrls, [resultUrl]);
 });
 
 test("chatplus task refresh recovers a stale conversation by its saved upstream task id", async () => {

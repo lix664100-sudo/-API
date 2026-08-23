@@ -10,6 +10,7 @@ import {
 import { mirrorImageUrls } from "./image-store.js";
 import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "./image-limits.js";
 import { createFastTaskRefresher } from "./fast-task-refresher.js";
+import { subscribeChatplusConversationUpdates } from "./chatplus-conversation-updates.js";
 import {
   checkProxyReachability,
   isProxyConnectionError,
@@ -22,10 +23,12 @@ import {
 } from "./proxy.js";
 import {
   getTask,
+  listChatplusConversationUpdates,
   listActiveTasks,
   listTodayAccountRoutingUsage,
   loadConfig,
   recordTaskStat,
+  storeChatplusConversationUpdate,
   updateAccountMeta,
   updateAccountStatus,
   upsertTask
@@ -83,6 +86,10 @@ const PROXY_GUARDED_CLIENT_METHODS = new Set([
 ]);
 let activeTaskConcurrency = { ...defaultTaskConcurrency };
 let routingReservationQueue = Promise.resolve();
+
+subscribeChatplusConversationUpdates(({ conversationId, payload, fingerprint }) => (
+  storeChatplusConversationUpdate(conversationId, fingerprint, payload)
+));
 
 function normalizeSourceTaskId(value) {
   const text = String(Array.isArray(value) ? value[0] : value || "").trim();
@@ -2575,11 +2582,15 @@ async function refreshTaskOnce(taskId, options = {}) {
   let refreshReadSucceeded = false;
   const finalCheck = upstreamResultWaitExpired(task);
   const forceReconnect = upstreamReconnectDue(task, finalCheck);
+  const persistedUpdates = channel.type === "chatplus"
+    ? await listChatplusConversationUpdates(externalId)
+    : [];
   try {
     refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
       carId: task.raw?.selectedCarId,
       carType: task.raw?.selectedCarType,
       upstreamTaskId: task.raw?.upstreamTaskId,
+      persistedUpdates,
       timeoutSec: FAST_TASK_REFRESH_TIMEOUT_SEC,
       forceReconnect
     }));
