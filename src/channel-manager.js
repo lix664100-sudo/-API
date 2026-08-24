@@ -3897,6 +3897,7 @@ function noUsableTargetError(taskType, options = {}) {
     ? "当前没有可用的对话账号，请先检测账号状态。"
     : "当前没有可用的生图账号，请先检测账号状态或等待额度恢复。");
   error.status = 503;
+  error.code = "NO_USABLE_ACCOUNT";
   return error;
 }
 

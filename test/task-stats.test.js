@@ -77,7 +77,7 @@ test("compact task stats preserve totals while combining repeated records", () =
   assert.equal(summary.find((record) => record.status === "failed").failedTasks, 1);
 });
 
-test("最近生图趋势按北京时间汇总成功和失败，并补齐没有任务的日期", () => {
+test("最近账号产值按北京时间分别汇总生图和对话，并补齐没有任务的日期", () => {
   const now = Date.parse("2026-07-18T12:00:00+08:00");
   const summary = summarizeDailyTaskStats([
     {
@@ -149,14 +149,15 @@ test("最近生图趋势按北京时间汇总成功和失败，并补齐没有�
   assert.equal(summary.days.length, 30);
   assert.equal(summary.days.at(-1), "2026-07-18");
   assert.ok(summary.days.includes("2026-07-06"));
-  assert.equal(summary.records.length, 2);
+  assert.equal(summary.records.length, 3);
 
-  const drawing = summary.records.find((record) => record.accountId === "account-a");
+  const drawing = summary.records.find((record) => record.accountId === "account-a" && record.recordKind === "image");
   assert.deepEqual(drawing, {
     day: "2026-07-05",
     accountId: "account-a",
     accountName: "账号A",
     channelGroup: "drawing",
+    recordKind: "image",
     tasks: 2,
     successTasks: 1,
     failedTasks: 1,
@@ -169,8 +170,16 @@ test("最近生图趋势按北京时间汇总成功和失败，并补齐没有�
 
   const chatplus = summary.records.find((record) => record.accountId === "account-b");
   assert.equal(chatplus.day, "2026-07-05");
+  assert.equal(chatplus.recordKind, "image");
   assert.equal(chatplus.successTasks, 1);
   assert.equal(chatplus.failedTasks, 0);
+
+  const chat = summary.records.find((record) => record.recordKind === "chat");
+  assert.equal(chat.accountId, "account-a");
+  assert.equal(chat.tasks, 2);
+  assert.equal(chat.successTasks, 1);
+  assert.equal(chat.failedTasks, 1);
+  assert.equal(chat.successImages, 1);
 });
 
 test("趋势范围会限制在服务器保留的天数内", () => {
@@ -266,6 +275,7 @@ test("分时出图按北京时间每30分钟统计成功图片", () => {
     failedTasks: 1,
     systemRejectedTasks: 0,
     successImages: 2,
+    successConversations: 0,
     accountCount: 1,
     successRate: 50
   });
@@ -273,6 +283,59 @@ test("分时出图按北京时间每30分钟统计成功图片", () => {
   assert.equal(summary.totalImages, 3);
   assert.equal(summary.failedTasks, 1);
   assert.deepEqual(summary.peak, { start: "09:00", end: "09:30", successImages: 2 });
+});
+
+test("分时对话产值支持按账号筛选并与生图分开统计", () => {
+  const day = "2026-07-18";
+  const records = [
+    {
+      day,
+      time: Date.parse("2026-07-18T09:05:00+08:00"),
+      status: "success",
+      taskType: "chat",
+      tasks: 1,
+      accountId: "account-a"
+    },
+    {
+      day,
+      time: Date.parse("2026-07-18T09:15:00+08:00"),
+      status: "failed",
+      taskType: "chat",
+      tasks: 1,
+      failedTasks: 1,
+      accountId: "account-a"
+    },
+    {
+      day,
+      time: Date.parse("2026-07-18T09:20:00+08:00"),
+      status: "success",
+      taskType: "chat",
+      tasks: 1,
+      accountId: "account-b"
+    },
+    {
+      day,
+      time: Date.parse("2026-07-18T09:25:00+08:00"),
+      status: "success",
+      taskType: "img2img",
+      tasks: 1,
+      successImages: 1,
+      accountId: "account-a"
+    }
+  ];
+
+  const summary = summarizeIntradayTaskStats(records, day, Date.now(), {
+    accountId: "account-a",
+    recordKind: "chat"
+  });
+
+  assert.equal(summary.totalConversations, 1);
+  assert.equal(summary.totalImages, 0);
+  assert.equal(summary.totalTasks, 2);
+  assert.equal(summary.failedTasks, 1);
+  assert.equal(summary.buckets[18].successConversations, 1);
+  assert.equal(summary.buckets[18].accountCount, 1);
+  assert.deepEqual(summary.peak, { start: "09:00", end: "09:30", successConversations: 1 });
 });
 
 test("system rejections are reported separately and do not lower account success rates", () => {
@@ -349,6 +412,24 @@ test("a concurrency rejection before submission is not assigned to the attempted
 
   assert.equal(record.accountId, "");
   assert.equal(record.accountName, "");
+  assert.equal(record.tasks, 0);
+  assert.equal(record.failedTasks, 0);
+  assert.equal(record.systemRejectedTasks, 1);
+});
+
+test("a no-usable-account rejection is excluded from account productivity", async () => {
+  const completedAt = new Date().toISOString();
+  const record = await recordTaskStat({
+    id: "no-usable-account-before-submission",
+    status: "failed",
+    taskType: "img2img",
+    responseJson: { code: "NO_USABLE_ACCOUNT" },
+    raw: { returnedError: true },
+    createdAt: completedAt,
+    completedAt
+  });
+
+  assert.equal(record.accountId, "");
   assert.equal(record.tasks, 0);
   assert.equal(record.failedTasks, 0);
   assert.equal(record.systemRejectedTasks, 1);

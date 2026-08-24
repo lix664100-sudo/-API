@@ -2303,7 +2303,13 @@ function taskStatDuration(task, status) {
 function taskWasSystemRejected(task, status) {
   if (status !== "failed" || task?.raw?.returnedError !== true || task?.raw?.submitted === true) return false;
   const code = String(task?.responseJson?.code || task?.code || "").trim().toUpperCase();
-  return ["CONCURRENCY_LIMIT", "QUOTA_PROTECTION"].includes(code);
+  return [
+    "CHAT_USAGE_LIMIT",
+    "CONCURRENCY_LIMIT",
+    "NO_USABLE_ACCOUNT",
+    "QUOTA_EXHAUSTED",
+    "QUOTA_PROTECTION"
+  ].includes(code);
 }
 
 function taskStatCount(record) {
@@ -2314,6 +2320,13 @@ function taskStatCount(record) {
 function taskStatValue(record, field, fallback = 0) {
   const value = record?.[field];
   return Math.max(0, Number(value === undefined || value === null ? fallback : value) || 0);
+}
+
+function taskStatRecordKind(record) {
+  const taskType = String(record?.taskType || "").trim().toLowerCase();
+  if (taskType === "chat") return "chat";
+  if (imageTaskTypes.has(taskType)) return "image";
+  return "";
 }
 
 function taskStatRecord(task) {
@@ -2371,17 +2384,19 @@ export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now 
   const grouped = new Map();
 
   for (const record of records) {
-    if (!imageTaskTypes.has(record?.taskType)) continue;
+    const recordKind = taskStatRecordKind(record);
+    if (!recordKind) continue;
     const day = record?.day || dateKeyInShanghai(record?.time);
     if (!visibleDays.has(day)) continue;
     const accountId = String(record?.accountId || "");
     const channelGroup = String(record?.channelGroup || "other");
-    const key = `${day}\u0000${accountId}\u0000${channelGroup}`;
+    const key = `${day}\u0000${accountId}\u0000${channelGroup}\u0000${recordKind}`;
     const current = grouped.get(key) || {
       day,
       accountId,
       accountName: record?.accountName || "",
       channelGroup,
+      recordKind,
       tasks: 0,
       successTasks: 0,
       failedTasks: 0,
@@ -2420,6 +2435,7 @@ export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now 
         a.day.localeCompare(b.day)
         || a.accountId.localeCompare(b.accountId)
         || a.channelGroup.localeCompare(b.channelGroup)
+        || a.recordKind.localeCompare(b.recordKind)
       ))
   };
 }
@@ -2497,8 +2513,10 @@ function intradayTimeLabel(totalMinutes) {
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
-export function summarizeIntradayTaskStats(records = [], day, now = Date.now()) {
+export function summarizeIntradayTaskStats(records = [], day, now = Date.now(), options = {}) {
   const targetDay = intradayTargetDay(day, now);
+  const recordKind = options.recordKind === "chat" ? "chat" : "image";
+  const accountIdFilter = String(options.accountId || "").trim();
   const bucketCount = 24 * 60 / intradayIntervalMinutes;
   const buckets = Array.from({ length: bucketCount }, (_, index) => {
     const startMinute = index * intradayIntervalMinutes;
@@ -2512,12 +2530,14 @@ export function summarizeIntradayTaskStats(records = [], day, now = Date.now()) 
       failedTasks: 0,
       systemRejectedTasks: 0,
       successImages: 0,
+      successConversations: 0,
       accountIds: new Set()
     };
   });
 
   for (const record of records) {
-    if (!imageTaskTypes.has(record?.taskType)) continue;
+    if (taskStatRecordKind(record) !== recordKind) continue;
+    if (accountIdFilter && String(record?.accountId || "") !== accountIdFilter) continue;
     const recordDay = record?.day || dateKeyInShanghai(record?.time);
     if (recordDay !== targetDay) continue;
     const minute = minutesInShanghai(record?.time);
@@ -2528,7 +2548,8 @@ export function summarizeIntradayTaskStats(records = [], day, now = Date.now()) 
     bucket.systemRejectedTasks += taskStatValue(record, "systemRejectedTasks");
     if (record?.status === "success") {
       bucket.successTasks += taskCount;
-      bucket.successImages += Math.max(0, Number(record?.successImages || 0) || 0);
+      if (recordKind === "chat") bucket.successConversations += taskCount;
+      else bucket.successImages += Math.max(0, Number(record?.successImages || 0) || 0);
     } else if (record?.status === "failed") {
       bucket.failedTasks += taskStatValue(record, "failedTasks", taskCount);
     }
@@ -2546,24 +2567,27 @@ export function summarizeIntradayTaskStats(records = [], day, now = Date.now()) 
     failedTasks: bucket.failedTasks,
     systemRejectedTasks: bucket.systemRejectedTasks,
     successImages: bucket.successImages,
+    successConversations: bucket.successConversations,
     accountCount: bucket.accountIds.size,
     successRate: bucket.tasks ? Number((bucket.successTasks / bucket.tasks * 100).toFixed(1)) : null
   }));
+  const outputField = recordKind === "chat" ? "successConversations" : "successImages";
   const peak = normalizedBuckets.reduce((best, bucket) => (
-    bucket.successImages > best.successImages ? bucket : best
+    bucket[outputField] > best[outputField] ? bucket : best
   ), normalizedBuckets[0]);
 
   return {
     day: targetDay,
     intervalMinutes: intradayIntervalMinutes,
     totalImages: normalizedBuckets.reduce((sum, bucket) => sum + bucket.successImages, 0),
+    totalConversations: normalizedBuckets.reduce((sum, bucket) => sum + bucket.successConversations, 0),
     totalTasks: normalizedBuckets.reduce((sum, bucket) => sum + bucket.tasks, 0),
     failedTasks: normalizedBuckets.reduce((sum, bucket) => sum + bucket.failedTasks, 0),
     systemRejectedTasks: normalizedBuckets.reduce((sum, bucket) => sum + bucket.systemRejectedTasks, 0),
-    peak: peak?.successImages > 0 ? {
+    peak: peak?.[outputField] > 0 ? {
       start: peak.start,
       end: peak.end,
-      successImages: peak.successImages
+      [outputField]: peak[outputField]
     } : null,
     buckets: normalizedBuckets
   };
@@ -2780,22 +2804,30 @@ export async function listTodayAccountRoutingUsage(now = Date.now()) {
   return value;
 }
 
-export async function listIntradayTaskStats(day) {
+export async function listIntradayTaskStats(day, accountId = "") {
   const targetDay = intradayTargetDay(day);
-  const cached = intradayStatsCache.get(targetDay);
+  const accountIdFilter = String(accountId || "").trim();
+  const cacheKey = `${targetDay}\u0000${accountIdFilter || "all"}`;
+  const cached = intradayStatsCache.get(cacheKey);
   if (cached) return { ...cached, generatedAt: new Date().toISOString() };
   const revision = statsRevision;
   const stats = await loadTaskStatsSnapshot();
   const records = Object.values(stats.records || {});
-  const intraday = summarizeIntradayTaskStats(records, targetDay);
+  const intraday = summarizeIntradayTaskStats(records, targetDay, Date.now(), { accountId: accountIdFilter });
+  const chatIntraday = summarizeIntradayTaskStats(records, targetDay, Date.now(), {
+    accountId: accountIdFilter,
+    recordKind: "chat"
+  });
   const targetTimestamp = Date.parse(`${targetDay}T12:00:00+08:00`);
   const daily = summarizeDailyTaskStats(records, 1, targetTimestamp);
   const result = {
     ...intraday,
+    accountId: accountIdFilter,
+    chat: chatIntraday,
     updatedAt: stats.updatedAt || null,
     dailyRecords: daily.records
   };
-  if (revision === statsRevision) intradayStatsCache.set(targetDay, result);
+  if (revision === statsRevision) intradayStatsCache.set(cacheKey, result);
   return { ...result, generatedAt: new Date().toISOString() };
 }
 
