@@ -636,14 +636,111 @@
 
       .account-usage-detail {
         display: grid;
-        gap: 2px;
-        padding-bottom: 3px;
+        gap: 5px;
+        padding: 7px 0;
         border-bottom: 1px solid #f0f2f5;
+      }
+
+      .account-usage-detail:first-child {
+        padding-top: 0;
       }
 
       .account-usage-detail:last-child {
         padding-bottom: 0;
         border-bottom: 0;
+      }
+
+      .account-usage-routing {
+        min-width: 220px;
+        gap: 0;
+      }
+
+      .account-usage-heading,
+      .account-usage-metrics {
+        display: flex;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 5px 10px;
+      }
+
+      .account-usage .account-usage-label {
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .account-usage .account-usage-share {
+        padding: 1px 6px;
+        color: #175cd3;
+        font-size: 11px;
+        font-weight: 650;
+        line-height: 18px;
+        white-space: nowrap;
+        background: #eff4ff;
+        border-radius: 4px;
+      }
+
+      .account-usage .account-usage-metric {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 4px;
+        color: #667085;
+        font-size: 12px;
+        line-height: 18px;
+        white-space: nowrap;
+      }
+
+      .account-usage .account-usage-metric-value {
+        color: #344054;
+        font-weight: 650;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .quota-column-title {
+        display: grid;
+        gap: 1px;
+        line-height: 1.25;
+      }
+
+      .quota-column-note {
+        color: #667085;
+        font-size: 11px;
+        font-weight: 400;
+      }
+
+      .quota-list {
+        display: grid;
+        gap: 6px;
+        min-width: 0;
+      }
+
+      .quota-line {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        min-width: 0;
+      }
+
+      .quota-line + .quota-line {
+        padding-top: 6px;
+        border-top: 1px solid #f0f2f5;
+      }
+
+      .quota-name {
+        color: #667085;
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+
+      .quota-value {
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 650;
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+        white-space: nowrap;
       }
 
       .quota-reset-list {
@@ -2957,7 +3054,7 @@
         const balance = numberValue(account.balance ?? account.quota);
         const quota = numberValue(account.quota);
         if (channel?.type === "chatplus") return chatQuotaText(account, channel, account);
-        return `${quota}/${balance}`;
+        return quotaPairText(quota, balance);
       }
 
       function confirmedChatQuotaEmpty(status = {}) {
@@ -3098,7 +3195,7 @@
           return parts.join("｜") || "-";
         }
         if (channel?.type === "chatplus") return chatQuotaText(null, channel, stats.chatStatus);
-        return `${numberValue(stats.quota)}/${numberValue(stats.balance)}`;
+        return quotaPairText(stats.quota, stats.balance);
       }
 
       function channelTypeName(type) {
@@ -3220,7 +3317,29 @@
 
       function quotaPairText(quota, balance) {
         if ([quota, balance].every((item) => item === null || item === undefined || item === "")) return "-";
-        return `${valueText(quota)}/${valueText(balance)}`;
+        return `${valueText(balance)}/${valueText(quota)}`;
+      }
+
+      function quotaColumnTitle() {
+        return h(Tooltip, { title: "额度统一显示为：剩余额度 / 总额度" },
+          h("div", { className: "quota-column-title" }, [
+            h("span", { key: "title" }, "额度"),
+            h("span", { className: "quota-column-note", key: "note" }, "剩余 / 总额")
+          ])
+        );
+      }
+
+      function quotaTextCell(text) {
+        const lines = String(text || "-").split("｜").filter(Boolean);
+        return h("div", { className: "quota-list" }, lines.map((line, index) => {
+          const separatorAt = line.indexOf(" ");
+          const label = separatorAt > 0 ? line.slice(0, separatorAt) : "";
+          const value = separatorAt > 0 ? line.slice(separatorAt + 1) : line;
+          return h("div", { className: "quota-line", key: `${label || "quota"}-${index}` }, [
+            label ? h("span", { className: "quota-name", key: "label" }, label) : null,
+            h("span", { className: "quota-value", key: "value" }, value)
+          ].filter(Boolean));
+        }));
       }
 
       function aggregateChatReferenceUsage(accounts, channelType, modelKeys) {
@@ -3231,7 +3350,16 @@
 
         modelKeys.forEach((modelKey) => {
           const usages = statuses
-            .map((status) => status?.meta?.referenceUsage?.[modelKey])
+            .map((status) => {
+              const usage = status?.meta?.referenceUsage?.[modelKey];
+              if (!usage) return null;
+              const activeModelKey = String(status.quotaModel || status.meta?.chatModel || "").trim().toLowerCase();
+              const confirmedUsageLimit = status.status === "quota_empty"
+                && status.quotaConfirmedByUpstream === true
+                && status.quotaReason !== "image_quota"
+                && (!activeModelKey || activeModelKey === modelKey);
+              return confirmedUsageLimit ? { ...usage, balance: 0 } : usage;
+            })
             .filter((usage) => (
               usage
               && usage.quota !== null
@@ -3270,6 +3398,8 @@
       function chatQuotaText(account, channel, status = {}) {
         const modelName = checkedChatModelName(account, channel);
         if (chatSubscriptionExpired(status)) return `${modelName} 套餐已过期`;
+        const activeModelKey = chatModelKey(status.quotaModel || status.meta?.chatModel);
+        const confirmedUsageLimit = confirmedChatQuotaEmpty(status) && status.quotaReason !== "image_quota";
         const referenceParts = chatModelsForChannel(channel)
           .filter((item) => item.enabled)
           .map((item) => {
@@ -3285,7 +3415,10 @@
               && String(usage.balance).trim() !== ""
               && Number.isFinite(Number(usage.balance));
             if (!quotaKnown || !balanceKnown) return "";
-            return `${item.name} 剩余 ${valueText(usage.balance)}/${valueText(usage.quota)}`;
+            const balance = confirmedUsageLimit && (!activeModelKey || activeModelKey === item.key)
+              ? 0
+              : usage.balance;
+            return `${item.name} ${valueText(balance)}/${valueText(usage.quota)}`;
           })
           .filter(Boolean);
         if (referenceParts.length) return referenceParts.join("｜");
@@ -4703,9 +4836,14 @@
       }
 
       function taskModelInfo(row = {}) {
+        const actualModel = taskActualModel(row);
         return {
           requested: taskModelCode(taskRequestedModel(row)),
-          actual: taskModelCode(taskActualModel(row))
+          actual: actualModel
+            ? taskModelCode(actualModel)
+            : row.raw?.returnedError === true && row.raw?.submitted !== true
+              ? "未调用"
+              : "未记录"
         };
       }
 
@@ -5444,11 +5582,22 @@
         function routingSubmittedItem(label, slot, state, successCount, unit, key) {
           const automatic = numberValue(state?.submitted?.auto);
           const explicit = numberValue(state?.submitted?.explicit);
-          const detail = [`成功 ${numberValue(successCount)} ${unit}`];
-          if (explicit > 0) detail.push(`指定账号 ${explicit} ${unit}`);
+          const metrics = [
+            ["自动提交", `${automatic} ${unit}`],
+            ["成功", `${numberValue(successCount)} ${unit}`]
+          ];
+          if (explicit > 0) metrics.push(["指定账号", `${explicit} ${unit}`]);
           return h("div", { className: "account-usage-detail", key }, [
-            h("strong", { key: "automatic" }, `${label} 自动提交 ${automatic} ${unit} · ${routingSubmittedPercent(slot, state)}%`),
-            h("span", { key: "detail" }, detail.join("｜"))
+            h("div", { className: "account-usage-heading", key: "heading" }, [
+              h("strong", { className: "account-usage-label", key: "label" }, label),
+              h("span", { className: "account-usage-share", key: "share" }, `占比 ${routingSubmittedPercent(slot, state)}%`)
+            ]),
+            h("div", { className: "account-usage-metrics", key: "metrics" }, metrics.map(([metricLabel, metricValue]) => (
+              h("span", { className: "account-usage-metric", key: metricLabel }, [
+                h("span", { key: "label" }, metricLabel),
+                h("span", { className: "account-usage-metric-value", key: "value" }, metricValue)
+              ])
+            )))
           ]);
         }
 
@@ -6987,11 +7136,11 @@
             }
           },
           {
-            title: "额度",
+            title: quotaColumnTitle(),
             width: 230,
             render: (_, row) => {
               const stats = channelStats.get(row.id) || {};
-              return h("span", null, channelQuotaText(row, stats));
+              return quotaTextCell(channelQuotaText(row, stats));
             }
           },
           { title: "优先级", dataIndex: "priority", width: 90 },
@@ -7157,7 +7306,7 @@
             title: h(Tooltip, {
               title: "比例只统计系统自动分配且已提交给上游的任务。指定账号的任务单独显示，不参与自动分流。"
             }, h("span", null, "今日分流")),
-            width: 235,
+            width: 260,
             render: (_, row) => {
               if (!runtimeStatus?.routing) return "统计加载中";
               const usage = accountTodayUsage.get(row.id) || {};
@@ -7191,7 +7340,7 @@
                   "chat"
                 ));
               }
-              return h("div", { className: "account-usage" }, items.length ? items : "-");
+              return h("div", { className: "account-usage account-usage-routing" }, items.length ? items : "-");
             }
           },
           {
@@ -7212,9 +7361,9 @@
             }
           },
           {
-            title: "额度",
-            width: 230,
-            render: (_, row) => accountQuotaText(row, channels.find((item) => item.id === row.channelId))
+            title: quotaColumnTitle(),
+            width: 210,
+            render: (_, row) => quotaTextCell(accountQuotaText(row, channels.find((item) => item.id === row.channelId)))
           },
           {
             title: "额度重置时间",
@@ -7720,8 +7869,8 @@
               h("div", { className: "metric" }, [
                 h("div", { className: "metric-icon" }, Icon.WalletOutlined ? h(Icon.WalletOutlined) : null),
                 h("div", null, [
-                  h("div", { className: "metric-label" }, "绘图剩余额度"),
-                  h("div", { className: "metric-value" }, totals.drawingAccountCount ? totals.balance : "-")
+                  h("div", { className: "metric-label" }, "绘图额度（剩余 / 总额）"),
+                  h("div", { className: "metric-value compact" }, totals.drawingAccountCount ? quotaPairText(totals.quota, totals.balance) : "-")
                 ])
               ]),
               h("div", { className: "metric" }, [
@@ -7851,8 +8000,8 @@
                           h("div", { className: "detail-stat-value" }, `${selectedStats.enabledCount || 0}/${selectedStats.accountCount || 0}`)
                         ]),
                         h("div", { className: "detail-stat" }, [
-                          h("div", { className: "detail-stat-label" }, "额度与状态"),
-                          h("div", { className: "detail-stat-value" }, channelQuotaText(selectedChannel, selectedStats))
+                          h("div", { className: "detail-stat-label" }, "额度（剩余 / 总额）"),
+                          h("div", { className: "detail-stat-value" }, quotaTextCell(channelQuotaText(selectedChannel, selectedStats)))
                         ])
                       ]),
                       (selectedChannel.type === "chatplus" || (selectedChannel.type === "shareai" && channelAbilityEnabled(selectedChannel, "chatplus")))

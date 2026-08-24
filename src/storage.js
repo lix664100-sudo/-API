@@ -1907,6 +1907,7 @@ function taskListRawSummary(raw = {}) {
   const summary = {
     endpoint: raw?.endpoint,
     submitted: raw?.submitted,
+    returnedError: raw?.returnedError,
     queued: raw?.queued,
     requestedModel: raw?.requestedModel,
     upstreamModel: raw?.upstreamModel,

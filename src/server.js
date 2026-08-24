@@ -1316,6 +1316,7 @@ app.post("/api/draw/edit", async (request, reply) => {
   try {
     const reserveBeforeImageRead = async (partialInput = {}) => {
       if (admission) return;
+      input = { ...input, ...partialInput };
       requestMeta = mergeInputSourceTaskId(requestMeta, partialInput);
       admission = await reserveImageRequestAdmission(request, requestMeta, partialInput);
     };
@@ -1465,6 +1466,7 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
   try {
     const reserveBeforeImageRead = async (partialInput = {}) => {
       if (admission) return;
+      input = { ...input, ...partialInput };
       requestMeta = mergeInputSourceTaskId(requestMeta, partialInput);
       admission = await reserveImageRequestAdmission(request, requestMeta, partialInput);
     };

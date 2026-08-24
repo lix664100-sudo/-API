@@ -217,6 +217,15 @@ test("任务记录分别显示调用模型和实际使用模型", () => {
     requested: "gemini",
     actual: "未记录"
   });
+  assert.deepEqual(localValue(taskModelInfo({
+    status: "failed",
+    modelId: "gpt",
+    requestJson: { model: "gpt" },
+    raw: { returnedError: true }
+  })), {
+    requested: "gpt",
+    actual: "未调用"
+  });
   assert.match(adminHtml, /\["调用模型", info\.requested\]/);
   assert.match(adminHtml, /\["实际模型", info\.actual\]/);
 });
@@ -296,9 +305,11 @@ test("两个改图入口都会在读取图片前占住并发名额", () => {
     const routeEnd = serverSource.indexOf("\n});", routeStart);
     const routeSource = serverSource.slice(routeStart, routeEnd);
     const readAt = routeSource.indexOf("readImageInput(request");
+    const preserveInputAt = routeSource.indexOf("input = { ...input, ...partialInput }");
     const reserveAt = routeSource.indexOf("reserveImageRequestAdmission(request, requestMeta, partialInput)");
 
     assert.ok(routeStart >= 0 && routeEnd > routeStart, `${route} 必须存在`);
+    assert.ok(preserveInputAt >= 0 && preserveInputAt < reserveAt, `${route} 必须先保存已经收到的模型和任务说明`);
     assert.ok(reserveAt >= 0 && reserveAt < readAt, `${route} 必须先准备并发检查再读取图片`);
     assert.match(routeSource, /beforeImageRead: reserveBeforeImageRead/);
   }

@@ -141,6 +141,25 @@ test("content-policy failures have a separate safety-review status", async () =>
   );
 });
 
+test("task list keeps the marker for a request rejected before an upstream call", async () => {
+  await upsertTask({
+    id: "task-returned-before-call",
+    status: "failed",
+    taskType: "img2img",
+    modelId: "gpt",
+    requestJson: { model: "gpt" },
+    responseJson: { status: 503, message: "当前没有可用的生图账号。" },
+    raw: { returnedError: true },
+    createdAt: new Date().toISOString()
+  });
+
+  const page = await listTaskPage({ keyword: "task-returned-before-call" });
+
+  assert.equal(page.total, 1);
+  assert.equal(page.items[0].requestJson.model, "gpt");
+  assert.equal(page.items[0].raw.returnedError, true);
+});
+
 test("task pages return lightweight summaries and load large details only on demand", async () => {
   const imageData = `data:image/png;base64,${"A".repeat(180_000)}`;
   const longReply = `完整回复-${"回复内容".repeat(2000)}`;

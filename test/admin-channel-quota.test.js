@@ -6,6 +6,21 @@ import vm from "node:vm";
 const adminHtml = await readFile(new URL("../admin/index.html", import.meta.url), "utf8");
 const fixedNow = Date.parse("2026-08-23T00:00:00+08:00");
 
+const quotaPairFunctionMatch = adminHtml.match(
+  /function quotaPairText\(quota, balance\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function quotaColumnTitle/
+);
+
+assert.ok(quotaPairFunctionMatch, "管理后台中应存在统一额度显示方法");
+
+const quotaPairFunctionSource = quotaPairFunctionMatch[0].replace(
+  /\r?\n\r?\n      function quotaColumnTitle$/,
+  ""
+);
+const quotaPairText = vm.runInNewContext(
+  `(${quotaPairFunctionSource.replace(/^function /, "function ")})`,
+  { valueText: (value) => String(value) }
+);
+
 const remainingTimeFunctionMatch = adminHtml.match(
   /function formatRemainingTime\(value, now = Date\.now\(\)\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function quotaResetTimeText/
 );
@@ -73,6 +88,7 @@ const chatQuotaText = vm.runInNewContext(
       { key: "gemini", name: "Gemini", enabled: true }
     ],
     confirmedChatQuotaEmpty,
+    chatModelKey: (value) => String(value || "").trim().toLowerCase(),
     valueText: (value) => String(value)
   }
 );
@@ -237,6 +253,11 @@ function shareAIAccount({ enabled = true, referenceUsage = {} } = {}) {
   };
 }
 
+test("额度数字统一按剩余额度除以总额度显示", () => {
+  assert.equal(quotaPairText(100, 0), "0/100");
+  assert.equal(quotaPairText(70, 1), "1/70");
+});
+
 test("渠道额度会汇总所有启用账号的同一模型", () => {
   const accounts = [
     shareAIAccount({
@@ -334,6 +355,34 @@ test("没有任何有效额度数据时不显示虚假的零额度", () => {
   );
 });
 
+test("上游已确认额度用完时忽略过期的正数余额", () => {
+  const exhausted = shareAIAccount({
+    referenceUsage: {
+      gemini: { quota: 70, used: 1, balance: 69, period: "24h" }
+    }
+  });
+  Object.assign(exhausted.meta.abilities.chatplus, {
+    status: "quota_empty",
+    quotaReason: "chat_usage_limit",
+    quotaModel: "gemini",
+    quotaConfirmedByUpstream: true
+  });
+
+  assert.deepEqual(
+    structuredClone(aggregateChatReferenceUsage([exhausted], "shareai", ["gemini"])),
+    {
+      gemini: {
+        quota: 70,
+        balance: 0,
+        used: 70,
+        quotaResetAt: "",
+        period: "24h"
+      }
+    }
+  );
+  assert.equal(chatQuotaText(null, {}, exhausted.meta.abilities.chatplus), "Gemini 0/70");
+});
+
 test("后台明确显示当前模型剩余为零时账号状态显示额度不足", () => {
   assert.equal(confirmedChatQuotaEmpty({
     status: "ok",
@@ -369,7 +418,7 @@ test("一个模型为零时仍显示零和另一个模型的可用额度", () =>
         gemini: { quota: 70, used: 70, balance: 0 }
       }
     }
-  }), "GPT 剩余 200/220｜Gemini 剩余 0/70");
+  }), "GPT 200/220｜Gemini 0/70");
 });
 
 test("聊天状态可用但没有额度数据时显示额度未获取", () => {
