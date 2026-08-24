@@ -17,7 +17,7 @@ function loadProductivityHelpers() {
     taskRecordKind: (record) => record?.recordKind || (record?.taskType === "chat" ? "chat" : "image")
   };
   vm.runInNewContext(
-    `${adminHtml.slice(start, end)}\nthis.helpers = { productivityDayData, productivityTrendData };`,
+    `${adminHtml.slice(start, end)}\nthis.helpers = { productivityDayData, productivityRangeData, productivityRuntimeData, productivityTrendData };`,
     context
   );
   return context.helpers;
@@ -31,8 +31,8 @@ test("未分配请求不会成为账号，也不会拉低账号平均产值", ()
   const { productivityDayData } = loadProductivityHelpers();
   const day = "2026-08-24";
   const accounts = [
-    { id: "account-a", name: "账号A" },
-    { id: "account-b", name: "账号B" }
+    { id: "account-a", name: "账号A", channelId: "channel-a" },
+    { id: "account-b", name: "账号B", channelId: "channel-b" }
   ];
   const daily = {
     days: [day],
@@ -98,22 +98,30 @@ test("选择账号后，生图、对话、趋势和未分配请求使用同一�
   const { productivityDayData, productivityTrendData } = loadProductivityHelpers();
   const day = "2026-08-24";
   const accounts = [
-    { id: "account-a", name: "账号A" },
-    { id: "account-b", name: "账号B" }
+    { id: "account-a", name: "账号A", channelId: "channel-a" },
+    { id: "account-b", name: "账号B", channelId: "channel-b" }
   ];
   const daily = {
     days: [day],
     records: [
-      { day, recordKind: "image", accountId: "account-a", tasks: 2, successTasks: 2, successImages: 3 },
-      { day, recordKind: "chat", accountId: "account-a", tasks: 4, successTasks: 3, failedTasks: 1 },
-      { day, recordKind: "image", accountId: "account-b", tasks: 1, successTasks: 1, successImages: 7 },
-      { day, recordKind: "chat", accountId: "account-b", tasks: 8, successTasks: 8 },
+      { day, recordKind: "image", accountId: "account-a", channelId: "channel-a", tasks: 2, successTasks: 2, successImages: 3 },
+      { day, recordKind: "chat", accountId: "account-a", channelId: "channel-a", tasks: 4, successTasks: 3, failedTasks: 1 },
+      { day, recordKind: "image", accountId: "account-b", channelId: "channel-b", tasks: 1, successTasks: 1, successImages: 7 },
+      { day, recordKind: "chat", accountId: "account-b", channelId: "channel-b", tasks: 8, successTasks: 8 },
       { day, recordKind: "image", accountId: "", tasks: 9, failedTasks: 9 }
     ]
   };
 
   const selected = localValue(productivityDayData(daily, accounts, day, "account-a"));
-  const trend = localValue(productivityTrendData(daily, { days: [] }, 7, "account-a"));
+  const trend = localValue(productivityTrendData(
+    daily,
+    { days: [] },
+    day,
+    day,
+    "account-a",
+    "channel-a",
+    accounts
+  ));
 
   assert.equal(selected.rows.length, 1);
   assert.equal(selected.rows[0].id, "account-a");
@@ -124,4 +132,61 @@ test("选择账号后，生图、对话、趋势和未分配请求使用同一�
   assert.equal(trend[0].totalChats, 3);
   assert.equal(trend[0].imageSuccessRate, 100);
   assert.equal(trend[0].chatSuccessRate, 75);
+});
+
+test("日期范围与渠道筛选会同步影响汇总、趋势和系统并发", () => {
+  const { productivityRangeData, productivityRuntimeData, productivityTrendData } = loadProductivityHelpers();
+  const startDay = "2026-08-23";
+  const endDay = "2026-08-24";
+  const accounts = [
+    { id: "account-a", name: "账号A", channelId: "channel-a" },
+    { id: "account-b", name: "账号B", channelId: "channel-b" }
+  ];
+  const daily = {
+    days: [startDay, endDay],
+    records: [
+      { day: startDay, recordKind: "image", accountId: "account-a", channelId: "channel-a", tasks: 1, successTasks: 1, successImages: 2 },
+      { day: endDay, recordKind: "image", accountId: "account-a", channelId: "channel-a", tasks: 1, successTasks: 1, successImages: 3 },
+      { day: endDay, recordKind: "chat", accountId: "account-a", channelId: "channel-a", tasks: 3, successTasks: 2, failedTasks: 1 },
+      { day: endDay, recordKind: "image", accountId: "account-b", channelId: "channel-b", tasks: 1, successTasks: 1, successImages: 9 },
+      { day: endDay, recordKind: "image", accountId: "", channelId: "channel-a", tasks: 4, failedTasks: 4 }
+    ]
+  };
+  const concurrency = {
+    days: [
+      { day: startDay, samples: 2, averageRunning: 1, peakRunning: 2, averageConfigured: 10 },
+      { day: endDay, samples: 1, averageRunning: 4, peakRunning: 5, averageConfigured: 13 }
+    ]
+  };
+
+  const range = localValue(productivityRangeData(
+    daily,
+    accounts,
+    startDay,
+    endDay,
+    "all",
+    "channel-a"
+  ));
+  const trend = localValue(productivityTrendData(
+    daily,
+    concurrency,
+    startDay,
+    endDay,
+    "all",
+    "channel-a",
+    accounts
+  ));
+  const runtime = localValue(productivityRuntimeData(concurrency, startDay, endDay));
+
+  assert.equal(range.rows.length, 1);
+  assert.equal(range.rows[0].id, "account-a");
+  assert.equal(range.totalImages, 5);
+  assert.equal(range.totalChats, 2);
+  assert.equal(range.preAssignmentTasks, 4);
+  assert.deepEqual(trend.map((row) => row.totalImages), [2, 3]);
+  assert.deepEqual(trend.map((row) => row.totalChats), [0, 2]);
+  assert.equal(runtime.samples, 3);
+  assert.equal(runtime.averageRunning, 2);
+  assert.equal(runtime.peakRunning, 5);
+  assert.equal(runtime.averageConfigured, 11);
 });

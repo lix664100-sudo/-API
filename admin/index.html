@@ -2078,6 +2078,7 @@
         Typography,
         Upload
       } = antd;
+      const { RangePicker } = DatePicker;
       const Icon = window.icons || {};
       const h = React.createElement;
 
@@ -4205,6 +4206,12 @@
         return month && date ? `${Number(month)}月${Number(date)}日` : day || "-";
       }
 
+      function productivityRangeLabel(startDay, endDay) {
+        return startDay === endDay
+          ? chartDayLabel(startDay)
+          : `${chartDayLabel(startDay)}–${chartDayLabel(endDay)}`;
+      }
+
       function TaskTrendChart({ data, onHoverDay }) {
         const containerRef = useRef(null);
         const chartRef = useRef(null);
@@ -4331,10 +4338,12 @@
         });
       }
 
-      function productivityEmptyRow(id, name) {
+      function productivityEmptyRow(id, name, channelId = "", channelName = "") {
         return {
           id,
           name,
+          channelId,
+          channelName,
           imageTasks: 0,
           imageSuccessTasks: 0,
           imageFailedTasks: 0,
@@ -4349,19 +4358,41 @@
         };
       }
 
-      function productivityDayData(daily, accounts, day, accountFilter = "all") {
+      function productivityRecordChannelId(record, accountMap) {
+        const accountId = String(record?.accountId || "").trim();
+        return String(record?.channelId || accountMap.get(accountId)?.channelId || "").trim();
+      }
+
+      function productivityRangeData(
+        daily,
+        accounts,
+        startDay,
+        endDay,
+        accountFilter = "all",
+        channelFilter = "all"
+      ) {
         const rows = new Map();
+        const accountList = Array.isArray(accounts) ? accounts : [];
+        const accountMap = new Map(accountList.map((account) => [String(account.id), account]));
         let systemRejectedImageTasks = 0;
         let systemRejectedChatTasks = 0;
         let unassignedImageTasks = 0;
         let unassignedChatTasks = 0;
-        (Array.isArray(accounts) ? accounts : []).forEach((account) => {
+        accountList.forEach((account) => {
           const id = String(account.id);
           if (accountFilter !== "all" && id !== accountFilter) return;
-          rows.set(id, productivityEmptyRow(id, account.name || account.username || account.id || "未命名账号"));
+          if (channelFilter !== "all" && String(account.channelId || "") !== channelFilter) return;
+          rows.set(id, productivityEmptyRow(
+            id,
+            account.name || account.username || account.id || "未命名账号",
+            account.channelId || "",
+            account.channelName || ""
+          ));
         });
         (Array.isArray(daily?.records) ? daily.records : []).forEach((record) => {
-          if (record.day !== day) return;
+          if (record.day < startDay || record.day > endDay) return;
+          const recordChannelId = productivityRecordChannelId(record, accountMap);
+          if (channelFilter !== "all" && recordChannelId !== channelFilter) return;
           const recordKind = taskRecordKind(record);
           const accountKey = String(record.accountId || record.accountName || "").trim();
           if (!accountKey) {
@@ -4378,7 +4409,9 @@
           if (accountFilter !== "all" && accountKey !== accountFilter) return;
           const current = rows.get(accountKey) || productivityEmptyRow(
             accountKey,
-            record.accountName || record.accountId || "已移除账号"
+            record.accountName || record.accountId || "已移除账号",
+            recordChannelId,
+            record.channelName || ""
           );
           if (recordKind === "chat") {
             current.chatTasks += numberValue(record.tasks);
@@ -4414,7 +4447,8 @@
         const preAssignmentImageTasks = systemRejectedImageTasks + unassignedImageTasks;
         const preAssignmentChatTasks = systemRejectedChatTasks + unassignedChatTasks;
         return {
-          day,
+          startDay,
+          endDay,
           totalImages,
           totalImageTasks,
           totalImageSuccessTasks,
@@ -4451,9 +4485,41 @@
         };
       }
 
-      function productivityTrendData(daily, concurrency, rangeDays, accountFilter = "all") {
-        const days = Array.isArray(daily?.days) ? daily.days.slice(-rangeDays) : [];
+      function productivityDayData(daily, accounts, day, accountFilter = "all", channelFilter = "all") {
+        return productivityRangeData(daily, accounts, day, day, accountFilter, channelFilter);
+      }
+
+      function productivityRuntimeData(concurrency, startDay, endDay) {
+        const rows = (Array.isArray(concurrency?.days) ? concurrency.days : [])
+          .filter((item) => item.day >= startDay && item.day <= endDay && numberValue(item.samples) > 0);
+        const samples = rows.reduce((sum, item) => sum + numberValue(item.samples), 0);
+        return {
+          startDay,
+          endDay,
+          samples,
+          averageRunning: samples
+            ? rows.reduce((sum, item) => sum + numberValue(item.averageRunning) * numberValue(item.samples), 0) / samples
+            : 0,
+          peakRunning: rows.reduce((peak, item) => Math.max(peak, numberValue(item.peakRunning)), 0),
+          averageConfigured: samples
+            ? rows.reduce((sum, item) => sum + numberValue(item.averageConfigured) * numberValue(item.samples), 0) / samples
+            : 0
+        };
+      }
+
+      function productivityTrendData(
+        daily,
+        concurrency,
+        startDay,
+        endDay,
+        accountFilter = "all",
+        channelFilter = "all",
+        accounts = []
+      ) {
+        const days = (Array.isArray(daily?.days) ? daily.days : [])
+          .filter((day) => day >= startDay && day <= endDay);
         const visibleDays = new Set(days);
+        const accountMap = new Map((Array.isArray(accounts) ? accounts : []).map((account) => [String(account.id), account]));
         const totals = new Map(days.map((day) => [day, {
           day,
           totalImages: 0,
@@ -4473,6 +4539,7 @@
           if (!visibleDays.has(record.day)) return;
           const accountId = String(record.accountId || "").trim();
           if (!accountId || (accountFilter !== "all" && accountId !== accountFilter)) return;
+          if (channelFilter !== "all" && productivityRecordChannelId(record, accountMap) !== channelFilter) return;
           const current = totals.get(record.day);
           if (taskRecordKind(record) === "chat") {
             current.totalChats += numberValue(record.successTasks);
@@ -4662,6 +4729,122 @@
           className: "intraday-chart",
           role: "img",
           "aria-label": `${chartDayLabel(day)}每30分钟生图与对话产值图`
+        });
+      }
+
+      function ProductivityRangeOutputChart({ data, rangeLabel }) {
+        const containerRef = useRef(null);
+        const chartRef = useRef(null);
+        const rows = Array.isArray(data) ? data : [];
+
+        useEffect(() => {
+          if (!containerRef.current || !window.echarts) return undefined;
+          const chart = window.echarts.init(containerRef.current, null, { renderer: "canvas" });
+          chartRef.current = chart;
+          const resize = () => chart.resize();
+          const observer = typeof ResizeObserver === "function" ? new ResizeObserver(resize) : null;
+          if (observer) observer.observe(containerRef.current);
+          else window.addEventListener("resize", resize);
+          return () => {
+            if (observer) observer.disconnect();
+            else window.removeEventListener("resize", resize);
+            chart.dispose();
+            chartRef.current = null;
+          };
+        }, []);
+
+        useEffect(() => {
+          const chart = chartRef.current;
+          if (!chart) return;
+          chart.setOption({
+            animationDuration: 260,
+            color: ["#69b1ff", "#0f9f8f"],
+            aria: {
+              enabled: true,
+              description: `${rangeLabel}每日成功图片和成功对话数量`
+            },
+            tooltip: {
+              trigger: "axis",
+              axisPointer: { type: "shadow" },
+              backgroundColor: "rgba(16, 24, 40, 0.94)",
+              borderWidth: 0,
+              padding: [10, 12],
+              textStyle: { color: "#ffffff", fontSize: 12 },
+              formatter: (items) => {
+                const row = rows[items?.[0]?.dataIndex ?? 0] || {};
+                return [
+                  `<strong>${chartDayLabel(row.day)}</strong>`,
+                  `成功图片：${numberValue(row.totalImages)} 张`,
+                  `成功对话：${numberValue(row.totalChats)} 次`,
+                  `生图成功率：${row.imageSuccessRate === null ? "暂无" : `${numberValue(row.imageSuccessRate).toFixed(1)}%`}`,
+                  `对话成功率：${row.chatSuccessRate === null ? "暂无" : `${numberValue(row.chatSuccessRate).toFixed(1)}%`}`
+                ].join("<br>");
+              }
+            },
+            legend: {
+              top: 2,
+              left: 4,
+              itemWidth: 18,
+              itemHeight: 8,
+              textStyle: { color: "#475467", fontSize: 12 },
+              data: ["成功图片", "成功对话"]
+            },
+            grid: { top: 42, right: 24, bottom: 34, left: 18, containLabel: true },
+            xAxis: {
+              type: "category",
+              data: rows.map((row) => chartDayLabel(row.day)),
+              axisLine: { lineStyle: { color: "#d0d5dd" } },
+              axisTick: { show: false },
+              axisLabel: { color: "#667085", fontSize: 11, hideOverlap: true }
+            },
+            yAxis: [
+              {
+                type: "value",
+                min: 0,
+                minInterval: 1,
+                name: "张",
+                nameTextStyle: { color: "#667085", fontSize: 11 },
+                axisLabel: { color: "#667085", fontSize: 11 },
+                splitLine: { lineStyle: { color: "#eaecf0", type: "dashed" } }
+              },
+              {
+                type: "value",
+                min: 0,
+                minInterval: 1,
+                name: "次",
+                nameTextStyle: { color: "#667085", fontSize: 11 },
+                axisLabel: { color: "#667085", fontSize: 11 },
+                splitLine: { show: false }
+              }
+            ],
+            series: [
+              {
+                name: "成功图片",
+                type: "bar",
+                barMaxWidth: 24,
+                data: rows.map((row) => row.totalImages),
+                itemStyle: { color: "#91caff", borderRadius: [2, 2, 0, 0] },
+                emphasis: { itemStyle: { color: "#1677ff" } }
+              },
+              {
+                name: "成功对话",
+                type: "line",
+                yAxisIndex: 1,
+                smooth: 0.2,
+                showSymbol: rows.length <= 7,
+                symbolSize: 6,
+                lineStyle: { width: 2 },
+                data: rows.map((row) => row.totalChats)
+              }
+            ]
+          }, true);
+        }, [rows, rangeLabel]);
+
+        return h("div", {
+          ref: containerRef,
+          className: "intraday-chart",
+          role: "img",
+          "aria-label": `${rangeLabel}每日生图与对话产值图`
         });
       }
 
@@ -5247,9 +5430,12 @@
         const taskManualActionAtRef = useRef(0);
         const [taskTrendDays, setTaskTrendDays] = useState(30);
         const [taskTrendHoverDay, setTaskTrendHoverDay] = useState("");
-        const [productivityDay, setProductivityDay] = useState(dateKeyInShanghai(Date.now()));
+        const [productivityDateRange, setProductivityDateRange] = useState(() => {
+          const today = dateKeyInShanghai(Date.now());
+          return [today, today];
+        });
+        const [productivityChannelFilter, setProductivityChannelFilter] = useState("all");
         const [productivityAccountFilter, setProductivityAccountFilter] = useState("all");
-        const [productivityTrendDays, setProductivityTrendDays] = useState(7);
         const [channelModalOpen, setChannelModalOpen] = useState(false);
         const [accountModalOpen, setAccountModalOpen] = useState(false);
         const [accountImportOpen, setAccountImportOpen] = useState(false);
@@ -5589,19 +5775,38 @@
           ];
         }, [accounts, tasks, statRecords]);
 
+        const productivityChannelOptions = useMemo(() => {
+          const options = new Map();
+          channels.forEach((channel) => options.set(channel.id, channel.name || "未命名渠道"));
+          (Array.isArray(dailyStats?.records) ? dailyStats.records : []).forEach((record) => {
+            if (record.channelId && !options.has(record.channelId)) {
+              options.set(record.channelId, record.channelName || "已移除渠道");
+            }
+          });
+          return [
+            { label: "全部渠道", value: "all" },
+            ...[...options.entries()].map(([value, label]) => ({ label, value }))
+          ];
+        }, [channels, dailyStats]);
+
         const productivityAccountOptions = useMemo(() => {
           const options = new Map();
-          accounts.forEach((account) => options.set(account.id, account.name || account.username || "未命名账号"));
+          const accountMap = new Map(accounts.map((account) => [String(account.id), account]));
+          accounts.forEach((account) => {
+            if (productivityChannelFilter !== "all" && String(account.channelId || "") !== productivityChannelFilter) return;
+            options.set(account.id, account.name || account.username || "未命名账号");
+          });
           (Array.isArray(dailyStats?.records) ? dailyStats.records : []).forEach((record) => {
-            if (record.accountId && !options.has(record.accountId)) {
-              options.set(record.accountId, record.accountName || "已移除账号");
-            }
+            if (!record.accountId || options.has(record.accountId)) return;
+            const recordChannelId = productivityRecordChannelId(record, accountMap);
+            if (productivityChannelFilter !== "all" && recordChannelId !== productivityChannelFilter) return;
+            options.set(record.accountId, record.accountName || "已移除账号");
           });
           return [
             { label: "全部账号", value: "all" },
             ...[...options.entries()].map(([value, label]) => ({ label, value }))
           ];
-        }, [accounts, dailyStats]);
+        }, [accounts, dailyStats, productivityChannelFilter]);
 
         const taskSourceChannelOptions = useMemo(() => ([
           { label: "全部渠道", value: "all" },
@@ -5663,23 +5868,77 @@
         ), [trendData, taskTrendHoverDay]);
         const taskRangeTitle = taskHoveredStats ? chartDayLabel(taskHoveredStats.day) : `近${taskTrendDays}天`;
         const taskRangeDisplay = taskHoveredStats || taskRangeStats;
+        const productivityStartDay = productivityDateRange[0];
+        const productivityEndDay = productivityDateRange[1];
+        const productivitySingleDay = productivityStartDay === productivityEndDay;
+        const productivitySelectedRangeLabel = productivityRangeLabel(productivityStartDay, productivityEndDay);
         const selectedProductivity = useMemo(() => (
-          productivityDayData(dailyStats, accounts, productivityDay, productivityAccountFilter)
-        ), [dailyStats, accounts, productivityDay, productivityAccountFilter]);
+          productivityRangeData(
+            dailyStats,
+            accounts,
+            productivityStartDay,
+            productivityEndDay,
+            productivityAccountFilter,
+            productivityChannelFilter
+          )
+        ), [
+          dailyStats,
+          accounts,
+          productivityStartDay,
+          productivityEndDay,
+          productivityAccountFilter,
+          productivityChannelFilter
+        ]);
+        const selectedProductivityChannel = productivityChannelFilter === "all"
+          ? null
+          : productivityChannelOptions.find((option) => option.value === productivityChannelFilter) || null;
         const selectedProductivityAccount = productivityAccountFilter === "all"
           ? null
           : productivityAccountOptions.find((option) => option.value === productivityAccountFilter) || null;
+        const productivityScopeName = [selectedProductivityChannel?.label, selectedProductivityAccount?.label]
+          .filter(Boolean)
+          .join(" / ");
         const productivityRuntime = useMemo(() => (
-          (Array.isArray(concurrencyStats?.days) ? concurrencyStats.days : [])
-            .find((item) => item.day === productivityDay) || { day: productivityDay, samples: 0 }
-        ), [concurrencyStats, productivityDay]);
+          productivityRuntimeData(concurrencyStats, productivityStartDay, productivityEndDay)
+        ), [concurrencyStats, productivityStartDay, productivityEndDay]);
         const productivityTrend = useMemo(() => (
-          productivityTrendData(dailyStats, concurrencyStats, productivityTrendDays, productivityAccountFilter)
-        ), [dailyStats, concurrencyStats, productivityTrendDays, productivityAccountFilter]);
+          productivityTrendData(
+            dailyStats,
+            concurrencyStats,
+            productivityStartDay,
+            productivityEndDay,
+            productivityAccountFilter,
+            productivityChannelFilter,
+            accounts
+          )
+        ), [
+          dailyStats,
+          concurrencyStats,
+          productivityStartDay,
+          productivityEndDay,
+          productivityAccountFilter,
+          productivityChannelFilter,
+          accounts
+        ]);
+        const productivityImagePeakDay = productivityTrend.reduce((best, row) => (
+          !best || row.totalImages > best.totalImages ? row : best
+        ), null);
+        const productivityChatPeakDay = productivityTrend.reduce((best, row) => (
+          !best || row.totalChats > best.totalChats ? row : best
+        ), null);
 
         useEffect(() => {
           setTaskTrendHoverDay("");
         }, [taskTrendDays, taskAccountFilter, taskChannelFilter]);
+
+        useEffect(() => {
+          if (
+            productivityAccountFilter !== "all"
+            && !productivityAccountOptions.some((option) => option.value === productivityAccountFilter)
+          ) {
+            setProductivityAccountFilter("all");
+          }
+        }, [productivityAccountFilter, productivityAccountOptions]);
 
         const accountTodayUsage = useMemo(() => {
           const today = dateKeyInShanghai(Date.now());
@@ -6053,8 +6312,9 @@
         useEffect(() => {
           let cancelled = false;
           let requesting = false;
-          const targetDay = productivityDay;
+          const targetDay = productivityEndDay;
           const targetAccountId = productivityAccountFilter === "all" ? "" : productivityAccountFilter;
+          const targetChannelId = productivityChannelFilter === "all" ? "" : productivityChannelFilter;
           const loadIntraday = async (showLoading = false) => {
             if (requesting) return;
             requesting = true;
@@ -6062,8 +6322,14 @@
             try {
               const params = new URLSearchParams({ day: targetDay });
               if (targetAccountId) params.set("accountId", targetAccountId);
+              if (targetChannelId) params.set("channelId", targetChannelId);
               const data = await api(`/api/stats/intraday?${params.toString()}`);
-              if (cancelled || data?.day !== targetDay || String(data?.accountId || "") !== targetAccountId) return;
+              if (
+                cancelled
+                || data?.day !== targetDay
+                || String(data?.accountId || "") !== targetAccountId
+                || String(data?.channelId || "") !== targetChannelId
+              ) return;
               setIntradayStats(data);
               setIntradayError(false);
               setIntradayRefreshedAt(Date.parse(data.generatedAt || "") || Date.now());
@@ -6088,7 +6354,13 @@
             }
           };
 
-          setIntradayStats({ day: targetDay, accountId: targetAccountId, buckets: [], chat: { buckets: [] } });
+          setIntradayStats({
+            day: targetDay,
+            accountId: targetAccountId,
+            channelId: targetChannelId,
+            buckets: [],
+            chat: { buckets: [] }
+          });
           setIntradayError(false);
           setIntradayRefreshedAt(null);
           loadIntraday(true);
@@ -6099,7 +6371,7 @@
             cancelled = true;
             if (timer) clearInterval(timer);
           };
-        }, [productivityDay, productivityAccountFilter]);
+        }, [productivityEndDay, productivityAccountFilter, productivityChannelFilter]);
 
         useEffect(() => {
           const timer = setInterval(() => {
@@ -7643,7 +7915,7 @@
             ])
           },
           {
-            title: "当日产值占比",
+            title: "所选范围占比",
             width: 220,
             render: (_, row) => h("div", { className: "productivity-share-list" }, [
               productivityShareRow("生图", row.imageShare, "image"),
@@ -8249,16 +8521,42 @@
                     children: h("div", { className: "operation-body" }, [
                       h("div", { className: "productivity-toolbar" }, [
                         h(Space, { size: 8, wrap: true }, [
-                          h("span", { className: "toolbar-note", key: "date-label" }, "查看日期"),
-                          h(DatePicker, {
-                            key: "date",
-                            value: window.dayjs(productivityDay),
+                          h("span", { className: "toolbar-note", key: "date-label" }, "日期范围"),
+                          h(RangePicker, {
+                            key: "date-range",
+                            value: [window.dayjs(productivityStartDay), window.dayjs(productivityEndDay)],
                             allowClear: false,
+                            minDate: window.dayjs().subtract(29, "day"),
                             maxDate: window.dayjs(),
+                            disabledDate: (current) => (
+                              current.isAfter(window.dayjs(), "day")
+                              || current.isBefore(window.dayjs().subtract(29, "day"), "day")
+                            ),
                             format: "YYYY-MM-DD",
-                            onChange: (value) => {
-                              if (value) setProductivityDay(value.format("YYYY-MM-DD"));
-                            }
+                            presets: [
+                              { label: "今天", value: [window.dayjs(), window.dayjs()] },
+                              { label: "近7天", value: [window.dayjs().subtract(6, "day"), window.dayjs()] },
+                              { label: "近30天", value: [window.dayjs().subtract(29, "day"), window.dayjs()] }
+                            ],
+                            onChange: (values) => {
+                              if (values?.[0] && values?.[1]) {
+                                setProductivityDateRange([
+                                  values[0].format("YYYY-MM-DD"),
+                                  values[1].format("YYYY-MM-DD")
+                                ]);
+                              }
+                            },
+                            style: { minWidth: 250 }
+                          }),
+                          h("span", { className: "toolbar-note", key: "channel-label" }, "渠道"),
+                          h(Select, {
+                            key: "channel",
+                            value: productivityChannelFilter,
+                            onChange: setProductivityChannelFilter,
+                            options: productivityChannelOptions,
+                            optionFilterProp: "label",
+                            showSearch: true,
+                            style: { minWidth: 180 }
                           }),
                           h("span", { className: "toolbar-note", key: "account-label" }, "账号"),
                           h(Select, {
@@ -8271,9 +8569,9 @@
                             style: { minWidth: 210 }
                           })
                         ]),
-                        h("span", { className: "toolbar-note" }, selectedProductivityAccount
-                          ? `正在查看 ${selectedProductivityAccount.label}，生图与对话分别统计`
-                          : "生图与对话分别统计，账号平均按当天实际参与账号计算")
+                        h("span", { className: "toolbar-note" }, productivityScopeName
+                          ? `正在查看 ${productivityScopeName}，生图与对话分别统计`
+                          : "生图与对话分别统计，账号平均按所选范围内实际参与账号计算")
                       ]),
                       h("div", { className: "productivity-summary" }, [
                         h("div", { className: "productivity-summary-item", key: "images" }, [
@@ -8302,11 +8600,11 @@
                           h("div", { className: "productivity-summary-note" }, `对话 ${selectedProductivity.averageChatDurationMs === null ? "—" : formatDuration(selectedProductivity.averageChatDurationMs)}`)
                         ]),
                         h("div", { className: "productivity-summary-item", key: "concurrency" }, [
-                          h("div", { className: "task-summary-label" }, "系统平均并发"),
+                          h("div", { className: "task-summary-label" }, "全系统平均并发"),
                           h("div", { className: "productivity-summary-value" }, productivityRuntime.samples ? numberValue(productivityRuntime.averageRunning).toFixed(1) : "—"),
                           h("div", { className: "productivity-summary-note" }, productivityRuntime.samples
                             ? `最高 ${numberValue(productivityRuntime.peakRunning)} / 上限 ${numberValue(productivityRuntime.averageConfigured).toFixed(1)}`
-                            : "该日暂无并发记录")
+                            : "所选范围暂无并发记录")
                         ])
                       ]),
                       productivityAccountFilter === "all" && selectedProductivity.preAssignmentTasks > 0
@@ -8314,7 +8612,7 @@
                             key: "unassigned",
                             type: "warning",
                             showIcon: true,
-                            message: `当天有 ${selectedProductivity.preAssignmentTasks.toLocaleString("zh-CN")} 个请求在分配账号前结束（生图 ${selectedProductivity.preAssignmentImageTasks.toLocaleString("zh-CN")} 个，对话 ${selectedProductivity.preAssignmentChatTasks.toLocaleString("zh-CN")} 个），已从账号产值和成功率中排除。`,
+                            message: `所选范围有 ${selectedProductivity.preAssignmentTasks.toLocaleString("zh-CN")} 个请求在分配账号前结束（生图 ${selectedProductivity.preAssignmentImageTasks.toLocaleString("zh-CN")} 个，对话 ${selectedProductivity.preAssignmentChatTasks.toLocaleString("zh-CN")} 个），已从账号产值和成功率中排除。`,
                             style: { marginBottom: 10 }
                           })
                         : null,
@@ -8327,30 +8625,46 @@
                       h("section", { className: "intraday-section" }, [
                         h("div", { className: "intraday-header" }, [
                           h("div", null, [
-                            h("h3", null, "当日分时产值"),
-                            h("p", null, "每30分钟分别统计成功图片和成功对话")
+                            h("h3", null, productivitySingleDay ? "当日分时产值" : "每日产值变化"),
+                            h("p", null, productivitySingleDay
+                              ? "每30分钟分别统计成功图片和成功对话"
+                              : "按天统计所选范围内的成功图片和成功对话")
                           ]),
                           h("div", { className: "intraday-meta" }, [
                             h("span", { key: "image-total" }, [
                               "生图 ",
-                              h("strong", { key: "value" }, `${numberValue(intradayStats.totalImages).toLocaleString("zh-CN")} 张`)
+                              h("strong", { key: "value" }, `${numberValue(productivitySingleDay ? intradayStats.totalImages : selectedProductivity.totalImages).toLocaleString("zh-CN")} 张`)
                             ]),
                             h("span", { key: "chat-total" }, [
                               "对话 ",
-                              h("strong", { key: "value" }, `${numberValue(intradayStats.chat?.totalConversations).toLocaleString("zh-CN")} 次`)
+                              h("strong", { key: "value" }, `${numberValue(productivitySingleDay ? intradayStats.chat?.totalConversations : selectedProductivity.totalChats).toLocaleString("zh-CN")} 次`)
                             ]),
-                            h("span", { key: "image-peak" }, intradayStats.peak
-                              ? [
-                                  "生图高峰 ",
-                                  h("strong", { key: "value" }, `${intradayStats.peak.start}–${intradayStats.peak.end} / ${numberValue(intradayStats.peak.successImages).toLocaleString("zh-CN")} 张`)
-                                ]
-                              : "生图高峰 暂无"),
-                            h("span", { key: "chat-peak" }, intradayStats.chat?.peak
-                              ? [
-                                  "对话高峰 ",
-                                  h("strong", { key: "value" }, `${intradayStats.chat.peak.start}–${intradayStats.chat.peak.end} / ${numberValue(intradayStats.chat.peak.successConversations).toLocaleString("zh-CN")} 次`)
-                                ]
-                              : "对话高峰 暂无"),
+                            h("span", { key: "image-peak" }, productivitySingleDay
+                              ? (intradayStats.peak
+                                  ? [
+                                      "生图高峰 ",
+                                      h("strong", { key: "value" }, `${intradayStats.peak.start}–${intradayStats.peak.end} / ${numberValue(intradayStats.peak.successImages).toLocaleString("zh-CN")} 张`)
+                                    ]
+                                  : "生图高峰 暂无")
+                              : (productivityImagePeakDay?.totalImages > 0
+                                  ? [
+                                      "生图高峰 ",
+                                      h("strong", { key: "value" }, `${chartDayLabel(productivityImagePeakDay.day)} / ${numberValue(productivityImagePeakDay.totalImages).toLocaleString("zh-CN")} 张`)
+                                    ]
+                                  : "生图高峰 暂无")),
+                            h("span", { key: "chat-peak" }, productivitySingleDay
+                              ? (intradayStats.chat?.peak
+                                  ? [
+                                      "对话高峰 ",
+                                      h("strong", { key: "value" }, `${intradayStats.chat.peak.start}–${intradayStats.chat.peak.end} / ${numberValue(intradayStats.chat.peak.successConversations).toLocaleString("zh-CN")} 次`)
+                                    ]
+                                  : "对话高峰 暂无")
+                              : (productivityChatPeakDay?.totalChats > 0
+                                  ? [
+                                      "对话高峰 ",
+                                      h("strong", { key: "value" }, `${chartDayLabel(productivityChatPeakDay.day)} / ${numberValue(productivityChatPeakDay.totalChats).toLocaleString("zh-CN")} 次`)
+                                    ]
+                                  : "对话高峰 暂无")),
                             h("span", {
                               key: "refresh",
                               className: `intraday-refresh${intradayError ? " is-error" : ""}`
@@ -8358,17 +8672,22 @@
                               ? "自动更新失败，稍后重试"
                               : intradayLoading
                                 ? "正在加载分时数据"
-                                : productivityDay === dateKeyInShanghai(Date.now())
+                                : productivityEndDay === dateKeyInShanghai(Date.now())
                                   ? `每60秒更新 · ${formatClock(intradayRefreshedAt)}`
                                   : `历史数据 · ${formatClock(intradayRefreshedAt)}`)
                           ])
                         ]),
-                        intradayStats.buckets?.length
-                          ? h(IntradayOutputChart, { data: intradayStats, day: productivityDay })
-                          : h("div", { className: "intraday-placeholder" }, intradayError ? "分时数据暂时无法加载" : "正在加载分时数据")
+                        productivitySingleDay
+                          ? (intradayStats.buckets?.length
+                              ? h(IntradayOutputChart, { data: intradayStats, day: productivityEndDay })
+                              : h("div", { className: "intraday-placeholder" }, intradayError ? "分时数据暂时无法加载" : "正在加载分时数据"))
+                          : h(ProductivityRangeOutputChart, {
+                              data: productivityTrend,
+                              rangeLabel: productivitySelectedRangeLabel
+                            })
                       ]),
                       h("div", { className: "productivity-table-title" }, [
-                        h("h3", null, `${chartDayLabel(productivityDay)}账号产值明细`),
+                        h("h3", null, `${productivitySelectedRangeLabel}账号产值明细`),
                         h("span", { className: "toolbar-note" }, `成功图片 ${selectedProductivity.totalImages.toLocaleString("zh-CN")} 张 · 成功对话 ${selectedProductivity.totalChats.toLocaleString("zh-CN")} 次 · 账号内失败 ${(selectedProductivity.totalImageFailedTasks + selectedProductivity.totalChatFailedTasks).toLocaleString("zh-CN")} 个`)
                       ]),
                       h(Table, {
@@ -8378,25 +8697,16 @@
                         pagination: selectedProductivity.rows.length > 12 ? { pageSize: 12 } : false,
                         scroll: { x: 1230 },
                         size: "small",
-                        locale: { emptyText: "这一天还没有账号数据" }
+                        locale: { emptyText: "所选范围还没有账号数据" }
                       }),
                       h("div", { className: "productivity-trends" }, [
                         h("div", { className: "task-trend-header" }, [
                           h("div", null, [
                             h("h3", { className: "task-trend-title" }, "每日产值与效率"),
-                            h("div", { className: "task-trend-desc" }, selectedProductivityAccount
-                              ? `${selectedProductivityAccount.label} 的生图、对话、处理时间和成功率变化`
-                              : "分别查看生图、对话、处理时间和成功率变化")
-                          ]),
-                          h(Segmented, {
-                            value: productivityTrendDays,
-                            onChange: setProductivityTrendDays,
-                            options: [
-                              { label: "近7天", value: 7 },
-                              { label: "近30天", value: 30 }
-                            ],
-                            size: "small"
-                          })
+                            h("div", { className: "task-trend-desc" }, productivityScopeName
+                              ? `${productivitySelectedRangeLabel} · ${productivityScopeName}`
+                              : `${productivitySelectedRangeLabel}的生图、对话、处理时间和成功率变化`)
+                          ])
                         ]),
                         h("div", { className: "productivity-chart-grid" }, [
                           h("section", { className: "productivity-chart-panel", key: "image-output" }, [

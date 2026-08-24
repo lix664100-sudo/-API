@@ -2389,12 +2389,15 @@ export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now 
     const day = record?.day || dateKeyInShanghai(record?.time);
     if (!visibleDays.has(day)) continue;
     const accountId = String(record?.accountId || "");
+    const channelId = String(record?.channelId || "");
     const channelGroup = String(record?.channelGroup || "other");
-    const key = `${day}\u0000${accountId}\u0000${channelGroup}\u0000${recordKind}`;
+    const key = `${day}\u0000${accountId}\u0000${channelId}\u0000${channelGroup}\u0000${recordKind}`;
     const current = grouped.get(key) || {
       day,
       accountId,
       accountName: record?.accountName || "",
+      channelId,
+      channelName: record?.channelName || "",
       channelGroup,
       recordKind,
       tasks: 0,
@@ -2434,6 +2437,7 @@ export function summarizeDailyTaskStats(records = [], days = dailyStatDays, now 
       .sort((a, b) => (
         a.day.localeCompare(b.day)
         || a.accountId.localeCompare(b.accountId)
+        || a.channelId.localeCompare(b.channelId)
         || a.channelGroup.localeCompare(b.channelGroup)
         || a.recordKind.localeCompare(b.recordKind)
       ))
@@ -2517,6 +2521,7 @@ export function summarizeIntradayTaskStats(records = [], day, now = Date.now(), 
   const targetDay = intradayTargetDay(day, now);
   const recordKind = options.recordKind === "chat" ? "chat" : "image";
   const accountIdFilter = String(options.accountId || "").trim();
+  const channelIdFilter = String(options.channelId || "").trim();
   const bucketCount = 24 * 60 / intradayIntervalMinutes;
   const buckets = Array.from({ length: bucketCount }, (_, index) => {
     const startMinute = index * intradayIntervalMinutes;
@@ -2538,6 +2543,7 @@ export function summarizeIntradayTaskStats(records = [], day, now = Date.now(), 
   for (const record of records) {
     if (taskStatRecordKind(record) !== recordKind) continue;
     if (accountIdFilter && String(record?.accountId || "") !== accountIdFilter) continue;
+    if (channelIdFilter && String(record?.channelId || "") !== channelIdFilter) continue;
     const recordDay = record?.day || dateKeyInShanghai(record?.time);
     if (recordDay !== targetDay) continue;
     const minute = minutesInShanghai(record?.time);
@@ -2804,18 +2810,23 @@ export async function listTodayAccountRoutingUsage(now = Date.now()) {
   return value;
 }
 
-export async function listIntradayTaskStats(day, accountId = "") {
+export async function listIntradayTaskStats(day, accountId = "", channelId = "") {
   const targetDay = intradayTargetDay(day);
   const accountIdFilter = String(accountId || "").trim();
-  const cacheKey = `${targetDay}\u0000${accountIdFilter || "all"}`;
+  const channelIdFilter = String(channelId || "").trim();
+  const cacheKey = `${targetDay}\u0000${accountIdFilter || "all"}\u0000${channelIdFilter || "all"}`;
   const cached = intradayStatsCache.get(cacheKey);
   if (cached) return { ...cached, generatedAt: new Date().toISOString() };
   const revision = statsRevision;
   const stats = await loadTaskStatsSnapshot();
   const records = Object.values(stats.records || {});
-  const intraday = summarizeIntradayTaskStats(records, targetDay, Date.now(), { accountId: accountIdFilter });
+  const intraday = summarizeIntradayTaskStats(records, targetDay, Date.now(), {
+    accountId: accountIdFilter,
+    channelId: channelIdFilter
+  });
   const chatIntraday = summarizeIntradayTaskStats(records, targetDay, Date.now(), {
     accountId: accountIdFilter,
+    channelId: channelIdFilter,
     recordKind: "chat"
   });
   const targetTimestamp = Date.parse(`${targetDay}T12:00:00+08:00`);
@@ -2823,6 +2834,7 @@ export async function listIntradayTaskStats(day, accountId = "") {
   const result = {
     ...intraday,
     accountId: accountIdFilter,
+    channelId: channelIdFilter,
     chat: chatIntraday,
     updatedAt: stats.updatedAt || null,
     dailyRecords: daily.records

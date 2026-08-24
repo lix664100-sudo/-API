@@ -156,6 +156,8 @@ test("最近账号产值按北京时间分别汇总生图和对话，并补齐�
     day: "2026-07-05",
     accountId: "account-a",
     accountName: "账号A",
+    channelId: "",
+    channelName: "",
     channelGroup: "drawing",
     recordKind: "image",
     tasks: 2,
@@ -180,6 +182,44 @@ test("最近账号产值按北京时间分别汇总生图和对话，并补齐�
   assert.equal(chat.successTasks, 1);
   assert.equal(chat.failedTasks, 1);
   assert.equal(chat.successImages, 1);
+});
+
+test("账号产值保留实际渠道，同一账号跨渠道时不会混在一条记录里", () => {
+  const now = Date.parse("2026-07-18T12:00:00+08:00");
+  const summary = summarizeDailyTaskStats([
+    {
+      day: "2026-07-18",
+      time: now,
+      status: "success",
+      taskType: "text2img",
+      accountId: "account-a",
+      accountName: "账号A",
+      channelId: "channel-a",
+      channelName: "渠道A",
+      channelGroup: "drawing",
+      tasks: 1,
+      successImages: 2
+    },
+    {
+      day: "2026-07-18",
+      time: now,
+      status: "success",
+      taskType: "text2img",
+      accountId: "account-a",
+      accountName: "账号A",
+      channelId: "channel-b",
+      channelName: "渠道B",
+      channelGroup: "drawing",
+      tasks: 1,
+      successImages: 3
+    }
+  ], 7, now);
+
+  assert.equal(summary.records.length, 2);
+  assert.deepEqual(
+    summary.records.map((record) => [record.channelId, record.channelName, record.successImages]),
+    [["channel-a", "渠道A", 2], ["channel-b", "渠道B", 3]]
+  );
 });
 
 test("趋势范围会限制在服务器保留的天数内", () => {
@@ -294,7 +334,8 @@ test("分时对话产值支持按账号筛选并与生图分开统计", () => {
       status: "success",
       taskType: "chat",
       tasks: 1,
-      accountId: "account-a"
+      accountId: "account-a",
+      channelId: "channel-a"
     },
     {
       day,
@@ -303,7 +344,8 @@ test("分时对话产值支持按账号筛选并与生图分开统计", () => {
       taskType: "chat",
       tasks: 1,
       failedTasks: 1,
-      accountId: "account-a"
+      accountId: "account-a",
+      channelId: "channel-b"
     },
     {
       day,
@@ -311,7 +353,8 @@ test("分时对话产值支持按账号筛选并与生图分开统计", () => {
       status: "success",
       taskType: "chat",
       tasks: 1,
-      accountId: "account-b"
+      accountId: "account-b",
+      channelId: "channel-a"
     },
     {
       day,
@@ -320,19 +363,21 @@ test("分时对话产值支持按账号筛选并与生图分开统计", () => {
       taskType: "img2img",
       tasks: 1,
       successImages: 1,
-      accountId: "account-a"
+      accountId: "account-a",
+      channelId: "channel-a"
     }
   ];
 
   const summary = summarizeIntradayTaskStats(records, day, Date.now(), {
     accountId: "account-a",
+    channelId: "channel-a",
     recordKind: "chat"
   });
 
   assert.equal(summary.totalConversations, 1);
   assert.equal(summary.totalImages, 0);
-  assert.equal(summary.totalTasks, 2);
-  assert.equal(summary.failedTasks, 1);
+  assert.equal(summary.totalTasks, 1);
+  assert.equal(summary.failedTasks, 0);
   assert.equal(summary.buckets[18].successConversations, 1);
   assert.equal(summary.buckets[18].accountCount, 1);
   assert.deepEqual(summary.peak, { start: "09:00", end: "09:30", successConversations: 1 });

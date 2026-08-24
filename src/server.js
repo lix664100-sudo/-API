@@ -1252,7 +1252,7 @@ app.get("/api/stats", async (request) => ({
 
 app.get("/api/stats/intraday", async (request) => ({
   ok: true,
-  data: await listIntradayTaskStats(request.query?.day, request.query?.accountId)
+  data: await listIntradayTaskStats(request.query?.day, request.query?.accountId, request.query?.channelId)
 }));
 
 app.get("/api/admin/runtime", async () => ({ ok: true, data: await getRuntimeStatus() }));
