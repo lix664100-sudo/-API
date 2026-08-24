@@ -11,6 +11,12 @@ import {
 } from "../chatplus-conversation-updates.js";
 import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "../image-limits.js";
 import { normalizeProxyUrl } from "../proxy.js";
+import {
+  isShareAiPortalAccountRejection,
+  isShareAiPortalConnectionError,
+  reportShareAiPortalFailure,
+  useAvailableShareAiPortal
+} from "../shareai-portal-router.js";
 import { isImagePolicyFailureMessage } from "../task-error-policy.js";
 
 export { isImagePolicyFailureMessage } from "../task-error-policy.js";
@@ -2362,12 +2368,14 @@ export class ChatplusClient {
     onImageCarCooldown,
     curlRunner = runCurl,
     fetchImpl = fetch,
-    proxyAgentFactory = (proxyUrl) => new ProxyAgent({ getProxyForUrl: () => proxyUrl })
+    proxyAgentFactory = (proxyUrl) => new ProxyAgent({ getProxyForUrl: () => proxyUrl }),
+    portalDirectoryLoader
   }) {
     this.config = config;
     this.channel = channel;
     this.account = account;
-    this.baseUrl = trimSlash(channel?.settings?.baseUrl || "https://www.chatplus.cc");
+    this.configuredBaseUrl = trimSlash(channel?.settings?.baseUrl || "https://www.chatplus.cc");
+    this.baseUrl = this.configuredBaseUrl;
     this.carId = "";
     this.carType = "chatgpt";
     this.cookies = [];
@@ -2388,6 +2396,7 @@ export class ChatplusClient {
     this.curlRunner = curlRunner;
     this.fetchImpl = fetchImpl;
     this.proxyAgentFactory = proxyAgentFactory;
+    this.portalDirectoryLoader = portalDirectoryLoader;
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWorks = new Map();
     this.concurrentChatSessions = new Map();
@@ -2414,7 +2423,7 @@ export class ChatplusClient {
     this.config = config;
     this.channel = channel;
     this.account = account;
-    this.baseUrl = trimSlash(channel?.settings?.baseUrl || "https://www.chatplus.cc");
+    this.configuredBaseUrl = trimSlash(channel?.settings?.baseUrl || "https://www.chatplus.cc");
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     this.onProCarsUnavailable = typeof onProCarsUnavailable === "function" ? onProCarsUnavailable : null;
     this.onProCarsAvailable = typeof onProCarsAvailable === "function" ? onProCarsAvailable : null;
@@ -2422,6 +2431,7 @@ export class ChatplusClient {
     restoreSavedImageCarCooldowns(account, channel);
     if (changed) {
       this.contextSignature = nextSignature;
+      this.baseUrl = this.configuredBaseUrl;
       this.proCarRestrictionSaved = savedProCarRestriction(account, channel);
       this.proCarsUnavailableUntil = savedProCarRestrictionUntil(account, channel);
       this.resetSession();
@@ -2702,10 +2712,12 @@ export class ChatplusClient {
         if (!isAuthSessionError(error)) throw error;
         const carId = this.carId;
         const carType = this.carType;
-        await this.performPortalLogin({ timeoutSec });
-        this.carId = carId;
-        this.carType = carType;
-        await this.performEnterCar(carId, carType, { timeoutSec });
+        await this.sessionLock(async () => {
+          await this.performPortalLogin({ timeoutSec });
+          this.carId = carId;
+          this.carType = carType;
+          await this.performEnterCar(carId, carType, { timeoutSec });
+        });
         return readSocketUrl();
       }
     };
@@ -3010,6 +3022,7 @@ export class ChatplusClient {
 
   sessionSnapshot() {
     return {
+      baseUrl: this.baseUrl,
       cookies: [...this.cookies],
       portalLoggedIn: this.portalLoggedIn,
       carId: this.carId,
@@ -3020,6 +3033,7 @@ export class ChatplusClient {
   }
 
   restoreSession(snapshot = {}) {
+    this.baseUrl = trimSlash(snapshot.baseUrl || this.baseUrl);
     this.cookies = Array.isArray(snapshot.cookies) ? [...snapshot.cookies] : [];
     this.portalLoggedIn = Boolean(snapshot.portalLoggedIn);
     this.carId = String(snapshot.carId || "");
@@ -3206,16 +3220,56 @@ export class ChatplusClient {
       label: "登录账号"
     }, async () => {
       this.assertConfigured();
-      const login = await this.json("/frontend-api/login", {
-        method: "POST",
-        timeoutSec: options.timeoutSec,
-        body: {
-          userToken: this.account.username,
-          password: this.account.password,
-          token: ""
-        }
-      });
-      if (login?.code !== 1) throw new Error(login?.msg || "聊天站登录失败。");
+      let selected;
+      try {
+        selected = await useAvailableShareAiPortal({
+          configuredUrls: [this.baseUrl, this.configuredBaseUrl],
+          proxyUrl: proxyUrlFor(this.account),
+          directoryUrl: this.config?.shareAiDirectoryUrl,
+          directoryTimeoutMs: Number(options.timeoutSec || DEFAULT_CONNECT_TIMEOUT_SEC) * 1000,
+          fetchImpl: this.fetchImpl,
+          proxyAgentFactory: this.proxyAgentFactory,
+          directoryLoader: this.portalDirectoryLoader,
+          attempt: async (baseUrl) => {
+            this.baseUrl = baseUrl;
+            this.cookies = [];
+            this.portalLoggedIn = false;
+            const response = await this.http("/frontend-api/login", {
+              method: "POST",
+              timeoutSec: options.timeoutSec,
+              followRedirect: true,
+              body: {
+                userToken: this.account.username,
+                password: this.account.password,
+                token: ""
+              }
+            });
+            let login = null;
+            try {
+              login = response.body ? JSON.parse(response.body) : null;
+            } catch {
+              login = null;
+            }
+            if (response.status < 200 || response.status >= 300 || Number(login?.code) !== 1) {
+              const error = new Error(login?.msg || `登录入口返回异常：${response.status || "无响应"}`);
+              error.status = response.status;
+              error.body = response.body;
+              error.portalAccountRejected = Boolean(
+                login && isShareAiPortalAccountRejection(login?.msg)
+              );
+              throw error;
+            }
+            if (!this.cookies.length) throw new Error("登录入口没有返回有效会话。");
+            return login;
+          }
+        });
+      } catch (error) {
+        this.baseUrl = this.configuredBaseUrl;
+        this.cookies = [];
+        this.portalLoggedIn = false;
+        throw error;
+      }
+      this.baseUrl = selected.url;
       this.portalLoggedIn = true;
     });
   }
@@ -3227,17 +3281,30 @@ export class ChatplusClient {
     });
   }
 
-  async loadAccountUsages(options = {}) {
+  async loadAccountUsages(options = {}, portalRetried = false) {
     await this.loginPortal(options);
-    const payload = await this.json("/frontend-api/getme", {
-      timeoutSec: options.timeoutSec
-    });
-    if (payload?.code !== undefined && payload.code !== 1) {
-      throw new Error(payload?.msg || "读取聊天额度失败。");
+    try {
+      const payload = await this.json("/frontend-api/getme", {
+        timeoutSec: options.timeoutSec
+      });
+      if (payload?.code !== undefined && payload.code !== 1) {
+        throw new Error(payload?.msg || "读取聊天额度失败。");
+      }
+      return Object.fromEntries(
+        ["gpt", "grok", "gemini"].map((key) => [key, chatUsageFromPayload(payload, key)])
+      );
+    } catch (error) {
+      if (portalRetried || !isShareAiPortalConnectionError(error)) throw error;
+      reportShareAiPortalFailure({
+        proxyUrl: proxyUrlFor(this.account),
+        url: this.baseUrl
+      });
+      await this.sessionLock(async () => {
+        this.resetSession();
+        await this.performPortalLogin(options);
+      });
+      return this.loadAccountUsages(options, true);
     }
-    return Object.fromEntries(
-      ["gpt", "grok", "gemini"].map((key) => [key, chatUsageFromPayload(payload, key)])
-    );
   }
 
   async loadAccountUsage(options = {}, modelKey = "") {
@@ -3246,29 +3313,47 @@ export class ChatplusClient {
     return usages[route.key] || usages.gpt;
   }
 
-  async performEnterCar(carId, carType, options = {}) {
-    if (!this.portalLoggedIn) await this.performPortalLogin(options);
-    const session = await this.json(`/auth/loginSession?carid=${encodeURIComponent(carId)}&carType=${encodeURIComponent(carType)}`, {
-      timeoutSec: options.timeoutSec,
-      followRedirect: true
-    });
-    if (session?.code !== 1) throw new Error(session?.msg || "进入聊天车队失败。");
-    const page = await this.http(carType === "gemini" ? "/app" : "/", {
-      followRedirect: true,
-      timeoutSec: options.timeoutSec,
-      headers: {
-        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "upgrade-insecure-requests": "1"
+  async performEnterCar(carId, carType, options = {}, portalRetried = false) {
+    try {
+      if (!this.portalLoggedIn) await this.performPortalLogin(options);
+      const session = await this.json(`/auth/loginSession?carid=${encodeURIComponent(carId)}&carType=${encodeURIComponent(carType)}`, {
+        timeoutSec: options.timeoutSec,
+        followRedirect: true
+      });
+      if (!session || typeof session !== "object") {
+        const error = new Error("登录入口没有返回有效的车位信息。");
+        error.code = "INVALID_UPSTREAM_RESPONSE";
+        throw error;
       }
-    });
-    if (page.status >= 400) {
-      const error = new Error(`进入聊天页面失败：${page.status}`);
-      error.status = page.status;
-      error.body = page.body;
-      throw error;
-    }
-    if (carType === "gemini") {
-      this.geminiSession = geminiSessionFromPage(page.body, this.geminiSession);
+      if (session.code !== 1) throw new Error(session.msg || "进入聊天车队失败。");
+      const page = await this.http(carType === "gemini" ? "/app" : "/", {
+        followRedirect: true,
+        timeoutSec: options.timeoutSec,
+        headers: {
+          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "upgrade-insecure-requests": "1"
+        }
+      });
+      if (page.status >= 400) {
+        const error = new Error(`进入聊天页面失败：${page.status}`);
+        error.status = page.status;
+        error.body = page.body;
+        throw error;
+      }
+      if (carType === "gemini") {
+        this.geminiSession = geminiSessionFromPage(page.body, this.geminiSession);
+      }
+    } catch (error) {
+      if (portalRetried || !isShareAiPortalConnectionError(error)) throw error;
+      reportShareAiPortalFailure({
+        proxyUrl: proxyUrlFor(this.account),
+        url: this.baseUrl
+      });
+      this.resetSession();
+      await this.performPortalLogin(options);
+      this.carId = carId;
+      this.carType = carType;
+      return this.performEnterCar(carId, carType, options, true);
     }
   }
 
@@ -3553,7 +3638,8 @@ export class ChatplusClient {
           meta: {
             chatModel: usageRoute.key,
             recoveryUsage: usage,
-            referenceUsage
+            referenceUsage,
+            portalBaseUrl: this.baseUrl
           }
         };
       }
@@ -3573,7 +3659,8 @@ export class ChatplusClient {
           meta: {
             chatModel: usageRoute.key,
             recoveryUsage: usage,
-            referenceUsage
+            referenceUsage,
+            portalBaseUrl: this.baseUrl
           }
         };
       }
@@ -3610,7 +3697,8 @@ export class ChatplusClient {
               : ""
           },
           recoveryUsage: usage,
-          referenceUsage
+          referenceUsage,
+          portalBaseUrl: this.baseUrl
         }
       };
     });

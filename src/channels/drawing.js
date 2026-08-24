@@ -1,6 +1,10 @@
 import fetch, { Headers } from "node-fetch";
 import { ProxyAgent } from "proxy-agent";
 import { normalizeProxyUrl } from "../proxy.js";
+import {
+  isShareAiPortalAccountRejection,
+  useAvailableShareAiPortal
+} from "../shareai-portal-router.js";
 
 const ACCOUNT_CHECK_TIMEOUT_MS = 3000;
 const MIN_DRAWING_BALANCE_FOR_IMAGE = 2;
@@ -79,16 +83,16 @@ function invalidUpstreamResponseError(text, status = 0) {
   return error;
 }
 
-async function fetchWithTimeout(url, options = {}) {
+async function fetchWithTimeout(url, options = {}, fetchImpl = fetch) {
   const timeoutMs = Number(options.timeoutMs || 0);
   const fetchOptions = { ...options };
   delete fetchOptions.timeoutMs;
-  if (!(timeoutMs > 0)) return fetch(url, fetchOptions);
+  if (!(timeoutMs > 0)) return fetchImpl(url, fetchOptions);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...fetchOptions, signal: fetchOptions.signal || controller.signal });
+    return await fetchImpl(url, { ...fetchOptions, signal: fetchOptions.signal || controller.signal });
   } catch (error) {
     if (error?.name === "AbortError") {
       throw new Error("目标网站打不开，可能是服务器 IP 被限制或代理不可用。");
@@ -232,16 +236,28 @@ function confirmedDrawingTask(task, drawingBaseUrl = "") {
 }
 
 export class DrawingClient {
-  constructor({ config, channel, account, sessionLock }) {
+  constructor({
+    config,
+    channel,
+    account,
+    sessionLock,
+    fetchImpl = fetch,
+    proxyAgentFactory = (proxyUrl) => new ProxyAgent({ getProxyForUrl: () => proxyUrl }),
+    portalDirectoryLoader
+  }) {
     this.config = config;
     this.channel = channel;
     this.account = account;
-    this.mainBaseUrl = trimSlash(config.mainBaseUrl || "https://ikun.aishare.icu");
+    this.configuredMainBaseUrl = trimSlash(config.mainBaseUrl || "https://ikun.aishare.icu");
+    this.mainBaseUrl = this.configuredMainBaseUrl;
     this.drawingBaseUrl = trimSlash(channel?.settings?.baseUrl || config.drawingBaseUrl || "https://drawing.aishare.icu");
     this.accessToken = "";
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
+    this.fetchImpl = fetchImpl;
+    this.proxyAgentFactory = proxyAgentFactory;
+    this.portalDirectoryLoader = portalDirectoryLoader;
     this.proxyUrl = proxyUrlFor(account);
-    this.proxyAgent = this.proxyUrl ? new ProxyAgent({ getProxyForUrl: () => this.proxyUrl }) : null;
+    this.proxyAgent = this.proxyUrl ? this.proxyAgentFactory(this.proxyUrl) : null;
     this.contextSignature = this.makeContextSignature({ config, channel, account });
   }
 
@@ -261,14 +277,16 @@ export class DrawingClient {
     this.config = config;
     this.channel = channel;
     this.account = account;
-    this.mainBaseUrl = trimSlash(config.mainBaseUrl || "https://ikun.aishare.icu");
+    this.configuredMainBaseUrl = trimSlash(config.mainBaseUrl || "https://ikun.aishare.icu");
     this.drawingBaseUrl = trimSlash(channel?.settings?.baseUrl || config.drawingBaseUrl || "https://drawing.aishare.icu");
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     if (changed) {
       this.contextSignature = nextSignature;
       this.accessToken = "";
+      this.mainBaseUrl = this.configuredMainBaseUrl;
+      this.proxyAgent?.destroy?.();
       this.proxyUrl = proxyUrlFor(account);
-      this.proxyAgent = this.proxyUrl ? new ProxyAgent({ getProxyForUrl: () => this.proxyUrl }) : null;
+      this.proxyAgent = this.proxyUrl ? this.proxyAgentFactory(this.proxyUrl) : null;
     }
   }
 
@@ -280,27 +298,57 @@ export class DrawingClient {
 
   async performLogin(options = {}) {
     this.assertConfigured();
-    const loginOptions = {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      timeoutMs: options.timeoutMs,
-      body: JSON.stringify({
-        userToken: this.account.username,
-        password: this.account.password,
-        token: ""
-      })
-    };
-    if (this.proxyAgent) loginOptions.agent = this.proxyAgent;
+    let selected;
+    try {
+      selected = await useAvailableShareAiPortal({
+        configuredUrls: [this.configuredMainBaseUrl],
+        proxyUrl: this.proxyUrl,
+        directoryUrl: this.config?.shareAiDirectoryUrl,
+        directoryTimeoutMs: options.timeoutMs,
+        fetchImpl: this.fetchImpl,
+        proxyAgentFactory: this.proxyAgentFactory,
+        directoryLoader: this.portalDirectoryLoader,
+        attempt: async (baseUrl) => {
+          this.mainBaseUrl = baseUrl;
+          const loginOptions = {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            redirect: "follow",
+            timeoutMs: options.timeoutMs,
+            body: JSON.stringify({
+              userToken: this.account.username,
+              password: this.account.password,
+              token: ""
+            })
+          };
+          if (this.proxyAgent) loginOptions.agent = this.proxyAgent;
 
-    const loginResponse = await fetchWithTimeout(`${this.mainBaseUrl}/frontend-api/login`, loginOptions);
+          const loginResponse = await fetchWithTimeout(
+            `${baseUrl}/frontend-api/login`,
+            loginOptions,
+            this.fetchImpl
+          );
+          const loginPayload = await loginResponse.json().catch(() => null);
+          if (!loginResponse.ok || loginPayload?.code !== 1) {
+            const error = new Error(loginPayload?.msg || `登录入口返回异常：${loginResponse.status}`);
+            error.status = loginResponse.status;
+            error.portalAccountRejected = Boolean(
+              loginPayload && isShareAiPortalAccountRejection(loginPayload?.msg)
+            );
+            throw error;
+          }
 
-    const loginPayload = await loginResponse.json().catch(() => null);
-    if (!loginResponse.ok || loginPayload?.code !== 1) {
-      throw new Error(loginPayload?.msg || `主站登录失败：${loginResponse.status}`);
+          const shareSession = getCookieValue(extractSetCookies(loginResponse.headers), "share-session");
+          if (!shareSession) throw new Error("登录入口没有返回有效会话。");
+          return shareSession;
+        }
+      });
+    } catch (error) {
+      this.mainBaseUrl = this.configuredMainBaseUrl;
+      throw error;
     }
-
-    const shareSession = getCookieValue(extractSetCookies(loginResponse.headers), "share-session");
-    if (!shareSession) throw new Error("主站登录成功，但没有拿到会话。");
+    this.mainBaseUrl = selected.url;
+    const shareSession = selected.value;
 
     const ssoData = await this.request("/api/v1/auth/external-sso", {
       method: "POST",
@@ -349,7 +397,11 @@ export class DrawingClient {
     };
     if (this.proxyAgent) requestOptions.agent = this.proxyAgent;
 
-    const response = await fetchWithTimeout(`${this.drawingBaseUrl}${apiPath}`, requestOptions);
+    const response = await fetchWithTimeout(
+      `${this.drawingBaseUrl}${apiPath}`,
+      requestOptions,
+      this.fetchImpl
+    );
 
     const text = await response.text();
     let payload = null;
@@ -397,7 +449,7 @@ export class DrawingClient {
       quotaResetAt: quotaResetAtFrom(profile, stats),
       expireAt: profile?.external_sub_expire_at || "",
       message: quotaEmpty ? "绘图积分不足" : "绘图账号可用",
-      meta: { profile, stats }
+      meta: { profile, stats, portalBaseUrl: this.mainBaseUrl }
     };
   }
 
