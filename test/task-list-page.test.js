@@ -174,13 +174,18 @@ test("task list keeps the marker for a request rejected before an upstream call"
   assert.equal(failures.total, 0);
 });
 
-test("historical no-usable-account records are moved out of the failure filter", async () => {
-  const taskId = "task-historical-no-usable-account";
+test("historical quota rejections are moved out of the failure filter", async () => {
+  const taskId = "task-historical-quota-rejection";
   await upsertTask({
     id: taskId,
     status: "failed",
     taskType: "img2img",
-    errorMessage: "当前没有可用的生图账号。",
+    errorMessage: "任务失败：可用账号额度不足或暂不可用。",
+    attempts: [{ quotaEmpty: true, message: "绘图额度不足。" }],
+    responseJson: {
+      code: "QUOTA_EXHAUSTED",
+      attempts: [{ quotaEmpty: true, message: "绘图额度不足。" }]
+    },
     raw: { returnedError: true },
     createdAt: new Date().toISOString()
   });
@@ -188,7 +193,7 @@ test("historical no-usable-account records are moved out of the failure filter",
 
   const database = new Database(path.join(dataDir, "storage.sqlite"));
   database.prepare("UPDATE tasks SET list_status = 'failed' WHERE id = ?").run(taskId);
-  database.prepare("DELETE FROM storage_meta WHERE key = ?").run("task_list_concurrency_limited_v1");
+  database.prepare("DELETE FROM storage_meta WHERE key = ?").run("task_list_concurrency_limited_v2");
   database.close();
 
   const concurrencyLimited = await listTaskPage({

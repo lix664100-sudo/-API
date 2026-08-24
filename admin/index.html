@@ -2254,19 +2254,41 @@
         return attempts.filter((item) => item && String(item.message || "").trim());
       }
 
+      function isUnavailableTaskAttempt(item) {
+        const message = String(item?.message || "");
+        return item?.busy === true
+          || item?.quotaEmpty === true
+          || /正在处理中|额度不足|积分不足|使用次数已达上限|额度.{0,12}(?:用完|耗尽)|暂时没有图片额度|账号.{0,8}暂不可用/.test(message);
+      }
+
+      function isQuotaUnavailableTask(row) {
+        const code = String(row?.responseJson?.code || row?.code || "").trim().toUpperCase();
+        if (["QUOTA_EXHAUSTED", "CHAT_USAGE_LIMIT"].includes(code)) return true;
+        const message = String(row?.errorMessage || row?.responseJson?.message || "").trim();
+        if (/^任务失败：可用账号额度不足或暂不可用/.test(message)) return true;
+        const attempts = taskAttempts(row);
+        return attempts.length > 0 && attempts.every((item) => (
+          item?.quotaEmpty === true
+            || /额度不足|积分不足|使用次数已达上限|额度.{0,12}(?:用完|耗尽)|暂时没有图片额度/.test(String(item?.message || ""))
+        ));
+      }
+
       function isConcurrencyLimitedTask(row) {
         if (String(row?.status || "").toLowerCase() !== "failed") return false;
         if (String(row?.listStatus || "").toLowerCase() === "concurrency_limited") return true;
         const code = String(row?.responseJson?.code || row?.code || "").trim().toUpperCase();
         if (code === "CONCURRENCY_LIMIT") return true;
-        if (row?.raw?.submitted !== true && code === "NO_USABLE_ACCOUNT") return true;
+        if (row?.raw?.submitted !== true
+          && ["NO_USABLE_ACCOUNT", "QUOTA_EXHAUSTED", "CHAT_USAGE_LIMIT"].includes(code)) return true;
         const attempts = taskAttempts(row);
-        if (attempts.length && attempts.every((item) => item.busy || /正在处理中/.test(String(item.message || "")))) {
+        if (row?.raw?.submitted !== true && attempts.length && attempts.every(isUnavailableTaskAttempt)) {
           return true;
         }
         const message = String(row?.errorMessage || row?.responseJson?.message || "").trim();
         return row?.raw?.submitted !== true
-          && (/^并发上限/.test(message) || /^当前没有可用的(?:生图|对话)账号/.test(message));
+          && (/^并发上限/.test(message)
+            || /^当前没有可用的(?:生图|对话)账号/.test(message)
+            || /^任务失败：可用账号额度不足或暂不可用/.test(message));
       }
 
       function isQuotaProtectedTask(row) {
@@ -2346,6 +2368,9 @@
         if (isConcurrencyLimitedTask(row)
           && (code === "NO_USABLE_ACCOUNT" || /^当前没有可用的(?:生图|对话)账号/.test(message))) {
           return "并发已满：当前没有可用账号，请检测账号状态或等待额度恢复。";
+        }
+        if (isConcurrencyLimitedTask(row) && isQuotaUnavailableTask(row)) {
+          return "并发已满：当前可用账号额度不足，请检测账号额度或等待恢复。";
         }
         if (!attempts.length) return "";
         if (row?.raw?.submitted === true || taskSubmissionRoutes(row).length) return "";

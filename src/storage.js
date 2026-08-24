@@ -368,7 +368,7 @@ function ensureTaskSafetyReviewStatuses(database) {
 }
 
 function ensureTaskConcurrencyLimitedStatuses(database) {
-  const migrationKey = "task_list_concurrency_limited_v1";
+  const migrationKey = "task_list_concurrency_limited_v2";
   if (getStorageMeta(database, migrationKey)) return;
   const cutoff = Date.now() - taskHistoryDays * 24 * 60 * 60 * 1000;
   const rows = database.prepare(`
@@ -1751,9 +1751,18 @@ function taskListStatus(task) {
   const rejectedBeforeSubmission = task?.raw?.submitted !== true;
   if (!rejectedBeforeSubmission) return status;
   if (code === "QUOTA_PROTECTION") return "quota_protected";
-  return ["CONCURRENCY_LIMIT", "NO_USABLE_ACCOUNT"].includes(code)
+  const attempts = Array.isArray(task?.attempts) ? task.attempts : task?.responseJson?.attempts || [];
+  const allAccountsUnavailable = attempts.length > 0 && attempts.every((attempt) => {
+    const attemptMessage = String(attempt?.message || "");
+    return attempt?.busy === true
+      || attempt?.quotaEmpty === true
+      || /正在处理中|额度不足|积分不足|使用次数已达上限|额度.{0,12}(?:用完|耗尽)|暂时没有图片额度|账号.{0,8}暂不可用/.test(attemptMessage);
+  });
+  return ["CONCURRENCY_LIMIT", "NO_USABLE_ACCOUNT", "QUOTA_EXHAUSTED", "CHAT_USAGE_LIMIT"].includes(code)
     || /^并发上限/.test(message)
     || /^当前没有可用的(?:生图|对话)账号/.test(message)
+    || /^任务失败：可用账号额度不足或暂不可用/.test(message)
+    || allAccountsUnavailable
     ? "concurrency_limited"
     : status;
 }
