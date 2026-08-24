@@ -149,16 +149,57 @@ test("task list keeps the marker for a request rejected before an upstream call"
     taskType: "img2img",
     modelId: "gpt",
     requestJson: { model: "gpt" },
-    responseJson: { status: 503, message: "当前没有可用的生图账号。" },
+    responseJson: {
+      status: 503,
+      code: "NO_USABLE_ACCOUNT",
+      message: "当前没有可用的生图账号，请先检测账号状态或等待额度恢复。"
+    },
     raw: { returnedError: true },
     createdAt: new Date().toISOString()
   });
 
-  const page = await listTaskPage({ keyword: "task-returned-before-call" });
+  const page = await listTaskPage({
+    keyword: "task-returned-before-call",
+    status: "concurrency_limited"
+  });
+  const failures = await listTaskPage({
+    keyword: "task-returned-before-call",
+    status: "failed"
+  });
 
   assert.equal(page.total, 1);
+  assert.equal(page.items[0].listStatus, "concurrency_limited");
   assert.equal(page.items[0].requestJson.model, "gpt");
   assert.equal(page.items[0].raw.returnedError, true);
+  assert.equal(failures.total, 0);
+});
+
+test("historical no-usable-account records are moved out of the failure filter", async () => {
+  const taskId = "task-historical-no-usable-account";
+  await upsertTask({
+    id: taskId,
+    status: "failed",
+    taskType: "img2img",
+    errorMessage: "当前没有可用的生图账号。",
+    raw: { returnedError: true },
+    createdAt: new Date().toISOString()
+  });
+  await closeStorage();
+
+  const database = new Database(path.join(dataDir, "storage.sqlite"));
+  database.prepare("UPDATE tasks SET list_status = 'failed' WHERE id = ?").run(taskId);
+  database.prepare("DELETE FROM storage_meta WHERE key = ?").run("task_list_concurrency_limited_v1");
+  database.close();
+
+  const concurrencyLimited = await listTaskPage({
+    keyword: taskId,
+    status: "concurrency_limited"
+  });
+  const failures = await listTaskPage({ keyword: taskId, status: "failed" });
+
+  assert.equal(concurrencyLimited.total, 1);
+  assert.equal(concurrencyLimited.items[0].listStatus, "concurrency_limited");
+  assert.equal(failures.total, 0);
 });
 
 test("task pages return lightweight summaries and load large details only on demand", async () => {

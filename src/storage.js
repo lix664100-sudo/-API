@@ -367,6 +367,28 @@ function ensureTaskSafetyReviewStatuses(database) {
   setStorageMeta(database, migrationKey, new Date().toISOString());
 }
 
+function ensureTaskConcurrencyLimitedStatuses(database) {
+  const migrationKey = "task_list_concurrency_limited_v1";
+  if (getStorageMeta(database, migrationKey)) return;
+  const cutoff = Date.now() - taskHistoryDays * 24 * 60 * 60 * 1000;
+  const rows = database.prepare(`
+    SELECT id, payload
+    FROM tasks
+    WHERE status = 'failed' AND list_status = 'failed' AND created_time >= ?
+  `).all(cutoff);
+  const update = database.prepare("UPDATE tasks SET list_status = 'concurrency_limited' WHERE id = ?");
+  database.transaction((items) => {
+    for (const row of items) {
+      try {
+        if (taskListStatus(JSON.parse(row.payload)) === "concurrency_limited") update.run(row.id);
+      } catch {
+        // Ignore malformed historical rows.
+      }
+    }
+  })(rows);
+  setStorageMeta(database, migrationKey, new Date().toISOString());
+}
+
 function pruneTaskStatRows(database, now = Date.now()) {
   const cutoff = now - statRecordDays * 24 * 60 * 60 * 1000;
   database.prepare("DELETE FROM task_stats WHERE time < ?").run(cutoff);
@@ -477,6 +499,7 @@ async function openStorageDatabase() {
     `);
     ensureTaskListColumns(database);
     ensureTaskSafetyReviewStatuses(database);
+    ensureTaskConcurrencyLimitedStatuses(database);
     database.exec(`
       CREATE INDEX IF NOT EXISTS tasks_record_kind_time_idx
         ON tasks(record_kind, created_time DESC);
@@ -1728,7 +1751,9 @@ function taskListStatus(task) {
   const rejectedBeforeSubmission = task?.raw?.submitted !== true;
   if (!rejectedBeforeSubmission) return status;
   if (code === "QUOTA_PROTECTION") return "quota_protected";
-  return code === "CONCURRENCY_LIMIT" || /^并发上限/.test(message)
+  return ["CONCURRENCY_LIMIT", "NO_USABLE_ACCOUNT"].includes(code)
+    || /^并发上限/.test(message)
+    || /^当前没有可用的(?:生图|对话)账号/.test(message)
     ? "concurrency_limited"
     : status;
 }

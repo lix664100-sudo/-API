@@ -2256,14 +2256,17 @@
 
       function isConcurrencyLimitedTask(row) {
         if (String(row?.status || "").toLowerCase() !== "failed") return false;
+        if (String(row?.listStatus || "").toLowerCase() === "concurrency_limited") return true;
         const code = String(row?.responseJson?.code || row?.code || "").trim().toUpperCase();
         if (code === "CONCURRENCY_LIMIT") return true;
+        if (row?.raw?.submitted !== true && code === "NO_USABLE_ACCOUNT") return true;
         const attempts = taskAttempts(row);
         if (attempts.length && attempts.every((item) => item.busy || /正在处理中/.test(String(item.message || "")))) {
           return true;
         }
         const message = String(row?.errorMessage || row?.responseJson?.message || "").trim();
-        return row?.raw?.submitted !== true && /^并发上限/.test(message);
+        return row?.raw?.submitted !== true
+          && (/^并发上限/.test(message) || /^当前没有可用的(?:生图|对话)账号/.test(message));
       }
 
       function isQuotaProtectedTask(row) {
@@ -2338,11 +2341,16 @@
 
       function taskFailureSummaryText(row, value) {
         const attempts = taskAttempts(row);
+        const code = String(row?.responseJson?.code || row?.code || "").trim().toUpperCase();
+        const message = String(row?.errorMessage || row?.responseJson?.message || value || "").trim();
+        if (isConcurrencyLimitedTask(row)
+          && (code === "NO_USABLE_ACCOUNT" || /^当前没有可用的(?:生图|对话)账号/.test(message))) {
+          return "并发已满：当前没有可用账号，请检测账号状态或等待额度恢复。";
+        }
         if (!attempts.length) return "";
         if (row?.raw?.submitted === true || taskSubmissionRoutes(row).length) return "";
-        const text = String(value || "");
         const messages = attempts.map((item) => String(item.message || "")).join("；");
-        if (/并发上限/.test(text) || attempts.every((item) => item.busy || /正在处理中/.test(String(item.message || "")))) {
+        if (isConcurrencyLimitedTask(row)) {
           return "并发已满：可用账号都在处理其他任务。";
         }
         if (/额度|积分不足|用完|耗尽|暂时没有图片额度/.test(messages)) {

@@ -504,6 +504,13 @@ test("并发已满使用独立的黄色状态，不再显示为任务失败", ()
     },
     raw: { submitted: false }
   };
+  const noUsableAccount = {
+    status: "failed",
+    taskType: "img2img",
+    errorMessage: "当前没有可用的生图账号，请先检测账号状态或等待额度恢复。",
+    responseJson: { code: "NO_USABLE_ACCOUNT" },
+    raw: { returnedError: true }
+  };
   const realFailure = {
     status: "failed",
     taskType: "img2img",
@@ -515,6 +522,9 @@ test("并发已满使用独立的黄色状态，不再显示为任务失败", ()
   assert.equal(isConcurrencyLimitedTask(concurrencyLimited), true);
   assert.equal(taskPresentationStatus(concurrencyLimited), "concurrency_limited");
   assert.match(taskErrorText(concurrencyLimited), /^并发已满：/);
+  assert.equal(isConcurrencyLimitedTask(noUsableAccount), true);
+  assert.equal(taskPresentationStatus(noUsableAccount), "concurrency_limited");
+  assert.equal(taskErrorText(noUsableAccount), "并发已满：当前没有可用账号，请检测账号状态或等待额度恢复。");
   assert.equal(isConcurrencyLimitedTask(realFailure), false);
   assert.equal(taskPresentationStatus(realFailure), "failed");
   assert.match(adminHtml, /concurrency_limited: \["warning", "并发已满"\]/);
