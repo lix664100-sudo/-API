@@ -1,6 +1,8 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import fetch from "node-fetch";
+import { ProxyAgent } from "proxy-agent";
 import {
   chatplusConversationUpdates,
   chatplusConversationUpdateVersion,
@@ -2350,7 +2352,18 @@ async function measureTaskStage(recorder, stage, work) {
 }
 
 export class ChatplusClient {
-  constructor({ config, channel, account, sessionLock, onProCarsUnavailable, onProCarsAvailable, onImageCarCooldown }) {
+  constructor({
+    config,
+    channel,
+    account,
+    sessionLock,
+    onProCarsUnavailable,
+    onProCarsAvailable,
+    onImageCarCooldown,
+    curlRunner = runCurl,
+    fetchImpl = fetch,
+    proxyAgentFactory = (proxyUrl) => new ProxyAgent({ getProxyForUrl: () => proxyUrl })
+  }) {
     this.config = config;
     this.channel = channel;
     this.account = account;
@@ -2372,6 +2385,9 @@ export class ChatplusClient {
     this.onProCarsUnavailable = typeof onProCarsUnavailable === "function" ? onProCarsUnavailable : null;
     this.onProCarsAvailable = typeof onProCarsAvailable === "function" ? onProCarsAvailable : null;
     this.onImageCarCooldown = typeof onImageCarCooldown === "function" ? onImageCarCooldown : null;
+    this.curlRunner = curlRunner;
+    this.fetchImpl = fetchImpl;
+    this.proxyAgentFactory = proxyAgentFactory;
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWorks = new Map();
     this.concurrentChatSessions = new Map();
@@ -2425,6 +2441,52 @@ export class ChatplusClient {
     return this.cookies.join("; ");
   }
 
+  async fetchHttp(url, options = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Number(options.timeoutSec) * 1000);
+    const proxyUrl = proxyUrlFor(this.account);
+    const agent = proxyUrl ? this.proxyAgentFactory(proxyUrl) : undefined;
+    try {
+      const response = await this.fetchImpl(url, {
+        method: options.method || "GET",
+        headers: options.headers || {},
+        body: options.input === "" || options.input === undefined ? undefined : options.input,
+        redirect: options.followRedirect ? "follow" : "manual",
+        agent,
+        signal: controller.signal
+      });
+      const decoder = new TextDecoder();
+      let body = "";
+      if (response.body) {
+        for await (const chunk of response.body) {
+          body += decoder.decode(chunk, { stream: true });
+          if (typeof options.abortWhen !== "function") continue;
+          const candidate = options.abortWhen(body.length > 32768 ? body.slice(-32768) : body);
+          if (candidate instanceof Error) {
+            controller.abort();
+            throw candidate;
+          }
+        }
+        body += decoder.decode();
+      }
+      return {
+        status: response.status,
+        headers: typeof response.headers?.raw === "function" ? response.headers.raw() : {},
+        body
+      };
+    } catch (error) {
+      if (error?.name !== "AbortError") throw error;
+      const timeoutError = new Error("聊天站响应慢，代理可能可用但请求超时。");
+      timeoutError.status = 504;
+      timeoutError.code = "CURL_TIMEOUT";
+      timeoutError.curlCode = 28;
+      throw timeoutError;
+    } finally {
+      clearTimeout(timer);
+      agent?.destroy?.();
+    }
+  }
+
   async http(path, options = {}) {
     const url = /^https?:\/\//i.test(path) ? path : `${this.baseUrl}${path.startsWith("/") ? "" : "/"}${path}`;
     const sameSite = url.startsWith(this.baseUrl);
@@ -2446,20 +2508,33 @@ export class ChatplusClient {
     const proxyUrl = proxyUrlFor(this.account);
     if (proxyUrl) args.push("--proxy", proxyUrl);
     args.push("-X", options.method || "GET", url);
-    for (const [key, value] of Object.entries(headers)) {
-      args.push("-H", `${key}: ${value}`);
-    }
     let input = "";
     if (hasBody) {
       input = options.rawBody || Buffer.isBuffer(options.body) || options.body instanceof Uint8Array
         ? options.body
         : typeof options.body === "string" ? options.body : JSON.stringify(options.body);
       args.push("--data-binary", "@-");
-      if (!headers["content-type"] && !options.rawBody) args.push("-H", "content-type: application/json");
+      if (!headers["content-type"] && !options.rawBody) headers["content-type"] = "application/json";
     }
-    const result = splitHttp(await runCurl(args, input, {
-      abortWhen: options.abortWhen
-    }));
+    for (const [key, value] of Object.entries(headers)) {
+      args.push("-H", `${key}: ${value}`);
+    }
+    let result;
+    try {
+      result = splitHttp(await this.curlRunner(args, input, {
+        abortWhen: options.abortWhen
+      }));
+    } catch (error) {
+      if (error?.code !== "CURL_TLS_CONNECT_ERROR") throw error;
+      result = await this.fetchHttp(url, {
+        method: options.method || "GET",
+        headers,
+        input,
+        followRedirect: options.followRedirect,
+        timeoutSec: requestTimeoutSec(options, this.config),
+        abortWhen: options.abortWhen
+      });
+    }
     setCookiesFromHeaders(this.cookies, result.headers);
     return result;
   }
