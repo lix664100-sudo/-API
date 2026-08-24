@@ -140,7 +140,39 @@ function curlProcessError(code, stderr) {
   return error;
 }
 
-function runCurl(args, input = "", options = {}) {
+function isCurlTlsHandshakeError(error) {
+  return Number(error?.curlCode) === 35
+    || error?.code === "CURL_35"
+    || /SSL_ERROR_SYSCALL|SSL connect error|secure TLS connection was established|TLS handshake/i
+      .test(String(error?.message || ""));
+}
+
+export function curlTlsCompatibilityArgs(args = []) {
+  return ["--http1.1", "--tlsv1.2", "--tls-max", "1.2", ...args];
+}
+
+export async function runCurlWithTlsCompatibilityRetry(attempt, args, input = "", options = {}) {
+  try {
+    return await attempt(args, input, options);
+  } catch (error) {
+    if (!isCurlTlsHandshakeError(error)) throw error;
+  }
+
+  try {
+    return await attempt(curlTlsCompatibilityArgs(args), input, options);
+  } catch (error) {
+    const finalError = error instanceof Error ? error : new Error(String(error || "聊天站安全连接失败。"));
+    finalError.tlsCompatibilityRetryAttempted = true;
+    if (isCurlTlsHandshakeError(finalError)) {
+      finalError.code = "CURL_TLS_CONNECT_ERROR";
+      finalError.status = 502;
+      finalError.message = "聊天站安全连接失败，系统已自动使用兼容方式重试，但仍未连接成功。";
+    }
+    throw finalError;
+  }
+}
+
+function runCurlAttempt(args, input = "", options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(CURL_COMMAND, args, { windowsHide: true });
     let stdout = "";
@@ -196,7 +228,11 @@ function runCurl(args, input = "", options = {}) {
   });
 }
 
-function runCurlBuffer(args, input = "") {
+function runCurl(args, input = "", options = {}) {
+  return runCurlWithTlsCompatibilityRetry(runCurlAttempt, args, input, options);
+}
+
+function runCurlBufferAttempt(args, input = "") {
   return new Promise((resolve, reject) => {
     const child = spawn(CURL_COMMAND, args, { windowsHide: true });
     const stdout = [];
@@ -218,6 +254,10 @@ function runCurlBuffer(args, input = "") {
     if (input) child.stdin.end(input);
     else child.stdin.end();
   });
+}
+
+function runCurlBuffer(args, input = "") {
+  return runCurlWithTlsCompatibilityRetry(runCurlBufferAttempt, args, input);
 }
 
 function splitHttp(raw) {
