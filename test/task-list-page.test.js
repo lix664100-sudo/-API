@@ -3,6 +3,7 @@ import { after, test } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-task-list-page-"));
 process.env.DATA_DIR = dataDir;
@@ -162,6 +163,7 @@ test("task list keeps the marker for a request rejected before an upstream call"
 
 test("task pages return lightweight summaries and load large details only on demand", async () => {
   const imageData = `data:image/png;base64,${"A".repeat(180_000)}`;
+  const previewUrl = "/uploads/previews/task-large-chat.png";
   const longReply = `完整回复-${"回复内容".repeat(2000)}`;
   await upsertTask({
     id: "task-large-chat",
@@ -189,7 +191,7 @@ test("task pages return lightweight summaries and load large details only on dem
       usage: { estimated: true, prompt_tokens: 8, completion_tokens: 12, total_tokens: 20 },
       raw: { fullPayload: "B".repeat(120_000) }
     },
-    inputImageUrls: [imageData],
+    inputImageUrls: [previewUrl],
     createdAt: new Date().toISOString()
   });
 
@@ -208,6 +210,36 @@ test("task pages return lightweight summaries and load large details only on dem
   assert.equal(searched.items.some((task) => task.id === "task-large-chat"), true);
 
   const detail = await getTask("task-large-chat");
-  assert.equal(detail.requestJson.messages[0].content[1].image_url.url, imageData);
+  assert.equal(detail.requestJson.messages[0].content[1].image_url.url, "[图片内容已省略]");
+  assert.deepEqual(detail.inputImageUrls, [previewUrl]);
+  assert.equal(JSON.stringify(detail).includes(imageData), false);
   assert.equal(detail.responseText, longReply);
+});
+
+test("updating one task does not load unrelated task payloads", async () => {
+  await upsertTask({
+    id: "task-direct-update",
+    status: "processing",
+    taskType: "chat",
+    createdAt: new Date().toISOString()
+  });
+  await closeStorage();
+
+  const database = new Database(path.join(dataDir, "storage.sqlite"));
+  database.prepare(`
+    INSERT INTO tasks (
+      id, source_task_id, created_at, created_time, status,
+      account_id, channel_id, channel_group, record_kind, list_status, search_text, payload
+    ) VALUES (?, '', ?, ?, 'success', '', '', 'chatplus', 'chat', 'success', 'malformed history', ?)
+  `).run("task-malformed-history", new Date().toISOString(), Date.now() - 1, "{not-json");
+  database.close();
+
+  const stored = await upsertTask({
+    id: "task-direct-update",
+    status: "success",
+    responseText: "done"
+  });
+
+  assert.equal(stored.status, "success");
+  assert.equal((await getTask("task-direct-update")).responseText, "done");
 });

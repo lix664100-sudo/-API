@@ -16,6 +16,7 @@ const runtimeStatsFile = path.join(dataDir, "runtime-stats.json");
 const databaseFile = path.join(dataDir, "storage.sqlite");
 const taskHistoryDays = 2;
 const taskHistoryLimit = 50000;
+const legacyTaskListPayloadLimit = 32 * 1024 * 1024;
 const statRecordDays = 31;
 const dailyStatDays = 30;
 const imageTaskTypes = new Set(["text2img", "img2img"]);
@@ -35,19 +36,17 @@ let tasksWriteQueue = Promise.resolve();
 let configWriteQueue = Promise.resolve();
 let chatplusUpdatesWriteQueue = Promise.resolve();
 let statsRevision = 0;
+let taskPruneAt = 0;
 let routingRevision = 0;
 let routingPruneAt = 0;
 let chatplusUpdatesPruneAt = 0;
 let statsSnapshot = null;
 const intradayStatsCache = new Map();
 let todayAccountRoutingUsageCache = null;
-let tasksLoadPromise = null;
 let storageDatabase = null;
 let storageDatabasePromise = null;
-let tasksSnapshot = {
-  ready: false,
-  tasks: []
-};
+const storedImageDataPattern = /data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/_=-]+/gi;
+const storedImageDataPlaceholder = "[图片内容已省略]";
 
 const defaultImageStorage = {
   mode: "smart",
@@ -147,10 +146,10 @@ function storageTaskId(task = {}) {
 }
 
 function writeTaskRow(database, task) {
-  const stored = {
+  const stored = compactStoredTask({
     ...task,
     id: storageTaskId(task)
-  };
+  });
   const listColumns = taskListColumnValues(stored);
   database.prepare(`
     INSERT INTO tasks (
@@ -185,6 +184,13 @@ function writeTaskRow(database, task) {
     JSON.stringify(stored)
   );
   return stored;
+}
+
+function compactStoredTask(task) {
+  const serialized = JSON.stringify(task, (_key, value) => typeof value === "string"
+    ? value.replace(storedImageDataPattern, storedImageDataPlaceholder)
+    : value);
+  return JSON.parse(serialized);
 }
 
 function writeTaskStatRow(database, record) {
@@ -290,14 +296,6 @@ function setStorageMeta(database, key, value) {
 
 function getStorageMeta(database, key) {
   return database.prepare("SELECT value FROM storage_meta WHERE key = ?").pluck().get(key) || "";
-}
-
-function removeTaskRows(database, tasks = []) {
-  if (!tasks.length) return;
-  const remove = database.prepare("DELETE FROM tasks WHERE id = ?");
-  database.transaction((items) => {
-    for (const task of items) remove.run(String(task.id || ""));
-  })(tasks);
 }
 
 function ensureTaskListColumns(database) {
@@ -530,17 +528,13 @@ export async function closeStorage() {
   }
   storageDatabase = null;
   storageDatabasePromise = null;
-  tasksLoadPromise = null;
   statsSnapshot = null;
+  taskPruneAt = 0;
   routingRevision = 0;
   routingPruneAt = 0;
   chatplusUpdatesPruneAt = 0;
   intradayStatsCache.clear();
   todayAccountRoutingUsageCache = null;
-  tasksSnapshot = {
-    ready: false,
-    tasks: []
-  };
 }
 
 function normalizeChatModelKey(value) {
@@ -1660,45 +1654,27 @@ function limitTasks(tasks) {
     .slice(0, taskHistoryLimit);
 }
 
-function setTasksSnapshot(tasks) {
-  tasksSnapshot = {
-    ready: true,
-    tasks
-  };
-  return tasks;
-}
-
-async function loadTasksFromDatabase() {
+export async function listTasks() {
+  await tasksWriteQueue.catch(() => {});
   const database = await getStorageDatabase();
-  const tasks = database.prepare(`
+  const tasks = [];
+  let payloadBytes = 0;
+  for (const row of database.prepare(`
     SELECT payload
     FROM tasks
     ORDER BY created_time DESC
-  `).all().map((row) => JSON.parse(row.payload));
-  const limited = limitTasks(tasks);
-  if (limited.length !== tasks.length) {
-    const retainedIds = new Set(limited.map((task) => String(task.id || "")));
-    removeTaskRows(
-      database,
-      tasks.filter((task) => !retainedIds.has(String(task.id || "")))
-    );
+    LIMIT ?
+  `).iterate(taskHistoryLimit)) {
+    const rowBytes = Buffer.byteLength(row.payload, "utf8");
+    if (payloadBytes && payloadBytes + rowBytes > legacyTaskListPayloadLimit) break;
+    payloadBytes += rowBytes;
+    try {
+      tasks.push(JSON.parse(row.payload));
+    } catch {
+      // Ignore malformed historical rows.
+    }
   }
-  return setTasksSnapshot(limited);
-}
-
-async function loadTasks({ waitForWrites = true } = {}) {
-  if (waitForWrites) await tasksWriteQueue.catch(() => {});
-  if (tasksSnapshot.ready) return tasksSnapshot.tasks;
-  if (!tasksLoadPromise) {
-    tasksLoadPromise = loadTasksFromDatabase().finally(() => {
-      tasksLoadPromise = null;
-    });
-  }
-  return tasksLoadPromise;
-}
-
-export async function listTasks() {
-  return loadTasks();
+  return tasks;
 }
 
 export async function listActiveTasks() {
@@ -1781,10 +1757,9 @@ function taskSearchParts(value) {
 }
 
 function stripTaskImageData(value) {
-  return String(value || "").replace(
-    /data:image\/[a-z0-9.+-]+;base64,(?:[a-z0-9+/=]+|\[omitted[^\]]*\])/gi,
-    "[图片]"
-  );
+  return String(value || "")
+    .replace(storedImageDataPattern, "[图片]")
+    .replace(/data:image\/[a-z0-9.+-]+;base64,\[omitted[^\]]*\]/gi, "[图片]");
 }
 
 function taskRequestSearchText(request = {}) {
@@ -2114,32 +2089,50 @@ function shouldKeepStoredTask(current, incoming) {
   return false;
 }
 
-function taskIdentityIndex(tasks, task) {
-  const id = String(task?.id || "").trim();
-  return id ? tasks.findIndex((item) => String(item.id) === id) : -1;
+function storedTaskById(database, id) {
+  const payload = database.prepare("SELECT payload FROM tasks WHERE id = ?").pluck().get(String(id || ""));
+  if (!payload) return null;
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+function pruneTaskRows(database, now = Date.now()) {
+  const cutoff = now - taskHistoryDays * 24 * 60 * 60 * 1000;
+  const activeStatuses = ["processing", "queued", "pending", "unknown", "waiting_upstream"];
+  database.prepare(`
+    DELETE FROM tasks
+    WHERE created_time < ?
+      AND status NOT IN (${activeStatuses.map(() => "?").join(", ")})
+  `).run(cutoff, ...activeStatuses);
+  database.prepare(`
+    DELETE FROM tasks
+    WHERE id IN (
+      SELECT id
+      FROM tasks
+      ORDER BY created_time DESC
+      LIMIT -1 OFFSET ?
+    )
+  `).run(taskHistoryLimit);
 }
 
 export async function upsertTask(task) {
   const write = tasksWriteQueue.catch(() => {}).then(async () => {
-    const tasks = [...await loadTasks({ waitForWrites: false })];
-    const index = taskIdentityIndex(tasks, task);
+    const database = await getStorageDatabase();
+    const id = storageTaskId(task);
+    const current = storedTaskById(database, id);
     const next = {
       ...task,
+      id,
       updatedAt: new Date().toISOString()
     };
-    if (index >= 0 && shouldKeepStoredTask(tasks[index], next)) return tasks[index];
-    const storedCandidate = index >= 0
-      ? { ...tasks[index], ...next, id: tasks[index].id || next.id }
+    if (current && shouldKeepStoredTask(current, next)) return current;
+    const storedCandidate = current
+      ? { ...current, ...next, id: current.id || next.id }
       : { ...next, createdAt: task.createdAt || new Date().toISOString() };
-    const stored = {
-      ...storedCandidate,
-      id: storageTaskId(storedCandidate)
-    };
-    if (index >= 0) tasks[index] = stored;
-    else tasks.push(stored);
-    const limited = limitTasks(tasks);
-    const database = await getStorageDatabase();
-    writeTaskRow(database, stored);
+    const stored = writeTaskRow(database, storedCandidate);
     if (writeTaskRoutingEvent(database, stored)) {
       if (Date.now() >= routingPruneAt) {
         pruneRoutingEvents(database);
@@ -2148,14 +2141,10 @@ export async function upsertTask(task) {
       routingRevision += 1;
       todayAccountRoutingUsageCache = null;
     }
-    if (limited.length !== tasks.length) {
-      const retainedIds = new Set(limited.map((item) => String(item.id || "")));
-      removeTaskRows(
-        database,
-        tasks.filter((item) => !retainedIds.has(String(item.id || "")))
-      );
+    if (Date.now() >= taskPruneAt) {
+      pruneTaskRows(database);
+      taskPruneAt = Date.now() + 60 * 60 * 1000;
     }
-    setTasksSnapshot(limited);
     return stored;
   });
   tasksWriteQueue = write.catch(() => {});
@@ -2697,13 +2686,21 @@ async function loadStats() {
 
 async function seedStatsFromTasks(stats) {
   if (Object.keys(stats.records || {}).length) return stats;
-  const tasks = await loadTasks();
-  const records = [];
-  for (const task of tasks) {
-    const record = taskStatRecord(task);
-    if (record) records.push(record);
-  }
   const database = await getStorageDatabase();
+  const records = [];
+  for (const row of database.prepare(`
+    SELECT payload
+    FROM tasks
+    ORDER BY created_time DESC
+    LIMIT ?
+  `).iterate(taskHistoryLimit)) {
+    try {
+      const record = taskStatRecord(JSON.parse(row.payload));
+      if (record) records.push(record);
+    } catch {
+      // Ignore malformed historical rows.
+    }
+  }
   database.transaction((items) => {
     for (const record of items) writeTaskStatRow(database, record);
     pruneTaskStatRows(database);
