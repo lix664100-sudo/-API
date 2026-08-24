@@ -4588,13 +4588,15 @@ function imageFailureReport(task = {}, error = {}, options = {}) {
       || error?.message
   );
   const failureReason = readableFailureReason(error?.failureReason || upstreamText || error?.message);
+  const policyFailure = String(error?.code || "").toLowerCase() === "content_policy"
+    || isImagePolicyFailureMessage(failureReason || upstreamText || error?.message);
   const failureStage = failedTaskStage(task, error);
   const stageText = !submissionConfirmed && failureStage?.label
     ? `，停在“${failureStage.label}”`
     : "";
-  const returnUpstreamMessage = String(error?.code || "").toLowerCase() === "content_policy"
-    && Boolean(failureReason);
+  const returnUpstreamMessage = policyFailure && Boolean(failureReason);
   return {
+    code: policyFailure ? "content_policy" : "",
     failureType: submissionConfirmed ? "upstream_no_image" : "submission_failed",
     submissionConfirmed,
     failureReason,
@@ -4610,6 +4612,7 @@ function imageFailureReport(task = {}, error = {}, options = {}) {
 
 function imageFailureResponseFields(report) {
   return {
+    ...(report.code ? { code: report.code } : {}),
     message: report.message,
     failureType: report.failureType,
     submissionConfirmed: report.submissionConfirmed,

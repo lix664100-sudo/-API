@@ -9,6 +9,9 @@ import {
 } from "../chatplus-conversation-updates.js";
 import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "../image-limits.js";
 import { normalizeProxyUrl } from "../proxy.js";
+import { isImagePolicyFailureMessage } from "../task-error-policy.js";
+
+export { isImagePolicyFailureMessage } from "../task-error-policy.js";
 
 const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
 const ACCOUNT_CHECK_TIMEOUT_SEC = 20;
@@ -1264,15 +1267,6 @@ function imageQuotaError(message = "图片生成额度已用完。") {
   error.quotaConfirmedByUpstream = true;
   error.status = 429;
   return error;
-}
-
-export function isImagePolicyFailureMessage(content) {
-  const text = String(content || "").replace(/\s+/g, " ").trim();
-  if (!text) return false;
-  return /(?:violate|violates|violating).{0,160}(?:guardrails|policy|policies|content)/i.test(text)
-    || /(?:guardrails|content policy|safety policy|safety system).{0,160}(?:image|content|request|third-party)/i.test(text)
-    || /similarity to third-party content/i.test(text)
-    || /(?:内容安全|安全拦截|上游渠道内容安全拦截|违规)/.test(text);
 }
 
 function isImageRateLimitMessage(content) {

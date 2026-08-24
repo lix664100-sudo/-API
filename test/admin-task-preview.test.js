@@ -105,7 +105,7 @@ function loadTaskFailureHelpers() {
   assert.ok(start >= 0 && end > start, "任务失败说明辅助逻辑必须存在");
 
   const context = {};
-  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { isConcurrencyLimitedTask, taskPresentationStatus, taskErrorText, taskReturnJson, taskSubmissionRouteText };`, context);
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { isConcurrencyLimitedTask, isSafetyReviewTask, taskPresentationStatus, taskErrorText, taskReturnJson, taskSubmissionRouteText };`, context);
   return context.helpers;
 }
 
@@ -508,6 +508,21 @@ test("并发已满使用独立的黄色状态，不再显示为任务失败", ()
   assert.equal(taskPresentationStatus(realFailure), "failed");
   assert.match(adminHtml, /concurrency_limited: \["warning", "并发已满"\]/);
   assert.match(adminHtml, /task-concurrency-card/);
+});
+
+test("上游内容审核使用独立的安全审核状态", () => {
+  const { isSafetyReviewTask, taskPresentationStatus } = loadTaskFailureHelpers();
+  const reviewed = {
+    status: "failed",
+    listStatus: "safety_review",
+    responseJson: { code: "content_policy" },
+    raw: { submitted: true }
+  };
+
+  assert.equal(isSafetyReviewTask(reviewed), true);
+  assert.equal(taskPresentationStatus(reviewed), "safety_review");
+  assert.match(adminHtml, /safety_review: \["warning", "安全审核"\]/);
+  assert.match(adminHtml, /\{ label: "安全审核", value: "safety_review" \}/);
 });
 
 test("共享车位失效不会再显示为聊天账号掉线", () => {

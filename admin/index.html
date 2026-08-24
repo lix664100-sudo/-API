@@ -2123,10 +2123,18 @@
         return row?.raw?.submitted !== true && code === "QUOTA_PROTECTION";
       }
 
+      function isSafetyReviewTask(row) {
+        if (String(row?.status || "").toLowerCase() !== "failed") return false;
+        if (String(row?.listStatus || "").toLowerCase() === "safety_review") return true;
+        const code = String(row?.responseJson?.code || row?.code || "").trim().toUpperCase();
+        return code === "CONTENT_POLICY";
+      }
+
       function taskPresentationStatus(row) {
+        if (isSafetyReviewTask(row)) return "safety_review";
         if (isConcurrencyLimitedTask(row)) return "concurrency_limited";
         if (isQuotaProtectedTask(row)) return "quota_protected";
-        return String(row?.status || "");
+        return String(row?.listStatus || row?.status || "");
       }
 
       function isChatTaskRow(row) {
@@ -3387,6 +3395,7 @@
           error: ["error", "异常"],
           success: ["success", "成功"],
           failed: ["error", "失败"],
+          safety_review: ["warning", "安全审核"],
           concurrency_limited: ["warning", "并发已满"],
           quota_protected: ["warning", "额度保护"],
           cancelled: ["default", "已取消"],
@@ -7548,6 +7557,7 @@
                 { label: "全部状态", value: "all" },
                 { label: "成功", value: "success" },
                 { label: "失败", value: "failed" },
+                { label: "安全审核", value: "safety_review" },
                 { label: "并发已满", value: "concurrency_limited" },
                 { label: "额度保护", value: "quota_protected" },
                 { label: "排队中", value: "queued" },

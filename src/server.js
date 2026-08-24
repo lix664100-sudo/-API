@@ -42,6 +42,7 @@ import {
 } from "./image-store.js";
 import { MAX_INPUT_IMAGE_COUNT } from "./image-limits.js";
 import { chatCompletionSseBody, openAIErrorPayload } from "./openai-compat.js";
+import { shouldPersistReturnedErrorTask } from "./task-error-policy.js";
 import {
   cleanupMediaStorage,
   getMediaStorageStats,
@@ -174,6 +175,7 @@ function errorUpstreamText(error, responseJson = {}) {
 }
 
 async function persistReturnedErrorTask(error, context, payload, status) {
+  if (!shouldPersistReturnedErrorTask(error, payload)) return null;
   const responseJson = error.responseJson || error.task?.responseJson || {};
   const sourceTaskId = errorSourceTaskId(error, responseJson, context);
   if (!sourceTaskId) return null;

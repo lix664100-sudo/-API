@@ -107,6 +107,40 @@ test("task pages return the newest matching records without returning the full h
   assert.deepEqual(chatTasks.items.map((task) => task.id), ["task-middle-chat"]);
 });
 
+test("content-policy failures have a separate safety-review status", async () => {
+  const now = Date.now();
+  await upsertTask({
+    id: "task-safety-review-code",
+    status: "failed",
+    taskType: "img2img",
+    responseJson: {
+      code: "content_policy",
+      message: "The prompt may violate our content policies."
+    },
+    raw: { submitted: true },
+    createdAt: new Date(now).toISOString()
+  });
+  await upsertTask({
+    id: "task-safety-review-message",
+    status: "failed",
+    taskType: "img2img",
+    errorMessage: "上游生成失败：The prompt may violate our content policies.",
+    raw: { submitted: true },
+    createdAt: new Date(now - 1).toISOString()
+  });
+
+  const reviewed = await listTaskPage({ status: "safety_review" });
+
+  assert.equal(reviewed.total, 2);
+  assert.deepEqual(
+    reviewed.items.map((task) => [task.id, task.listStatus]),
+    [
+      ["task-safety-review-code", "safety_review"],
+      ["task-safety-review-message", "safety_review"]
+    ]
+  );
+});
+
 test("task pages return lightweight summaries and load large details only on demand", async () => {
   const imageData = `data:image/png;base64,${"A".repeat(180_000)}`;
   const longReply = `完整回复-${"回复内容".repeat(2000)}`;

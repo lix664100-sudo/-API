@@ -5,6 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { normalizeProxyUrl, safeProxyEndpoint } from "./proxy.js";
 import { normalizeQuotaProtectionSettings } from "./quota-protection.js";
+import { isImagePolicyFailureMessage } from "./task-error-policy.js";
 
 const rootDir = process.cwd();
 const dataDir = path.resolve(rootDir, process.env.DATA_DIR || "data");
@@ -346,6 +347,28 @@ function ensureTaskListColumns(database) {
   })(pending);
 }
 
+function ensureTaskSafetyReviewStatuses(database) {
+  const migrationKey = "task_list_safety_review_v1";
+  if (getStorageMeta(database, migrationKey)) return;
+  const cutoff = Date.now() - taskHistoryDays * 24 * 60 * 60 * 1000;
+  const rows = database.prepare(`
+    SELECT id, payload
+    FROM tasks
+    WHERE status = 'failed' AND list_status = 'failed' AND created_time >= ?
+  `).all(cutoff);
+  const update = database.prepare("UPDATE tasks SET list_status = 'safety_review' WHERE id = ?");
+  database.transaction((items) => {
+    for (const row of items) {
+      try {
+        if (taskListStatus(JSON.parse(row.payload)) === "safety_review") update.run(row.id);
+      } catch {
+        // Ignore malformed historical rows.
+      }
+    }
+  })(rows);
+  setStorageMeta(database, migrationKey, new Date().toISOString());
+}
+
 function pruneTaskStatRows(database, now = Date.now()) {
   const cutoff = now - statRecordDays * 24 * 60 * 60 * 1000;
   database.prepare("DELETE FROM task_stats WHERE time < ?").run(cutoff);
@@ -455,6 +478,7 @@ async function openStorageDatabase() {
       );
     `);
     ensureTaskListColumns(database);
+    ensureTaskSafetyReviewStatuses(database);
     database.exec(`
       CREATE INDEX IF NOT EXISTS tasks_record_kind_time_idx
         ON tasks(record_kind, created_time DESC);
@@ -1718,6 +1742,13 @@ function taskListStatus(task) {
   if (status !== "failed") return status;
   const code = String(task?.responseJson?.code || task?.code || "").trim().toUpperCase();
   const message = String(task?.errorMessage || task?.responseJson?.message || "").trim();
+  const policyText = [
+    message,
+    task?.upstreamText,
+    task?.responseJson?.failureReason,
+    task?.responseJson?.upstreamText
+  ].filter(Boolean).join(" ");
+  if (code === "CONTENT_POLICY" || isImagePolicyFailureMessage(policyText)) return "safety_review";
   const rejectedBeforeSubmission = task?.raw?.submitted !== true;
   if (!rejectedBeforeSubmission) return status;
   if (code === "QUOTA_PROTECTION") return "quota_protected";
@@ -1906,6 +1937,7 @@ function taskListSummary(task = {}) {
     externalId: task.externalId,
     taskNo: task.taskNo,
     status: task.status,
+    listStatus: taskListStatus(task),
     code: task.code,
     taskType: task.taskType,
     modelId: task.modelId,

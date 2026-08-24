@@ -1298,6 +1298,75 @@ test("fast drawing quota check waits long enough for normal account checks", asy
   }
 });
 
+test("drawing policy refusal is stored as content policy", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        drawingBaseUrl: "https://drawing.example.test",
+        enabledAbilities: { drawing: true, chatplus: false }
+      }
+    }],
+    accounts: [{
+      id: "account-drawing-policy",
+      channelId: "shareai",
+      name: "drawing-policy@example.com",
+      username: "drawing-policy@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "ok", balance: 10, message: "drawing ok" }
+        }
+      }
+    }]
+  });
+
+  const id = "task-drawing-policy-refusal";
+  const policyMessage = "We're so sorry, but the prompt may violate our content policies.";
+  await upsertTask({
+    id,
+    externalId: 12345,
+    status: "processing",
+    taskType: "img2img",
+    prompt: "policy refusal",
+    channelId: "shareai:drawing",
+    channelName: "ShareAI/绘图站",
+    channelType: "drawing",
+    accountId: "account-drawing-policy",
+    accountName: "drawing-policy@example.com",
+    raw: { submitted: true },
+    createdAt: new Date().toISOString()
+  });
+
+  const originalGetTask = DrawingClient.prototype.getTask;
+  DrawingClient.prototype.getTask = async (externalId) => ({
+    externalId,
+    status: "failed",
+    taskType: "img2img",
+    imageCount: 0,
+    imageUrls: [],
+    errorMessage: `中转服务返回错误：${policyMessage}`,
+    raw: { submitted: true }
+  });
+
+  try {
+    const result = await refreshTask(id);
+    assert.equal(result.status, "failed");
+    assert.equal(result.responseJson.code, "content_policy");
+    assert.match(result.responseJson.message, /content policies/);
+  } finally {
+    DrawingClient.prototype.getTask = originalGetTask;
+    await saveConfig(config);
+  }
+});
+
 test("有上游编号的旧任务超过等待时间后保持等待上游", async () => {
   const config = await loadConfig();
   await saveConfig({
