@@ -151,3 +151,28 @@ test("连接超时等可能已经提交的请求不会改用第二种连接方�
   );
   assert.equal(fetchCalls, 0);
 });
+
+test("进入聊天车队时会跟随官方线路跳转", async () => {
+  const calls = [];
+  const client = new ChatplusClient({
+    config: {},
+    channel: { settings: { baseUrl: "https://china.example.test" } },
+    account: { username: "user@example.test", password: "secret" },
+    sessionLock: async (work) => work(),
+    curlRunner: async (args) => {
+      calls.push(args);
+      if (args.some((value) => String(value).includes("/auth/loginSession"))) {
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"code\":1}";
+      }
+      return "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html></html>";
+    }
+  });
+  client.portalLoggedIn = true;
+
+  await client.performEnterCar("car-1", "chatgpt");
+
+  const loginSessionCall = calls.find((args) =>
+    args.some((value) => String(value).includes("/auth/loginSession"))
+  );
+  assert.equal(loginSessionCall.includes("-L"), true);
+});

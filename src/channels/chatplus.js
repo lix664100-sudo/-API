@@ -3249,7 +3249,8 @@ export class ChatplusClient {
   async performEnterCar(carId, carType, options = {}) {
     if (!this.portalLoggedIn) await this.performPortalLogin(options);
     const session = await this.json(`/auth/loginSession?carid=${encodeURIComponent(carId)}&carType=${encodeURIComponent(carType)}`, {
-      timeoutSec: options.timeoutSec
+      timeoutSec: options.timeoutSec,
+      followRedirect: true
     });
     if (session?.code !== 1) throw new Error(session?.msg || "进入聊天车队失败。");
     const page = await this.http(carType === "gemini" ? "/app" : "/", {
