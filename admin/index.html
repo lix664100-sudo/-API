@@ -301,6 +301,11 @@
         margin: 20px auto 36px;
       }
 
+      .content.is-accounts-page {
+        width: calc(100% - 32px);
+        max-width: none;
+      }
+
       .content > [hidden] {
         display: none !important;
       }
@@ -680,58 +685,117 @@
 
       .account-list {
         display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+        align-items: start;
         gap: 14px;
         min-width: 0;
         padding: 16px 18px 20px;
       }
 
       .account-card {
+        position: relative;
         min-width: 0;
         overflow: hidden;
         border: 1px solid var(--line);
+        border-top: 3px solid #12b76a;
         border-radius: 10px;
         background: #fff;
       }
 
+      .account-card.is-danger {
+        border-top-color: #f04438;
+      }
+
+      .account-card.is-warning {
+        border-top-color: #f79009;
+      }
+
+      .account-card.is-muted,
       .account-card.is-disabled {
+        border-top-color: #98a2b3;
         background: #fafafa;
       }
 
-      .account-card.is-disabled .account-card-column,
       .account-card.is-disabled .account-card-section {
         background: #fafafa;
       }
 
       .account-card-header {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 16px 24px;
-        padding: 18px;
+        display: grid;
+        gap: 12px;
+        padding: 16px 16px 14px;
       }
 
-      .account-card-summary {
-        display: grid;
-        grid-template-columns: minmax(220px, 0.85fr) minmax(320px, 1.15fr);
+      .account-card-title-row {
+        display: flex;
         align-items: start;
-        gap: 18px 32px;
-        flex: 1 1 640px;
+        justify-content: space-between;
+        gap: 12px;
         min-width: 0;
       }
 
       .account-card-overview {
         display: grid;
-        gap: 10px;
+        gap: 8px;
+        flex: 1 1 auto;
         min-width: 0;
       }
 
-      .account-card-controls {
+      .account-card-health {
         display: flex;
-        align-items: center;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-        gap: 8px 10px;
-        flex: 0 1 auto;
+        align-items: flex-start;
+        gap: 9px;
+        min-width: 0;
+        padding: 10px 11px;
+        border: 1px solid #d1fadf;
+        border-radius: 8px;
+        background: #f0fdf4;
+        color: #05603a;
+      }
+
+      .account-card-health.is-danger {
+        border-color: #fecdca;
+        background: #fff4f3;
+        color: #b42318;
+      }
+
+      .account-card-health.is-warning {
+        border-color: #fedf89;
+        background: #fffaeb;
+        color: #b54708;
+      }
+
+      .account-card-health.is-muted {
+        border-color: #e4e7ec;
+        background: #f9fafb;
+        color: #475467;
+      }
+
+      .account-card-health-dot {
+        flex: 0 0 8px;
+        width: 8px;
+        height: 8px;
+        margin-top: 5px;
+        border-radius: 50%;
+        background: currentColor;
+      }
+
+      .account-card-health-copy {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      .account-card-health-copy strong {
+        font-size: 13px;
+        font-weight: 760;
+      }
+
+      .account-card-health-copy span {
+        overflow-wrap: anywhere;
+        color: #667085;
       }
 
       .account-card-enable {
@@ -751,7 +815,7 @@
         gap: 6px;
       }
 
-      .account-card-body {
+      .account-card-primary {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 1px;
@@ -760,20 +824,66 @@
         background: var(--line);
       }
 
-      .account-card-column {
-        display: grid;
-        align-content: start;
-        min-width: 0;
+      .account-card-primary .account-card-section {
         background: #fff;
+      }
+
+      .account-card-details {
+        min-width: 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .account-card-details > summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        min-height: 42px;
+        padding: 10px 16px;
+        color: #344054;
+        background: #fbfcfe;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 680;
+        list-style: none;
+        user-select: none;
+      }
+
+      .account-card-details > summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .account-card-details > summary:focus-visible {
+        outline: 2px solid rgba(22, 119, 255, 0.4);
+        outline-offset: -2px;
+      }
+
+      .account-card-details-chevron {
+        display: inline-flex;
+        color: #667085;
+        transition: transform 180ms cubic-bezier(0.23, 1, 0.32, 1);
+      }
+
+      .account-card-details[open] .account-card-details-chevron {
+        transform: rotate(180deg);
+      }
+
+      .account-card-details-body {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1px;
+        min-width: 0;
+        background: var(--line);
       }
 
       .account-card-section {
         min-width: 0;
-        padding: 16px 18px 17px;
+        padding: 13px 14px 14px;
+        background: #fff;
       }
 
-      .account-card-section + .account-card-section {
-        border-top: 1px solid var(--line);
+      .account-card-details-body .account-card-section:first-child {
+        grid-column: 1 / -1;
       }
 
       .account-card-label,
@@ -786,7 +896,7 @@
 
       .account-card-content {
         min-width: 0;
-        margin-top: 8px;
+        margin-top: 7px;
         color: #344054;
         font-size: 13px;
         line-height: 1.55;
@@ -804,12 +914,32 @@
         min-width: 0;
       }
 
+      .account-card-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        min-height: 49px;
+        padding: 10px 12px 10px 16px;
+        border-top: 1px solid var(--line);
+        background: #fff;
+      }
+
       .account-card .routing-overview {
         min-width: 0;
       }
 
       .account-card .proxy-host {
         max-width: 100%;
+      }
+
+      .account-card .routing-comparison-item {
+        grid-template-columns: 62px 105px minmax(110px, 1fr);
+        gap: 6px;
+      }
+
+      .account-card .routing-comparison-item.is-target-only {
+        grid-template-columns: 62px minmax(0, 1fr);
       }
 
       .account-list-empty {
@@ -2605,27 +2735,6 @@
           grid-template-columns: 250px minmax(0, 1fr);
         }
 
-        .account-card-header {
-          flex-direction: column;
-        }
-
-        .account-card-summary,
-        .account-card-controls {
-          width: 100%;
-        }
-
-        .account-card-summary {
-          flex: 0 1 auto;
-        }
-
-        .account-card-controls {
-          justify-content: flex-start;
-        }
-
-        .account-card-body {
-          grid-template-columns: repeat(2, minmax(0, 1fr));
-        }
-
         .productivity-chart-grid {
           grid-template-columns: 1fr;
         }
@@ -2656,7 +2765,8 @@
           padding-inline: 16px;
         }
 
-        .content {
+        .content,
+        .content.is-accounts-page {
           width: min(100% - 28px, 1720px);
         }
       }
@@ -2687,7 +2797,8 @@
           flex: 0 0 auto;
         }
 
-        .content {
+        .content,
+        .content.is-accounts-page {
           width: min(100% - 20px, 760px);
           margin-top: 12px;
         }
@@ -2783,13 +2894,19 @@
           justify-content: flex-start;
         }
 
-        .account-card-summary,
-        .account-card-body {
+        .account-list,
+        .account-card-primary,
+        .account-card-details-body {
           grid-template-columns: 1fr;
         }
 
-        .account-card-actions {
-          justify-content: flex-start;
+        .account-card-details-body .account-card-section:first-child {
+          grid-column: auto;
+        }
+
+        .account-card-details-body .account-card-section + .account-card-section,
+        .account-card-primary .account-card-section + .account-card-section {
+          border-top: 1px solid var(--line);
         }
 
         .account-pagination {
@@ -2864,7 +2981,8 @@
 
       @media (prefers-reduced-motion: reduce) {
         .page-surface,
-        .account-freeze-chevron {
+        .account-freeze-chevron,
+        .account-card-details-chevron {
           animation: none;
           transition: none;
         }
@@ -9069,47 +9187,136 @@
           ]);
         }
 
+        function accountCardHealth(row, rowChannel) {
+          const alerts = [];
+          const priority = { danger: 3, warning: 2, muted: 1, normal: 0 };
+          const addAlert = (tone, text) => {
+            if (!text || alerts.some((item) => item.text === text)) return;
+            alerts.push({ tone, text });
+          };
+
+          if (!rowChannel) addAlert("danger", "所属渠道已移除");
+          if (row.enabled === false) {
+            addAlert("muted", "账号已停用");
+          } else {
+            if (rowChannel?.enabled === false) addAlert("warning", "渠道已停用");
+            const statusEntries = rowChannel?.type === "shareai"
+              ? [
+                  channelAbilityEnabled(rowChannel, "drawing")
+                    ? { label: "绘图", status: drawingDisplayStatus(abilityStatus(row, "drawing")) }
+                    : null,
+                  channelAbilityEnabled(rowChannel, "chatplus")
+                    ? {
+                        label: checkedChatModelName(row, rowChannel),
+                        status: accountCheckDisplayStatus(row, rowChannel) || chatDisplayStatus(abilityStatus(row, "chatplus"))
+                      }
+                    : null
+                ].filter(Boolean)
+              : [{ label: "账号", status: accountCheckDisplayStatus(row, rowChannel) || accountEffectiveStatus(row, rowChannel) }];
+
+            statusEntries.forEach(({ label, status }) => {
+              if (status === "disconnected") addAlert("danger", "线路掉线，正在自动换线");
+              else if (["error", "failed", "activation_failed", "registration_failed"].includes(status)) addAlert("danger", `${label}异常`);
+              else if (status === "subscription_expired") addAlert("danger", `${label}套餐已过期`);
+              else if (status === "check_timeout") addAlert("warning", `${label}检测超时`);
+              else if (status === "quota_empty") addAlert("warning", `${label}额度不足`);
+              else if (status === "subscription_missing") addAlert("warning", `${label}未订阅`);
+              else if (status === "activation_required") addAlert("warning", `${label}未激活`);
+              else if (["unknown", ""].includes(status)) addAlert("muted", `${label}尚未检测`);
+            });
+
+            if (drawingAccountIsCooling(row)) addAlert("warning", "绘图线路冷却中");
+            if (accountCarFreezes(row, rowChannel, nowTick).length) addAlert("warning", "部分车位暂时冻结");
+          }
+
+          if (row.proxyUrl) {
+            const proxyCheck = row?.meta?.proxyCheck || {};
+            if (isPipeProxyExpired(row.proxyUrl)) addAlert("danger", "IP 已到期");
+            else if (proxyCheck.status === "failed") addAlert("danger", "IP 不可用");
+          }
+
+          if (!alerts.length) {
+            return { tone: "normal", headline: "状态正常", detail: "最近检测未发现异常" };
+          }
+
+          alerts.sort((left, right) => priority[right.tone] - priority[left.tone]);
+          const [primary, ...rest] = alerts;
+          const fallbackDetail = primary.text === "账号已停用"
+            ? "不会参与任务分配"
+            : primary.tone === "muted"
+              ? "建议先检测账号状态"
+              : "请根据提示检查这个账号";
+          return {
+            tone: primary.tone,
+            headline: primary.text,
+            detail: rest.length ? rest.map((item) => item.text).join(" · ") : fallbackDetail
+          };
+        }
+
+        function accountCardHealthContent(health) {
+          return h("div", {
+            className: `account-card-health is-${health.tone}`,
+            role: "status",
+            key: "health"
+          }, [
+            h("span", { className: "account-card-health-dot", "aria-hidden": true, key: "dot" }),
+            h("div", { className: "account-card-health-copy", key: "copy" }, [
+              h("strong", { key: "headline" }, health.headline),
+              h("span", { key: "detail" }, health.detail)
+            ])
+          ]);
+        }
+
         function accountCard(row) {
           const rowChannel = channels.find((item) => item.id === row.channelId);
+          const health = accountCardHealth(row, rowChannel);
           return h("article", {
-            className: `account-card${row.enabled === false ? " is-disabled" : ""}`,
+            className: `account-card is-${health.tone}${row.enabled === false ? " is-disabled" : ""}`,
             key: row.id
           }, [
             h("header", { className: "account-card-header", key: "header" }, [
-              h("div", { className: "account-card-summary", key: "summary" }, [
+              h("div", { className: "account-card-title-row", key: "title" }, [
                 h("div", { className: "account-card-overview", key: "overview" }, [
                   accountIdentityContent(row),
                   accountChannelContent(row, rowChannel)
-                ]),
-                accountStatusContent(row, rowChannel)
+                ])
               ]),
-              h("div", { className: "account-card-controls", key: "controls" }, [
-                h("label", { className: "account-card-enable", key: "enable" }, [
-                  h("span", { key: "label" }, "启用"),
-                  h(Switch, {
-                    checked: row.enabled !== false,
-                    onChange: (checked) => saveAccount({ ...row, enabled: checked }),
-                    key: "switch"
-                  })
-                ]),
-                accountActionsContent(row, rowChannel)
-              ])
+              accountCardHealthContent(health),
+              accountStatusContent(row, rowChannel)
             ]),
-            h("div", { className: "account-card-body", key: "body" }, [
-              h("div", { className: "account-card-column", key: "account-column" }, [
-                accountCardSection("代理", proxyCell(row.proxyUrl, row), "proxy"),
-                accountCardSection("额度与时间", h("div", { className: "account-card-fields" }, [
-                  accountCardField("额度（剩余 / 总额）", quotaTextCell(accountQuotaText(row, rowChannel)), "quota"),
+            h("div", { className: "account-card-primary", key: "primary" }, [
+              accountCardSection("代理 IP", proxyCell(row.proxyUrl, row), "proxy"),
+              accountCardSection("额度", quotaTextCell(accountQuotaText(row, rowChannel)), "quota")
+            ]),
+            h("details", { className: "account-card-details", key: "details" }, [
+              h("summary", { key: "summary" }, [
+                h("span", { key: "text" }, "查看分流、并发和时间"),
+                h("span", { className: "account-card-details-chevron", "aria-hidden": true, key: "icon" },
+                  Icon.DownOutlined ? h(Icon.DownOutlined) : null
+                )
+              ]),
+              h("div", { className: "account-card-details-body", key: "body" }, [
+                accountCardSection("时间信息", h("div", { className: "account-card-fields" }, [
                   accountCardField("额度重置", accountQuotaResetCell(row, rowChannel, nowTick), "reset"),
                   accountCardField("套餐到期", accountExpireText(row, rowChannel), "expire")
-                ]), "timing")
-              ]),
-              h("div", { className: "account-card-column", key: "routing-column" }, [
+                ]), "timing"),
                 accountCardSection(h(Tooltip, {
                   title: "每种能力独立统计。目标表示当前可用账号的计划比例；今日表示系统自动分配且已提交给上游的实际比例。指定账号不计入今日比例。"
                 }, h("span", null, "分流情况")), accountRoutingContent(row, rowChannel), "routing"),
                 accountCardSection("并发", accountConcurrencyContent(row, rowChannel), "concurrency")
               ])
+            ]),
+            h("footer", { className: "account-card-footer", key: "footer" }, [
+              h("label", { className: "account-card-enable", key: "enable" }, [
+                h("span", { key: "label" }, "启用"),
+                h(Switch, {
+                  size: "small",
+                  checked: row.enabled !== false,
+                  onChange: (checked) => saveAccount({ ...row, enabled: checked }),
+                  key: "switch"
+                })
+              ]),
+              accountActionsContent(row, rowChannel)
             ])
           ]);
         }
@@ -9674,7 +9881,7 @@
               h(Button, { icon: Icon.LogoutOutlined ? h(Icon.LogoutOutlined) : null, onClick: onLogout }, "退出")
             ])
           ]),
-          h("main", { className: "content" }, [
+          h("main", { className: `content${activePage === "accounts" ? " is-accounts-page" : ""}` }, [
             h("section", { className: "metrics-grid page-surface", key: "metrics", hidden: activePage !== "overview" }, [
               h("div", { className: "metric" }, [
                 h("div", { className: "metric-icon" }, Icon.BranchesOutlined ? h(Icon.BranchesOutlined) : null),

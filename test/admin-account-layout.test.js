@@ -6,10 +6,10 @@ const adminHtml = await readFile(new URL("../admin/index.html", import.meta.url)
 
 test("账号管理使用独立信息块并移除横向宽表", () => {
   assert.match(adminHtml, /paginatedAccounts\.map\(accountCard\)/);
-  assert.match(adminHtml, /className: `account-card/);
-  assert.match(adminHtml, /accountCardSection\("代理"/);
+  assert.match(adminHtml, /className: `account-card is-\$\{health\.tone\}/);
+  assert.match(adminHtml, /accountCardSection\("代理 IP"/);
   assert.match(adminHtml, /accountCardSection\("并发"/);
-  assert.match(adminHtml, /accountCardSection\("额度与时间"/);
+  assert.match(adminHtml, /accountCardSection\("时间信息"/);
   assert.doesNotMatch(adminHtml, /scroll: \{ x: 2450 \}/);
   assert.doesNotMatch(adminHtml, /account-table-wrap/);
 });
@@ -36,17 +36,27 @@ test("冻结记录默认只展示一条并可按需展开", () => {
   assert.match(adminHtml, /\.account-car-freeze\.is-preview \{[\s\S]*?text-overflow: ellipsis;[\s\S]*?white-space: nowrap;/);
 });
 
-test("账号概览和详细信息采用清晰的两列层级", () => {
+test("账号卡片在宽屏自动多列排列并使用完整可用宽度", () => {
+  assert.match(adminHtml, /className: `content\$\{activePage === "accounts" \? " is-accounts-page" : ""\}`/);
+  assert.match(adminHtml, /\.content\.is-accounts-page \{[\s\S]*?width: calc\(100% - 32px\);[\s\S]*?max-width: none;/);
+  assert.match(adminHtml, /\.account-list \{[\s\S]*?grid-template-columns: repeat\(auto-fill, minmax\(360px, 1fr\)\);/);
+});
+
+test("账号概览突出异常状态并默认收起次要信息", () => {
   assert.match(adminHtml, /className: "account-card-overview"/);
-  assert.match(adminHtml, /className: "account-card-column"/);
-  assert.match(adminHtml, /\.account-card-summary \{[\s\S]*?grid-template-columns: minmax\(220px, 0\.85fr\) minmax\(320px, 1\.15fr\);/);
-  assert.match(adminHtml, /\.account-card-body \{[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
-  assert.match(adminHtml, /\.account-card-column \{[\s\S]*?align-content: start;/);
+  assert.match(adminHtml, /function accountCardHealth\(row, rowChannel\)/);
+  assert.match(adminHtml, /"线路掉线，正在自动换线"/);
+  assert.match(adminHtml, /"IP 已到期"/);
+  assert.match(adminHtml, /"IP 不可用"/);
+  assert.match(adminHtml, /className: `account-card-health is-\$\{health\.tone\}`/);
+  assert.match(adminHtml, /h\("details", \{ className: "account-card-details"/);
+  assert.match(adminHtml, /"查看分流、并发和时间"/);
+  assert.match(adminHtml, /\.account-card-primary \{[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
   assert.match(adminHtml, /\.account-identity-name \{[\s\S]*?font-size: 15px;/);
   assert.match(adminHtml, /\.account-card-label,[\s\S]*?font-size: 12px;/);
 });
 
 test("账号信息块在窄屏改为单列", () => {
   assert.match(adminHtml, /@media \(max-width: 780px\)/);
-  assert.match(adminHtml, /\.account-card-summary,\s*\.account-card-body \{\s*grid-template-columns: 1fr;/);
+  assert.match(adminHtml, /\.account-list,\s*\.account-card-primary,\s*\.account-card-details-body \{\s*grid-template-columns: 1fr;/);
 });
