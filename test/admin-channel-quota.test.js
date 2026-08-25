@@ -94,13 +94,13 @@ const chatQuotaText = vm.runInNewContext(
 );
 
 const drawingDisplayStatusFunctionMatch = adminHtml.match(
-  /function drawingDisplayStatus\(status = \{\}\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function aggregateChatStatus/
+  /function drawingDisplayStatus\(status = \{\}\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function knownNumber/
 );
 
 assert.ok(drawingDisplayStatusFunctionMatch, "管理后台中应存在绘图额度状态显示方法");
 
 const drawingDisplayStatusFunctionSource = drawingDisplayStatusFunctionMatch[0].replace(
-  /\r?\n\r?\n      function aggregateChatStatus$/,
+  /\r?\n\r?\n      function knownNumber$/,
   ""
 );
 const drawingDisplayStatus = vm.runInNewContext(
@@ -213,7 +213,14 @@ const channelStatusFunctionSource = channelStatusFunctionMatch[0].replace(
 );
 const getChannelStatus = vm.runInNewContext(
   `(${channelStatusFunctionSource.replace(/^function /, "function ")})`,
-  { accountEffectiveStatus }
+  {
+    isPipeProxyExpired: () => false,
+    accountCheckDisplayStatus: () => "",
+    accountCapabilityStates: (account) => [
+      { status: drawingDisplayStatus(account?.meta?.abilities?.drawing || {}) },
+      { status: account?.meta?.abilities?.chatplus?.status || "unknown" }
+    ]
+  }
 );
 
 const aggregateStatusFunctionMatch = adminHtml.match(

@@ -81,8 +81,9 @@ test("账号卡片在剩余额度旁显示保护线", () => {
   assert.match(adminHtml, /quota-protection-note/);
 });
 
-test("触发额度保护后显示具体项目且不重复显示额度不足", () => {
-  assert.match(adminHtml, /addReason\(`\$\{item\.label\} 达到保护线 \$\{quotaProtectionThresholdText\(item\)\}`\)/);
-  assert.match(adminHtml, /status !== "quota_empty" \|\| !protectionReasonItems\.length/);
-  assert.match(adminHtml, /Number\(balance\) > 0/);
+test("触发额度保护后按具体项目判断，不会把其他可用项目一起停掉", () => {
+  assert.match(adminHtml, /function capabilityStatusWithProtection\(baseStatus, protection\)/);
+  assert.match(adminHtml, /return knownNumber\(balance\) && Number\(balance\) <= 0 \? "quota_empty" : "protection"/);
+  assert.match(adminHtml, /return `\$\{label\}达到保护线 \$\{quotaProtectionThresholdText\(capability\.protection\)\}`/);
+  assert.match(adminHtml, /availableCount > 0[\s\S]*?"partial"/);
 });

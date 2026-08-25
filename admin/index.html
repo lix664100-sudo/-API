@@ -657,6 +657,22 @@
         font-weight: 720;
       }
 
+      .account-context-item.is-success strong {
+        color: #067647;
+      }
+
+      .account-context-item.is-warning strong {
+        color: #b54708;
+      }
+
+      .account-context-item.is-danger strong {
+        color: #b42318;
+      }
+
+      .account-context-item.is-muted strong {
+        color: #667085;
+      }
+
       .account-toolbar {
         display: flex;
         align-items: flex-start;
@@ -704,6 +720,10 @@
 
       .account-card.is-danger {
         border-top-color: #f04438;
+      }
+
+      .account-card.is-warning {
+        border-top-color: #f79009;
       }
 
       .account-card.is-muted,
@@ -755,6 +775,12 @@
         color: #b42318;
       }
 
+      .account-card-health.is-warning {
+        border-color: #fedf89;
+        background: #fffaeb;
+        color: #b54708;
+      }
+
       .account-card-health.is-muted {
         border-color: #e4e7ec;
         background: #f9fafb;
@@ -786,7 +812,8 @@
 
       .account-card-health-copy span {
         overflow-wrap: anywhere;
-        color: #667085;
+        color: currentColor;
+        opacity: 0.82;
       }
 
       .account-card-enable {
@@ -6133,13 +6160,21 @@
         if (!relatedAccounts.length) return "empty";
         const statuses = relatedAccounts
           .filter((item) => item.enabled !== false)
-          .map((item) => accountEffectiveStatus(item, channel));
+          .flatMap((item) => {
+            const proxyCheck = item?.meta?.proxyCheck || {};
+            if (isPipeProxyExpired(item.proxyUrl) || proxyCheck.status === "failed") return ["error"];
+            const checkStatus = accountCheckDisplayStatus(item, channel);
+            if (checkStatus) return [checkStatus];
+            return accountCapabilityStates(item, channel).map((capability) => capability.status);
+          });
         if (statuses.some((status) => status === "ok")) return "ok";
-        if (statuses.some((status) => status === "subscription_expired")) return "subscription_expired";
-        if (statuses.some((status) => status === "subscription_missing")) return "subscription_missing";
+        if (statuses.some((status) => status === "check_timeout")) return "check_timeout";
         if (statuses.some((status) => status === "disconnected")) return "disconnected";
         if (statuses.some((status) => status === "error" || status === "failed")) return "error";
+        if (statuses.some((status) => status === "subscription_expired")) return "subscription_expired";
+        if (statuses.some((status) => status === "subscription_missing")) return "subscription_missing";
         if (statuses.some((status) => status === "quota_empty")) return "quota_empty";
+        if (statuses.some((status) => status === "protection")) return "quota_protected";
         if (statuses.some((status) => status === "activation_required")) return "activation_required";
         return "unknown";
       }
@@ -6160,6 +6195,123 @@
           && Number.isFinite(Number(balance));
         if (balanceKnown && Number(balance) < 2) return "quota_empty";
         return status.status || "unknown";
+      }
+
+      function knownNumber(value) {
+        return value !== null
+          && value !== undefined
+          && String(value).trim() !== ""
+          && Number.isFinite(Number(value));
+      }
+
+      function capabilityStatusWithProtection(baseStatus, protection) {
+        if (!protection?.state?.active) return baseStatus || "unknown";
+        if (["error", "failed", "disconnected", "subscription_expired", "subscription_missing", "activation_required", "disabled"].includes(baseStatus)) {
+          return baseStatus;
+        }
+        const balance = protection.state.balance;
+        return knownNumber(balance) && Number(balance) <= 0 ? "quota_empty" : "protection";
+      }
+
+      function accountCapabilityStates(account, channel) {
+        if (!channel) return [];
+        const protectionByKey = new Map(
+          accountQuotaProtectionItems(account, channel).map((item) => [item.key, item])
+        );
+
+        if (channel.type === "shareai") {
+          const capabilities = [];
+          if (channelAbilityEnabled(channel, "drawing")) {
+            const protection = protectionByKey.get("drawing");
+            capabilities.push({
+              key: "drawing",
+              label: "绘图",
+              status: capabilityStatusWithProtection(
+                drawingDisplayStatus(abilityStatus(account, "drawing")),
+                protection
+              ),
+              protection
+            });
+          }
+
+          if (channelAbilityEnabled(channel, "chatplus")) {
+            const chatplus = abilityStatus(account, "chatplus");
+            const baseStatus = chatDisplayStatus(chatplus);
+            const activeModelKey = chatModelKey(chatplus.quotaModel || chatplus.meta?.chatModel);
+            const enabledModels = chatModelsForChannel(channel).filter((model) => model.enabled);
+            const visibleModels = enabledModels.filter((model) => (
+              chatplus.meta?.referenceUsage?.[model.key]
+              || protectionByKey.get(`chatplus-${model.key}`)?.state
+              || model.key === activeModelKey
+            ));
+            const models = visibleModels.length
+              ? visibleModels
+              : [enabledModels.find((model) => model.default) || enabledModels[0]].filter(Boolean);
+
+            models.forEach((model) => {
+              const usage = chatplus.meta?.referenceUsage?.[model.key] || {};
+              const protection = protectionByKey.get(`chatplus-${model.key}`);
+              const expireTime = Date.parse(usage.expireAt || "");
+              let modelStatus = Number.isFinite(expireTime) && expireTime <= Date.now()
+                ? "subscription_expired"
+                : baseStatus;
+              if (!["error", "failed", "disconnected", "subscription_expired", "subscription_missing", "activation_required", "disabled"].includes(modelStatus)) {
+                if (knownNumber(usage.balance)) modelStatus = Number(usage.balance) <= 0 ? "quota_empty" : "ok";
+                else if (baseStatus === "quota_empty" && activeModelKey && model.key !== activeModelKey) modelStatus = "unknown";
+              }
+              capabilities.push({
+                key: `chatplus-${model.key}`,
+                label: model.name,
+                status: capabilityStatusWithProtection(modelStatus, protection),
+                protection
+              });
+            });
+          }
+          return capabilities;
+        }
+
+        if (channel.type === "chatplus") {
+          return [{
+            key: "chatplus",
+            label: checkedChatModelName(account, channel),
+            status: chatDisplayStatus(account)
+          }];
+        }
+
+        return [{ key: "drawing", label: "绘图", status: drawingDisplayStatus(account) }];
+      }
+
+      function summarizeAccountCapabilities(capabilities = []) {
+        const statuses = capabilities.map((item) => item.status || "unknown");
+        const errorStatuses = ["disconnected", "error", "failed", "check_timeout"];
+        const availableCount = statuses.filter((status) => status === "ok").length;
+        const hasError = statuses.some((status) => errorStatuses.includes(status));
+        if (availableCount === statuses.length && statuses.length) return { state: "available", group: "ok" };
+        if (availableCount > 0) return { state: hasError ? "partial_error" : "partial", group: hasError ? "error" : "partial" };
+        if (hasError) return { state: errorStatuses.find((status) => statuses.includes(status)) || "error", group: "error" };
+        const priority = ["subscription_expired", "subscription_missing", "quota_empty", "protection", "activation_required", "unknown"];
+        return { state: priority.find((status) => statuses.includes(status)) || "unknown", group: "business" };
+      }
+
+      function accountCapabilityReason(capability = {}) {
+        const label = capability.label || "账号";
+        const map = {
+          ok: `${label}可用`,
+          quota_empty: `${label}额度用完`,
+          subscription_expired: `${label}套餐到期`,
+          subscription_missing: `${label}未订阅`,
+          disconnected: `${label}线路掉线`,
+          error: `${label}异常`,
+          failed: `${label}异常`,
+          check_timeout: `${label}检测超时`,
+          activation_required: `${label}未激活`,
+          disabled: `${label}已停用`,
+          unknown: `${label}未检测`
+        };
+        if (capability.status === "protection") {
+          return `${label}达到保护线 ${quotaProtectionThresholdText(capability.protection)}`;
+        }
+        return map[capability.status] || `${label}暂不可用`;
       }
 
       function aggregateChatStatus(accounts, channel) {
@@ -6225,6 +6377,16 @@
       function getChannelStats(channel, accounts) {
         const related = accounts.filter((item) => item.channelId === channel.id);
         const enabled = related.filter((item) => item.enabled !== false);
+        const serviceable = channel.enabled === false
+          ? []
+          : enabled.filter((item) => {
+              const proxyCheck = item?.meta?.proxyCheck || {};
+              return !isPipeProxyExpired(item.proxyUrl)
+                && proxyCheck.status !== "failed"
+                && accountCheckDisplayStatus(item, channel) !== "check_timeout";
+            });
+        const capabilityRows = serviceable.map((item) => accountCapabilityStates(item, channel));
+        const okCount = capabilityRows.filter((items) => items.some((item) => item.status === "ok")).length;
         if (channel?.type === "shareai") {
           const drawingEnabled = channelAbilityEnabled(channel, "drawing");
           const chatEnabled = channelAbilityEnabled(channel, "chatplus");
@@ -6234,7 +6396,9 @@
           return {
             accountCount: related.length,
             enabledCount: enabled.length,
-            okCount: related.filter((item) => accountEffectiveStatus(item, channel) === "ok").length,
+            okCount,
+            drawingOkCount: capabilityRows.filter((items) => items.some((item) => item.key === "drawing" && item.status === "ok")).length,
+            chatOkCount: capabilityRows.filter((items) => items.some((item) => item.key.startsWith("chatplus") && item.status === "ok")).length,
             quota: drawingQuota,
             balance: drawingBalance,
             drawingQuota,
@@ -6249,7 +6413,7 @@
         return {
           accountCount: related.length,
           enabledCount: enabled.length,
-          okCount: related.filter((item) => accountEffectiveStatus(item, channel) === "ok").length,
+          okCount,
           quota: related.reduce((sum, item) => sum + numberValue(item.quota), 0),
           balance: related.reduce((sum, item) => sum + numberValue(item.balance ?? item.quota), 0),
           ...(chatStatus ? { chatStatus } : {}),
@@ -6696,65 +6860,47 @@
           return map;
         }, [channels, accounts]);
 
-        function accountDisplayStatus(account) {
-          const channel = channels.find((item) => item.id === account.channelId);
-          return accountCheckDisplayStatus(account, channel) || accountEffectiveStatus(account, channel);
-        }
-
         function accountAvailabilityInfo(account) {
           const channel = channels.find((item) => item.id === account.channelId);
           if (account.enabled === false) {
-            return { state: "disabled", reasons: ["账号已停用"] };
+            return { state: "disabled", group: "disabled", statuses: ["disabled"], reasons: ["账号已停用"] };
           }
 
-          const reasons = [];
-          const addReason = (text) => {
-            if (text && !reasons.includes(text)) reasons.push(text);
+          if (!channel) {
+            return { state: "error", group: "error", statuses: ["error"], reasons: ["所属渠道已移除"] };
+          }
+          if (channel.enabled === false) {
+            return { state: "channel_disabled", group: "disabled", statuses: ["disabled"], reasons: ["渠道已停用"] };
+          }
+
+          const proxyCheck = account?.meta?.proxyCheck || {};
+          if (account.proxyUrl && isPipeProxyExpired(account.proxyUrl)) {
+            return { state: "error", group: "error", statuses: ["error"], reasons: ["代理 IP 已到期"] };
+          }
+          if (account.proxyUrl && proxyCheck.status === "failed") {
+            return { state: "error", group: "error", statuses: ["error"], reasons: ["代理 IP 不可用"] };
+          }
+          if (accountCheckDisplayStatus(account, channel) === "check_timeout") {
+            return { state: "check_timeout", group: "error", statuses: ["check_timeout"], reasons: ["账号检测超时"] };
+          }
+
+          const capabilities = accountCapabilityStates(account, channel);
+          const summary = summarizeAccountCapabilities(capabilities);
+          const unavailable = capabilities.filter((item) => item.status !== "ok");
+          const available = capabilities.filter((item) => item.status === "ok");
+          const reasons = summary.state === "available"
+            ? available.map(accountCapabilityReason)
+            : [...unavailable, ...available].map(accountCapabilityReason);
+          return {
+            ...summary,
+            capabilities,
+            statuses: [...new Set(capabilities.map((item) => item.status || "unknown"))],
+            reasons: reasons.length ? reasons : ["账号尚未检测"]
           };
-          if (!channel) addReason("所属渠道已移除");
-          else if (channel.enabled === false) addReason("渠道已停用");
-
-          const status = accountDisplayStatus(account);
-          const statusReasons = {
-            disconnected: "线路掉线，正在自动换线",
-            error: "账号异常",
-            failed: "账号异常",
-            subscription_expired: "套餐已过期",
-            subscription_missing: "未订阅",
-            quota_empty: "额度不足",
-            check_timeout: "检测超时",
-            activation_required: "账号未激活",
-            unknown: "尚未检测"
-          };
-          const activeProtectionItems = accountQuotaProtectionItems(account, channel)
-            .filter((item) => item.state?.active);
-          const protectionReasonItems = activeProtectionItems.filter((item) => {
-            const balance = item.state?.balance;
-            return balance === null || balance === undefined || balance === "" || Number(balance) > 0;
-          });
-          if (status !== "ok" && (status !== "quota_empty" || !protectionReasonItems.length)) {
-            addReason(statusReasons[status] || statusInfo(status)[1]);
-          }
-
-          if (account.proxyUrl) {
-            const proxyCheck = account?.meta?.proxyCheck || {};
-            if (isPipeProxyExpired(account.proxyUrl)) addReason("IP 已到期");
-            else if (proxyCheck.status === "failed") addReason("IP 不可用");
-          }
-
-          protectionReasonItems.forEach((item) => {
-            addReason(`${item.label} 达到保护线 ${quotaProtectionThresholdText(item)}`);
-          });
-
-          return reasons.length
-            ? { state: "unavailable", reasons }
-            : { state: "available", reasons: ["账号状态正常"] };
         }
 
         function accountStatusGroup(account) {
-          const state = accountAvailabilityInfo(account).state;
-          if (state === "disabled") return "disabled";
-          return state === "available" ? "ok" : "attention";
+          return accountAvailabilityInfo(account).group;
         }
 
         const filteredChannels = useMemo(() => {
@@ -6769,27 +6915,29 @@
           const group = accountStatusGroup(account);
           result[group] += 1;
           return result;
-        }, { ok: 0, attention: 0, disabled: 0 }), [accounts, channels, nowTick]);
+        }, { ok: 0, partial: 0, business: 0, error: 0, disabled: 0 }), [accounts, channels, nowTick]);
 
         const accountScopeStats = useMemo(() => selectedAccounts.reduce((result, account) => {
           const group = accountStatusGroup(account);
           result[group] += 1;
           return result;
-        }, { ok: 0, attention: 0, disabled: 0 }), [selectedAccounts, channels, nowTick]);
+        }, { ok: 0, partial: 0, business: 0, error: 0, disabled: 0 }), [selectedAccounts, channels, nowTick]);
 
         const filteredAccounts = useMemo(() => {
           const keyword = accountSearchText.trim().toLowerCase();
-          const order = { attention: 0, disabled: 1, ok: 2 };
+          const order = { error: 0, business: 1, partial: 2, disabled: 3, ok: 4 };
           return selectedAccounts.filter((account) => {
             const channel = channels.find((item) => item.id === account.channelId);
             const haystack = `${account.name || ""} ${account.username || ""} ${account.proxyUrl || ""} ${channel?.name || ""}`.toLowerCase();
             const keywordOk = !keyword || haystack.includes(keyword);
-            const group = accountStatusGroup(account);
+            const availability = accountAvailabilityInfo(account);
+            const group = availability.group;
             const statusOk = accountStatusFilter === "all"
-              || (accountStatusFilter === "attention" && group === "attention")
               || (accountStatusFilter === "disabled" && group === "disabled")
               || (accountStatusFilter === "ok" && group === "ok")
-              || accountDisplayStatus(account) === accountStatusFilter;
+              || (accountStatusFilter === "partial" && group === "partial")
+              || (accountStatusFilter === "error" && group === "error")
+              || availability.statuses.includes(accountStatusFilter);
             return keywordOk && statusOk;
           }).sort((left, right) => order[accountStatusGroup(left)] - order[accountStatusGroup(right)]);
         }, [selectedAccounts, channels, accountSearchText, accountStatusFilter, nowTick]);
@@ -8997,10 +9145,32 @@
           if (availability.state === "disabled") {
             return { tone: "muted", headline: "已停用", detail: "账号已停用" };
           }
+          if (availability.state === "channel_disabled") {
+            return { tone: "muted", headline: "渠道停用", detail: availability.reasons.join(" · ") };
+          }
           if (availability.state === "available") {
             return { tone: "normal", headline: "可用", detail: availability.reasons.join(" · ") };
           }
-          return { tone: "danger", headline: "不可用", detail: availability.reasons.join(" · ") };
+          if (availability.state === "partial") {
+            return { tone: "warning", headline: "部分可用", detail: availability.reasons.join(" · ") };
+          }
+          if (availability.state === "partial_error") {
+            return { tone: "danger", headline: "部分异常", detail: availability.reasons.join(" · ") };
+          }
+          const businessHeadlines = {
+            protection: "额度保护",
+            quota_empty: "额度用完",
+            subscription_expired: "套餐到期",
+            subscription_missing: "未订阅",
+            activation_required: "未激活"
+          };
+          if (businessHeadlines[availability.state]) {
+            return { tone: "warning", headline: businessHeadlines[availability.state], detail: availability.reasons.join(" · ") };
+          }
+          if (availability.state === "unknown") {
+            return { tone: "muted", headline: "未检测", detail: availability.reasons.join(" · ") };
+          }
+          return { tone: "danger", headline: "账号异常", detail: availability.reasons.join(" · ") };
         }
 
         function accountCardHealthContent(health) {
@@ -9756,18 +9926,26 @@
                         h("span", { className: "channel-nav-name", key: "name" }, "全部账号"),
                         accounts.length
                           ? h(Tag, {
-                              color: allAccountStats.attention ? "warning" : allAccountStats.disabled ? "default" : "success",
+                              color: allAccountStats.error
+                                ? "error"
+                                : allAccountStats.business || allAccountStats.partial
+                                  ? "warning"
+                                  : allAccountStats.disabled ? "default" : "success",
                               key: "status"
-                            }, allAccountStats.attention
-                              ? `${allAccountStats.attention} 个不可用`
-                              : allAccountStats.disabled
-                                ? `${allAccountStats.disabled} 个已停用`
-                                : "账号正常")
+                            }, allAccountStats.error
+                              ? `${allAccountStats.error} 个异常`
+                              : allAccountStats.business
+                                ? `${allAccountStats.business} 个待恢复`
+                                : allAccountStats.partial
+                                  ? `${allAccountStats.partial} 个部分可用`
+                                  : allAccountStats.disabled
+                                    ? `${allAccountStats.disabled} 个已停用`
+                                    : "账号正常")
                           : h(Tag, { key: "status" }, "暂无账号")
                       ]),
                       h("div", { className: "channel-nav-meta", key: "meta" }, [
                         h("span", { key: "total" }, `共 ${accounts.length} 个`),
-                        h("span", { key: "ok" }, `可用 ${allAccountStats.ok} 个`)
+                        h("span", { key: "ok" }, `可处理 ${allAccountStats.ok + allAccountStats.partial} 个`)
                       ])
                     ]),
                     ...filteredChannels.map((channel) => {
@@ -9784,7 +9962,7 @@
                         ]),
                         h("div", { className: "channel-nav-meta", key: "meta" }, [
                           h("span", { key: "type" }, channelTypeName(channel.type)),
-                          h("span", { key: "count" }, `正常 ${stats.okCount || 0}/${stats.accountCount || 0}`)
+                          h("span", { key: "count" }, `可处理 ${stats.okCount || 0}/${stats.accountCount || 0}`)
                         ])
                       ]);
                     }),
@@ -9851,10 +10029,24 @@
                         h("span", { key: "label" }, "渠道类型"),
                         h("strong", { key: "value" }, channelTypeName(selectedChannel.type))
                       ]),
-                      h("span", { className: "account-context-item", key: "ok" }, [
-                        h("span", { key: "label" }, "可用账号"),
-                        h("strong", { key: "value" }, `${accountScopeStats.ok}/${selectedAccounts.length}`)
-                      ]),
+                      selectedChannel.type === "shareai" && channelAbilityEnabled(selectedChannel, "drawing")
+                        ? h("span", { className: "account-context-item is-success", key: "drawing-ok" }, [
+                            h("span", { key: "label" }, "绘图可用"),
+                            h("strong", { key: "value" }, `${selectedStats.drawingOkCount || 0}/${selectedStats.enabledCount || 0}`)
+                          ])
+                        : null,
+                      selectedChannel.type === "shareai" && channelAbilityEnabled(selectedChannel, "chatplus")
+                        ? h("span", { className: "account-context-item is-success", key: "chat-ok" }, [
+                            h("span", { key: "label" }, "聊天可用"),
+                            h("strong", { key: "value" }, `${selectedStats.chatOkCount || 0}/${selectedStats.enabledCount || 0}`)
+                          ])
+                        : null,
+                      selectedChannel.type !== "shareai"
+                        ? h("span", { className: "account-context-item is-success", key: "ok" }, [
+                            h("span", { key: "label" }, "可处理账号"),
+                            h("strong", { key: "value" }, `${selectedStats.okCount || 0}/${selectedStats.enabledCount || 0}`)
+                          ])
+                        : null,
                       h("span", { className: "account-context-item", key: "enabled" }, [
                         h("span", { key: "label" }, "启用账号"),
                         h("strong", { key: "value" }, `${selectedStats.enabledCount || 0}/${selectedStats.accountCount || 0}`)
@@ -9869,15 +10061,23 @@
                         h("span", { key: "label" }, "账号总数"),
                         h("strong", { key: "value" }, selectedAccounts.length)
                       ]),
-                      h("span", { className: "account-context-item", key: "ok" }, [
+                      h("span", { className: "account-context-item is-success", key: "ok" }, [
                         h("span", { key: "label" }, "可用"),
                         h("strong", { key: "value" }, accountScopeStats.ok)
                       ]),
-                      h("span", { className: "account-context-item", key: "attention" }, [
-                        h("span", { key: "label" }, "不可用"),
-                        h("strong", { key: "value" }, accountScopeStats.attention)
+                      h("span", { className: "account-context-item is-warning", key: "partial" }, [
+                        h("span", { key: "label" }, "部分可用"),
+                        h("strong", { key: "value" }, accountScopeStats.partial)
                       ]),
-                      h("span", { className: "account-context-item", key: "disabled" }, [
+                      h("span", { className: "account-context-item is-warning", key: "business" }, [
+                        h("span", { key: "label" }, "待恢复"),
+                        h("strong", { key: "value" }, accountScopeStats.business)
+                      ]),
+                      h("span", { className: "account-context-item is-danger", key: "error" }, [
+                        h("span", { key: "label" }, "异常"),
+                        h("strong", { key: "value" }, accountScopeStats.error)
+                      ]),
+                      h("span", { className: "account-context-item is-muted", key: "disabled" }, [
                         h("span", { key: "label" }, "已停用"),
                         h("strong", { key: "value" }, accountScopeStats.disabled)
                       ])
@@ -9898,14 +10098,14 @@
                       options: [
                         { label: "全部状态", value: "all" },
                         { label: "可用", value: "ok" },
-                        { label: "不可用", value: "attention" },
+                        { label: "部分可用", value: "partial" },
+                        { label: "账号异常", value: "error" },
+                        { label: "额度保护", value: "protection" },
+                        { label: "额度用完", value: "quota_empty" },
                         { label: "未订阅", value: "subscription_missing" },
-                        { label: "套餐已过期", value: "subscription_expired" },
-                        { label: "自动换线中", value: "disconnected" },
-                        { label: "额度不足", value: "quota_empty" },
+                        { label: "套餐到期", value: "subscription_expired" },
                         { label: "检测超时", value: "check_timeout" },
                         { label: "未激活", value: "activation_required" },
-                        { label: "异常", value: "error" },
                         { label: "未检测", value: "unknown" },
                         { label: "已停用", value: "disabled" }
                       ],
