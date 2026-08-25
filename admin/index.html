@@ -369,15 +369,15 @@
 
       .task-channel-flow {
         display: grid;
-        gap: 4px;
+        gap: 2px;
         min-width: 0;
         font-size: 12px;
-        line-height: 1.4;
+        line-height: 1.35;
       }
 
       .task-channel-line {
         display: flex;
-        align-items: flex-start;
+        align-items: center;
         gap: 4px;
         min-width: 0;
       }
@@ -389,9 +389,11 @@
 
       .task-channel-value {
         min-width: 0;
-        overflow-wrap: anywhere;
+        overflow: hidden;
         color: var(--ink);
         font-weight: 650;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .task-channel-mode {
@@ -404,28 +406,33 @@
 
       .task-model-detail {
         display: grid;
-        gap: 6px;
+        gap: 2px;
         min-width: 0;
         font-size: 12px;
-        line-height: 1.4;
+        line-height: 1.35;
       }
 
       .task-model-line {
-        display: grid;
-        gap: 1px;
+        display: flex;
+        align-items: baseline;
+        gap: 5px;
         min-width: 0;
       }
 
       .task-model-label {
+        flex: 0 0 auto;
         color: var(--muted);
         font-size: 11px;
       }
 
       .task-model-value {
+        min-width: 0;
+        overflow: hidden;
         color: var(--ink);
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         font-weight: 650;
-        overflow-wrap: anywhere;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .task-model-value.is-missing {
@@ -457,6 +464,35 @@
       .task-meta-label {
         flex: 0 0 auto;
         color: var(--muted);
+      }
+
+      .task-meta-value {
+        min-width: 0;
+      }
+
+      .task-meta.is-compact {
+        gap: 4px 12px;
+        margin-top: 6px;
+        line-height: 1.35;
+      }
+
+      .task-meta.is-compact .task-meta-item {
+        max-width: min(100%, 320px);
+        padding: 0;
+        overflow: hidden;
+        border: 0;
+        background: transparent;
+      }
+
+      .task-meta.is-compact .task-meta-value {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .task-meta-action {
+        display: inline-flex;
+        align-items: center;
       }
 
       .task-timing {
@@ -1530,8 +1566,8 @@
       }
 
       .task-thumb {
-        width: 86px;
-        height: 62px;
+        width: 72px;
+        height: 52px;
         overflow: hidden;
         border: 1px solid var(--line);
         border-radius: 6px;
@@ -1546,8 +1582,8 @@
 
       .task-preview-trigger {
         display: block;
-        width: 86px;
-        height: 62px;
+        width: 72px;
+        height: 52px;
         margin: 0;
         padding: 0;
         border: 0;
@@ -1764,6 +1800,32 @@
         vertical-align: top;
       }
 
+      .task-status-summary {
+        display: grid;
+        gap: 7px;
+        min-width: 0;
+      }
+
+      .task-status-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+
+      .task-duration-value {
+        color: #344054;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        font-weight: 720;
+        line-height: 1.35;
+      }
+
+      .task-route-summary {
+        display: grid;
+        gap: 7px;
+        min-width: 0;
+      }
+
       .task-token-usage {
         display: grid;
         gap: 3px;
@@ -1787,13 +1849,13 @@
       }
 
       .task-copy-block + .task-copy-block {
-        margin-top: 10px;
-        padding-top: 9px;
+        margin-top: 7px;
+        padding-top: 7px;
         border-top: 1px solid #eef2f6;
       }
 
       .task-copy-label {
-        margin-bottom: 4px;
+        margin-bottom: 2px;
         color: var(--muted);
         font-size: 11px;
         font-weight: 700;
@@ -1804,17 +1866,18 @@
         color: var(--ink);
         font-size: 13px;
         font-weight: 620;
-        line-height: 1.6;
+        line-height: 1.45;
         overflow-wrap: anywhere;
         display: -webkit-box;
         -webkit-box-orient: vertical;
-        -webkit-line-clamp: 5;
+        -webkit-line-clamp: 3;
         overflow: hidden;
       }
 
       .task-copy-preview.is-answer {
         color: #475467;
         font-weight: 500;
+        -webkit-line-clamp: 2;
       }
 
       .task-copy-detail {
@@ -2518,8 +2581,11 @@
         return legacy ? [legacy] : [];
       }
 
-      function taskRouteLabel(route) {
-        const channel = compactChannelName(route?.channelName || route?.channelId || "");
+      function taskRouteLabel(route, row) {
+        const savedChannel = compactChannelName(route?.channelName || route?.channelId || "");
+        const channel = row?.taskType === "chat"
+          ? savedChannel.replace(/(^|\/)聊天生图$/, "$1对话")
+          : savedChannel;
         const account = compactErrorText(route?.accountName || route?.accountId || "");
         if (channel && account) return `${channel} · ${account}`;
         return channel || account || "未知渠道";
@@ -2527,13 +2593,13 @@
 
       function taskSubmissionRouteText(row) {
         const first = taskSubmissionRoutes(row)[0];
-        return first ? taskRouteLabel(first) : "未提交";
+        return first ? taskRouteLabel(first, row) : "未提交";
       }
 
       function taskGenerationRouteText(row) {
         if (row?.taskType === "chat") return "不适用";
         const routes = taskGenerationRoutes(row);
-        return routes.length ? routes.map(taskRouteLabel).join(" / ") : "未成功";
+        return routes.length ? routes.map((route) => taskRouteLabel(route, row)).join(" / ") : "未成功";
       }
 
       function taskRoutingMode(row = {}) {
@@ -3096,7 +3162,7 @@
         const upstreamTaskId = taskUpstreamTaskId(row);
         const upstreamTitle = taskUpstreamTitle(row);
         const carId = taskCarId(row);
-        const items = [
+        const fullItems = [
           conversationAction ? ["上游对话", conversationAction] : null,
           !conversationAction && taskConversationUnavailable(row) ? ["上游对话", "未返回有效编号"] : null,
           upstreamTaskId ? ["上游任务ID", upstreamTaskId] : null,
@@ -3107,13 +3173,31 @@
           meta.calledAt ? ["调用时间", formatDateTime(meta.calledAt)] : null,
           taskNetworkLabel(row) ? ["代理", taskNetworkLabel(row)] : null
         ].filter(Boolean);
+        const sourceTaskId = taskSourceId(row);
+        const compactItems = [
+          meta.calledAt ? ["时间", formatDateTime(meta.calledAt)] : null,
+          sourceTaskId
+            ? ["调用任务", sourceTaskId]
+            : row?.id ? ["本地任务", String(row.id)] : null,
+          conversationAction ? ["上游对话", conversationAction] : null,
+          !conversationAction && taskConversationUnavailable(row) ? ["上游对话", "未返回有效编号"] : null,
+          upstreamTaskId ? ["上游任务", upstreamTaskId] : null
+        ].filter(Boolean);
+        const items = options.compact ? compactItems : fullItems;
         return items.length
-          ? h("div", { className: "task-meta" }, items.map(([label, value]) =>
-              h("span", { className: "task-meta-item", key: label }, [
+          ? h("div", { className: `task-meta${options.compact ? " is-compact" : ""}` }, [
+              ...items.map(([label, value]) => h("span", {
+                className: "task-meta-item",
+                key: label,
+                title: typeof value === "string" ? `${label}：${value}` : undefined
+              }, [
                 h("span", { className: "task-meta-label", key: "label" }, `${label}：`),
-                h("span", { key: "value" }, value)
-              ])
-            ))
+                h("span", { className: "task-meta-value", key: "value" }, value)
+              ])),
+              options.detailAction
+                ? h("span", { className: "task-meta-action", key: "action" }, options.detailAction)
+                : null
+            ].filter(Boolean))
           : null;
       }
 
@@ -3658,8 +3742,8 @@
         const status = taskPresentationStatus(row);
         const [color, text] = statusInfo(status);
         const style = status === "concurrency_limited"
-          ? { borderColor: "#fde68a", background: "#fffbeb", color: "#78350f" }
-          : undefined;
+          ? { marginInlineEnd: 0, borderColor: "#fde68a", background: "#fffbeb", color: "#78350f" }
+          : { marginInlineEnd: 0 };
         return h(Tag, { color, style }, text);
       }
 
@@ -8200,16 +8284,20 @@
                   onClick: () => summaryOnly ? openTaskPreview(row) : setTaskPreview(row)
                 }, `查看对话图片（${inputImageCount}）`)
               : null,
-            taskMetaLine(row, config, { onInspectUpstream: openTaskUpstreamDetail, upstreamLoadingTaskId }),
-            taskTimingLine(row),
-            summaryOnly ? h(Button, {
-              key: "detail",
-              type: "link",
-              size: "small",
-              className: "task-upstream-action",
-              loading: String(taskDetailLoadingId) === String(row.id),
-              onClick: () => openTaskDetail(row)
-            }, "查看完整记录") : null,
+            taskMetaLine(row, config, {
+              compact: summaryOnly,
+              onInspectUpstream: openTaskUpstreamDetail,
+              upstreamLoadingTaskId,
+              detailAction: summaryOnly ? h(Button, {
+                key: "detail",
+                type: "link",
+                size: "small",
+                className: "task-upstream-action",
+                loading: String(taskDetailLoadingId) === String(row.id),
+                onClick: () => openTaskDetail(row)
+              }, "查看完整记录") : null
+            }),
+            options.detail ? taskTimingLine(row) : null,
             row.status === "interrupted"
               ? h("div", { className: "task-response", key: "interrupted" }, [
                   h("span", { key: "message" }, row.responseJson?.message || "服务重启时任务被中断，结果无法确认；此任务不计失败。"),
@@ -8270,7 +8358,34 @@
 
         function taskRecordTypeTag(row) {
           const isChat = taskRecordKind(row) === "chat";
-          return h(Tag, { color: isChat ? "cyan" : "blue", bordered: false }, taskTypeLabel(row?.taskType));
+          const label = isChat ? "对话" : taskTypeLabel(row?.taskType || "生图");
+          return h(Tag, {
+            color: isChat ? "cyan" : "blue",
+            bordered: false,
+            style: { marginInlineEnd: 0 }
+          }, label);
+        }
+
+        function taskStatusSummaryCell(row) {
+          const duration = taskDuration(row, nowTick);
+          return h("div", { className: "task-status-summary" }, [
+            h("div", { className: "task-status-tags", key: "tags" }, [
+              taskStatusTag(row),
+              taskRecordTypeTag(row)
+            ]),
+            h("span", {
+              className: "task-duration-value",
+              key: "duration",
+              title: `处理时间：${duration}`
+            }, duration)
+          ]);
+        }
+
+        function taskRouteSummaryCell(row) {
+          return h("div", { className: "task-route-summary" }, [
+            taskModelCell(row),
+            taskChannelFlow(row)
+          ]);
         }
 
         function taskRecordMetricsCell(row) {
@@ -8286,52 +8401,41 @@
           {
             title: "预览",
             dataIndex: "imageUrls",
-            width: 104,
+            width: 82,
+            responsive: ["sm"],
             render: (_urls, row) => taskPreviewCell(row)
           },
-          { title: "状态", dataIndex: "status", width: 90, render: (_, row) => taskStatusTag(row) },
-          { title: "类型", dataIndex: "taskType", width: 90, render: taskTypeLabel },
-          { title: "模型", width: 220, render: (_, row) => taskModelCell(row) },
-          { title: "渠道", width: 300, render: (_, row) => taskChannelFlow(row) },
+          { title: "状态 / 耗时", dataIndex: "status", width: 136, render: (_, row) => taskStatusSummaryCell(row) },
+          { title: "模型 / 渠道", width: 260, responsive: ["lg"], render: (_, row) => taskRouteSummaryCell(row) },
           {
             title: "任务信息",
             dataIndex: "prompt",
-            width: 620,
             render: (_, row) => taskRecordContent(row)
           },
-          { title: "耗时", width: 120, render: (_, row) => taskDuration(row, nowTick) },
-          { title: "比例", dataIndex: "ratio", width: 80 },
-          { title: "图片", dataIndex: "imageCount", width: 70 }
+          { title: "用量 / 规格", width: 146, responsive: ["md"], render: (_, row) => taskRecordMetricsCell(row) }
         ];
 
         const chatTaskColumns = [
-          { title: "状态", dataIndex: "status", width: 90, render: (_, row) => taskStatusTag(row) },
-          { title: "模型", width: 220, render: (_, row) => taskModelCell(row) },
-          { title: "渠道", width: 300, render: (_, row) => taskChannelFlow(row) },
+          { title: "状态 / 耗时", dataIndex: "status", width: 136, render: (_, row) => taskStatusSummaryCell(row) },
+          { title: "模型 / 渠道", width: 260, responsive: ["lg"], render: (_, row) => taskRouteSummaryCell(row) },
           {
             title: "对话内容",
             dataIndex: "prompt",
-            width: 760,
             render: (_, row) => taskRecordContent(row, { chat: true })
           },
-          { title: "预计 TOKEN", width: 190, render: (_, row) => chatTaskTokenUsageCell(row) },
-          { title: "耗时", width: 120, render: (_, row) => taskDuration(row, nowTick) }
+          { title: "预计 TOKEN", width: 156, responsive: ["md"], render: (_, row) => chatTaskTokenUsageCell(row) }
         ];
 
         const mixedTaskColumns = [
-          { title: "预览", dataIndex: "imageUrls", width: 104, render: (_urls, row) => taskPreviewCell(row) },
-          { title: "状态", dataIndex: "status", width: 90, render: (_, row) => taskStatusTag(row) },
-          { title: "类型", dataIndex: "taskType", width: 96, render: (_, row) => taskRecordTypeTag(row) },
-          { title: "模型", width: 220, render: (_, row) => taskModelCell(row) },
-          { title: "渠道", width: 300, render: (_, row) => taskChannelFlow(row) },
+          { title: "预览", dataIndex: "imageUrls", width: 82, responsive: ["sm"], render: (_urls, row) => taskPreviewCell(row) },
+          { title: "状态 / 耗时", dataIndex: "status", width: 136, render: (_, row) => taskStatusSummaryCell(row) },
+          { title: "模型 / 渠道", width: 260, responsive: ["lg"], render: (_, row) => taskRouteSummaryCell(row) },
           {
             title: "任务信息",
             dataIndex: "prompt",
-            width: 760,
             render: (_, row) => taskRecordContent(row, { chat: taskRecordKind(row) === "chat" })
           },
-          { title: "用量 / 规格", width: 190, render: (_, row) => taskRecordMetricsCell(row) },
-          { title: "耗时", width: 120, render: (_, row) => taskDuration(row, nowTick) }
+          { title: "用量 / 规格", width: 156, responsive: ["md"], render: (_, row) => taskRecordMetricsCell(row) }
         ];
 
         function taskRecordTabLabel(kind, label, icon) {
@@ -8486,8 +8590,8 @@
               columns: isAll ? mixedTaskColumns : isChat ? chatTaskColumns : imageTaskColumns,
               dataSource: filteredTasks,
               loading: taskListLoading,
+              size: "small",
               tableLayout: "fixed",
-              scroll: { x: isAll ? 1880 : isChat ? 1680 : 1690 },
               pagination: { pageSize: 8, showSizeChanger: false },
               locale: { emptyText: h(Empty, { description: `暂无${recordName}记录` }) }
             })

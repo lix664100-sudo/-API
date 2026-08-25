@@ -178,14 +178,19 @@ test("任务缩略图打开原图与生成结果弹窗，并支持多图放大�
   assert.match(adminHtml, /@media \(max-width: 780px\)[\s\S]*\.task-compare-grid[\s\S]*grid-template-columns: 1fr/);
 });
 
-test("全部、生图和对话记录均可查看，表格固定列宽避免长内容撑坏页面", () => {
+test("全部、生图和对话记录均可在一屏查看，耗时靠前且窄屏自动精简次要列", () => {
   assert.match(adminHtml, /taskRecordTabLabel\("all", "全部记录"/);
   assert.match(adminHtml, /taskRecordTabLabel\("image", "生图记录"/);
   assert.match(adminHtml, /taskRecordTabLabel\("chat", "对话记录"/);
   assert.match(adminHtml, /tableLayout: "fixed"/);
-  assert.match(adminHtml, /scroll: \{ x: isAll \? 1880 : isChat \? 1680 : 1690 \}/);
+  assert.match(adminHtml, /size: "small"/);
+  assert.doesNotMatch(adminHtml, /scroll: \{ x: isAll \?/);
+  assert.match(adminHtml, /title: "状态 \/ 耗时"[\s\S]*?taskStatusSummaryCell\(row\)/);
+  assert.match(adminHtml, /title: "模型 \/ 渠道"[\s\S]*?responsive: \["lg"\]/);
+  assert.match(adminHtml, /title: "预计 TOKEN"[\s\S]*?responsive: \["md"\]/);
   assert.match(adminHtml, /\.task-copy-full[\s\S]*max-height: 320px/);
-  assert.match(adminHtml, /\.task-copy-preview[\s\S]*-webkit-line-clamp: 5/);
+  assert.match(adminHtml, /\.task-copy-preview[\s\S]*-webkit-line-clamp: 3/);
+  assert.match(adminHtml, /\.task-copy-preview\.is-answer[\s\S]*-webkit-line-clamp: 2/);
   assert.doesNotMatch(adminHtml, /h\("div", \{ className: "task-response" \}, row\.responseText\)/);
 });
 
@@ -336,6 +341,26 @@ test("任务渠道按首次提交和全部成功渠道显示，并自动去重",
   assert.equal(taskGenerationRouteText(row), "渠道A · 账号A / 渠道B · 账号B / 渠道C");
   assert.match(adminHtml, /"提交："/);
   assert.match(adminHtml, /"生成："/);
+});
+
+test("对话记录显示对话类型，提交渠道不再误写成聊天生图", () => {
+  const { taskSubmissionRouteText } = loadTaskRouteHelpers();
+  const chatRow = {
+    taskType: "chat",
+    externalId: "conversation-chat",
+    channelName: "谷歌 https://claude.midjourneye.com//聊天生图",
+    accountName: "测试账号"
+  };
+  const imageRow = {
+    ...chatRow,
+    taskType: "text2img"
+  };
+
+  assert.equal(taskSubmissionRouteText(chatRow), "谷歌 https://claude.midjourneye.com/对话 · 测试账号");
+  assert.equal(taskSubmissionRouteText(imageRow), "谷歌 https://claude.midjourneye.com/聊天生图 · 测试账号");
+  assert.match(adminHtml, /const label = isChat \? "对话" : taskTypeLabel/);
+  assert.match(adminHtml, /function taskStatusSummaryCell\(row\)[\s\S]*?taskRecordTypeTag\(row\)/);
+  assert.match(adminHtml, /const chatTaskColumns = \[[\s\S]*?title: "状态 \/ 耗时"[\s\S]*?taskStatusSummaryCell\(row\)/);
 });
 
 test("旧任务和未提交任务也有明确的渠道状态", () => {

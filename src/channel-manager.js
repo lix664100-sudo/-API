@@ -5184,7 +5184,7 @@ async function finishChatTask(task, result, channel, account, attempts, response
   return nextTask;
 }
 
-async function runChatCompletionTask(task, input) {
+async function runChatCompletionTask(task, input, reserved = null) {
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = requestedAccountIdForInput(input);
@@ -5195,73 +5195,94 @@ async function runChatCompletionTask(task, input) {
   const preferredTarget = requestedAccountId
     ? targets.find((target) => target.account.id === requestedAccountId)
     : targets.find((target) => target.account.id === task.accountId && target.channel.id === task.channelId);
-  const orderedChatTargets = preferredTarget
-    ? [preferredTarget, ...targets.filter((target) => !sameTarget(target, preferredTarget))]
-    : targets;
-  const attempts = [];
+  const orderedChatTargets = reserved?.target
+    ? orderedTargets(targets, reserved)
+    : preferredTarget
+      ? [preferredTarget, ...targets.filter((target) => !sameTarget(target, preferredTarget))]
+      : targets;
+  const attempts = [...(reserved?.attempts || [])];
   if (!targets.length) {
+    reserved?.release?.();
     const error = noChatTargetsError(config, requestedChannel);
     error.task = await failQueuedTask(task, error, attempts);
     throw error;
   }
-  for (const target of orderedChatTargets) {
-    const { channel, account } = target;
-    try {
-      const finished = await runChatplusAccountWork(channel, account, async () => {
-        if (!(await ensureTargetReady(config, target, "chat", attempts, { input }))) return null;
-        const client = getWorkClient(config, channel, account);
-        if (typeof client.createChatCompletion !== "function") {
-          throw new Error("这个渠道暂不支持对话。");
-        }
-        const upstreamResult = await client.createChatCompletion(input);
-        const result = await mirrorTaskImages({
-          ...upstreamResult,
-          usage: upstreamResult.usage || estimateChatTokenUsage(input, upstreamResult.content)
-        }, config, client);
-        const responseJson = chatCompletionResponseJson({ result, channel });
-        const finishedTask = await finishChatTask(task, result, channel, account, attempts, responseJson);
-          return { result, channel, account, task: finishedTask, responseJson };
-      }, {
-        taskType: "chat",
-        modelKey: targetChatModelKey(target, input),
-        quotaProbe: targetConfirmedQuotaBlocksTask(target, "chat", input)
-          && targetConfirmedQuotaRetryDue(target, input)
-      });
-      if (finished) return finished;
-    } catch (error) {
-      const status = Number(error.status || error.statusCode || 0);
-      attempts.push({
-        channelId: channel.id,
-        channelName: channel.name,
-        accountId: account.id,
-        accountName: account.name,
-        message: error.message || "调用失败",
-        ...attemptMetadataForError(error),
-        ...(error?.selectedCarId ? { carId: error.selectedCarId } : {}),
-        ...(Array.isArray(error?.carAttempts) && error.carAttempts.length
-          ? { carAttempts: taskResponseJson(error.carAttempts) }
-          : {})
-      });
-      if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
-        await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error, {
-          explicitChatQuotaOnly: true
-        }));
-      } else if (channel.type === "chatplus" && isChatBlockedError(error)) {
-        await markChatCooldown(account.id, channel, error);
+  let reservedRelease = reserved?.release || null;
+  try {
+    for (const target of orderedChatTargets) {
+      const { channel, account } = target;
+      let release = null;
+      if (reservedRelease && sameTarget(target, reserved?.target)) {
+        release = reservedRelease;
+        reservedRelease = null;
       } else {
-        await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error, {
-          explicitChatQuotaOnly: channel.type === "chatplus"
-        }));
+        release = await tryReserveTaskSlot(targetTaskSlot(target, "chat"), target, input);
+        if (!release) {
+          attempts.push(await targetBusyAttempt(target, "chat", input));
+          continue;
+        }
       }
-      if (error?.code === "UPSTREAM_CONVERSATION_NOT_CREATED") {
-        error.task = await failQueuedTask(task, error, attempts);
-        throw error;
-      }
-      if (status === 400 && !isChatBlockedError(error)) {
-        error.task = await failQueuedTask(task, error, attempts);
-        throw error;
+      try {
+        const finished = await runChatplusAccountWork(channel, account, async () => {
+          if (!(await ensureTargetReady(config, target, "chat", attempts, { input }))) return null;
+          const client = getWorkClient(config, channel, account);
+          if (typeof client.createChatCompletion !== "function") {
+            throw new Error("这个渠道暂不支持对话。");
+          }
+          const upstreamResult = await client.createChatCompletion(input);
+          const result = await mirrorTaskImages({
+            ...upstreamResult,
+            usage: upstreamResult.usage || estimateChatTokenUsage(input, upstreamResult.content)
+          }, config, client);
+          const responseJson = chatCompletionResponseJson({ result, channel });
+          const finishedTask = await finishChatTask(task, result, channel, account, attempts, responseJson);
+          return { result, channel, account, task: finishedTask, responseJson };
+        }, {
+          taskType: "chat",
+          modelKey: targetChatModelKey(target, input),
+          quotaProbe: targetConfirmedQuotaBlocksTask(target, "chat", input)
+            && targetConfirmedQuotaRetryDue(target, input)
+        });
+        if (finished) return finished;
+      } catch (error) {
+        const status = Number(error.status || error.statusCode || 0);
+        attempts.push({
+          channelId: channel.id,
+          channelName: channel.name,
+          accountId: account.id,
+          accountName: account.name,
+          message: error.message || "调用失败",
+          ...attemptMetadataForError(error),
+          ...(error?.selectedCarId ? { carId: error.selectedCarId } : {}),
+          ...(Array.isArray(error?.carAttempts) && error.carAttempts.length
+            ? { carAttempts: taskResponseJson(error.carAttempts) }
+            : {})
+        });
+        if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
+          await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error, {
+            explicitChatQuotaOnly: true
+          }));
+        } else if (channel.type === "chatplus" && isChatBlockedError(error)) {
+          await markChatCooldown(account.id, channel, error);
+        } else {
+          await updateTargetAccountStatus(account.id, channel, accountStatusFromError(error, {
+            explicitChatQuotaOnly: channel.type === "chatplus"
+          }));
+        }
+        if (error?.code === "UPSTREAM_CONVERSATION_NOT_CREATED") {
+          error.task = await failQueuedTask(task, error, attempts);
+          throw error;
+        }
+        if (status === 400 && !isChatBlockedError(error)) {
+          error.task = await failQueuedTask(task, error, attempts);
+          throw error;
+        }
+      } finally {
+        release();
       }
     }
+  } finally {
+    reservedRelease?.();
   }
 
   const error = new Error(readableChatFailure(attempts));
@@ -5390,9 +5411,8 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
     });
   }
 
-  const reserved = await tryReserveFirstAvailableTarget(targets, "chat", { input });
-  const queueOrder = reserved?.orderedTargets || await orderTargetsByRoutingUsage(targets, "chat", input);
-  const target = reserved?.target || queueOrder[0];
+  const reserved = await reserveFirstAvailableTarget(targets, "chat", { input });
+  const target = reserved.target;
   const task = queuedTask({
     input,
     target,
@@ -5400,12 +5420,9 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
     prompt: cleanChatPrompt(input),
     imageCount: chatImageCount(input),
     inputImageUrls: taskInputPreviewUrls(input, taskOptions.inputImageUrls),
-    raw: {
-      endpoint: "/v1/chat/completions",
-      ...(reserved ? {} : { waitingForSlot: true })
-    },
+    raw: { endpoint: "/v1/chat/completions" },
     requestMeta,
-    status: reserved ? "processing" : "queued"
+    status: "processing"
   });
   try {
     await upsertTask(task);
@@ -5415,17 +5432,11 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
   }
   scheduledChatTasks.add(task.id);
   runInBackground(async () => {
-    let taskReservation = reserved;
     try {
-      let queuedChatTask = task;
-      if (!taskReservation) {
-        taskReservation = await waitForFirstAvailableTarget(targets, "chat", { input });
-        queuedChatTask = await startQueuedTask(task, taskReservation.target, taskReservation.queueWaitMs);
-      }
-      await runChatCompletionTask(queuedChatTask, input);
+      await runChatCompletionTask(task, input, reserved);
     } finally {
       scheduledChatTasks.delete(task.id);
-      taskReservation?.release();
+      reserved.release();
     }
   });
   return task;
@@ -6020,7 +6031,7 @@ export async function createChatCompletion(input = {}, requestMeta = {}, taskOpt
     await upsertTask(task);
     scheduledChatTasks.add(task.id);
     try {
-      const result = await runChatCompletionTask(task, input);
+      const result = await runChatCompletionTask(task, input, reserved);
       return chatCompletionResponse(result);
     } finally {
       scheduledChatTasks.delete(task.id);
