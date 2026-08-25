@@ -4,16 +4,21 @@ import test from "node:test";
 
 const adminHtml = await readFile(new URL("../admin/index.html", import.meta.url), "utf8");
 
-test("account table distinguishes effective routing targets from configured weights", () => {
-  assert.match(adminHtml, /当前有效目标/);
-  assert.match(adminHtml, /当前不参与/);
-  assert.match(adminHtml, /比例只统计系统自动分配且已提交给上游的任务/);
+test("account table compares routing targets with today's actual routing", () => {
+  assert.match(adminHtml, /分流情况/);
+  assert.match(adminHtml, /每种能力独立统计/);
+  assert.match(adminHtml, /目标表示当前可用账号的计划比例/);
+  assert.match(adminHtml, /今日无自动分流/);
 });
 
-test("account table shows automatic and explicit submissions separately", () => {
-  assert.match(adminHtml, /自动提交/);
+test("account table keeps routing volume separate from productivity", () => {
+  assert.match(adminHtml, /自动分流/);
   assert.match(adminHtml, /指定账号/);
-  assert.match(adminHtml, /不参与自动分流/);
+  assert.doesNotMatch(adminHtml, /accountTodayUsage/);
+  const routingStart = adminHtml.indexOf("function routingComparisonItem");
+  const routingEnd = adminHtml.indexOf("function markTaskListInteraction", routingStart);
+  assert.ok(routingStart >= 0 && routingEnd > routingStart);
+  assert.doesNotMatch(adminHtml.slice(routingStart, routingEnd), /成功/);
 });
 
 test("task records mark explicit account routing", () => {

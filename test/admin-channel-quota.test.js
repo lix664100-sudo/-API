@@ -428,6 +428,19 @@ test("聊天状态可用但没有额度数据时显示额度未获取", () => {
   }), "GPT 额度未获取");
 });
 
+test("未订阅套餐显示为未订阅而不是暂不可用", () => {
+  const status = {
+    status: "subscription_missing",
+    quotaModel: "gpt",
+    meta: { chatModel: "gpt", referenceUsage: {} }
+  };
+
+  assert.equal(chatQuotaText(null, {}, status), "GPT 未订阅");
+  assert.deepEqual(chatQuotaResetTexts({}, status, fixedNow), ["GPT 未订阅"]);
+  assert.match(adminHtml, /subscription_missing:\s*\["default",\s*"未订阅"\]/);
+  assert.match(adminHtml, /\{ label: "未订阅", value: "subscription_missing" \}/);
+});
+
 test("绘图余额小于两点时不能显示可用", () => {
   assert.equal(drawingDisplayStatus({ status: "ok", balance: 0 }), "quota_empty");
   assert.equal(drawingDisplayStatus({ status: "ok", balance: 1 }), "quota_empty");
@@ -675,6 +688,24 @@ test("GPT 套餐已过期时不再显示旧的未来日期", () => {
   assert.equal(accountExpireText(account, channel), "已过期");
 });
 
+test("未订阅套餐时到期栏显示未订阅", () => {
+  const account = {
+    expireAt: "旧的账号到期时间",
+    meta: {
+      abilities: {
+        drawing: { status: "ok", expireAt: "旧的绘图到期时间" },
+        chatplus: { status: "subscription_missing", expireAt: "" }
+      }
+    }
+  };
+  const channel = {
+    type: "shareai",
+    settings: { enabledAbilities: { drawing: true, chatplus: true }, defaultChatModel: "gpt" }
+  };
+
+  assert.equal(accountExpireText(account, channel), "未订阅");
+});
+
 test("GPT 套餐过期时整体状态不能被绘图可用覆盖", () => {
   const account = {
     enabled: true,
@@ -692,6 +723,25 @@ test("GPT 套餐过期时整体状态不能被绘图可用覆盖", () => {
   };
 
   assert.equal(accountEffectiveStatus(account, channel), "subscription_expired");
+});
+
+test("未订阅套餐时整体状态不能被绘图可用覆盖", () => {
+  const account = {
+    enabled: true,
+    status: "ok",
+    meta: {
+      abilities: {
+        drawing: { status: "ok" },
+        chatplus: { status: "subscription_missing" }
+      }
+    }
+  };
+  const channel = {
+    type: "shareai",
+    settings: { enabledAbilities: { drawing: true, chatplus: true } }
+  };
+
+  assert.equal(accountEffectiveStatus(account, channel), "subscription_missing");
 });
 
 test("绘图余额不足时整体状态不能显示可用", () => {

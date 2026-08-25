@@ -595,15 +595,63 @@ test("GPT 套餐时间已过期时不再沿用旧的可用状态", async () => {
   assert.equal(sessionCount, 0);
 });
 
-test("无有效 GPT 订阅时即使绘图可用也标记套餐已过期", async () => {
+test("Gemini 车位均未订阅套餐时返回未订阅而不是普通故障", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gemini" } },
+    account: { id: "account-gemini-no-plan", username: "gemini-no-plan@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let selectedCount = 0;
+  client.selectCar = async () => {
+    if (selectedCount) throw new Error("Gemini 暂时没有可用车辆。");
+    selectedCount += 1;
+    return {
+      carId: "gemini-no-plan-car-1",
+      carType: "gemini",
+      strategy: "thinking"
+    };
+  };
+  client.enterCar = async () => {
+    throw new Error("当前账号未订阅套餐");
+  };
+  client.resetSession = async () => {};
+
+  await assert.rejects(
+    client.prepareChatSession({ model: "gemini" }, new Set(), 5),
+    (error) => {
+      assert.equal(error.code, "CHAT_SUBSCRIPTION_MISSING");
+      assert.equal(error.subscriptionMissing, true);
+      assert.equal(error.subscriptionModel, "gemini");
+      assert.equal(error.message, "Gemini 未订阅套餐，暂不参与任务分配。");
+      return true;
+    }
+  );
+  assert.equal(selectedCount, 1);
+});
+
+test("Gemini 未订阅套餐时检测正常完成并退出任务分配", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
     defaultChannel: "shareai",
+    channels: config.channels.map((channel) => channel.id === "shareai"
+      ? {
+          ...channel,
+          settings: {
+            ...channel.settings,
+            defaultChatModel: "gemini",
+            chatModels: (channel.settings?.chatModels || []).map((model) => ({
+              ...model,
+              default: model.key === "gemini"
+            }))
+          }
+        }
+      : channel),
     accounts: [{
       id: "account-no-subscription",
       channelId: "shareai",
-      name: "套餐过期测试账号",
+      name: "未订阅测试账号",
       username: "no-subscription@example.com",
       password: "test",
       enabled: true,
@@ -626,24 +674,31 @@ test("无有效 GPT 订阅时即使绘图可用也标记套餐已过期", async 
     message: "绘图账号可用"
   });
   ChatplusClient.prototype.check = async () => {
-    const error = new Error("GPT 自动找车失败：车位一：用户没有有效的chatgpt订阅；车位二：用户没有有效的chatgpt订阅");
-    error.code = "CHAT_SUBSCRIPTION_EXPIRED";
-    error.subscriptionExpired = true;
+    const error = new Error("Gemini 未订阅套餐，暂不参与任务分配。");
+    error.code = "CHAT_SUBSCRIPTION_MISSING";
+    error.subscriptionMissing = true;
+    error.subscriptionModel = "gemini";
+    error.subscriptionModelName = "Gemini";
     throw error;
   };
 
   try {
-    await assert.rejects(
-      checkAccount("account-no-subscription"),
-      /GPT 套餐已过期/
-    );
+    const result = await checkAccount("account-no-subscription");
+    assert.equal(result.status, "subscription_missing");
+    assert.match(result.message, /Gemini 未订阅套餐/);
 
     const stored = await loadConfig();
     const account = stored.accounts.find((item) => item.id === "account-no-subscription");
-    assert.equal(account.status, "subscription_expired");
+    assert.equal(account.status, "subscription_missing");
     assert.equal(account.meta.abilities.drawing.status, "ok");
-    assert.equal(account.meta.abilities.chatplus.status, "subscription_expired");
+    assert.equal(account.meta.abilities.chatplus.status, "subscription_missing");
+    assert.equal(account.meta.abilities.chatplus.meta.chatModel, "gemini");
     assert.equal(account.meta.abilities.chatplus.expireAt, "");
+
+    const runtime = await getRuntimeStatus();
+    assert.equal(runtime.routing.accounts[account.id].slots.chat.available, false);
+    assert.equal(runtime.routing.accounts[account.id].slots.chat.reason, "未订阅");
+    assert.equal(runtime.routing.accounts[account.id].slots.chatImage.reason, "未订阅");
   } finally {
     ChatplusClient.prototype.check = originalChatCheck;
     DrawingClient.prototype.check = originalDrawingCheck;

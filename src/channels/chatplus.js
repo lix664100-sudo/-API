@@ -411,12 +411,26 @@ function isCarPlanMismatchError(error) {
     || /\u4e0d\u662f\s*Ultra\s*\u7528\u6237|\u5347\u7ea7\u540e\u4f7f\u7528\u8be5\u8f66|not.{0,24}ultra|ultra.{0,24}user|(?:upgrade|\u5347\u7ea7).{0,24}(?:car|\u8be5\u8f66|\u8f66\u4f4d|Ultra)/i.test(text);
 }
 
-function isChatSubscriptionExpiredText(value) {
-  return /用户没有有效的\s*chatgpt\s*订阅|没有可用的\s*chatgpt\s*套餐|(?:chatgpt|gpt).{0,18}(?:订阅|套餐).{0,12}(?:过期|无效)|no valid.{0,20}(?:subscription|plan)|(?:subscription|plan).{0,20}(?:expired|invalid|not valid)/i.test(String(value || ""));
+function isChatSubscriptionMissingText(value) {
+  return /用户没有有效的\s*(?:chatgpt|gpt|gemini|grok)?\s*订阅|没有可用的\s*(?:chatgpt|gpt|gemini|grok)?\s*套餐|(?:未订阅|没有订阅|无订阅).{0,12}(?:套餐)?|no valid.{0,20}(?:subscription|plan)|not subscribed|subscription required/i.test(String(value || ""));
 }
 
-function chatSubscriptionExpiredError(expireAt = "") {
-  const error = new Error("GPT 套餐已过期，请续费后重新检测。");
+function isChatSubscriptionExpiredText(value) {
+  return /(?:chatgpt|gpt|gemini|grok)?.{0,18}(?:订阅|套餐).{0,12}(?:已?过期|无效)|(?:subscription|plan).{0,20}(?:expired|invalid|not valid)/i.test(String(value || ""));
+}
+
+function chatSubscriptionMissingError(modelKey = "", modelName = "当前模型") {
+  const error = new Error(`${modelName} 未订阅套餐，暂不参与任务分配。`);
+  error.code = "CHAT_SUBSCRIPTION_MISSING";
+  error.status = 403;
+  error.subscriptionMissing = true;
+  error.subscriptionModel = modelKey;
+  error.subscriptionModelName = modelName;
+  return error;
+}
+
+function chatSubscriptionExpiredError(expireAt = "", modelName = "GPT") {
+  const error = new Error(`${modelName} 套餐已过期，请续费后重新检测。`);
   error.code = "CHAT_SUBSCRIPTION_EXPIRED";
   error.status = 403;
   error.subscriptionExpired = true;
@@ -3541,13 +3555,22 @@ export class ChatplusClient {
       ...(input.taskStageRecorder ? { taskStageRecorder: input.taskStageRecorder } : {})
     };
     const errors = [];
+    let subscriptionMissingAttempts = 0;
     let subscriptionExpiredAttempts = 0;
     let recheckProCars = input.recheckProCars === true;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const selected = await this.selectCar(route, ignoredCarIds, {
-        ...requestOptions,
-        recheckProCars
-      });
+      let selected;
+      try {
+        selected = await this.selectCar(route, ignoredCarIds, {
+          ...requestOptions,
+          recheckProCars
+        });
+      } catch (error) {
+        const allPreviousFailuresWerePlanRelated = errors.length > 0
+          && subscriptionMissingAttempts + subscriptionExpiredAttempts === errors.length;
+        if (allPreviousFailuresWerePlanRelated && /暂时没有可用的?.*(?:车辆|车位)/.test(String(error?.message || ""))) break;
+        throw error;
+      }
       const selectedProCar = selected.car?.isPro === true || selected.car?.isUltra === true;
       if (recheckProCars && selectedProCar) recheckProCars = false;
       ignoredCarIds.add(selected.carId);
@@ -3573,10 +3596,18 @@ export class ChatplusClient {
         }
         return { route, selected, init, revision: this.sessionRevision };
       } catch (error) {
-        if (route.key === "gpt" && isChatSubscriptionExpiredText(`${error?.message || ""} ${error?.body || ""}`)) {
+        const subscriptionText = `${error?.message || ""} ${error?.body || ""}`;
+        const subscriptionExpired = isChatSubscriptionExpiredText(subscriptionText);
+        const subscriptionMissing = !subscriptionExpired && isChatSubscriptionMissingText(subscriptionText);
+        if (subscriptionExpired) {
           subscriptionExpiredAttempts += 1;
+        } else if (subscriptionMissing) {
+          subscriptionMissingAttempts += 1;
         }
-        const retryableCarError = isAuthSessionError(error) || isCarPlanMismatchError(error);
+        const retryableCarError = subscriptionMissing
+          || subscriptionExpired
+          || isAuthSessionError(error)
+          || isCarPlanMismatchError(error);
         if (retryableCarError) {
           await this.rememberProCarsUnavailable(error);
           this.rememberAuthFailedCar(selected);
@@ -3590,10 +3621,15 @@ export class ChatplusClient {
       }
     }
     const error = new Error(`${route.name} 自动找车失败：${errors.join("；")}`);
-    if (route.key === "gpt" && errors.length > 0 && subscriptionExpiredAttempts === errors.length) {
+    if (errors.length > 0 && subscriptionMissingAttempts === errors.length) {
+      throw chatSubscriptionMissingError(route.key, route.name);
+    }
+    if (errors.length > 0 && subscriptionExpiredAttempts === errors.length) {
       error.code = "CHAT_SUBSCRIPTION_EXPIRED";
       error.status = 403;
       error.subscriptionExpired = true;
+      error.subscriptionModel = route.key;
+      error.subscriptionModelName = route.name;
     } else if (errors.length) {
       tagCarPoolUnavailable(error);
     }
@@ -5238,14 +5274,16 @@ export class ChatplusClient {
       throw error;
     }
 
+    const taskStageRecorder = createTaskStageRecorder(input);
+    const trackedInput = { ...input, taskStageRecorder };
     const modelKey = this.chatRouteForInput({
-      ...input,
+      ...trackedInput,
       preferImageCar: files.length > 0
     }).key;
     return this.runAccountWork(async () => {
       let conversationToDelete = null;
       try {
-        const result = await this.withImageQuotaFallback(prompt, { ...input, files, preferImageCar: files.length > 0 }, async (conversation) => {
+        const result = await this.withImageQuotaFallback(prompt, { ...trackedInput, files, preferImageCar: files.length > 0 }, async (conversation) => {
           conversationToDelete = conversation;
           const { events, conversationId, route, directContent } = conversation;
           const streamContent = extractAssistantText(events);
@@ -5275,8 +5313,11 @@ export class ChatplusClient {
           model,
           content,
           imageUrls,
-          raw: { conversationId, eventCount: events.length, imageCount: files.length, outputImageCount: imageUrls.length, detailTextLength: detailContent.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy, ...geminiRouteMetadata(route) }
+          raw: { conversationId, eventCount: events.length, imageCount: files.length, outputImageCount: imageUrls.length, detailTextLength: detailContent.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, strategy: selected?.strategy, ...geminiRouteMetadata(route), stageTimings: taskStageSnapshot(taskStageRecorder) }
         };
+      } catch (error) {
+        error.stageTimings = taskStageSnapshot(taskStageRecorder);
+        throw error;
       } finally {
         if (conversationToDelete?.conversationId) {
           try {

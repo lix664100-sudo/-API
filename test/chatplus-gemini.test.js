@@ -1159,6 +1159,59 @@ test("普通对话没有创建对话时会停用当前车位并换一个车位",
   assert.ok(Date.parse(cooldowns[0].cooldownUntil) > Date.now() + 23 * 60 * 60 * 1000);
 });
 
+test("普通对话会返回各处理阶段的耗时明细", async () => {
+  const testClient = client();
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    ignoredCarIds.add("timed-chat-car");
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId: "timed-chat-car", carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.sendGeminiConversation = async (_prompt, input, route, selected) => {
+    await input.taskStageRecorder.record({
+      id: "timed-chat-upstream",
+      key: "upstream_generation",
+      label: "等待上游处理",
+      status: "success",
+      startedAt: "2026-08-25T00:00:00.000Z",
+      finishedAt: "2026-08-25T00:00:01.234Z",
+      durationMs: 1234,
+      carId: selected.carId,
+      carType: selected.carType
+    });
+    return {
+      events: [],
+      conversationId: "conversation-with-stage-timings",
+      model: "gemini",
+      upstreamModel: "gemini",
+      route,
+      selected,
+      submissionConfirmed: true,
+      directContent: "耗时已经记录。",
+      imageUrls: []
+    };
+  };
+
+  const result = await testClient.createChatCompletion({
+    model: "gemini",
+    messages: [{ role: "user", content: "请记录这次对话的耗时。" }]
+  });
+
+  assert.deepEqual(result.raw.stageTimings, [{
+    id: "timed-chat-upstream",
+    key: "upstream_generation",
+    label: "等待上游处理",
+    status: "success",
+    startedAt: "2026-08-25T00:00:00.000Z",
+    finishedAt: "2026-08-25T00:00:01.234Z",
+    durationMs: 1234,
+    carId: "timed-chat-car",
+    carType: "gemini"
+  }]);
+});
+
 test("连续两个车位都没有创建对话时任务失败并保存两个车位", async () => {
   const testClient = client();
   const selectedCars = [];
