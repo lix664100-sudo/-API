@@ -1483,6 +1483,26 @@
         white-space: nowrap;
       }
 
+      .quota-value-stack {
+        display: grid;
+        justify-items: end;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .quota-protection-note {
+        color: #667085;
+        font-size: 11px;
+        font-weight: 500;
+        line-height: 1.3;
+        white-space: nowrap;
+      }
+
+      .quota-protection-note.is-active {
+        color: #d92d20;
+        font-weight: 650;
+      }
+
       .quota-reset-list {
         display: flex;
         flex-direction: column;
@@ -4252,10 +4272,19 @@
 
       function accountQuotaProtectionItems(account, channel) {
         if (channel?.type !== "shareai") return [];
+        const settings = quotaProtectionSettings(channel?.settings?.quotaProtection);
+        if (!settings.enabled) return [];
         const items = [];
         if (channelAbilityEnabled(channel, "drawing")) {
-          const state = quotaProtectionState(abilityStatus(account, "drawing"), "drawing", channel);
-          if (state) items.push({ key: "drawing", label: "绘图", state });
+          const drawing = abilityStatus(account, "drawing");
+          const state = quotaProtectionState(drawing, "drawing", channel);
+          items.push({
+            key: "drawing",
+            label: "绘图",
+            quota: state?.quota ?? drawing.quota ?? account.quota,
+            settings,
+            state
+          });
         }
         if (channelAbilityEnabled(channel, "chatplus")) {
           const chatplus = abilityStatus(account, "chatplus");
@@ -4263,10 +4292,30 @@
             .filter((model) => model.enabled)
             .forEach((model) => {
               const state = quotaProtectionState(chatplus, model.key, channel);
-              if (state) items.push({ key: `chatplus-${model.key}`, label: model.name, state });
+              const usage = chatplus.meta?.referenceUsage?.[model.key] || {};
+              items.push({
+                key: `chatplus-${model.key}`,
+                label: model.name,
+                quota: state?.quota ?? usage.quota,
+                settings,
+                state
+              });
             });
         }
         return items;
+      }
+
+      function quotaProtectionThresholdText(item = {}) {
+        const state = item.state && typeof item.state === "object" ? item.state : {};
+        const settings = item.settings && typeof item.settings === "object" ? item.settings : {};
+        const rawPercent = state.thresholdPercent ?? (settings.mode === "fixed" ? settings.fixedPercent : null);
+        const percent = Number(rawPercent);
+        if (!Number.isFinite(percent) || percent <= 0) return "检测后确定";
+
+        const quota = Number(state.quota ?? item.quota);
+        if (!Number.isFinite(quota) || quota <= 0) return `${percent}%`;
+        const threshold = Math.round((quota * percent / 100) * 10) / 10;
+        return String(threshold);
       }
 
       function quotaPairText(quota, balance) {
@@ -4274,15 +4323,24 @@
         return `${valueText(balance)}/${valueText(quota)}`;
       }
 
-      function quotaTextCell(text) {
+      function quotaTextCell(text, protectionItems = []) {
+        const protectionByLabel = new Map(protectionItems.map((item) => [item.label, item]));
         const lines = String(text || "-").split("｜").filter(Boolean);
         return h("div", { className: "quota-list" }, lines.map((line, index) => {
           const separatorAt = line.indexOf(" ");
           const label = separatorAt > 0 ? line.slice(0, separatorAt) : "";
           const value = separatorAt > 0 ? line.slice(separatorAt + 1) : line;
+          const protection = protectionByLabel.get(label);
+          const threshold = protection && value.includes("/") ? quotaProtectionThresholdText(protection) : "";
           return h("div", { className: "quota-line", key: `${label || "quota"}-${index}` }, [
             label ? h("span", { className: "quota-name", key: "label" }, label) : null,
-            h("span", { className: "quota-value", key: "value" }, value)
+            h("span", { className: "quota-value-stack", key: "value-stack" }, [
+              h("span", { className: "quota-value", key: "value" }, value),
+              threshold ? h("span", {
+                className: `quota-protection-note${protection.state?.active ? " is-active" : ""}`,
+                key: "protection"
+              }, `保护线 ${threshold}`) : null
+            ].filter(Boolean))
           ].filter(Boolean));
         }));
       }
@@ -6668,7 +6726,15 @@
             activation_required: "账号未激活",
             unknown: "尚未检测"
           };
-          if (status !== "ok") addReason(statusReasons[status] || statusInfo(status)[1]);
+          const activeProtectionItems = accountQuotaProtectionItems(account, channel)
+            .filter((item) => item.state?.active);
+          const protectionReasonItems = activeProtectionItems.filter((item) => {
+            const balance = item.state?.balance;
+            return balance === null || balance === undefined || balance === "" || Number(balance) > 0;
+          });
+          if (status !== "ok" && (status !== "quota_empty" || !protectionReasonItems.length)) {
+            addReason(statusReasons[status] || statusInfo(status)[1]);
+          }
 
           if (account.proxyUrl) {
             const proxyCheck = account?.meta?.proxyCheck || {};
@@ -6676,9 +6742,9 @@
             else if (proxyCheck.status === "failed") addReason("IP 不可用");
           }
 
-          if (accountQuotaProtectionItems(account, channel).some((item) => item.state.active)) {
-            addReason("额度保护中");
-          }
+          protectionReasonItems.forEach((item) => {
+            addReason(`${item.label} 达到保护线 ${quotaProtectionThresholdText(item)}`);
+          });
 
           return reasons.length
             ? { state: "unavailable", reasons }
@@ -8969,7 +9035,10 @@
             ]),
             h("div", { className: "account-card-primary", key: "primary" }, [
               accountCardSection("代理 IP", proxyCell(row.proxyUrl, row), "proxy"),
-              accountCardSection("剩余额度", quotaTextCell(accountQuotaText(row, rowChannel)), "quota"),
+              accountCardSection("剩余额度", quotaTextCell(
+                accountQuotaText(row, rowChannel),
+                accountQuotaProtectionItems(row, rowChannel)
+              ), "quota"),
               accountCardSection("额度刷新", accountQuotaResetCell(row, rowChannel, nowTick), "reset")
             ]),
             h("details", { className: "account-card-details", key: "details" }, [
