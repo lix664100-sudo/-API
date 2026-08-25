@@ -8,7 +8,7 @@ import path from "node:path";
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-chat-task-timing-"));
 process.env.DATA_DIR = dataDir;
 
-const { closeStorage, getTask, loadConfig, saveConfig } = await import("../src/storage.js");
+const { closeStorage, getTask, loadConfig, saveConfig, taskListItem } = await import("../src/storage.js");
 const { createChatCompletion, queueChatCompletion } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 
@@ -68,6 +68,10 @@ function timing(id, status = "success") {
   };
 }
 
+function upstreamTimings(task) {
+  return (task?.raw?.stageTimings || []).filter((stage) => stage.key === "upstream_generation");
+}
+
 async function waitForTerminalTask(taskId) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const task = await getTask(taskId);
@@ -94,12 +98,12 @@ test("同步和异步对话成功后都会保存耗时明细", async () => {
 
   try {
     const syncResponse = await createChatCompletion(chatInput("同步对话"));
-    assert.deepEqual(syncResponse.task.raw.stageTimings, [timing("sync-chat-stage")]);
+    assert.deepEqual(upstreamTimings(syncResponse.task), [timing("sync-chat-stage")]);
 
     const queued = await queueChatCompletion(chatInput("异步对话"));
     const asyncTask = await waitForTerminalTask(queued.id);
     assert.equal(asyncTask.status, "success");
-    assert.deepEqual(asyncTask.raw.stageTimings, [timing("async-chat-stage")]);
+    assert.deepEqual(upstreamTimings(asyncTask), [timing("async-chat-stage")]);
   } finally {
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
   }
@@ -120,11 +124,75 @@ test("普通对话失败后也会保存失败前的耗时明细", async () => {
       createChatCompletion(chatInput("失败对话")),
       (error) => {
         assert.equal(error.task?.status, "failed");
-        assert.deepEqual(error.task?.raw?.stageTimings, [timing("failed-chat-stage", "failed")]);
+        assert.deepEqual(upstreamTimings(error.task), [timing("failed-chat-stage", "failed")]);
         return true;
       }
     );
   } finally {
+    ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
+  }
+});
+
+test("普通对话发往上游后会立即更新提交渠道和当前阶段", async () => {
+  await prepareAccount();
+  const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
+  let releaseUpstream;
+  let reportUpstreamStarted;
+  const upstreamStarted = new Promise((resolve) => {
+    reportUpstreamStarted = resolve;
+  });
+  const holdUpstream = new Promise((resolve) => {
+    releaseUpstream = resolve;
+  });
+  ChatplusClient.prototype.createChatCompletion = async (input) => {
+    const activeStage = {
+      id: "live-chat-stage",
+      key: "upstream_generation",
+      label: "等待上游处理",
+      status: "processing",
+      startedAt: new Date().toISOString(),
+      carId: "live-chat-car",
+      carType: "chatgpt"
+    };
+    await input.onStageStart(activeStage);
+    reportUpstreamStarted();
+    await holdUpstream;
+    await input.onStage({
+      ...activeStage,
+      status: "success",
+      finishedAt: new Date().toISOString(),
+      durationMs: 20
+    });
+    return {
+      externalId: "conversation-live-stage",
+      model: "gpt",
+      content: "完成",
+      imageUrls: [],
+      raw: {}
+    };
+  };
+
+  let queued = null;
+  try {
+    queued = await queueChatCompletion(chatInput("实时状态对话"));
+    await upstreamStarted;
+    const activeTask = await getTask(queued.id);
+
+    assert.equal(activeTask.status, "processing");
+    assert.equal(activeTask.raw.submitted, true);
+    assert.equal(activeTask.raw.activeStage.label, "等待上游处理");
+    assert.equal(activeTask.raw.selectedCarId, "live-chat-car");
+    assert.equal(activeTask.submissionChannels.length, 1);
+    assert.equal(taskListItem(activeTask).raw.activeStage.label, "等待上游处理");
+
+    releaseUpstream();
+    const finishedTask = await waitForTerminalTask(queued.id);
+    assert.equal(finishedTask.status, "success");
+    assert.equal(finishedTask.raw.activeStage, undefined);
+    assert.ok(finishedTask.raw.stageTimings.some((stage) => stage.id === "live-chat-stage"));
+  } finally {
+    releaseUpstream?.();
+    if (queued?.id) await waitForTerminalTask(queued.id);
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
   }
 });

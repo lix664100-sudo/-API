@@ -711,22 +711,35 @@ test("a successful concurrent submission refreshes the reusable login session", 
   }
 });
 
-test("concurrent GPT tasks stagger conversation creation on the same car", async () => {
+test("concurrent GPT tasks stagger their starts but overlap on the same car", async () => {
   const client = clientForGpt({ accountId: "account-staggered-submit" });
   const selected = { carId: "shared-submit-car", carType: "chatgpt" };
   const startedAt = [];
   let active = 0;
   let maxActive = 0;
+  let releaseActive;
+  let reportAllStarted;
+  const holdActive = new Promise((resolve) => { releaseActive = resolve; });
+  const allStarted = new Promise((resolve) => { reportAllStarted = resolve; });
 
-  await Promise.all([1, 2, 3].map(() => client.runConversationSubmit(selected, async () => {
+  const submissions = [1, 2, 3].map(() => client.runConversationSubmit(selected, async () => {
     startedAt.push(Date.now());
     active += 1;
     maxActive = Math.max(maxActive, active);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    if (active === 3) reportAllStarted();
+    await holdActive;
     active -= 1;
-  })));
+  }));
 
-  assert.equal(maxActive, 1);
+  const overlapped = await Promise.race([
+    allStarted.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 5500))
+  ]);
+  releaseActive();
+  await Promise.all(submissions);
+
+  assert.equal(overlapped, true);
+  assert.equal(maxActive, 3);
   assert.ok(startedAt[1] - startedAt[0] >= 1900);
   assert.ok(startedAt[2] - startedAt[1] >= 1900);
 });

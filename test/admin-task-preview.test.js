@@ -631,9 +631,11 @@ test("账号忙碌时保留真正占用账号的任务信息", () => {
   );
 });
 
-test("并发面板明确显示满载立即拒绝，旧排队记录仍可查看", () => {
+test("并发面板明确显示对话满载排队，并展示排队记录和数量", () => {
   assert.match(adminHtml, /queued: \["processing", "排队中"\]/);
   assert.match(adminHtml, /\{ label: "排队中", value: "queued" \}/);
-  assert.match(adminHtml, /满载立即拒绝/);
-  assert.doesNotMatch(adminHtml, /满载自动排队/);
+  assert.match(adminHtml, /对话满载排队/);
+  assert.match(adminHtml, /`排队 \$\{queued\}`/);
+  assert.match(adminHtml, /等待空闲名额/);
+  assert.doesNotMatch(adminHtml, /满载立即拒绝/);
 });

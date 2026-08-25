@@ -1927,6 +1927,8 @@ function taskListRawSummary(raw = {}) {
     submitted: raw?.submitted,
     returnedError: raw?.returnedError,
     queued: raw?.queued,
+    waitingForSlot: raw?.waitingForSlot,
+    queueWaitMs: raw?.queueWaitMs,
     requestedModel: raw?.requestedModel,
     upstreamModel: raw?.upstreamModel,
     chatModel: raw?.chatModel,
@@ -1936,6 +1938,17 @@ function taskListRawSummary(raw = {}) {
     title: raw?.title,
     created_at: raw?.created_at,
     failureType: raw?.failureType,
+    activeStage: raw?.activeStage && typeof raw.activeStage === "object"
+      ? {
+          id: raw.activeStage.id,
+          key: raw.activeStage.key,
+          label: raw.activeStage.label,
+          status: raw.activeStage.status,
+          startedAt: raw.activeStage.startedAt,
+          carId: raw.activeStage.carId,
+          carType: raw.activeStage.carType
+        }
+      : undefined,
     stageTimings: Array.isArray(raw?.stageTimings) ? raw.stageTimings.slice(-30) : undefined,
     imageMirrorPending: raw?.imageMirrorPending,
     resultSaveError: raw?.resultSaveError,

@@ -11,6 +11,8 @@ test("account table compares routing targets with today's actual routing", () =>
   assert.match(adminHtml, /今日分流/);
   assert.match(adminHtml, /routing-target-marker/);
   assert.match(adminHtml, /今日无自动分流/);
+  assert.match(adminHtml, /allUnavailable/);
+  assert.match(adminHtml, /routing-comparison-item is-unavailable is-compact/);
 });
 
 test("account table keeps routing volume separate from productivity", () => {

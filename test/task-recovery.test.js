@@ -94,6 +94,33 @@ test("重启后没有上游编号的生图任务会变成结果待确认，且�
   assert.equal(Object.keys(stats.records).length, 0);
 });
 
+test("服务重启后排队中的对话任务会停止，不会永久卡在排队中", async () => {
+  const id = "task-restart-queued-chat";
+  await upsertTask({
+    id,
+    status: "queued",
+    taskType: "chat",
+    prompt: "等待空闲名额的对话",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/对话",
+    channelType: "chatplus",
+    accountId: "account-queued-chat",
+    accountName: "排队对话账号",
+    raw: { queued: true, waitingForSlot: true },
+    createdAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+    completedAt: null
+  });
+
+  const results = await refreshProcessingTasks();
+  const stored = await getTask(id);
+
+  assert.equal(results.some((result) => result.id === id && result.ok), true);
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.raw.queued, false);
+  assert.equal(stored.raw.waitingForSlot, false);
+  assert.match(stored.errorMessage, /服务|后台执行进程|停止/);
+});
+
 test("已经明确失败的任务不会被旧的结果待确认覆盖", async () => {
   const id = "task-failed-before-stale-interrupt";
   const failedAt = new Date().toISOString();

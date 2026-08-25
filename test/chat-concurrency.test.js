@@ -9,7 +9,7 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-chat-concurrency-"
 process.env.DATA_DIR = dataDir;
 
 const { closeStorage, getTask, listTasks, loadConfig, saveConfig } = await import("../src/storage.js");
-const { createChatCompletion, queueChatCompletion } = await import("../src/channel-manager.js");
+const { createChatCompletion, getRuntimeStatus, queueChatCompletion } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 
 after(async () => {
@@ -17,7 +17,7 @@ after(async () => {
   await rm(dataDir, { recursive: true, force: true });
 });
 
-function chatAccount(id, priority = 1) {
+function chatAccount(id, priority = 1, chatConcurrency = 1) {
   return {
     id,
     channelId: "shareai",
@@ -27,7 +27,7 @@ function chatAccount(id, priority = 1) {
     enabled: true,
     priority,
     status: "ok",
-    concurrency: { chat: 1, drawingImage: 1, chatImage: 1 },
+    concurrency: { chat: chatConcurrency, drawingImage: 1, chatImage: 1 },
     meta: {
       abilities: {
         drawing: { status: "quota_empty", message: "绘图额度不足" },
@@ -65,7 +65,16 @@ async function waitForTerminalTask(taskId) {
   return getTask(taskId);
 }
 
-test("异步对话并发已满时立即拒绝且不创建任务记录", async () => {
+async function waitForTaskByPrompt(prompt, status = "") {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const task = (await listTasks()).find((item) => item.prompt === prompt);
+    if (task && (!status || task.status === status)) return task;
+    await delay(10);
+  }
+  return (await listTasks()).find((item) => item.prompt === prompt) || null;
+}
+
+test("异步对话并发已满时创建排队记录并在空闲后继续", async () => {
   await saveChatAccounts([chatAccount("chat-full")]);
 
   const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
@@ -92,27 +101,195 @@ test("异步对话并发已满时立即拒绝且不创建任务记录", async ()
   };
 
   let firstTask = null;
-  let unexpectedTask = null;
+  let queuedTask = null;
   try {
     firstTask = await queueChatCompletion(chatInput("占用唯一并发"));
     await firstEntered;
     const beforeCount = (await listTasks()).length;
 
-    let rejection = null;
-    try {
-      unexpectedTask = await queueChatCompletion(chatInput("并发满时的新请求"));
-    } catch (error) {
-      rejection = error;
-    }
+    queuedTask = await queueChatCompletion(chatInput("并发满时的新请求"));
+    const storedQueuedTask = await getTask(queuedTask.id);
+    const runtime = await getRuntimeStatus();
 
-    assert.equal(rejection?.status, 429);
-    assert.equal(rejection?.code, "CONCURRENCY_LIMIT");
-    assert.equal((await listTasks()).length, beforeCount);
+    assert.equal(queuedTask.status, "queued");
+    assert.equal(storedQueuedTask.status, "queued");
+    assert.equal(storedQueuedTask.raw.waitingForSlot, true);
+    assert.equal(runtime.queued.chat, 1);
+    assert.equal((await listTasks()).length, beforeCount + 1);
     assert.equal(submitCount, 1);
+
+    releaseFirst();
+    const [firstFinished, queuedFinished] = await Promise.all([
+      waitForTerminalTask(firstTask.id),
+      waitForTerminalTask(queuedTask.id)
+    ]);
+    assert.equal(firstFinished.status, "success");
+    assert.equal(queuedFinished.status, "success");
+    assert.equal(queuedFinished.raw.waitingForSlot, false);
+    assert.ok(queuedFinished.raw.stageTimings.some((stage) => stage.key === "account_queue"));
+    assert.equal(submitCount, 2);
   } finally {
     releaseFirst?.();
     if (firstTask?.id) await waitForTerminalTask(firstTask.id);
-    if (unexpectedTask?.id) await waitForTerminalTask(unexpectedTask.id);
+    if (queuedTask?.id) await waitForTerminalTask(queuedTask.id);
+    ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
+  }
+});
+
+test("同一账号的三条普通对话会真正同时处理", async () => {
+  await saveChatAccounts([chatAccount("chat-parallel", 1, 3)]);
+
+  const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
+  let releaseRequests;
+  let reportAllEntered;
+  let activeCount = 0;
+  let maxActiveCount = 0;
+  const concurrentSubmitFlags = [];
+  const allEntered = new Promise((resolve) => {
+    reportAllEntered = resolve;
+  });
+  const holdRequests = new Promise((resolve) => {
+    releaseRequests = resolve;
+  });
+  ChatplusClient.prototype.createChatCompletion = async (input) => {
+    activeCount += 1;
+    maxActiveCount = Math.max(maxActiveCount, activeCount);
+    concurrentSubmitFlags.push(input.concurrentSubmit === true);
+    if (activeCount === 3) reportAllEntered();
+    try {
+      await holdRequests;
+      return {
+        externalId: `conversation-parallel-${String(input.messages?.[0]?.content || "")}`,
+        model: "gpt",
+        content: "完成",
+        imageUrls: [],
+        raw: {}
+      };
+    } finally {
+      activeCount -= 1;
+    }
+  };
+
+  let requests = [];
+  try {
+    requests = [1, 2, 3].map((index) => createChatCompletion(chatInput(`并发对话-${index}`)));
+    const enteredTogether = await Promise.race([
+      allEntered.then(() => true),
+      delay(500).then(() => false)
+    ]);
+
+    assert.equal(enteredTogether, true);
+    assert.equal(maxActiveCount, 3);
+    assert.deepEqual(concurrentSubmitFlags, [true, true, true]);
+    releaseRequests();
+    const responses = await Promise.all(requests);
+    assert.equal(responses.length, 3);
+  } finally {
+    releaseRequests?.();
+    await Promise.allSettled(requests);
+    ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
+  }
+});
+
+test("同步对话满载时也会留下排队记录并等待空闲名额", async () => {
+  await saveChatAccounts([chatAccount("chat-sync-queue")]);
+
+  const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
+  let releaseFirst;
+  let reportFirstEntered;
+  const firstEntered = new Promise((resolve) => { reportFirstEntered = resolve; });
+  const holdFirst = new Promise((resolve) => { releaseFirst = resolve; });
+  ChatplusClient.prototype.createChatCompletion = async (input) => {
+    const content = String(input.messages?.[0]?.content || "");
+    if (content === "同步占用并发") {
+      reportFirstEntered();
+      await holdFirst;
+    }
+    return {
+      externalId: `conversation-${content}`,
+      model: "gpt",
+      content: "完成",
+      imageUrls: [],
+      raw: {}
+    };
+  };
+
+  let firstRequest = null;
+  let queuedRequest = null;
+  try {
+    firstRequest = createChatCompletion(chatInput("同步占用并发"));
+    await firstEntered;
+    queuedRequest = createChatCompletion(chatInput("同步等待空闲"));
+    const queuedTask = await waitForTaskByPrompt("同步等待空闲", "queued");
+
+    assert.equal(queuedTask?.status, "queued");
+    assert.equal(queuedTask?.raw?.waitingForSlot, true);
+
+    releaseFirst();
+    const responses = await Promise.all([firstRequest, queuedRequest]);
+    const finishedQueuedTask = await getTask(queuedTask.id);
+    assert.equal(responses.length, 2);
+    assert.equal(finishedQueuedTask.status, "success");
+    assert.ok(finishedQueuedTask.raw.stageTimings.some((stage) => stage.key === "account_queue"));
+  } finally {
+    releaseFirst?.();
+    await Promise.allSettled([firstRequest, queuedRequest].filter(Boolean));
+    ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
+  }
+});
+
+test("前一条对话失败后也会释放名额继续处理排队任务", async () => {
+  await saveChatAccounts([chatAccount("chat-failure-release")]);
+
+  const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
+  let releaseFailure;
+  let reportFailureEntered;
+  const failureEntered = new Promise((resolve) => { reportFailureEntered = resolve; });
+  const holdFailure = new Promise((resolve) => { releaseFailure = resolve; });
+  ChatplusClient.prototype.createChatCompletion = async (input) => {
+    const content = String(input.messages?.[0]?.content || "");
+    if (content === "失败后释放") {
+      reportFailureEntered();
+      await holdFailure;
+      const error = new Error("上游拒绝了第一条对话");
+      error.status = 400;
+      throw error;
+    }
+    return {
+      externalId: "conversation-after-failure",
+      model: "gpt",
+      content: "排队任务完成",
+      imageUrls: [],
+      raw: {}
+    };
+  };
+
+  let failedRequest = null;
+  let failedTask = null;
+  let queuedTask = null;
+  try {
+    failedRequest = createChatCompletion(chatInput("失败后释放")).then(
+      (value) => ({ ok: true, value }),
+      (error) => ({ ok: false, error })
+    );
+    await failureEntered;
+    failedTask = await waitForTaskByPrompt("失败后释放", "processing");
+    queuedTask = await queueChatCompletion(chatInput("失败后的排队任务"));
+    assert.equal((await getTask(queuedTask.id)).status, "queued");
+
+    releaseFailure();
+    const [failedOutcome, succeeded] = await Promise.all([
+      failedRequest,
+      waitForTerminalTask(queuedTask.id)
+    ]);
+    assert.equal(failedOutcome.ok, false);
+    assert.equal(failedOutcome.error.task.status, "failed");
+    assert.equal(succeeded.status, "success");
+  } finally {
+    releaseFailure?.();
+    await failedRequest?.catch(() => {});
+    if (failedTask?.id) await waitForTerminalTask(failedTask.id);
+    if (queuedTask?.id) await waitForTerminalTask(queuedTask.id);
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
   }
 });

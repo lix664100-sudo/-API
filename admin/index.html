@@ -815,8 +815,9 @@
 
       .account-list {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(420px, 520px));
         align-items: start;
+        justify-content: start;
         gap: 14px;
         min-width: 0;
       }
@@ -855,8 +856,8 @@
 
       .account-card-header {
         display: grid;
-        gap: 10px;
-        padding: 15px 14px 12px;
+        gap: 8px;
+        padding: 12px;
       }
 
       .account-card-title-row {
@@ -879,7 +880,7 @@
         align-items: flex-start;
         gap: 9px;
         min-width: 0;
-        padding: 10px 11px;
+        padding: 8px 9px;
         border: 1px solid #d1fadf;
         border-radius: 8px;
         background: #f0fdf4;
@@ -928,7 +929,7 @@
       }
 
       .account-card-health-copy strong {
-        font-size: 17px;
+        font-size: 16px;
         font-weight: 780;
         line-height: 1.25;
       }
@@ -945,7 +946,7 @@
         gap: 7px;
         width: 100%;
         min-width: 0;
-        padding: 7px 9px;
+        padding: 5px 8px;
         border: 1px solid #fedf89;
         border-radius: 6px;
         background: #fffaeb;
@@ -1069,7 +1070,7 @@
       }
 
       .account-card-primary .account-card-section {
-        padding: 12px 14px 13px;
+        padding: 10px 12px 11px;
         background: #fbfcfe;
       }
 
@@ -1080,7 +1081,7 @@
 
       .account-card-section {
         min-width: 0;
-        padding: 13px 14px 14px;
+        padding: 11px 12px 12px;
         background: #fff;
       }
 
@@ -1098,7 +1099,7 @@
 
       .account-card-content {
         min-width: 0;
-        margin-top: 6px;
+        margin-top: 5px;
         color: #344054;
         font-size: 14px;
         line-height: 1.55;
@@ -1140,8 +1141,8 @@
         align-items: center;
         justify-content: space-between;
         gap: 10px;
-        min-height: 49px;
-        padding: 10px 12px 10px 16px;
+        min-height: 44px;
+        padding: 7px 10px 7px 12px;
         border-top: 1px solid var(--line);
         background: #fff;
       }
@@ -1572,7 +1573,7 @@
 
       .routing-overview {
         display: grid;
-        gap: 10px;
+        gap: 8px;
         min-width: 0;
       }
 
@@ -1600,9 +1601,9 @@
 
       .routing-comparison-item {
         display: grid;
-        gap: 7px;
+        gap: 6px;
         min-width: 0;
-        padding: 11px 0;
+        padding: 9px 0;
         border-bottom: 1px solid #f0f2f5;
         font-size: 13px;
         line-height: 1.45;
@@ -1644,9 +1645,9 @@
 
       .routing-comparison-measure {
         display: grid;
-        grid-template-columns: 86px minmax(0, 1fr);
+        grid-template-columns: 74px minmax(0, 1fr);
         align-items: center;
-        gap: 12px;
+        gap: 10px;
         min-width: 0;
       }
 
@@ -1661,7 +1662,7 @@
 
       .routing-comparison-current strong {
         color: #175cd3;
-        font-size: 20px;
+        font-size: 18px;
         font-weight: 760;
         font-variant-numeric: tabular-nums;
         line-height: 1.2;
@@ -1703,7 +1704,7 @@
         align-items: baseline;
         flex-wrap: wrap;
         gap: 3px 12px;
-        padding-left: 98px;
+        padding-left: 84px;
         color: #667085;
         font-size: 12px;
       }
@@ -1723,8 +1724,27 @@
         color: var(--muted);
       }
 
-      .routing-comparison-item.is-unavailable .routing-comparison-current strong {
+      .routing-comparison-item.is-compact {
+        display: flex;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 3px 8px;
+        padding: 7px 0;
+      }
+
+      .routing-comparison-item.is-compact .routing-comparison-label {
+        margin-right: auto;
+      }
+
+      .routing-comparison-compact-reason {
+        color: #b54708;
+        font-size: 12px;
+      }
+
+      .routing-comparison-compact-count {
+        width: 100%;
         color: #667085;
+        font-size: 11px;
       }
 
       .routing-overview-compact {
@@ -1734,7 +1754,8 @@
       .routing-overview-status {
         display: flex;
         align-items: baseline;
-        gap: 8px;
+        flex-wrap: wrap;
+        gap: 3px 8px;
         color: var(--muted);
         font-size: 12px;
       }
@@ -1746,21 +1767,35 @@
 
       .quota-list {
         display: grid;
-        gap: 6px;
+        gap: 8px;
         min-width: 0;
       }
 
       .quota-line {
-        display: flex;
-        align-items: baseline;
-        justify-content: space-between;
-        gap: 12px;
+        display: grid;
+        gap: 5px;
         min-width: 0;
       }
 
       .quota-line + .quota-line {
-        padding-top: 6px;
+        padding-top: 8px;
         border-top: 1px solid #f0f2f5;
+      }
+
+      .quota-line-heading,
+      .quota-label-group {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+        min-width: 0;
+      }
+
+      .quota-line-heading {
+        justify-content: space-between;
+      }
+
+      .quota-label-group {
+        flex-wrap: wrap;
       }
 
       .quota-name {
@@ -1771,26 +1806,66 @@
       }
 
       .quota-value {
-        color: var(--ink);
-        font-size: 13px;
-        font-weight: 650;
+        display: inline-flex;
+        align-items: baseline;
+        flex: 0 0 auto;
+        color: #175cd3;
         font-variant-numeric: tabular-nums;
-        text-align: right;
         white-space: nowrap;
       }
 
-      .quota-value-stack {
-        display: grid;
-        justify-items: end;
-        gap: 2px;
-        min-width: 0;
+      .quota-value strong {
+        font-size: 21px;
+        font-weight: 780;
+        line-height: 1;
+      }
+
+      .quota-value span {
+        color: #667085;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .quota-value.is-text {
+        color: #475467;
+        font-size: 13px;
+        font-weight: 680;
+      }
+
+      .quota-line.is-low .quota-value strong {
+        color: #b54708;
+      }
+
+      .quota-line.is-low .quota-meter-fill {
+        background: #f79009;
+      }
+
+      .quota-line.is-critical .quota-value strong {
+        color: #b42318;
+      }
+
+      .quota-line.is-critical .quota-meter-fill {
+        background: #f04438;
+      }
+
+      .quota-meter {
+        height: 4px;
+        overflow: hidden;
+        border-radius: 2px;
+        background: #e4e7ec;
+      }
+
+      .quota-meter-fill {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        background: #2e90fa;
       }
 
       .quota-protection-note {
         color: #667085;
         font-size: 11px;
         font-weight: 500;
-        line-height: 1.3;
         white-space: nowrap;
       }
 
@@ -2783,6 +2858,12 @@
         font-size: 12px;
         font-variant-numeric: tabular-nums;
         font-weight: 720;
+        line-height: 1.35;
+      }
+
+      .task-active-stage {
+        color: #667085;
+        font-size: 12px;
         line-height: 1.35;
       }
 
@@ -4704,17 +4785,56 @@
           const value = separatorAt > 0 ? line.slice(separatorAt + 1) : line;
           const protection = protectionByLabel.get(label);
           const threshold = protection && value.includes("/") ? quotaProtectionThresholdText(protection) : "";
-          return h("div", { className: "quota-line", key: `${label || "quota"}-${index}` }, [
-            label ? h("span", { className: "quota-name", key: "label" }, label) : null,
-            h("span", { className: "quota-value-stack", key: "value-stack" }, [
-              h("span", { className: "quota-value", key: "value" }, value),
-              threshold ? h("span", {
-                className: `quota-protection-note${protection.state?.active ? " is-active" : ""}`,
-                key: "protection"
-              }, `保护线 ${threshold}`) : null
-            ].filter(Boolean))
+          const metric = quotaMetricDetails(value, protection?.state?.active === true);
+          return h("div", {
+            className: `quota-line is-${metric.tone}`,
+            key: `${label || "quota"}-${index}`
+          }, [
+            h("div", { className: "quota-line-heading", key: "heading" }, [
+              h("div", { className: "quota-label-group", key: "label-group" }, [
+                label ? h("span", { className: "quota-name", key: "label" }, label) : null,
+                threshold ? h("span", {
+                  className: `quota-protection-note${protection.state?.active ? " is-active" : ""}`,
+                  key: "protection"
+                }, `保护线 ${threshold}`) : null
+              ].filter(Boolean)),
+              metric.known
+                ? h("span", { className: "quota-value", key: "value" }, [
+                    h("strong", { key: "remaining" }, metric.remaining),
+                    h("span", { key: "total" }, `/${metric.total}`)
+                  ])
+                : h("span", { className: "quota-value is-text", key: "value" }, metric.text)
+            ]),
+            metric.known ? h("div", {
+              className: "quota-meter",
+              role: "img",
+              "aria-label": `${label || "额度"}剩余 ${metric.remaining}，总额 ${metric.total}`,
+              key: "meter"
+            }, h("span", {
+              className: "quota-meter-fill",
+              style: { width: `${metric.percent}%` }
+            })) : null
           ].filter(Boolean));
         }));
+      }
+
+      function quotaMetricDetails(value, protectionActive = false) {
+        const text = String(value || "-").trim();
+        const match = text.match(/^(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)$/);
+        if (!match) return { known: false, text, tone: "normal" };
+        const remaining = Number(match[1]);
+        const total = Number(match[2]);
+        if (!Number.isFinite(remaining) || !Number.isFinite(total) || total <= 0) {
+          return { known: false, text, tone: "normal" };
+        }
+        const percent = Math.max(0, Math.min(100, Math.round((remaining / total) * 100)));
+        return {
+          known: true,
+          remaining: match[1],
+          total: match[2],
+          percent,
+          tone: protectionActive ? "critical" : percent <= 20 ? "low" : "normal"
+        };
       }
 
       function aggregateChatReferenceUsage(accounts, channelType, modelKeys) {
@@ -7714,8 +7834,22 @@
           if (explicit > 0) {
             todayItems.push(h("span", { className: "routing-comparison-explicit", key: "explicit" }, `指定账号 ${explicit} ${unit}`));
           }
+          if (!available) {
+            const historyText = [
+              automatic > 0 ? `今日自动分配 ${automatic} ${unit}` : "",
+              explicit > 0 ? `指定账号 ${explicit} ${unit}` : ""
+            ].filter(Boolean).join(" · ");
+            return h("div", {
+              className: "routing-comparison-item is-unavailable is-compact",
+              key
+            }, [
+              h("strong", { className: "routing-comparison-label", key: "label" }, label),
+              h("span", { className: "routing-comparison-compact-reason", key: "reason" }, `不参与 · ${reason}`),
+              historyText ? h("span", { className: "routing-comparison-compact-count", key: "history" }, historyText) : null
+            ].filter(Boolean));
+          }
           return h("div", {
-            className: `routing-comparison-item${available ? "" : " is-unavailable"}`,
+            className: "routing-comparison-item",
             key
           }, [
             h("div", { className: "routing-comparison-head", key: "head" }, [
@@ -7723,7 +7857,7 @@
               h("span", {
                 className: `routing-comparison-target${available ? "" : " is-unavailable"}`,
                 key: "target"
-              }, available ? `目标 ${targetPercent}%` : `不参与 · ${reason}`)
+              }, `目标 ${targetPercent}%`)
             ]),
             h("div", { className: "routing-comparison-measure", key: "measure" }, [
               h("div", { className: "routing-comparison-current", key: "current" }, [
@@ -7745,7 +7879,7 @@
                   percent: submittedPercent ?? 0,
                   showInfo: false,
                   size: ["100%", 8],
-                  strokeColor: available ? "#1677ff" : "#98a2b3",
+                  strokeColor: "#1677ff",
                   trailColor: "#e4e7ec",
                   strokeLinecap: "butt",
                   key: "progress"
@@ -8336,12 +8470,15 @@
         }, [tasks, taskListLoading, taskStatusFilter]);
 
         useEffect(() => {
-          if (numberValue(runtimeStatus?.running?.total) <= 0) return undefined;
+          const activeRuntimeCount = numberValue(runtimeStatus?.running?.total)
+            + numberValue(runtimeStatus?.queued?.total)
+            + numberValue(runtimeStatus?.waiting?.total);
+          if (activeRuntimeCount <= 0) return undefined;
           const timer = setInterval(() => {
             refreshRuntimeStatus().catch(() => {});
           }, 5000);
           return () => clearInterval(timer);
-        }, [runtimeStatus?.running?.total]);
+        }, [runtimeStatus?.running?.total, runtimeStatus?.queued?.total, runtimeStatus?.waiting?.total]);
 
         useEffect(() => {
           const hasActiveTask = tasks.some((item) => ["processing", "queued", "pending", "unknown", "waiting_upstream"].includes(item.status));
@@ -9774,6 +9911,22 @@
             ]);
           }
 
+          const allUnavailable = states.length > 0
+            && states.every((entry) => row.enabled === false || entry.state?.available !== true);
+          if (allUnavailable) {
+            const reasons = [...new Set(states.map((entry) => entry.state?.reason || "状态待确认"))];
+            return h("div", { className: "routing-overview routing-overview-compact" }, [
+              h("div", { className: "routing-overview-meta", key: "meta" },
+                h("span", { className: "routing-overview-weight" }, `分流权重 ${weight} 份`)
+              ),
+              h("div", { className: "routing-overview-status", key: "status" }, [
+                h("strong", { key: "unavailable" }, "不参与分流"),
+                h("span", { key: "reason" }, reasons.join(" · ")),
+                h("span", { key: "history" }, hasAutomaticRouting || hasExplicitRouting ? "今日有历史分流记录" : "今日无自动分流")
+              ])
+            ]);
+          }
+
           const items = states.map((entry) => routingComparisonItem(
             entry.label,
             entry.slot,
@@ -10328,6 +10481,12 @@
 
         function taskStatusSummaryCell(row) {
           const duration = taskDuration(row, nowTick);
+          const activeStage = String(row?.raw?.activeStage?.label || "").trim();
+          const stageText = String(row?.status || "") === "queued"
+            ? "等待空闲名额"
+            : ["processing", "pending", "unknown"].includes(String(row?.status || ""))
+              ? activeStage
+              : "";
           return h("div", { className: "task-status-summary" }, [
             h("div", { className: "task-status-tags", key: "tags" }, [
               taskStatusTag(row),
@@ -10337,8 +10496,11 @@
               className: "task-duration-value",
               key: "duration",
               title: `处理时间：${duration}`
-            }, duration)
-          ]);
+            }, duration),
+            stageText
+              ? h("span", { className: "task-active-stage", key: "stage" }, stageText)
+              : null
+          ].filter(Boolean));
         }
 
         function taskRouteSummaryCell(row) {
@@ -10537,9 +10699,9 @@
             ]),
             h("div", { className: "task-toolbar", key: "toolbar" }, [
               h("span", { className: "toolbar-note" }, isAll
-                ? "生图和对话任务合并显示；处理中和等待上游的记录会自动查询"
+                ? "生图和对话任务合并显示；排队中、处理中和等待上游的记录会自动更新"
                 : isChat
-                  ? "处理中会自动查询；长回复默认收起，不影响浏览其他记录"
+                  ? "排队中和处理中会自动更新；长回复默认收起，不影响浏览其他记录"
                   : "处理中和等待上游会自动查询；连续 30 分钟没有结果会停止查询，且不记为失败"),
               h(Button, { icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null, onClick: refreshProcessing, loading }, "刷新处理中")
             ]),
@@ -10594,7 +10756,7 @@
           return chatModelDefaults.find((item) => item.key === modelKey)?.name || String(modelKey || "").toUpperCase();
         }
 
-        function renderCapacityLane({ key, label, icon, capacity, waiting, color }) {
+        function renderCapacityLane({ key, label, icon, capacity, waiting, queued, color }) {
           const configured = numberValue(capacity?.configured);
           const available = numberValue(capacity?.available);
           const running = numberValue(capacity?.running);
@@ -10606,7 +10768,9 @@
                 h("span", { className: "capacity-lane-icon" }, icon),
                 label
               ]),
-              waiting > 0
+              queued > 0
+                ? h(Tag, { color: "blue" }, `排队 ${queued}`)
+                : waiting > 0
                 ? h(Tag, { color: "gold" }, `等待上游 ${waiting}`)
                 : h(Tag, { color: idle > 0 ? "green" : "default" }, idle > 0 ? `空闲 ${idle}` : "暂无空闲")
             ]),
@@ -10700,8 +10864,8 @@
                   ]),
                   h("div", { className: "capacity-subtitle" }, "可用数量只统计状态正常的账号；任务完成或停止后会自动释放名额")
                 ]),
-                h(Tooltip, { title: "达到可用并发上限后，新任务会立即返回繁忙，不进入处理列表。" },
-                  h(Tag, { color: "orange" }, "满载立即拒绝")
+                h(Tooltip, { title: "普通对话达到并发上限后会进入排队，空闲后自动继续；生图仍按各接口原有规则处理。" },
+                  h(Tag, { color: "blue" }, "对话满载排队")
                 )
               ]),
               h("div", { className: "capacity-grid" }, [
@@ -10713,6 +10877,7 @@
                         icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null,
                         capacity: drawingCapacity,
                         waiting: 0,
+                        queued: 0,
                         color: "#1677ff"
                       }),
                       ...runtimeModelEntries.flatMap(([modelKey, modelStatus]) => [
@@ -10722,6 +10887,7 @@
                           icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null,
                           capacity: modelStatus?.categories?.image,
                           waiting: numberValue(modelStatus?.waiting?.image),
+                          queued: numberValue(modelStatus?.queued?.image),
                           color: "#0f9f8f"
                         }),
                         renderCapacityLane({
@@ -10730,6 +10896,7 @@
                           icon: Icon.MessageOutlined ? h(Icon.MessageOutlined) : null,
                           capacity: modelStatus?.categories?.chat,
                           waiting: numberValue(modelStatus?.waiting?.chat),
+                          queued: numberValue(modelStatus?.queued?.chat),
                           color: "#7c3aed"
                         })
                       ])
@@ -10741,6 +10908,7 @@
                         icon: Icon.PictureOutlined ? h(Icon.PictureOutlined) : null,
                         capacity: imageCapacity,
                         waiting: numberValue(runtimeStatus?.waiting?.image),
+                        queued: numberValue(runtimeStatus?.queued?.image),
                         color: "#1677ff"
                       }),
                       renderCapacityLane({
@@ -10749,6 +10917,7 @@
                         icon: Icon.MessageOutlined ? h(Icon.MessageOutlined) : null,
                         capacity: chatCapacity,
                         waiting: numberValue(runtimeStatus?.waiting?.chat),
+                        queued: numberValue(runtimeStatus?.queued?.chat),
                         color: "#7c3aed"
                       })
                     ])

@@ -2328,8 +2328,28 @@ function createTaskStageRecorder(input = {}) {
   }
   const entries = [];
   const onStage = typeof input.onStage === "function" ? input.onStage : null;
+  const onStageStart = typeof input.onStageStart === "function" ? input.onStageStart : null;
   return {
     entries,
+    async start(entry) {
+      const active = {
+        id: entry.id || `stage-${randomUUID()}`,
+        key: String(entry.key || "").trim(),
+        label: String(entry.label || "").trim(),
+        status: "processing",
+        startedAt: entry.startedAt || new Date().toISOString(),
+        ...(entry.carId ? { carId: String(entry.carId) } : {}),
+        ...(entry.carType ? { carType: String(entry.carType) } : {})
+      };
+      if (onStageStart) {
+        try {
+          await onStageStart(active);
+        } catch (error) {
+          console.error("保存任务当前阶段失败：", error);
+        }
+      }
+      return active;
+    },
     async record(entry) {
       const saved = {
         id: entry.id || `stage-${randomUUID()}`,
@@ -2364,11 +2384,21 @@ async function measureTaskStage(recorder, stage, work) {
   if (!recorder) return work();
   const startedAt = new Date().toISOString();
   const started = performance.now();
+  const startingStage = typeof stage === "function" ? stage(null) : stage;
+  const stageId = startingStage?.id || `stage-${randomUUID()}`;
+  if (typeof recorder.start === "function") {
+    await recorder.start({
+      ...(startingStage || {}),
+      id: stageId,
+      startedAt
+    });
+  }
   try {
     const result = await work();
     const completedStage = typeof stage === "function" ? stage(result) : stage;
     await recorder.record({
       ...completedStage,
+      id: completedStage?.id || stageId,
       status: "success",
       startedAt,
       finishedAt: new Date().toISOString(),
@@ -2379,6 +2409,7 @@ async function measureTaskStage(recorder, stage, work) {
     const failedStage = typeof stage === "function" ? stage(null) : stage;
     await recorder.record({
       ...failedStage,
+      id: failedStage?.id || stageId,
       status: "failed",
       message: error?.message || "处理失败",
       startedAt,
@@ -3137,7 +3168,7 @@ export class ChatplusClient {
     const carType = String(selected.carType || "chatgpt").trim();
     const key = `${carType}:${carId}`;
     const previous = this.conversationSubmitWorks.get(key) || Promise.resolve();
-    const current = previous.catch(() => {}).then(async () => {
+    const start = previous.catch(() => {}).then(async () => {
       if (isBadCar(this.account?.id, carType, carId)) {
         const error = new Error(`车位 ${carId} 正在临时冻结，已切换其他车位。`);
         error.code = "IMAGE_CAR_COOLDOWN";
@@ -3158,14 +3189,14 @@ export class ChatplusClient {
       }
 
       this.conversationSubmitStartedAt.set(key, Date.now());
-      return work();
     });
-    this.conversationSubmitWorks.set(key, current);
+    this.conversationSubmitWorks.set(key, start);
     try {
-      return await current;
+      await start;
     } finally {
-      if (this.conversationSubmitWorks.get(key) === current) this.conversationSubmitWorks.delete(key);
+      if (this.conversationSubmitWorks.get(key) === start) this.conversationSubmitWorks.delete(key);
     }
+    return work();
   }
 
   chatRouteForInput(input = {}) {
@@ -4539,12 +4570,12 @@ export class ChatplusClient {
             });
         }
 
-        const submission = await measureTaskStage(requestInput.taskStageRecorder, {
+        const submission = await this.runConversationSubmit(selected, async () => measureTaskStage(requestInput.taskStageRecorder, {
           key: "upstream_generation",
           label: "等待上游处理",
           carId: selected?.carId,
           carType: selected?.carType
-        }, async () => this.runConversationSubmit(selected, async () => {
+        }, async () => {
           if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.started = true;
           const response = await runSubmitStep(() => submitClient.http("/backend-api/conversation", {
             method: "POST",
@@ -5376,11 +5407,7 @@ export class ChatplusClient {
 
     const taskStageRecorder = createTaskStageRecorder(input);
     const trackedInput = { ...input, taskStageRecorder };
-    const modelKey = this.chatRouteForInput({
-      ...trackedInput,
-      preferImageCar: files.length > 0
-    }).key;
-    return this.runAccountWork(async () => {
+    return this.runTaskWork(trackedInput, async () => {
       let conversationToDelete = null;
       try {
         const result = await this.withImageQuotaFallback(prompt, { ...trackedInput, files, preferImageCar: files.length > 0 }, async (conversation) => {
@@ -5427,6 +5454,6 @@ export class ChatplusClient {
           }
         }
       }
-    }, modelKey);
+    });
   }
 }

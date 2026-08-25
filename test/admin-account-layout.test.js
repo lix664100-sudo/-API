@@ -61,10 +61,10 @@ test("账号卡片仅在有冻结车位时显示一行提醒", () => {
   assert.doesNotMatch(adminHtml, /h\("details", \{ className: "account-freeze-details"/);
 });
 
-test("账号卡片在宽屏自动多列排列并使用完整可用宽度", () => {
+test("账号卡片在宽屏保持稳定宽度，不因账号少而撑满整行", () => {
   assert.match(adminHtml, /className: `content\$\{activePage === "accounts" \? " is-accounts-page" : ""\}`/);
   assert.match(adminHtml, /\.content\.is-accounts-page \{[\s\S]*?width: calc\(100% - 32px\);[\s\S]*?max-width: none;/);
-  assert.match(adminHtml, /\.account-list \{[\s\S]*?grid-template-columns: repeat\(auto-fit, minmax\(420px, 1fr\)\);/);
+  assert.match(adminHtml, /\.account-list \{[\s\S]*?grid-template-columns: repeat\(auto-fill, minmax\(420px, 520px\)\);[\s\S]*?justify-content: start;/);
 });
 
 test("账号概览按可用、业务暂停、真正异常和停用分层", () => {
@@ -98,6 +98,8 @@ test("套餐、分流和并发默认可见并提供分流进度", () => {
   assert.match(adminHtml, /"今日分流"/);
   assert.match(adminHtml, /h\(Progress, \{/);
   assert.match(adminHtml, /className: "routing-target-marker"/);
+  assert.match(adminHtml, /className: "routing-comparison-item is-unavailable is-compact"/);
+  assert.match(adminHtml, /"不参与分流"/);
   assert.match(adminHtml, /accountCardSection\("并发上限"/);
   assert.doesNotMatch(adminHtml, /className: "account-card-details"/);
 });

@@ -1212,6 +1212,88 @@ test("普通对话会返回各处理阶段的耗时明细", async () => {
   }]);
 });
 
+test("普通对话开始上游请求时会立即报告当前阶段", async () => {
+  const testClient = client();
+  const startedStages = [];
+  testClient.prepareChatSession = async (input, ignoredCarIds) => {
+    ignoredCarIds.add("live-stage-car");
+    return {
+      route: testClient.chatRouteForInput(input),
+      selected: { carId: "live-stage-car", carType: "gemini" },
+      init: {}
+    };
+  };
+  testClient.geminiSession.bl = "boq_assistant-bard-web-server_test";
+  testClient.uploadGeminiImages = async () => [];
+  testClient.http = async () => ({
+    status: 200,
+    headers: {},
+    body: geminiResponse({ text: "阶段报告成功" })
+  });
+
+  const result = await testClient.createChatCompletion({
+    model: "gemini",
+    messages: [{ role: "user", content: "请报告当前阶段。" }],
+    onStageStart: async (stage) => startedStages.push(stage)
+  });
+
+  const upstreamStage = startedStages.find((stage) => stage.key === "upstream_generation");
+  assert.equal(result.content, "阶段报告成功");
+  assert.equal(upstreamStage?.status, "processing");
+  assert.equal(upstreamStage?.label, "等待上游处理");
+  assert.equal(upstreamStage?.carId, "live-stage-car");
+  assert.ok(upstreamStage?.id);
+});
+
+test("普通对话开启并发提交时不会被账号内部再次排队", async () => {
+  const testClient = client();
+  let active = 0;
+  let maxActive = 0;
+  let releaseActive;
+  let reportBothStarted;
+  let requestIndex = 0;
+  const bothStarted = new Promise((resolve) => { reportBothStarted = resolve; });
+  const holdActive = new Promise((resolve) => { releaseActive = resolve; });
+  testClient.withImageQuotaFallback = async (_prompt, _input, work) => {
+    requestIndex += 1;
+    const currentIndex = requestIndex;
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    if (active === 2) reportBothStarted();
+    try {
+      await holdActive;
+      return work({
+        events: [],
+        conversationId: `conversation-inner-parallel-${currentIndex}`,
+        model: "gemini",
+        upstreamModel: "gemini-3.1-pro",
+        route: { key: "gemini" },
+        selected: { carId: "inner-parallel-car", carType: "gemini" },
+        directContent: `并发回复 ${currentIndex}`,
+        imageUrls: []
+      });
+    } finally {
+      active -= 1;
+    }
+  };
+
+  const requests = [1, 2].map((index) => testClient.createChatCompletion({
+    model: "gemini",
+    concurrentSubmit: true,
+    messages: [{ role: "user", content: `内部并发 ${index}` }]
+  }));
+  const overlapped = await Promise.race([
+    bothStarted.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 300))
+  ]);
+  releaseActive();
+  const results = await Promise.all(requests);
+
+  assert.equal(overlapped, true);
+  assert.equal(maxActive, 2);
+  assert.equal(results.length, 2);
+});
+
 test("连续两个车位都没有创建对话时任务失败并保存两个车位", async () => {
   const testClient = client();
   const selectedCars = [];

@@ -21,6 +21,15 @@ const quotaPairText = vm.runInNewContext(
   { valueText: (value) => String(value) }
 );
 
+const quotaMetricFunctionMatch = adminHtml.match(
+  /function quotaMetricDetails\(value, protectionActive = false\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function aggregateChatReferenceUsage/
+);
+
+assert.ok(quotaMetricFunctionMatch, "管理后台中应存在醒目的剩余额度显示方法");
+
+const quotaMetricDetails = vm.runInNewContext(`(${quotaMetricFunctionMatch[0]
+  .replace(/\r?\n\r?\n      function aggregateChatReferenceUsage$/, "")})`);
+
 const remainingTimeFunctionMatch = adminHtml.match(
   /function formatRemainingTime\(value, now = Date\.now\(\)\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function quotaResetTimeText/
 );
@@ -263,6 +272,25 @@ function shareAIAccount({ enabled = true, referenceUsage = {} } = {}) {
 test("额度数字统一按剩余额度除以总额度显示", () => {
   assert.equal(quotaPairText(100, 0), "0/100");
   assert.equal(quotaPairText(70, 1), "1/70");
+});
+
+test("剩余额度突出显示数字、比例和低额度状态", () => {
+  assert.deepEqual(structuredClone(quotaMetricDetails("142/220")), {
+    known: true,
+    remaining: "142",
+    total: "220",
+    percent: 65,
+    tone: "normal"
+  });
+  assert.equal(quotaMetricDetails("8/100").tone, "low");
+  assert.equal(quotaMetricDetails("8/100", true).tone, "critical");
+  assert.deepEqual(structuredClone(quotaMetricDetails("额度未获取")), {
+    known: false,
+    text: "额度未获取",
+    tone: "normal"
+  });
+  assert.match(adminHtml, /className: "quota-meter"/);
+  assert.match(adminHtml, /className: "quota-meter-fill"/);
 });
 
 test("渠道额度会汇总所有启用账号的同一模型", () => {

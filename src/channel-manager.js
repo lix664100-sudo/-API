@@ -546,6 +546,11 @@ export async function getRuntimeStatus() {
     chat: tasks.filter((task) => task.status === "waiting_upstream" && task.taskType === "chat").length
   };
   waiting.total = waiting.image + waiting.chat;
+  const queued = {
+    image: tasks.filter((task) => task.status === "queued" && task.taskType !== "chat").length,
+    chat: tasks.filter((task) => task.status === "queued" && task.taskType === "chat").length
+  };
+  queued.total = queued.image + queued.chat;
   for (const [modelKey, modelStatus] of Object.entries(models)) {
     modelStatus.waiting = {
       image: tasks.filter((task) =>
@@ -555,6 +560,19 @@ export async function getRuntimeStatus() {
       ).length,
       chat: tasks.filter((task) =>
         task.status === "waiting_upstream"
+        && task.taskType === "chat"
+        && task.channelType === "chatplus"
+        && storedTaskModelKey(task) === modelKey
+      ).length
+    };
+    modelStatus.queued = {
+      image: tasks.filter((task) =>
+        task.status === "queued"
+        && task.taskType !== "chat"
+        && storedTaskModelKey(task) === modelKey
+      ).length,
+      chat: tasks.filter((task) =>
+        task.status === "queued"
         && task.taskType === "chat"
         && task.channelType === "chatplus"
         && storedTaskModelKey(task) === modelKey
@@ -576,6 +594,7 @@ export async function getRuntimeStatus() {
     },
     models,
     waiting,
+    queued,
     routing: runtimeRoutingStatus(config, routingUsage)
   };
 }
@@ -1979,6 +1998,12 @@ function mergeTaskRaw(current = {}, incoming = {}) {
   };
 }
 
+function clearActiveTaskStage(raw = {}) {
+  const nextRaw = { ...(raw || {}) };
+  delete nextRaw.activeStage;
+  return nextRaw;
+}
+
 function completedTaskStage(key, label, startedAtMs, status = "success", error = null) {
   return {
     id: `stage-${randomUUID()}`,
@@ -1993,9 +2018,35 @@ function completedTaskStage(key, label, startedAtMs, status = "success", error =
 }
 
 async function persistTaskStage(task, stage) {
+  const raw = mergeTaskRaw(task.raw, { stageTimings: [stage] });
+  if (
+    raw.activeStage
+    && (
+      (stage?.id && raw.activeStage.id === stage.id)
+      || (!stage?.id && stage?.key && raw.activeStage.key === stage.key)
+    )
+  ) {
+    delete raw.activeStage;
+  }
   const nextTask = {
     ...task,
-    raw: mergeTaskRaw(task.raw, { stageTimings: [stage] })
+    raw
+  };
+  await upsertTask(nextTask);
+  return nextTask;
+}
+
+async function persistTaskStageStart(task, stage, channel, account) {
+  const startedTask = stage?.key === "upstream_generation"
+    ? markTaskSubmissionAttempt(task, channel, account)
+    : task;
+  const nextTask = {
+    ...startedTask,
+    raw: mergeTaskRaw(startedTask.raw, {
+      activeStage: stage,
+      ...(stage?.carId ? { selectedCarId: stage.carId } : {}),
+      ...(stage?.carType ? { selectedCarType: stage.carType } : {})
+    })
   };
   await upsertTask(nextTask);
   return nextTask;
@@ -4679,7 +4730,9 @@ async function failQueuedTask(task, error, attempts = [], stageTimings = []) {
       attempts: taskResponseJson(attempts)
     },
     completedAt: new Date().toISOString(),
-    raw: mergeTaskRaw(task.raw, {
+    raw: clearActiveTaskStage(mergeTaskRaw(task.raw, {
+      queued: false,
+      waitingForSlot: false,
       ...(error?.upstreamModel ? { upstreamModel: error.upstreamModel } : {}),
       ...(error?.selectedCarId ? { selectedCarId: error.selectedCarId } : {}),
       ...(error?.selectedCarType ? { selectedCarType: error.selectedCarType } : {}),
@@ -4692,7 +4745,7 @@ async function failQueuedTask(task, error, attempts = [], stageTimings = []) {
         error?.stageTimings,
         error?.taskStageTiming ? [error.taskStageTiming] : []
       )
-    })
+    }))
   };
   await upsertTask(failedTask);
   await recordTaskStat(failedTask);
@@ -4710,7 +4763,9 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
     submissionChannels: mergeTaskRoutes(task.submissionChannels, wrapped.submissionChannels),
     generationChannels: mergeTaskRoutes(task.generationChannels, wrapped.generationChannels),
     completedAt: isFinishedTask(status) ? task.completedAt || new Date().toISOString() : null,
-    raw: mergeTaskRaw(task.raw, wrapped.raw)
+    raw: isFinishedTask(status)
+      ? clearActiveTaskStage(mergeTaskRaw(task.raw, { queued: false, waitingForSlot: false }, wrapped.raw))
+      : mergeTaskRaw(task.raw, wrapped.raw)
   };
   if (!isFinishedTask(status) && task.raw?.submitted === true && savedTaskExternalId(nextTask)) {
     nextTask.raw = {
@@ -5169,15 +5224,16 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
 
 async function finishChatTask(task, result, channel, account, attempts, responseJson = null, stageTimings = []) {
   const route = taskRouteEntry(channel, account);
+  const submittedTask = result.externalId ? markTaskSubmissionAttempt(task, channel, account) : task;
   const nextTask = {
-    ...task,
-    externalId: result.externalId || task.externalId,
+    ...submittedTask,
+    externalId: result.externalId || submittedTask.externalId,
     status: "success",
     taskType: "chat",
-    modelId: result.model || task.modelId || "",
-    imageCount: result.raw?.imageCount ?? task.imageCount ?? 0,
-    imageUrls: result.imageUrls || task.imageUrls || [],
-    inputImageUrls: task.inputImageUrls || [],
+    modelId: result.model || submittedTask.modelId || "",
+    imageCount: result.raw?.imageCount ?? submittedTask.imageCount ?? 0,
+    imageUrls: result.imageUrls || submittedTask.imageUrls || [],
+    inputImageUrls: submittedTask.inputImageUrls || [],
     responseText: result.content || "",
     errorMessage: "",
     channelId: channel.id,
@@ -5186,15 +5242,19 @@ async function finishChatTask(task, result, channel, account, attempts, response
     accountId: account.id,
     accountName: account.name,
     submissionChannels: mergeTaskRoutes(
-      task.submissionChannels,
+      submittedTask.submissionChannels,
       result.externalId ? [route] : []
     ),
-    generationChannels: mergeTaskRoutes(task.generationChannels),
+    generationChannels: mergeTaskRoutes(submittedTask.generationChannels),
     network: taskNetworkMeta(account),
     attempts,
     responseJson: responseJson || chatCompletionResponseJson({ result, channel }),
     completedAt: new Date().toISOString(),
-    raw: mergeTaskRaw({ stageTimings }, result.raw || result)
+    raw: clearActiveTaskStage(mergeTaskRaw(
+      submittedTask.raw,
+      { queued: false, waitingForSlot: false, stageTimings },
+      result.raw || result
+    ))
   };
   await upsertTask(nextTask);
   await recordTaskStat(nextTask);
@@ -5202,7 +5262,7 @@ async function finishChatTask(task, result, channel, account, attempts, response
   return nextTask;
 }
 
-async function runChatCompletionTask(task, input, reserved = null) {
+async function runChatCompletionTask(task, input, reserved = null, options = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = requestedAccountIdForInput(input);
@@ -5210,28 +5270,40 @@ async function runChatCompletionTask(task, input, reserved = null) {
     accountId: strictAccountIdForInput(input),
     input
   });
+  let taskReservation = reserved;
+  let latestTask = task;
+  if (!targets.length) {
+    taskReservation?.release?.();
+    const error = noChatTargetsError(config, requestedChannel);
+    error.task = await failQueuedTask(latestTask, error, taskReservation?.attempts || []);
+    throw error;
+  }
+  if (!taskReservation && options.waitForSlot === true) {
+    try {
+      taskReservation = await waitForFirstAvailableTarget(targets, "chat", { input });
+      latestTask = await startQueuedTask(latestTask, taskReservation.target, taskReservation.queueWaitMs);
+    } catch (error) {
+      error.task = await failQueuedTask(latestTask, error, error?.attempts || []);
+      throw error;
+    }
+  }
   const preferredTarget = requestedAccountId
     ? targets.find((target) => target.account.id === requestedAccountId)
-    : targets.find((target) => target.account.id === task.accountId && target.channel.id === task.channelId);
-  const orderedChatTargets = reserved?.target
-    ? orderedTargets(targets, reserved)
+    : targets.find((target) => target.account.id === latestTask.accountId && target.channel.id === latestTask.channelId);
+  const orderedChatTargets = taskReservation?.target
+    ? orderedTargets(targets, taskReservation)
     : preferredTarget
       ? [preferredTarget, ...targets.filter((target) => !sameTarget(target, preferredTarget))]
       : targets;
-  const attempts = [...(reserved?.attempts || [])];
+  const attempts = [...(taskReservation?.attempts || [])];
   let chatStageTimings = [];
-  if (!targets.length) {
-    reserved?.release?.();
-    const error = noChatTargetsError(config, requestedChannel);
-    error.task = await failQueuedTask(task, error, attempts);
-    throw error;
-  }
-  let reservedRelease = reserved?.release || null;
+  let reservedRelease = taskReservation?.release || null;
   try {
     for (const target of orderedChatTargets) {
       const { channel, account } = target;
+      let taskState = latestTask;
       let release = null;
-      if (reservedRelease && sameTarget(target, reserved?.target)) {
+      if (reservedRelease && sameTarget(target, taskReservation?.target)) {
         release = reservedRelease;
         reservedRelease = null;
       } else {
@@ -5248,23 +5320,38 @@ async function runChatCompletionTask(task, input, reserved = null) {
           if (typeof client.createChatCompletion !== "function") {
             throw new Error("这个渠道暂不支持对话。");
           }
-          const upstreamResult = await client.createChatCompletion(input);
+          const onStageStart = async (stage) => {
+            taskState = await persistTaskStageStart(taskState, stage, channel, account);
+            latestTask = taskState;
+          };
+          const onStage = async (stage) => {
+            taskState = await persistTaskStage(taskState, stage);
+            latestTask = taskState;
+          };
+          const upstreamResult = await client.createChatCompletion({
+            ...input,
+            onStageStart,
+            onStage,
+            ...(channel.type === "chatplus" ? { concurrentSubmit: true } : {})
+          });
           chatStageTimings = mergeTaskStageTimings(chatStageTimings, upstreamResult?.raw?.stageTimings);
           const result = await mirrorTaskImages({
             ...upstreamResult,
             usage: upstreamResult.usage || estimateChatTokenUsage(input, upstreamResult.content)
           }, config, client);
           const responseJson = chatCompletionResponseJson({ result, channel });
-          const finishedTask = await finishChatTask(task, result, channel, account, attempts, responseJson, chatStageTimings);
+          const finishedTask = await finishChatTask(taskState, result, channel, account, attempts, responseJson, chatStageTimings);
           return { result, channel, account, task: finishedTask, responseJson };
         }, {
           taskType: "chat",
+          parallel: channel.type === "chatplus",
           modelKey: targetChatModelKey(target, input),
           quotaProbe: targetConfirmedQuotaBlocksTask(target, "chat", input)
             && targetConfirmedQuotaRetryDue(target, input)
         });
         if (finished) return finished;
       } catch (error) {
+        latestTask = taskState;
         chatStageTimings = mergeTaskStageTimings(chatStageTimings, error?.stageTimings);
         const status = Number(error.status || error.statusCode || 0);
         attempts.push({
@@ -5291,11 +5378,11 @@ async function runChatCompletionTask(task, input, reserved = null) {
           }));
         }
         if (error?.code === "UPSTREAM_CONVERSATION_NOT_CREATED") {
-          error.task = await failQueuedTask(task, error, attempts, chatStageTimings);
+          error.task = await failQueuedTask(taskState, error, attempts, chatStageTimings);
           throw error;
         }
         if (status === 400 && !isChatBlockedError(error)) {
-          error.task = await failQueuedTask(task, error, attempts, chatStageTimings);
+          error.task = await failQueuedTask(taskState, error, attempts, chatStageTimings);
           throw error;
         }
       } finally {
@@ -5307,7 +5394,7 @@ async function runChatCompletionTask(task, input, reserved = null) {
   }
 
   const error = new Error(readableChatFailure(attempts));
-  error.task = await failQueuedTask(task, error, attempts, chatStageTimings);
+  error.task = await failQueuedTask(latestTask, error, attempts, chatStageTimings);
   throw error;
 }
 
@@ -5432,8 +5519,12 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
     });
   }
 
-  const reserved = await reserveFirstAvailableTarget(targets, "chat", { input });
-  const target = reserved.target;
+  const reserved = await tryReserveFirstAvailableTarget(targets, "chat", { input });
+  const ordered = reserved?.orderedTargets?.length
+    ? reserved.orderedTargets
+    : await orderTargetsByRoutingUsage(targets, "chat", input);
+  const target = reserved?.target || ordered[0] || targets[0];
+  const waitingForSlot = !reserved;
   const task = queuedTask({
     input,
     target,
@@ -5441,9 +5532,9 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
     prompt: cleanChatPrompt(input),
     imageCount: chatImageCount(input),
     inputImageUrls: taskInputPreviewUrls(input, taskOptions.inputImageUrls),
-    raw: { endpoint: "/v1/chat/completions" },
+    raw: { endpoint: "/v1/chat/completions", waitingForSlot },
     requestMeta,
-    status: "processing"
+    status: waitingForSlot ? "queued" : "processing"
   });
   try {
     await upsertTask(task);
@@ -5454,10 +5545,10 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
   scheduledChatTasks.add(task.id);
   runInBackground(async () => {
     try {
-      await runChatCompletionTask(task, input, reserved);
+      await runChatCompletionTask(task, input, reserved, { waitForSlot: waitingForSlot });
     } finally {
       scheduledChatTasks.delete(task.id);
-      reserved.release();
+      reserved?.release();
     }
   });
   return task;
@@ -6063,28 +6154,36 @@ export async function createChatCompletion(input = {}, requestMeta = {}, taskOpt
     });
   }
 
-  const reserved = await reserveFirstAvailableTarget(targets, "chat", { input });
+  const reserved = await tryReserveFirstAvailableTarget(targets, "chat", { input });
+  const ordered = reserved?.orderedTargets?.length
+    ? reserved.orderedTargets
+    : await orderTargetsByRoutingUsage(targets, "chat", input);
+  const target = reserved?.target || ordered[0] || targets[0];
+  const waitingForSlot = !reserved;
+  const task = queuedTask({
+    input,
+    target,
+    taskType: "chat",
+    prompt: cleanChatPrompt(input),
+    imageCount: chatImageCount(input),
+    inputImageUrls: taskInputPreviewUrls(input, taskOptions.inputImageUrls),
+    raw: { endpoint: "/v1/chat/completions", waitingForSlot },
+    requestMeta,
+    status: waitingForSlot ? "queued" : "processing"
+  });
   try {
-    const task = queuedTask({
-      input,
-      target: reserved.target,
-      taskType: "chat",
-      prompt: cleanChatPrompt(input),
-      imageCount: chatImageCount(input),
-      inputImageUrls: taskInputPreviewUrls(input, taskOptions.inputImageUrls),
-      raw: { endpoint: "/v1/chat/completions" },
-      requestMeta
-    });
     await upsertTask(task);
-    scheduledChatTasks.add(task.id);
-    try {
-      const result = await runChatCompletionTask(task, input, reserved);
-      return chatCompletionResponse(result);
-    } finally {
-      scheduledChatTasks.delete(task.id);
-    }
+  } catch (error) {
+    reserved?.release();
+    throw error;
+  }
+  scheduledChatTasks.add(task.id);
+  try {
+    const result = await runChatCompletionTask(task, input, reserved, { waitForSlot: waitingForSlot });
+    return chatCompletionResponse(result);
   } finally {
-    reserved.release();
+    scheduledChatTasks.delete(task.id);
+    reserved?.release();
   }
 }
 export async function createTextTask(input = {}, wait = false, requestMeta = {}) {
