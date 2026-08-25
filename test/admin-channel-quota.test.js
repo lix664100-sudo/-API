@@ -638,7 +638,7 @@ test("账号额度时间会显示核验失败和套餐过期", () => {
 });
 
 test("账号信息块显示额度重置时间", () => {
-  assert.match(adminHtml, /accountCardField\("额度重置"/);
+  assert.match(adminHtml, /accountCardSection\("额度刷新"/);
   assert.match(adminHtml, /accountQuotaResetCell\(/);
   assert.match(adminHtml, /h\(Tag, \{/);
   assert.match(adminHtml, /className: `quota-reset-tag/);

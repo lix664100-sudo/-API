@@ -706,10 +706,6 @@
         border-top-color: #f04438;
       }
 
-      .account-card.is-warning {
-        border-top-color: #f79009;
-      }
-
       .account-card.is-muted,
       .account-card.is-disabled {
         border-top-color: #98a2b3;
@@ -759,12 +755,6 @@
         color: #b42318;
       }
 
-      .account-card-health.is-warning {
-        border-color: #fedf89;
-        background: #fffaeb;
-        color: #b54708;
-      }
-
       .account-card-health.is-muted {
         border-color: #e4e7ec;
         background: #f9fafb;
@@ -789,8 +779,9 @@
       }
 
       .account-card-health-copy strong {
-        font-size: 13px;
-        font-weight: 760;
+        font-size: 17px;
+        font-weight: 780;
+        line-height: 1.25;
       }
 
       .account-card-health-copy span {
@@ -826,6 +817,10 @@
 
       .account-card-primary .account-card-section {
         background: #fff;
+      }
+
+      .account-card-primary .account-card-section:last-child {
+        grid-column: 1 / -1;
       }
 
       .account-card-details {
@@ -886,8 +881,7 @@
         grid-column: 1 / -1;
       }
 
-      .account-card-label,
-      .account-card-field-label {
+      .account-card-label {
         color: #475467;
         font-size: 12px;
         font-weight: 680;
@@ -900,18 +894,6 @@
         color: #344054;
         font-size: 13px;
         line-height: 1.55;
-      }
-
-      .account-card-fields {
-        display: grid;
-        gap: 10px;
-        min-width: 0;
-      }
-
-      .account-card-field {
-        display: grid;
-        gap: 5px;
-        min-width: 0;
       }
 
       .account-card-footer {
@@ -1570,100 +1552,6 @@
         color: #667085;
         font-size: 11px;
         font-weight: 400;
-      }
-
-      .account-status {
-        display: grid;
-        gap: 6px;
-        min-width: 0;
-      }
-
-      .account-status-tags {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 6px;
-      }
-
-      .account-status-tags .ant-tag {
-        margin-inline-end: 0;
-      }
-
-      .account-status-time {
-        color: #667085;
-        font-size: 12px;
-        line-height: 1.4;
-        white-space: nowrap;
-      }
-
-      .account-car-freezes {
-        display: grid;
-        gap: 7px;
-        min-width: 0;
-        margin-top: 2px;
-        padding: 9px 10px;
-        border-radius: 6px;
-        background: #fffaeb;
-      }
-
-      .account-car-freeze {
-        color: #7a2e0e;
-        font-size: 12px;
-        line-height: 1.5;
-        overflow-wrap: anywhere;
-      }
-
-      .account-car-freeze strong {
-        color: #7a2e0e;
-        font-weight: 680;
-      }
-
-      .account-car-freeze.is-preview {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-
-      .account-freeze-details {
-        min-width: 0;
-      }
-
-      .account-freeze-details summary {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        color: #175cd3;
-        cursor: pointer;
-        font-size: 12px;
-        font-weight: 650;
-        list-style: none;
-        user-select: none;
-      }
-
-      .account-freeze-details summary::-webkit-details-marker {
-        display: none;
-      }
-
-      .account-freeze-details summary:focus-visible {
-        border-radius: 4px;
-        outline: 2px solid rgba(22, 119, 255, 0.4);
-        outline-offset: 2px;
-      }
-
-      .account-freeze-chevron {
-        display: inline-flex;
-        transition: transform 180ms cubic-bezier(0.23, 1, 0.32, 1);
-      }
-
-      .account-freeze-details[open] .account-freeze-chevron {
-        transform: rotate(180deg);
-      }
-
-      .account-freeze-list {
-        display: grid;
-        gap: 6px;
-        margin-top: 8px;
-        padding-top: 8px;
-        border-top: 1px solid #fde68a;
       }
 
       .routing-weight-control {
@@ -2904,6 +2792,10 @@
           grid-column: auto;
         }
 
+        .account-card-primary .account-card-section:last-child {
+          grid-column: auto;
+        }
+
         .account-card-details-body .account-card-section + .account-card-section,
         .account-card-primary .account-card-section + .account-card-section {
           border-top: 1px solid var(--line);
@@ -2981,7 +2873,6 @@
 
       @media (prefers-reduced-motion: reduce) {
         .page-surface,
-        .account-freeze-chevron,
         .account-card-details-chevron {
           animation: none;
           transition: none;
@@ -4329,52 +4220,6 @@
         return account?.meta?.abilities?.[key] || {};
       }
 
-      function conversationBusyFreezeText(value) {
-        return /对话过快|当前有多个任务执行中|已有任务(?:正在)?(?:执行|处理)|多个任务(?:正在)?(?:执行|处理)/
-          .test(String(value || ""));
-      }
-
-      function accountCarFreezes(account, channel, now = Date.now()) {
-        const stored = channel?.type === "shareai"
-          ? abilityStatus(account, "chatplus")?.meta?.imageCarCooldowns
-          : account?.meta?.chatplusImageCarCooldowns;
-        const currentTime = Number.isFinite(Number(now)) ? Number(now) : Date.now();
-        return Object.values(stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {})
-          .map((item) => {
-            const originalUntil = Date.parse(item?.cooldownUntil || "");
-            const legacyBusyFreeze = item?.reason === "conversation_not_created"
-              && conversationBusyFreezeText(item?.message);
-            const updatedAt = Date.parse(item?.updatedAt || "");
-            const correctedUntil = legacyBusyFreeze && Number.isFinite(originalUntil)
-              ? Math.min(originalUntil, Number.isFinite(updatedAt) ? updatedAt + 30_000 : currentTime)
-              : originalUntil;
-            return { ...(item || {}), cooldownUntil: correctedUntil };
-          })
-          .filter((item) => String(item.carId || "").trim() && Number.isFinite(item.cooldownUntil) && item.cooldownUntil > currentTime)
-          .sort((left, right) => left.cooldownUntil - right.cooldownUntil);
-      }
-
-      function carFreezeReason(cooldown = {}) {
-        if (cooldown.reason === "conversation_busy" || conversationBusyFreezeText(cooldown.message)) {
-          return "上游提示对话过快或已有任务正在处理";
-        }
-        const reasons = {
-          conversation_not_created: "上游没有创建对话",
-          image_quota: "该车位生图额度已用完",
-          image_failure: "该车位生图失败，等待自动复查",
-          car_auth: "该车位登录状态异常",
-          car_plan_mismatch: "当前账号不能使用该车位套餐",
-          subscription_missing: "该车位没有可用套餐",
-          subscription_expired: "该车位套餐已到期"
-        };
-        return reasons[cooldown.reason] || "该车位暂时不可用";
-      }
-
-      function carTypeName(carType) {
-        const names = { chatgpt: "GPT", gemini: "Gemini", grok: "Grok" };
-        return names[String(carType || "chatgpt").toLowerCase()] || "聊天";
-      }
-
       function quotaProtectionSettings(value = {}) {
         const percent = (input, fallback) => {
           const number = Math.round(Number(input));
@@ -4422,17 +4267,6 @@
             });
         }
         return items;
-      }
-
-      function quotaProtectionThresholdText(account, channel) {
-        const items = accountQuotaProtectionItems(account, channel);
-        if (!items.length) return "";
-        return `保护线：${items.map((item) => `${item.label} ${item.state.thresholdPercent}%`).join("｜")}`;
-      }
-
-      function quotaProtectionTooltip(item) {
-        const remaining = item.state.known ? `${item.state.remainingPercent}%` : "暂未获取";
-        return `${item.label}剩余 ${remaining}，保护线 ${item.state.thresholdPercent}%。达到保护线后仅暂停该项额度，其他可用能力不受影响。`;
       }
 
       function quotaPairText(quota, balance) {
@@ -4680,16 +4514,6 @@
           ? { marginInlineEnd: 0, borderColor: "#fde68a", background: "#fffbeb", color: "#78350f" }
           : { marginInlineEnd: 0 };
         return h(Tag, { color, style }, text);
-      }
-
-      function labeledStatusTag(key, label, status) {
-        const [color, text] = statusInfo(status);
-        const content = status === "subscription_expired"
-          ? `${label} 套餐已过期`
-          : /^[A-Za-z]/.test(label)
-            ? `${label} ${text}`
-            : `${label}${text}`;
-        return h(Tag, { key, color }, content);
       }
 
       function pipeProxyExpireText(value) {
@@ -6791,12 +6615,6 @@
           return Number.isFinite(until) && until > Date.now();
         }
 
-        function drawingCooldownText(account) {
-          const status = drawingCooldownStatus(account);
-          const ms = Math.max(0, Date.parse(status?.cooldownUntil || "") - Date.now());
-          return `${Math.max(1, Math.ceil(ms / 60000))} 分钟`;
-        }
-
         const matchingChatAccounts = useMemo(() => {
           const chatIds = new Set(chatChannels.map((item) => item.id));
           return accounts.filter((account) => {
@@ -6825,10 +6643,52 @@
           return accountCheckDisplayStatus(account, channel) || accountEffectiveStatus(account, channel);
         }
 
-        function accountStatusGroup(account) {
-          if (account.enabled === false) return "disabled";
+        function accountAvailabilityInfo(account) {
+          const channel = channels.find((item) => item.id === account.channelId);
+          if (account.enabled === false) {
+            return { state: "disabled", reasons: ["账号已停用"] };
+          }
+
+          const reasons = [];
+          const addReason = (text) => {
+            if (text && !reasons.includes(text)) reasons.push(text);
+          };
+          if (!channel) addReason("所属渠道已移除");
+          else if (channel.enabled === false) addReason("渠道已停用");
+
           const status = accountDisplayStatus(account);
-          return status === "ok" && !drawingAccountIsCooling(account) ? "ok" : "attention";
+          const statusReasons = {
+            disconnected: "线路掉线，正在自动换线",
+            error: "账号异常",
+            failed: "账号异常",
+            subscription_expired: "套餐已过期",
+            subscription_missing: "未订阅",
+            quota_empty: "额度不足",
+            check_timeout: "检测超时",
+            activation_required: "账号未激活",
+            unknown: "尚未检测"
+          };
+          if (status !== "ok") addReason(statusReasons[status] || statusInfo(status)[1]);
+
+          if (account.proxyUrl) {
+            const proxyCheck = account?.meta?.proxyCheck || {};
+            if (isPipeProxyExpired(account.proxyUrl)) addReason("IP 已到期");
+            else if (proxyCheck.status === "failed") addReason("IP 不可用");
+          }
+
+          if (accountQuotaProtectionItems(account, channel).some((item) => item.state.active)) {
+            addReason("额度保护中");
+          }
+
+          return reasons.length
+            ? { state: "unavailable", reasons }
+            : { state: "available", reasons: ["账号状态正常"] };
+        }
+
+        function accountStatusGroup(account) {
+          const state = accountAvailabilityInfo(account).state;
+          if (state === "disabled") return "disabled";
+          return state === "available" ? "ok" : "attention";
         }
 
         const filteredChannels = useMemo(() => {
@@ -6853,6 +6713,7 @@
 
         const filteredAccounts = useMemo(() => {
           const keyword = accountSearchText.trim().toLowerCase();
+          const order = { attention: 0, disabled: 1, ok: 2 };
           return selectedAccounts.filter((account) => {
             const channel = channels.find((item) => item.id === account.channelId);
             const haystack = `${account.name || ""} ${account.username || ""} ${account.proxyUrl || ""} ${channel?.name || ""}`.toLowerCase();
@@ -6864,7 +6725,7 @@
               || (accountStatusFilter === "ok" && group === "ok")
               || accountDisplayStatus(account) === accountStatusFilter;
             return keywordOk && statusOk;
-          });
+          }).sort((left, right) => order[accountStatusGroup(left)] - order[accountStatusGroup(right)]);
         }, [selectedAccounts, channels, accountSearchText, accountStatusFilter, nowTick]);
 
         const paginatedAccounts = useMemo(() => {
@@ -8913,121 +8774,6 @@
           ]);
         }
 
-        function accountCarFreezeLine(cooldown, key, preview = false) {
-          const carName = `${carTypeName(cooldown.carType)} 车位 ${cooldown.carId}`;
-          const detail = `${carFreezeReason(cooldown)}；${formatDateTime(cooldown.cooldownUntil)} 自动解除`;
-          return h("div", {
-            className: `account-car-freeze${preview ? " is-preview" : ""}`,
-            key,
-            title: preview ? `${carName}：${detail}` : undefined
-          }, [
-            h("strong", { key: "car" }, carName),
-            h("span", { key: "reason" }, `：${detail}`)
-          ]);
-        }
-
-        function accountCarFreezeContent(freezes) {
-          if (!freezes.length) return null;
-          const [firstFreeze, ...remainingFreezes] = freezes;
-          return h("div", { className: "account-car-freezes", key: "car-freezes" }, [
-            accountCarFreezeLine(firstFreeze, "preview", true),
-            remainingFreezes.length
-              ? h("details", { className: "account-freeze-details", key: "details" }, [
-                  h("summary", { key: "summary" }, [
-                    h("span", { key: "text" }, `查看全部 ${freezes.length} 条冻结记录`),
-                    h("span", { className: "account-freeze-chevron", "aria-hidden": true, key: "icon" },
-                      Icon.DownOutlined ? h(Icon.DownOutlined) : null
-                    )
-                  ]),
-                  h("div", { className: "account-freeze-list", key: "list" }, remainingFreezes.map((cooldown) =>
-                    accountCarFreezeLine(cooldown, `${cooldown.carType || "chatgpt"}:${cooldown.carId}`)
-                  ))
-                ])
-              : null
-          ].filter(Boolean));
-        }
-
-        function accountStatusContent(row, rowChannel) {
-          const effectiveStatus = accountEffectiveStatus(row, rowChannel);
-          const displayStatus = accountCheckDisplayStatus(row, rowChannel) || effectiveStatus;
-          const carFreezes = accountCarFreezes(row, rowChannel, nowTick);
-          if (row.enabled === false) {
-            return h("div", { className: "account-status", key: "status" }, [
-              h("div", { className: "account-status-tags", key: "tags" }, [
-                statusTag("disabled"),
-                carFreezes.length ? h(Tag, { color: "orange", key: "car-freeze" }, `冻结车位 ${carFreezes.length}`) : null
-              ].filter(Boolean)),
-              h("span", { className: "account-status-time", key: "time" }, "账号已停用"),
-              accountCarFreezeContent(carFreezes)
-            ].filter(Boolean));
-          }
-
-          const tags = [];
-          const statusTimes = [];
-          const protectionItems = accountQuotaProtectionItems(row, rowChannel);
-
-          if (rowChannel?.type === "shareai") {
-            if (channelAbilityEnabled(rowChannel, "drawing")) {
-              const drawing = abilityStatus(row, "drawing");
-              const drawingProtection = protectionItems.find((item) => item.key === "drawing" && item.state.active);
-              if (drawing.lastCheckAt) statusTimes.push(drawing.lastCheckAt);
-              if (drawingAccountIsCooling(row)) {
-                const cooldown = drawingCooldownStatus(row);
-                const reason = cooldown.cooldownReason === "drawing_rate_limited"
-                  ? "绘图站提示上传过于频繁，已按上游要求暂停该账号绘图"
-                  : "绘图站上游连续失败 3 次，已暂停该账号绘图";
-                const chatplusAvailable = channelAbilityEnabled(rowChannel, "chatplus")
-                  && chatDisplayStatus(abilityStatus(row, "chatplus")) === "ok";
-                const tooltip = `${chatplusAvailable ? "聊天生图正常，不受本次冷却影响。" : ""}${reason}；${formatDateTime(cooldown.cooldownUntil)} 自动恢复。`;
-                tags.push(h(Tooltip, { key: "drawing-cooldown", title: tooltip },
-                  h(Tag, { color: "orange" }, `${chatplusAvailable ? "仅绘图站冷却" : "绘图站冷却中"} · ${drawingCooldownText(row)}`)
-                ));
-              } else if (drawingProtection) {
-                tags.push(h(Tooltip, {
-                  key: "drawing-protection",
-                  title: quotaProtectionTooltip(drawingProtection)
-                }, h(Tag, { color: "orange" }, "绘图额度保护")));
-              } else {
-                tags.push(labeledStatusTag("drawing", "绘图", drawingDisplayStatus(drawing)));
-              }
-            }
-
-            if (channelAbilityEnabled(rowChannel, "chatplus")) {
-              const chatplus = abilityStatus(row, "chatplus");
-              const chatProtections = protectionItems.filter((item) => item.key.startsWith("chatplus-") && item.state.active);
-              if (chatplus.lastCheckAt) statusTimes.push(chatplus.lastCheckAt);
-              const chatStatus = accountCheckDisplayStatus(row, rowChannel) || chatDisplayStatus(chatplus);
-              if (chatProtections.length) {
-                chatProtections.forEach((item) => tags.push(h(Tooltip, {
-                  key: `${item.key}-protection`,
-                  title: quotaProtectionTooltip(item)
-                }, h(Tag, { color: "orange" }, `${item.label}额度保护`))));
-              } else {
-                tags.push(labeledStatusTag("chatplus", checkedChatModelName(row, rowChannel), chatStatus));
-              }
-            }
-          } else {
-            tags.push(h("span", { key: "status" }, statusTag(displayStatus)));
-            if (row.lastCheckAt) statusTimes.push(row.lastCheckAt);
-          }
-          if (carFreezes.length) {
-            tags.push(h(Tag, { color: "orange", key: "car-freeze" }, `冻结车位 ${carFreezes.length}`));
-          }
-
-          const updatedAt = statusTimes
-            .filter((value) => Number.isFinite(Date.parse(value)))
-            .sort((left, right) => Date.parse(right) - Date.parse(left))[0] || row.lastCheckAt || "";
-          const protectionText = quotaProtectionThresholdText(row, rowChannel);
-          return h("div", { className: "account-status", key: "status" }, [
-            h("div", { className: "account-status-tags", key: "tags" }, tags.length ? tags : [statusTag(displayStatus)]),
-            h("span", { className: "account-status-time", key: "time" }, updatedAt ? `状态更新 ${formatDateTime(updatedAt)}` : "尚未检测"),
-            protectionText
-              ? h("span", { className: "account-status-time", key: "protection" }, protectionText)
-              : null,
-            accountCarFreezeContent(carFreezes)
-          ].filter(Boolean));
-        }
-
         function accountRoutingContent(row, rowChannel) {
           if (!runtimeStatus?.routing) return "统计加载中";
           const weight = routingWeightValue(row.routingWeight);
@@ -9173,13 +8919,6 @@
           ]);
         }
 
-        function accountCardField(label, content, key) {
-          return h("div", { className: "account-card-field", key }, [
-            h("span", { className: "account-card-field-label", key: "label" }, label),
-            h("div", { key: "value" }, content)
-          ]);
-        }
-
         function accountCardSection(label, content, key) {
           return h("section", { className: "account-card-section", key }, [
             h("div", { className: "account-card-label", key: "label" }, label),
@@ -9187,70 +8926,15 @@
           ]);
         }
 
-        function accountCardHealth(row, rowChannel) {
-          const alerts = [];
-          const priority = { danger: 3, warning: 2, muted: 1, normal: 0 };
-          const addAlert = (tone, text) => {
-            if (!text || alerts.some((item) => item.text === text)) return;
-            alerts.push({ tone, text });
-          };
-
-          if (!rowChannel) addAlert("danger", "所属渠道已移除");
-          if (row.enabled === false) {
-            addAlert("muted", "账号已停用");
-          } else {
-            if (rowChannel?.enabled === false) addAlert("warning", "渠道已停用");
-            const statusEntries = rowChannel?.type === "shareai"
-              ? [
-                  channelAbilityEnabled(rowChannel, "drawing")
-                    ? { label: "绘图", status: drawingDisplayStatus(abilityStatus(row, "drawing")) }
-                    : null,
-                  channelAbilityEnabled(rowChannel, "chatplus")
-                    ? {
-                        label: checkedChatModelName(row, rowChannel),
-                        status: accountCheckDisplayStatus(row, rowChannel) || chatDisplayStatus(abilityStatus(row, "chatplus"))
-                      }
-                    : null
-                ].filter(Boolean)
-              : [{ label: "账号", status: accountCheckDisplayStatus(row, rowChannel) || accountEffectiveStatus(row, rowChannel) }];
-
-            statusEntries.forEach(({ label, status }) => {
-              if (status === "disconnected") addAlert("danger", "线路掉线，正在自动换线");
-              else if (["error", "failed", "activation_failed", "registration_failed"].includes(status)) addAlert("danger", `${label}异常`);
-              else if (status === "subscription_expired") addAlert("danger", `${label}套餐已过期`);
-              else if (status === "check_timeout") addAlert("warning", `${label}检测超时`);
-              else if (status === "quota_empty") addAlert("warning", `${label}额度不足`);
-              else if (status === "subscription_missing") addAlert("warning", `${label}未订阅`);
-              else if (status === "activation_required") addAlert("warning", `${label}未激活`);
-              else if (["unknown", ""].includes(status)) addAlert("muted", `${label}尚未检测`);
-            });
-
-            if (drawingAccountIsCooling(row)) addAlert("warning", "绘图线路冷却中");
-            if (accountCarFreezes(row, rowChannel, nowTick).length) addAlert("warning", "部分车位暂时冻结");
+        function accountCardHealth(row) {
+          const availability = accountAvailabilityInfo(row);
+          if (availability.state === "disabled") {
+            return { tone: "muted", headline: "已停用", detail: "账号已停用" };
           }
-
-          if (row.proxyUrl) {
-            const proxyCheck = row?.meta?.proxyCheck || {};
-            if (isPipeProxyExpired(row.proxyUrl)) addAlert("danger", "IP 已到期");
-            else if (proxyCheck.status === "failed") addAlert("danger", "IP 不可用");
+          if (availability.state === "available") {
+            return { tone: "normal", headline: "可用", detail: availability.reasons.join(" · ") };
           }
-
-          if (!alerts.length) {
-            return { tone: "normal", headline: "状态正常", detail: "最近检测未发现异常" };
-          }
-
-          alerts.sort((left, right) => priority[right.tone] - priority[left.tone]);
-          const [primary, ...rest] = alerts;
-          const fallbackDetail = primary.text === "账号已停用"
-            ? "不会参与任务分配"
-            : primary.tone === "muted"
-              ? "建议先检测账号状态"
-              : "请根据提示检查这个账号";
-          return {
-            tone: primary.tone,
-            headline: primary.text,
-            detail: rest.length ? rest.map((item) => item.text).join(" · ") : fallbackDetail
-          };
+          return { tone: "danger", headline: "不可用", detail: availability.reasons.join(" · ") };
         }
 
         function accountCardHealthContent(health) {
@@ -9269,7 +8953,7 @@
 
         function accountCard(row) {
           const rowChannel = channels.find((item) => item.id === row.channelId);
-          const health = accountCardHealth(row, rowChannel);
+          const health = accountCardHealth(row);
           return h("article", {
             className: `account-card is-${health.tone}${row.enabled === false ? " is-disabled" : ""}`,
             key: row.id
@@ -9281,25 +8965,22 @@
                   accountChannelContent(row, rowChannel)
                 ])
               ]),
-              accountCardHealthContent(health),
-              accountStatusContent(row, rowChannel)
+              accountCardHealthContent(health)
             ]),
             h("div", { className: "account-card-primary", key: "primary" }, [
               accountCardSection("代理 IP", proxyCell(row.proxyUrl, row), "proxy"),
-              accountCardSection("额度", quotaTextCell(accountQuotaText(row, rowChannel)), "quota")
+              accountCardSection("剩余额度", quotaTextCell(accountQuotaText(row, rowChannel)), "quota"),
+              accountCardSection("额度刷新", accountQuotaResetCell(row, rowChannel, nowTick), "reset")
             ]),
             h("details", { className: "account-card-details", key: "details" }, [
               h("summary", { key: "summary" }, [
-                h("span", { key: "text" }, "查看分流、并发和时间"),
+                h("span", { key: "text" }, "查看分流、并发和套餐"),
                 h("span", { className: "account-card-details-chevron", "aria-hidden": true, key: "icon" },
                   Icon.DownOutlined ? h(Icon.DownOutlined) : null
                 )
               ]),
               h("div", { className: "account-card-details-body", key: "body" }, [
-                accountCardSection("时间信息", h("div", { className: "account-card-fields" }, [
-                  accountCardField("额度重置", accountQuotaResetCell(row, rowChannel, nowTick), "reset"),
-                  accountCardField("套餐到期", accountExpireText(row, rowChannel), "expire")
-                ]), "timing"),
+                accountCardSection("套餐到期", accountExpireText(row, rowChannel), "expire"),
                 accountCardSection(h(Tooltip, {
                   title: "每种能力独立统计。目标表示当前可用账号的计划比例；今日表示系统自动分配且已提交给上游的实际比例。指定账号不计入今日比例。"
                 }, h("span", null, "分流情况")), accountRoutingContent(row, rowChannel), "routing"),
@@ -10009,7 +9690,7 @@
                               color: allAccountStats.attention ? "warning" : allAccountStats.disabled ? "default" : "success",
                               key: "status"
                             }, allAccountStats.attention
-                              ? `${allAccountStats.attention} 个需关注`
+                              ? `${allAccountStats.attention} 个不可用`
                               : allAccountStats.disabled
                                 ? `${allAccountStats.disabled} 个已停用`
                                 : "账号正常")
@@ -10124,7 +9805,7 @@
                         h("strong", { key: "value" }, accountScopeStats.ok)
                       ]),
                       h("span", { className: "account-context-item", key: "attention" }, [
-                        h("span", { key: "label" }, "需关注"),
+                        h("span", { key: "label" }, "不可用"),
                         h("strong", { key: "value" }, accountScopeStats.attention)
                       ]),
                       h("span", { className: "account-context-item", key: "disabled" }, [
@@ -10148,7 +9829,7 @@
                       options: [
                         { label: "全部状态", value: "all" },
                         { label: "可用", value: "ok" },
-                        { label: "需关注", value: "attention" },
+                        { label: "不可用", value: "attention" },
                         { label: "未订阅", value: "subscription_missing" },
                         { label: "套餐已过期", value: "subscription_expired" },
                         { label: "自动换线中", value: "disconnected" },
