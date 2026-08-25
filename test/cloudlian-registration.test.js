@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import {
+  accountNeedsActivationRenewal,
   chatActivationBaseUrl,
   cloudlianChannelBaseUrl,
+  createChatAccountBatchActivationService,
   createChatAccountActivationService,
   createCloudlianBatchRegistrationService,
   createCloudlianRegistrationService
@@ -439,4 +442,124 @@ test("聊天绘图共账号渠道激活后会等待两边一起检测", async ()
   const saved = harness.config().accounts[0];
   assert.equal(saved.meta.abilities.chatplus.status, "unknown");
   assert.equal(saved.meta.abilities.drawing.status, "unknown");
+});
+
+test("批量续费只接受当前渠道中启用的待续费账号", async () => {
+  const channel = {
+    id: "renewal-channel",
+    name: "续费渠道",
+    type: "chatplus",
+    settings: { baseUrl: "https://chat.example.com" }
+  };
+  const accounts = [
+    { id: "expired", channelId: channel.id, enabled: true, status: "subscription_expired" },
+    { id: "missing", channelId: channel.id, enabled: true, meta: { abilities: { chatplus: { status: "subscription_missing" } } } },
+    { id: "ready", channelId: channel.id, enabled: true, status: "ok" },
+    { id: "disabled", channelId: channel.id, enabled: false, status: "subscription_expired" }
+  ];
+  assert.equal(accountNeedsActivationRenewal(accounts[0]), true);
+  assert.equal(accountNeedsActivationRenewal(accounts[1]), true);
+  assert.equal(accountNeedsActivationRenewal(accounts[2]), false);
+  assert.equal(accountNeedsActivationRenewal(accounts[3]), false);
+
+  const calls = [];
+  const activateBatch = createChatAccountBatchActivationService({
+    loadConfig: async () => ({ channels: [channel], accounts }),
+    activateAccount: async (input) => {
+      calls.push(clone(input));
+      return { accountId: input.accountId, status: "ready", message: "续费成功" };
+    }
+  });
+  const result = await activateBatch({
+    channelId: channel.id,
+    rows: [
+      { rowId: "1", accountId: "expired", activationCode: "CODE-1" },
+      { rowId: "2", accountId: "missing", activationCode: "CODE-2" },
+      { rowId: "3", accountId: "ready", activationCode: "CODE-3" },
+      { rowId: "4", accountId: "disabled", activationCode: "CODE-4" }
+    ]
+  });
+
+  assert.deepEqual(calls.map((call) => call.accountId).sort(), ["expired", "missing"]);
+  assert.deepEqual(result.summary, { total: 4, success: 2, pending: 0, failed: 2 });
+  assert.match(result.results[2].message, /不需要续费/);
+  assert.match(result.results[3].message, /不需要续费/);
+});
+
+test("批量续费拦截重复激活码和重复账号并限制同时处理数量", async () => {
+  const channel = {
+    id: "renewal-channel",
+    type: "chatplus",
+    settings: { baseUrl: "https://chat.example.com" }
+  };
+  const accounts = Array.from({ length: 5 }, (_, index) => ({
+    id: `account-${index + 1}`,
+    channelId: channel.id,
+    enabled: true,
+    status: "subscription_expired"
+  }));
+  let running = 0;
+  let maxRunning = 0;
+  const activateBatch = createChatAccountBatchActivationService({
+    loadConfig: async () => ({ channels: [channel], accounts }),
+    activateAccount: async ({ accountId }) => {
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      running -= 1;
+      return { accountId, status: "ready", message: "续费成功" };
+    }
+  });
+  const result = await activateBatch({
+    channelId: channel.id,
+    rows: [
+      { rowId: "1", accountId: "account-1", activationCode: "CODE-1" },
+      { rowId: "2", accountId: "account-2", activationCode: "code-1" },
+      { rowId: "3", accountId: "account-1", activationCode: "CODE-3" },
+      { rowId: "4", accountId: "account-4", activationCode: "CODE-4" },
+      { rowId: "5", accountId: "account-5", activationCode: "CODE-5" }
+    ]
+  });
+
+  assert.equal(result.results[1].status, "duplicate");
+  assert.equal(result.results[2].status, "duplicate");
+  assert.ok(maxRunning <= 3);
+  assert.deepEqual(result.summary, { total: 5, success: 3, pending: 0, failed: 2 });
+});
+
+test("批量续费不会把账号以前使用过的旧激活码算成成功", async () => {
+  const channel = {
+    id: "renewal-channel",
+    type: "chatplus",
+    settings: { baseUrl: "https://chat.example.com" }
+  };
+  const activationCode = "USED-CODE";
+  const codeHash = createHash("sha256")
+    .update(`https://chat.example.com\n${activationCode}`)
+    .digest("hex");
+  const account = {
+    id: "expired-account",
+    channelId: channel.id,
+    enabled: true,
+    status: "subscription_expired",
+    meta: { activations: [{ codeHash }] }
+  };
+  let activationCalls = 0;
+  const activateBatch = createChatAccountBatchActivationService({
+    loadConfig: async () => ({ channels: [channel], accounts: [account] }),
+    activateAccount: async () => {
+      activationCalls += 1;
+      return { status: "already_bound" };
+    }
+  });
+
+  const result = await activateBatch({
+    channelId: channel.id,
+    rows: [{ rowId: "1", accountId: account.id, activationCode }]
+  });
+
+  assert.equal(activationCalls, 0);
+  assert.equal(result.results[0].status, "failed");
+  assert.match(result.results[0].message, /更换新的激活码/);
+  assert.deepEqual(result.summary, { total: 1, success: 0, pending: 0, failed: 1 });
 });

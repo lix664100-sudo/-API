@@ -10,9 +10,18 @@ const summaryFunctionMatch = adminHtml.match(
 assert.ok(summaryFunctionMatch, "管理后台中应存在按项目汇总账号状态的方法");
 const summarizeAccountCapabilities = vm.runInNewContext(`(${summaryFunctionMatch[0]
   .replace(/\r?\n\r?\n      function accountCapabilityReason$/, "")})`);
+const usabilityFunctionMatch = adminHtml.match(
+  /function accountUsabilityGroup\(account\) \{[\s\S]*?\r?\n        \}/
+);
+assert.ok(usabilityFunctionMatch, "管理后台中应存在账号可用性分组方法");
+const accountUsabilityGroup = vm.runInNewContext(`(${usabilityFunctionMatch[0]})`, {
+  accountAvailabilityInfo: (account) => account
+});
 
 test("账号管理使用独立信息块并移除横向宽表", () => {
-  assert.match(adminHtml, /paginatedAccounts\.map\(accountCard\)/);
+  assert.match(adminHtml, /function accountGroupSection\(/);
+  assert.match(adminHtml, /rows\.map\(accountCard\)/);
+  assert.match(adminHtml, /className: "account-groups"/);
   assert.match(adminHtml, /className: `account-card is-\$\{health\.tone\}/);
   assert.match(adminHtml, /accountCardSection\("代理 IP"/);
   assert.match(adminHtml, /accountCardSection\("额度刷新"/);
@@ -63,17 +72,34 @@ test("账号概览按可用、业务暂停、真正异常和停用分层", () =>
   assert.match(adminHtml, /"代理 IP 已到期"/);
   assert.match(adminHtml, /"代理 IP 不可用"/);
   assert.match(adminHtml, /className: `account-card-health is-\$\{health\.tone\}`/);
+  assert.match(adminHtml, /return \{ tone: "info", headline: "部分可用"/);
+  assert.match(adminHtml, /\.account-card-health\.is-info/);
   assert.match(adminHtml, /\.account-card-health\.is-warning/);
   assert.match(adminHtml, /h\("details", \{ className: "account-card-details"/);
   assert.match(adminHtml, /"查看分流、并发和套餐"/);
   assert.match(adminHtml, /\.account-card-primary \{[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
-  assert.match(adminHtml, /\.account-identity-name \{[\s\S]*?font-size: 15px;/);
+  assert.match(adminHtml, /\.account-identity-name \{[\s\S]*?font-size: 16px;/);
   assert.match(adminHtml, /\.account-card-label \{[\s\S]*?font-size: 12px;/);
 });
 
-test("异常账号排在待恢复、部分可用、停用和可用账号前面", () => {
-  assert.match(adminHtml, /const order = \{ error: 0, business: 1, partial: 2, disabled: 3, ok: 4 \};/);
+test("异常账号优先展示，已停用账号排在最后", () => {
+  assert.match(adminHtml, /const order = \{ error: 0, business: 1, partial: 2, ok: 3, disabled: 4 \};/);
   assert.match(adminHtml, /\.sort\(\(left, right\) => order\[accountStatusGroup\(left\)\] - order\[accountStatusGroup\(right\)\]\)/);
+});
+
+test("账号按不可用、可用和已停用分类，部分可用归入可用账号", () => {
+  assert.equal(accountUsabilityGroup({ state: "available" }), "available");
+  assert.equal(accountUsabilityGroup({ state: "partial" }), "available");
+  assert.equal(accountUsabilityGroup({ state: "partial_error" }), "available");
+  assert.equal(accountUsabilityGroup({ state: "quota_empty" }), "unavailable");
+  assert.equal(accountUsabilityGroup({ state: "subscription_expired" }), "unavailable");
+  assert.equal(accountUsabilityGroup({ state: "disabled" }), "disabled");
+  assert.match(adminHtml, /title: "不可用账号"/);
+  assert.match(adminHtml, /title: "可用账号"/);
+  assert.match(adminHtml, /title: "已停用账号"/);
+  assert.match(adminHtml, /collapsible: true/);
+  assert.match(adminHtml, /label: "可用账号（含部分可用）", value: "usable"/);
+  assert.match(adminHtml, /label: "不可用账号", value: "unavailable"/);
 });
 
 test("只有部分项目达到保护线时账号仍为部分可用", () => {
@@ -96,7 +122,7 @@ test("渠道概览分别统计绘图和聊天能力", () => {
   assert.match(adminHtml, /chatOkCount:/);
   assert.match(adminHtml, /"绘图可用"/);
   assert.match(adminHtml, /"聊天可用"/);
-  assert.match(adminHtml, /"待恢复"/);
+  assert.match(adminHtml, /"不可用账号"/);
   assert.match(adminHtml, /\{ label: "额度保护", value: "protection" \}/);
 });
 

@@ -30,6 +30,7 @@ import {
 import { DrawingClient } from "./channels/drawing.js";
 import {
   activateChatAccount,
+  activateChatAccounts,
   registerCloudlianAccount,
   registerCloudlianAccounts
 } from "./cloudlian-registration.js";
@@ -1095,6 +1096,35 @@ app.post("/api/accounts/:id/activate", async (request, reply) => {
       data: {
         config: publicConfig(await loadConfig()),
         result
+      }
+    };
+  } catch (error) {
+    return sendError(reply, error);
+  }
+});
+
+app.post("/api/channels/:id/accounts/activate-batch", async (request, reply) => {
+  try {
+    const batch = await activateChatAccounts({
+      channelId: request.params.id,
+      rows: request.body?.rows
+    });
+    const results = await verifyBoundAccounts(batch.results);
+    const successfulStatuses = new Set(["ready", "already_bound"]);
+    const pendingStatuses = new Set(["activation_uncertain"]);
+    return {
+      ok: true,
+      data: {
+        config: publicConfig(await loadConfig()),
+        result: {
+          results,
+          summary: {
+            total: results.length,
+            success: results.filter((item) => successfulStatuses.has(item?.status)).length,
+            pending: results.filter((item) => pendingStatuses.has(item?.status)).length,
+            failed: results.filter((item) => !successfulStatuses.has(item?.status) && !pendingStatuses.has(item?.status)).length
+          }
+        }
       }
     };
   } catch (error) {

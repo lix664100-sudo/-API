@@ -10,6 +10,8 @@ const MAX_PROXY_LENGTH = 2048;
 const MAX_REGISTER_ATTEMPTS = 3;
 const MAX_BATCH_REGISTRATIONS = 500;
 const BATCH_REGISTRATION_CONCURRENCY = 3;
+const MAX_BATCH_ACCOUNT_ACTIVATIONS = 500;
+const BATCH_ACCOUNT_ACTIVATION_CONCURRENCY = 3;
 const COMPLETED_STATES = new Set(["completed"]);
 const REGISTERED_STATES = new Set(["registered", "activating", "activation_required", "activation_uncertain"]);
 const activeActivationOperations = new Map();
@@ -777,3 +779,131 @@ export function createChatAccountActivationService(overrides = {}) {
 }
 
 export const activateChatAccount = createChatAccountActivationService();
+
+export function accountNeedsActivationRenewal(account = {}) {
+  if (account.enabled === false) return false;
+  const statuses = [
+    account.status,
+    account.meta?.registration?.status,
+    ...Object.values(account.meta?.abilities || {}).map((ability) => ability?.status)
+  ];
+  return statuses.some((status) => [
+    "subscription_expired",
+    "subscription_missing",
+    "activation_required"
+  ].includes(status));
+}
+
+export function createChatAccountBatchActivationService(overrides = {}) {
+  const dependencies = {
+    loadConfig,
+    activateAccount: activateChatAccount,
+    ...overrides
+  };
+
+  return async function activateChatAccounts(input = {}) {
+    const channelId = String(input.channelId || "").trim();
+    const rows = Array.isArray(input.rows) ? input.rows : [];
+    if (!channelId) throw inputError("请选择要续费的渠道。");
+    if (!rows.length) throw inputError("请至少输入一条激活码。");
+    if (rows.length > MAX_BATCH_ACCOUNT_ACTIVATIONS) {
+      throw inputError(`一次最多处理 ${MAX_BATCH_ACCOUNT_ACTIVATIONS} 条激活码。`);
+    }
+
+    const config = await dependencies.loadConfig();
+    const channel = config.channels.find((item) => item.id === channelId);
+    if (!channel) throw inputError("续费渠道不存在。", 404);
+    const baseUrl = chatActivationBaseUrl(channel);
+    if (!baseUrl) throw inputError("这个渠道不支持激活码续费。", 409);
+
+    const accountsById = new Map(config.accounts.map((account) => [account.id, account]));
+    const results = new Array(rows.length);
+    const seenCodes = new Set();
+    const seenAccounts = new Set();
+    let nextIndex = 0;
+
+    async function worker() {
+      while (nextIndex < rows.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const row = rows[index] || {};
+        const rowId = String(row.rowId || index + 1);
+        const accountId = String(row.accountId || "").trim();
+        const activationCode = String(row.activationCode || "").trim();
+        const duplicateCodeKey = activationCode.toLowerCase();
+
+        if (!activationCode) {
+          results[index] = { rowId, accountId, status: "failed", message: "缺少激活码。" };
+          continue;
+        }
+        if (activationCode.length > MAX_ACTIVATION_CODE_LENGTH) {
+          results[index] = { rowId, accountId, status: "failed", message: "激活码过长，请检查后重试。" };
+          continue;
+        }
+        if (seenCodes.has(duplicateCodeKey)) {
+          results[index] = { rowId, accountId, status: "duplicate", message: "这条激活码在本次续费中重复。" };
+          continue;
+        }
+        seenCodes.add(duplicateCodeKey);
+        if (!accountId) {
+          results[index] = { rowId, accountId, status: "failed", message: "请选择要续费的账号。" };
+          continue;
+        }
+        if (seenAccounts.has(accountId)) {
+          results[index] = { rowId, accountId, status: "duplicate", message: "这个账号在本次续费中重复。" };
+          continue;
+        }
+        seenAccounts.add(accountId);
+
+        const account = accountsById.get(accountId);
+        if (!account || account.channelId !== channelId) {
+          results[index] = { rowId, accountId, status: "failed", message: "账号不属于当前渠道，请重新预览。" };
+          continue;
+        }
+        if (!accountNeedsActivationRenewal(account)) {
+          results[index] = { rowId, accountId, status: "failed", message: "账号当前不需要续费，请刷新后重新预览。" };
+          continue;
+        }
+        const redeemedCodeHash = exchangeCodeHash(baseUrl, activationCode);
+        if (activationHistory(account).some((record) => record?.codeHash === redeemedCodeHash)) {
+          results[index] = { rowId, accountId, status: "failed", message: "这个激活码以前已用于当前账号，请更换新的激活码。" };
+          continue;
+        }
+
+        try {
+          results[index] = {
+            rowId,
+            accountId,
+            ...(await dependencies.activateAccount({ accountId, activationCode }))
+          };
+        } catch (error) {
+          results[index] = {
+            rowId,
+            accountId,
+            status: "failed",
+            message: shortMessage(error?.message, "续费失败，请稍后重试。")
+          };
+        }
+      }
+    }
+
+    await Promise.all(Array.from(
+      { length: Math.min(BATCH_ACCOUNT_ACTIVATION_CONCURRENCY, rows.length) },
+      () => worker()
+    ));
+
+    const successfulStatuses = new Set(["ready", "already_bound"]);
+    const pendingStatuses = new Set(["activation_uncertain"]);
+    return {
+      results,
+      summary: {
+        total: results.length,
+        success: results.filter((item) => successfulStatuses.has(item?.status)).length,
+        pending: results.filter((item) => pendingStatuses.has(item?.status)).length,
+        failed: results.filter((item) => !successfulStatuses.has(item?.status) && !pendingStatuses.has(item?.status)).length
+      }
+    };
+  };
+}
+
+export const activateChatAccounts = createChatAccountBatchActivationService();

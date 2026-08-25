@@ -665,6 +665,10 @@
         color: #b54708;
       }
 
+      .account-context-item.is-info strong {
+        color: #175cd3;
+      }
+
       .account-context-item.is-danger strong {
         color: #b42318;
       }
@@ -699,13 +703,122 @@
         gap: 8px;
       }
 
+      .account-groups {
+        display: grid;
+        gap: 28px;
+        min-width: 0;
+        padding: 18px;
+      }
+
+      .account-group {
+        min-width: 0;
+      }
+
+      .account-group-header,
+      .account-group > summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        min-height: 38px;
+        margin-bottom: 12px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid #e4e7ec;
+        list-style: none;
+      }
+
+      .account-group > summary {
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .account-group > summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .account-group > summary:focus-visible {
+        outline: 2px solid rgba(22, 119, 255, 0.4);
+        outline-offset: 4px;
+        border-radius: 4px;
+      }
+
+      .account-group-heading {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        min-width: 0;
+      }
+
+      .account-group-marker {
+        flex: 0 0 9px;
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: #d92d20;
+      }
+
+      .account-group.is-available .account-group-marker {
+        background: #1570ef;
+      }
+
+      .account-group.is-disabled .account-group-marker {
+        background: #98a2b3;
+      }
+
+      .account-group-title {
+        color: #101828;
+        font-size: 16px;
+        font-weight: 760;
+        line-height: 1.35;
+      }
+
+      .account-group-count {
+        flex: 0 0 auto;
+        min-width: 28px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #fef3f2;
+        color: #b42318;
+        font-size: 12px;
+        font-weight: 720;
+        text-align: center;
+      }
+
+      .account-group.is-available .account-group-count {
+        background: #eff8ff;
+        color: #175cd3;
+      }
+
+      .account-group.is-disabled .account-group-count {
+        background: #f2f4f7;
+        color: #475467;
+      }
+
+      .account-group-description {
+        margin-left: auto;
+        color: #667085;
+        font-size: 13px;
+        line-height: 1.45;
+        text-align: right;
+      }
+
+      .account-group-chevron {
+        display: inline-flex;
+        flex: 0 0 auto;
+        color: #667085;
+        transition: transform 180ms cubic-bezier(0.23, 1, 0.32, 1);
+      }
+
+      .account-group[open] .account-group-chevron {
+        transform: rotate(180deg);
+      }
+
       .account-list {
         display: grid;
         grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
         align-items: start;
         gap: 14px;
         min-width: 0;
-        padding: 16px 18px 20px;
       }
 
       .account-card {
@@ -726,6 +839,10 @@
         border-top-color: #f79009;
       }
 
+      .account-card.is-info {
+        border-top-color: #2e90fa;
+      }
+
       .account-card.is-muted,
       .account-card.is-disabled {
         border-top-color: #98a2b3;
@@ -738,8 +855,8 @@
 
       .account-card-header {
         display: grid;
-        gap: 12px;
-        padding: 16px 16px 14px;
+        gap: 10px;
+        padding: 15px 14px 12px;
       }
 
       .account-card-title-row {
@@ -781,6 +898,12 @@
         color: #b54708;
       }
 
+      .account-card-health.is-info {
+        border-color: #b2ddff;
+        background: #eff8ff;
+        color: #175cd3;
+      }
+
       .account-card-health.is-muted {
         border-color: #e4e7ec;
         background: #f9fafb;
@@ -798,10 +921,10 @@
 
       .account-card-health-copy {
         display: grid;
-        gap: 2px;
+        gap: 3px;
         min-width: 0;
-        font-size: 12px;
-        line-height: 1.4;
+        font-size: 13px;
+        line-height: 1.45;
       }
 
       .account-card-health-copy strong {
@@ -836,14 +959,16 @@
       .account-card-primary {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 1px;
+        gap: 10px;
         min-width: 0;
-        border-top: 1px solid var(--line);
-        background: var(--line);
+        padding: 0 14px 14px;
+        background: #fff;
       }
 
       .account-card-primary .account-card-section {
-        background: #fff;
+        padding: 11px 12px 12px;
+        border-radius: 8px;
+        background: #f8fafc;
       }
 
       .account-card-primary .account-card-section:last-child {
@@ -863,7 +988,7 @@
         min-height: 42px;
         padding: 10px 16px;
         color: #344054;
-        background: #fbfcfe;
+        background: #fff;
         cursor: pointer;
         font-size: 12px;
         font-weight: 680;
@@ -917,9 +1042,9 @@
 
       .account-card-content {
         min-width: 0;
-        margin-top: 7px;
+        margin-top: 6px;
         color: #344054;
-        font-size: 13px;
+        font-size: 14px;
         line-height: 1.55;
       }
 
@@ -1013,8 +1138,8 @@
       }
 
       .account-card-overview .account-channel-cell {
-        padding-top: 10px;
-        border-top: 1px solid #f0f2f5;
+        padding-top: 8px;
+        border-top: 1px solid #eaecf0;
       }
 
       .account-identity-name,
@@ -1029,7 +1154,7 @@
       }
 
       .account-identity-name {
-        font-size: 15px;
+        font-size: 16px;
         font-weight: 760;
       }
 
@@ -2829,6 +2954,24 @@
           justify-content: flex-start;
         }
 
+        .account-groups {
+          gap: 22px;
+          padding: 14px 12px 16px;
+        }
+
+        .account-group-header,
+        .account-group > summary {
+          align-items: flex-start;
+          flex-wrap: wrap;
+          gap: 6px 10px;
+        }
+
+        .account-group-description {
+          width: 100%;
+          margin-left: 18px;
+          text-align: left;
+        }
+
         .account-list,
         .account-card-primary,
         .account-card-details-body {
@@ -2845,7 +2988,7 @@
 
         .account-card-details-body .account-card-section + .account-card-section,
         .account-card-primary .account-card-section + .account-card-section {
-          border-top: 1px solid var(--line);
+          border-top: 0;
         }
 
         .account-pagination {
@@ -4755,6 +4898,82 @@
         return { rows, error: "" };
       }
 
+      function batchRenewalStatus(account = {}) {
+        const statuses = [
+          account.status,
+          account.meta?.registration?.status,
+          ...Object.values(account.meta?.abilities || {}).map((ability) => ability?.status)
+        ];
+        return ["activation_required", "subscription_expired", "subscription_missing"]
+          .find((status) => statuses.includes(status)) || "";
+      }
+
+      function batchRenewalEligible(account, channel) {
+        return Boolean(
+          account
+          && channel
+          && account.enabled !== false
+          && account.channelId === channel.id
+          && chatAccountActivationAvailable(channel)
+          && batchRenewalStatus(account)
+        );
+      }
+
+      function parseBatchRenewalCodes(value) {
+        const source = String(value || "")
+          .split(/\r?\n/)
+          .map((line, index) => ({ rowNumber: index + 1, activationCode: line.trim() }))
+          .filter((row) => row.activationCode);
+        if (source.length > 500) {
+          return { rows: [], error: "每次最多处理 500 条激活码，请拆分后重试。" };
+        }
+        const seen = new Set();
+        return {
+          error: "",
+          rows: source.map((row, index) => {
+            const duplicateKey = row.activationCode.toLowerCase();
+            const tooLong = row.activationCode.length > 512;
+            const duplicate = !tooLong && seen.has(duplicateKey);
+            if (!tooLong && !duplicate) seen.add(duplicateKey);
+            return {
+              key: `batch-renewal-${index}`,
+              rowId: String(row.rowNumber),
+              rowNumber: row.rowNumber,
+              activationCode: row.activationCode,
+              accountId: "",
+              status: tooLong ? "failed" : duplicate ? "duplicate" : "valid",
+              message: tooLong
+                ? "激活码过长"
+                : duplicate
+                  ? "本次名单中有相同激活码"
+                  : "等待续费"
+            };
+          })
+        };
+      }
+
+      function createBatchRenewalPreview(value, accounts, random = Math.random) {
+        const parsed = parseBatchRenewalCodes(value);
+        if (parsed.error) return parsed;
+        const shuffledAccounts = [...(accounts || [])];
+        for (let index = shuffledAccounts.length - 1; index > 0; index -= 1) {
+          const target = Math.floor(random() * (index + 1));
+          [shuffledAccounts[index], shuffledAccounts[target]] = [shuffledAccounts[target], shuffledAccounts[index]];
+        }
+        let nextAccount = 0;
+        return {
+          error: "",
+          rows: parsed.rows.map((row) => {
+            if (row.status !== "valid") return row;
+            const account = shuffledAccounts[nextAccount];
+            nextAccount += 1;
+            return account
+              ? { ...row, accountId: account.id }
+              : { ...row, status: "failed", message: "没有更多待续费账号可以分配" };
+          })
+        };
+      }
+
       function parseProxyAssignText(value) {
         const text = String(value || "").trim();
         if (!text) return [];
@@ -6578,6 +6797,12 @@
         const [cloudlianRegistrationRows, setCloudlianRegistrationRows] = useState([]);
         const [cloudlianRegistrationError, setCloudlianRegistrationError] = useState("");
         const [cloudlianRegistering, setCloudlianRegistering] = useState(false);
+        const [batchRenewalOpen, setBatchRenewalOpen] = useState(false);
+        const [batchRenewalText, setBatchRenewalText] = useState("");
+        const [batchRenewalRows, setBatchRenewalRows] = useState([]);
+        const [batchRenewalError, setBatchRenewalError] = useState("");
+        const [batchRenewing, setBatchRenewing] = useState(false);
+        const [batchRenewalFinished, setBatchRenewalFinished] = useState(false);
         const [accountActivationOpen, setAccountActivationOpen] = useState(false);
         const [accountActivating, setAccountActivating] = useState(false);
         const [accountToActivate, setAccountToActivate] = useState(null);
@@ -6619,6 +6844,9 @@
         const selectedAccounts = selectedChannel
           ? accounts.filter((item) => item.channelId === selectedChannel.id)
           : accounts;
+        const batchRenewalAccounts = selectedChannel
+          ? selectedAccounts.filter((account) => batchRenewalEligible(account, selectedChannel))
+          : [];
         const proxyAssignSummary = proxyAssignView(proxyAssignPreview);
         const accountModalChannel = channels.find((item) => item.id === (editingAccount?.channelId || editingAccountChannelId || selectedChannel?.id))
           || selectedChannel
@@ -6903,6 +7131,13 @@
           return accountAvailabilityInfo(account).group;
         }
 
+        function accountUsabilityGroup(account) {
+          const state = accountAvailabilityInfo(account).state;
+          if (["available", "partial", "partial_error"].includes(state)) return "available";
+          if (["disabled", "channel_disabled"].includes(state)) return "disabled";
+          return "unavailable";
+        }
+
         const filteredChannels = useMemo(() => {
           const keyword = searchText.trim().toLowerCase();
           return channels.filter((channel) => {
@@ -6911,21 +7146,25 @@
           });
         }, [channels, searchText]);
 
-        const allAccountStats = useMemo(() => accounts.reduce((result, account) => {
-          const group = accountStatusGroup(account);
-          result[group] += 1;
-          return result;
-        }, { ok: 0, partial: 0, business: 0, error: 0, disabled: 0 }), [accounts, channels, nowTick]);
-
         const accountScopeStats = useMemo(() => selectedAccounts.reduce((result, account) => {
           const group = accountStatusGroup(account);
           result[group] += 1;
           return result;
         }, { ok: 0, partial: 0, business: 0, error: 0, disabled: 0 }), [selectedAccounts, channels, nowTick]);
 
+        const allAccountUsabilityStats = useMemo(() => accounts.reduce((result, account) => {
+          result[accountUsabilityGroup(account)] += 1;
+          return result;
+        }, { available: 0, unavailable: 0, disabled: 0 }), [accounts, channels, nowTick]);
+
+        const accountScopeUsabilityStats = useMemo(() => selectedAccounts.reduce((result, account) => {
+          result[accountUsabilityGroup(account)] += 1;
+          return result;
+        }, { available: 0, unavailable: 0, disabled: 0 }), [selectedAccounts, channels, nowTick]);
+
         const filteredAccounts = useMemo(() => {
           const keyword = accountSearchText.trim().toLowerCase();
-          const order = { error: 0, business: 1, partial: 2, disabled: 3, ok: 4 };
+          const order = { error: 0, business: 1, partial: 2, ok: 3, disabled: 4 };
           return selectedAccounts.filter((account) => {
             const channel = channels.find((item) => item.id === account.channelId);
             const haystack = `${account.name || ""} ${account.username || ""} ${account.proxyUrl || ""} ${channel?.name || ""}`.toLowerCase();
@@ -6937,6 +7176,8 @@
               || (accountStatusFilter === "ok" && group === "ok")
               || (accountStatusFilter === "partial" && group === "partial")
               || (accountStatusFilter === "error" && group === "error")
+              || (accountStatusFilter === "usable" && accountUsabilityGroup(account) === "available")
+              || (accountStatusFilter === "unavailable" && accountUsabilityGroup(account) === "unavailable")
               || availability.statuses.includes(accountStatusFilter);
             return keywordOk && statusOk;
           }).sort((left, right) => order[accountStatusGroup(left)] - order[accountStatusGroup(right)]);
@@ -6946,6 +7187,16 @@
           const start = (accountPage - 1) * accountPageSize;
           return filteredAccounts.slice(start, start + accountPageSize);
         }, [filteredAccounts, accountPage, accountPageSize]);
+
+        const filteredAccountUsabilityStats = useMemo(() => filteredAccounts.reduce((result, account) => {
+          result[accountUsabilityGroup(account)] += 1;
+          return result;
+        }, { available: 0, unavailable: 0, disabled: 0 }), [filteredAccounts, channels, nowTick]);
+
+        const paginatedAccountGroups = useMemo(() => paginatedAccounts.reduce((result, account) => {
+          result[accountUsabilityGroup(account)].push(account);
+          return result;
+        }, { available: [], unavailable: [], disabled: [] }), [paginatedAccounts, channels, nowTick]);
 
         useEffect(() => {
           setAccountPage(1);
@@ -8088,6 +8339,97 @@
           }
         }
 
+        function openBatchRenewal() {
+          if (!selectedChannel) {
+            message.warning("请先选择一个渠道");
+            return;
+          }
+          if (!batchRenewalAccounts.length) {
+            message.info("当前渠道没有待续费账号");
+            return;
+          }
+          setBatchRenewalText("");
+          setBatchRenewalRows([]);
+          setBatchRenewalError("");
+          setBatchRenewalFinished(false);
+          setBatchRenewalOpen(true);
+        }
+
+        function previewBatchRenewals() {
+          const preview = createBatchRenewalPreview(batchRenewalText, batchRenewalAccounts);
+          setBatchRenewalRows(preview.rows);
+          setBatchRenewalError(preview.error);
+          setBatchRenewalFinished(false);
+          if (preview.error) message.error(preview.error);
+          else if (!preview.rows.length) message.warning("请先输入激活码");
+        }
+
+        function updateBatchRenewalAccount(rowId, accountId) {
+          setBatchRenewalRows((current) => {
+            const source = current.find((row) => row.rowId === rowId);
+            const occupied = current.find((row) => row.rowId !== rowId && row.accountId === accountId);
+            return current.map((row) => {
+              if (row.rowId === rowId) return { ...row, accountId, status: "valid", message: "等待续费" };
+              if (occupied && row.rowId === occupied.rowId && source?.accountId) {
+                return { ...row, accountId: source.accountId, status: "valid", message: "等待续费" };
+              }
+              return row;
+            });
+          });
+        }
+
+        function batchRenewalCanSubmit() {
+          if (!batchRenewalRows.length || batchRenewalFinished) return false;
+          const accountIds = batchRenewalRows.map((row) => row.accountId).filter(Boolean);
+          return batchRenewalRows.every((row) => row.status === "valid" && row.accountId)
+            && new Set(accountIds).size === accountIds.length;
+        }
+
+        async function submitBatchRenewals() {
+          if (!selectedChannel?.id || batchRenewing) return;
+          if (!batchRenewalRows.length) {
+            previewBatchRenewals();
+            return;
+          }
+          if (!batchRenewalCanSubmit()) {
+            message.warning("请先处理预览中的重复或未分配项目");
+            return;
+          }
+
+          setBatchRenewing(true);
+          try {
+            const response = await api(`/api/channels/${encodeURIComponent(selectedChannel.id)}/accounts/activate-batch`, {
+              method: "POST",
+              body: {
+                rows: batchRenewalRows.map((row) => ({
+                  rowId: row.rowId,
+                  accountId: row.accountId,
+                  activationCode: row.activationCode
+                }))
+              }
+            });
+            applyConfig(response.config);
+            await refreshRuntimeStatus();
+            const result = response.result || {};
+            const completedById = new Map((result.results || []).map((row) => [String(row.rowId), row]));
+            setBatchRenewalRows((current) => current.map((row) => ({
+              ...row,
+              ...(completedById.get(String(row.rowId)) || {})
+            })));
+            setBatchRenewalFinished(true);
+            const summary = result.summary || {};
+            if (summary.failed || summary.pending) {
+              message.warning(`续费完成：成功 ${summary.success || 0} 个，待确认 ${summary.pending || 0} 个，失败 ${summary.failed || 0} 个`);
+            } else {
+              message.success(`已成功续费 ${summary.success || batchRenewalRows.length} 个账号`);
+            }
+          } catch (error) {
+            message.error(error.message);
+          } finally {
+            setBatchRenewing(false);
+          }
+        }
+
         function openAccountActivation(account) {
           setAccountToActivate(account);
           accountActivationForm.resetFields();
@@ -8381,6 +8723,159 @@
               }
             }
           });
+        }
+
+        function closeBatchRenewal() {
+          if (batchRenewing) return;
+          setBatchRenewalOpen(false);
+          setBatchRenewalText("");
+          setBatchRenewalRows([]);
+          setBatchRenewalError("");
+          setBatchRenewalFinished(false);
+        }
+
+        function renderBatchRenewalModal() {
+          const selectedAccountIds = new Set(batchRenewalRows.map((row) => row.accountId).filter(Boolean));
+          const successCount = batchRenewalRows.filter((row) => ["ready", "already_bound"].includes(row.status)).length;
+          const pendingCount = batchRenewalRows.filter((row) => row.status === "activation_uncertain").length;
+          const failedCount = batchRenewalRows.filter((row) => ["failed", "duplicate", "activation_failed"].includes(row.status)).length;
+          const accountLabel = (account) => {
+            const name = account?.name || account?.username || "未命名账号";
+            return account?.username && account.username !== name ? `${name} · ${account.username}` : name;
+          };
+          const columns = [
+            { title: "行", dataIndex: "rowNumber", width: 54 },
+            {
+              title: "激活码",
+              dataIndex: "activationCode",
+              width: 150,
+              render: (value) => h("span", { className: "mono" }, maskedActivationCode(value))
+            },
+            {
+              title: "续费账号",
+              dataIndex: "accountId",
+              width: 310,
+              render: (value, row) => {
+                const current = selectedAccounts.find((account) => account.id === value);
+                if (batchRenewalFinished) return accountLabel(current) || "账号已移除";
+                return h(Select, {
+                  value: value || undefined,
+                  placeholder: "请选择待续费账号",
+                  style: { width: "100%" },
+                  showSearch: true,
+                  optionFilterProp: "label",
+                  disabled: batchRenewing || row.status === "duplicate" || row.activationCode.length > 512,
+                  options: batchRenewalAccounts.map((account) => {
+                    const renewalStatus = batchRenewalStatus(account);
+                    const statusText = statusInfo(renewalStatus)[1];
+                    return {
+                      label: `${accountLabel(account)} · ${statusText}`,
+                      value: account.id,
+                      disabled: !value && selectedAccountIds.has(account.id)
+                    };
+                  }),
+                  onChange: (accountId) => updateBatchRenewalAccount(row.rowId, accountId)
+                });
+              }
+            },
+            {
+              title: "状态",
+              dataIndex: "status",
+              width: 100,
+              render: (value) => statusTag(value)
+            },
+            {
+              title: "结果",
+              dataIndex: "message",
+              render: (value, row) => h("span", null, row.warning ? `${value || "已完成"}；检测提示：${row.warning}` : value || "-")
+            }
+          ];
+
+          return h(Modal, {
+            title: "批量续费",
+            open: batchRenewalOpen,
+            onCancel: closeBatchRenewal,
+            onOk: batchRenewalFinished ? closeBatchRenewal : batchRenewalRows.length ? submitBatchRenewals : previewBatchRenewals,
+            okText: batchRenewalFinished ? "关闭" : batchRenewalRows.length ? "开始续费" : "生成预览",
+            cancelText: "取消",
+            cancelButtonProps: { disabled: batchRenewing || batchRenewalFinished },
+            okButtonProps: {
+              disabled: batchRenewalFinished
+                ? false
+                : batchRenewalRows.length
+                  ? !batchRenewalCanSubmit()
+                  : !batchRenewalText.trim()
+            },
+            confirmLoading: batchRenewing,
+            maskClosable: !batchRenewing,
+            width: 980,
+            destroyOnClose: true
+          }, [
+            h(Alert, {
+              key: "scope",
+              type: "info",
+              showIcon: true,
+              message: `当前渠道有 ${batchRenewalAccounts.length} 个待续费账号`,
+              description: "每行填写一个激活码。系统会随机匹配套餐到期、未订阅或未激活的账号；确认续费前可以修改账号。",
+              style: { marginBottom: 14 }
+            }),
+            h(Input.TextArea, {
+              key: "codes",
+              value: batchRenewalText,
+              onChange: (event) => {
+                setBatchRenewalText(event.target.value);
+                setBatchRenewalRows([]);
+                setBatchRenewalError("");
+                setBatchRenewalFinished(false);
+              },
+              disabled: batchRenewing || batchRenewalFinished,
+              rows: 6,
+              autoComplete: "off",
+              placeholder: "每行一个激活码",
+              style: { marginBottom: 12 }
+            }),
+            batchRenewalError
+              ? h(Alert, { key: "error", type: "error", showIcon: true, message: batchRenewalError, style: { marginBottom: 12 } })
+              : null,
+            batchRenewalRows.length
+              ? h("div", { key: "preview" }, [
+                  h("div", {
+                    key: "summary",
+                    style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 10 }
+                  }, [
+                    h(Space, { size: 6, wrap: true, key: "tags" }, batchRenewalFinished
+                      ? [
+                          h(Tag, { color: "green", key: "success" }, `成功 ${successCount}`),
+                          h(Tag, { color: pendingCount ? "orange" : "default", key: "pending" }, `待确认 ${pendingCount}`),
+                          h(Tag, { color: failedCount ? "red" : "default", key: "failed" }, `失败 ${failedCount}`)
+                        ]
+                      : [
+                          h(Tag, { color: "blue", key: "codes" }, `激活码 ${batchRenewalRows.length}`),
+                          h(Tag, { key: "accounts" }, `已匹配 ${batchRenewalRows.filter((row) => row.accountId).length}`)
+                        ]),
+                    batchRenewalFinished
+                      ? null
+                      : h(Button, {
+                          key: "rematch",
+                          size: "small",
+                          icon: Icon.ReloadOutlined ? h(Icon.ReloadOutlined) : null,
+                          disabled: batchRenewing,
+                          onClick: previewBatchRenewals
+                        }, "重新随机分配")
+                  ]),
+                  h(Table, {
+                    key: "table",
+                    rowKey: "key",
+                    size: "small",
+                    pagination: batchRenewalRows.length > 8 ? { pageSize: 8, showSizeChanger: false } : false,
+                    scroll: { x: 860, y: 360 },
+                    dataSource: batchRenewalRows,
+                    columns,
+                    locale: { emptyText: "没有可续费的账号" }
+                  })
+                ])
+              : null
+          ].filter(Boolean));
         }
 
         function renderProxyAssignModal() {
@@ -8981,11 +9476,11 @@
               key: "name",
               title: rowChannel?.name || row.channelId || ""
             }, rowChannel?.name || row.channelId || "渠道已移除"),
-            h("div", {
-              className: `account-channel-state${rowChannelStatus === "ok" ? " is-ok" : " is-attention"}`,
+            rowChannelStatus === "ok" ? null : h("div", {
+              className: "account-channel-state is-attention",
               key: "status"
             }, `渠道${statusText}`)
-          ]);
+          ].filter(Boolean));
         }
 
         function accountRoutingContent(row, rowChannel) {
@@ -9152,7 +9647,7 @@
             return { tone: "normal", headline: "可用", detail: availability.reasons.join(" · ") };
           }
           if (availability.state === "partial") {
-            return { tone: "warning", headline: "部分可用", detail: availability.reasons.join(" · ") };
+            return { tone: "info", headline: "部分可用", detail: availability.reasons.join(" · ") };
           }
           if (availability.state === "partial_error") {
             return { tone: "danger", headline: "部分异常", detail: availability.reasons.join(" · ") };
@@ -9204,11 +9699,11 @@
               accountCardHealthContent(health)
             ]),
             h("div", { className: "account-card-primary", key: "primary" }, [
-              accountCardSection("代理 IP", proxyCell(row.proxyUrl, row), "proxy"),
               accountCardSection("剩余额度", quotaTextCell(
                 accountQuotaText(row, rowChannel),
                 accountQuotaProtectionItems(row, rowChannel)
               ), "quota"),
+              accountCardSection("代理 IP", proxyCell(row.proxyUrl, row), "proxy"),
               accountCardSection("额度刷新", accountQuotaResetCell(row, rowChannel, nowTick), "reset")
             ]),
             h("details", { className: "account-card-details", key: "details" }, [
@@ -9240,6 +9735,40 @@
             ])
           ]);
         }
+
+        function accountGroupHeader(title, description, count, collapsible = false) {
+          return [
+            h("div", { className: "account-group-heading", key: "heading" }, [
+              h("span", { className: "account-group-marker", "aria-hidden": true, key: "marker" }),
+              h("span", { className: "account-group-title", key: "title" }, title),
+              h("span", { className: "account-group-count", key: "count" }, count)
+            ]),
+            h("span", { className: "account-group-description", key: "description" }, description),
+            collapsible ? h("span", { className: "account-group-chevron", "aria-hidden": true, key: "chevron" },
+              Icon.DownOutlined ? h(Icon.DownOutlined) : null
+            ) : null
+          ].filter(Boolean);
+        }
+
+        function accountGroupSection({ key, title, description, count, rows, collapsible = false }) {
+          if (!rows.length) return null;
+          const className = `account-group is-${key}`;
+          if (collapsible) {
+            return h("details", {
+              className,
+              open: accountStatusFilter === "disabled" ? true : undefined,
+              key
+            }, [
+              h("summary", { key: "summary" }, accountGroupHeader(title, description, count, true)),
+              h("div", { className: "account-list", key: "list" }, rows.map(accountCard))
+            ]);
+          }
+          return h("section", { className, key }, [
+            h("div", { className: "account-group-header", key: "header" }, accountGroupHeader(title, description, count)),
+            h("div", { className: "account-list", key: "list" }, rows.map(accountCard))
+          ]);
+        }
+
         function productivityTaskCell(successTasks, failedTasks, totalTasks, successRate) {
           return h("div", { className: "productivity-cell-lines" }, [
             h("strong", { key: "counts" }, `成功 ${numberValue(successTasks).toLocaleString("zh-CN")} · 失败 ${numberValue(failedTasks).toLocaleString("zh-CN")}`),
@@ -9926,26 +10455,20 @@
                         h("span", { className: "channel-nav-name", key: "name" }, "全部账号"),
                         accounts.length
                           ? h(Tag, {
-                              color: allAccountStats.error
+                              color: allAccountUsabilityStats.unavailable
                                 ? "error"
-                                : allAccountStats.business || allAccountStats.partial
-                                  ? "warning"
-                                  : allAccountStats.disabled ? "default" : "success",
+                                : allAccountUsabilityStats.disabled ? "default" : "success",
                               key: "status"
-                            }, allAccountStats.error
-                              ? `${allAccountStats.error} 个异常`
-                              : allAccountStats.business
-                                ? `${allAccountStats.business} 个待恢复`
-                                : allAccountStats.partial
-                                  ? `${allAccountStats.partial} 个部分可用`
-                                  : allAccountStats.disabled
-                                    ? `${allAccountStats.disabled} 个已停用`
-                                    : "账号正常")
+                            }, allAccountUsabilityStats.unavailable
+                              ? `${allAccountUsabilityStats.unavailable} 个不可用`
+                              : allAccountUsabilityStats.disabled
+                                ? `${allAccountUsabilityStats.disabled} 个已停用`
+                                : "账号可用")
                           : h(Tag, { key: "status" }, "暂无账号")
                       ]),
                       h("div", { className: "channel-nav-meta", key: "meta" }, [
                         h("span", { key: "total" }, `共 ${accounts.length} 个`),
-                        h("span", { key: "ok" }, `可处理 ${allAccountStats.ok + allAccountStats.partial} 个`)
+                        h("span", { key: "ok" }, `可用 ${allAccountUsabilityStats.available} 个`)
                       ])
                     ]),
                     ...filteredChannels.map((channel) => {
@@ -10061,20 +10584,20 @@
                         h("span", { key: "label" }, "账号总数"),
                         h("strong", { key: "value" }, selectedAccounts.length)
                       ]),
-                      h("span", { className: "account-context-item is-success", key: "ok" }, [
-                        h("span", { key: "label" }, "可用"),
-                        h("strong", { key: "value" }, accountScopeStats.ok)
+                      h("span", { className: "account-context-item is-success", key: "available" }, [
+                        h("span", { key: "label" }, "可用账号"),
+                        h("strong", { key: "value" }, accountScopeUsabilityStats.available)
                       ]),
-                      h("span", { className: "account-context-item is-warning", key: "partial" }, [
-                        h("span", { key: "label" }, "部分可用"),
+                      h("span", { className: "account-context-item is-danger", key: "unavailable" }, [
+                        h("span", { key: "label" }, "不可用账号"),
+                        h("strong", { key: "value" }, accountScopeUsabilityStats.unavailable)
+                      ]),
+                      h("span", { className: "account-context-item is-info", key: "partial" }, [
+                        h("span", { key: "label" }, "其中部分可用"),
                         h("strong", { key: "value" }, accountScopeStats.partial)
                       ]),
-                      h("span", { className: "account-context-item is-warning", key: "business" }, [
-                        h("span", { key: "label" }, "待恢复"),
-                        h("strong", { key: "value" }, accountScopeStats.business)
-                      ]),
                       h("span", { className: "account-context-item is-danger", key: "error" }, [
-                        h("span", { key: "label" }, "异常"),
+                        h("span", { key: "label" }, "其中账号异常"),
                         h("strong", { key: "value" }, accountScopeStats.error)
                       ]),
                       h("span", { className: "account-context-item is-muted", key: "disabled" }, [
@@ -10097,7 +10620,9 @@
                       onChange: setAccountStatusFilter,
                       options: [
                         { label: "全部状态", value: "all" },
-                        { label: "可用", value: "ok" },
+                        { label: "可用账号（含部分可用）", value: "usable" },
+                        { label: "不可用账号", value: "unavailable" },
+                        { label: "完全可用", value: "ok" },
                         { label: "部分可用", value: "partial" },
                         { label: "账号异常", value: "error" },
                         { label: "额度保护", value: "protection" },
@@ -10115,6 +10640,15 @@
                   h("div", { className: "account-toolbar-actions", key: "actions" }, [
                     h("span", { className: "toolbar-note", key: "total" }, `当前 ${filteredAccounts.length} 个账号`),
                     !selectedChannel ? h("span", { className: "toolbar-note", key: "import-note" }, "批量导入需先选择渠道") : null,
+                    selectedChannel && chatAccountActivationAvailable(selectedChannel)
+                      ? h(Button, {
+                          icon: Icon.KeyOutlined ? h(Icon.KeyOutlined) : null,
+                          onClick: openBatchRenewal,
+                          disabled: !batchRenewalAccounts.length,
+                          title: batchRenewalAccounts.length ? `待续费账号 ${batchRenewalAccounts.length} 个` : "当前渠道没有待续费账号",
+                          key: "batch-renewal"
+                        }, "批量续费")
+                      : null,
                     selectedChannel && cloudlianRegistrationAvailable(selectedChannel)
                       ? h(Button, { icon: Icon.UserAddOutlined ? h(Icon.UserAddOutlined) : null, onClick: openCloudlianRegistration, key: "register" }, "批量自动注册")
                       : null,
@@ -10133,7 +10667,30 @@
                   ].filter(Boolean))
                 ]),
                 paginatedAccounts.length
-                  ? h("div", { className: "account-list", key: "list" }, paginatedAccounts.map(accountCard))
+                  ? h("div", { className: "account-groups", key: "groups" }, [
+                      accountGroupSection({
+                        key: "unavailable",
+                        title: "不可用账号",
+                        description: "当前无法接收任务，请优先处理",
+                        count: filteredAccountUsabilityStats.unavailable,
+                        rows: paginatedAccountGroups.unavailable
+                      }),
+                      accountGroupSection({
+                        key: "available",
+                        title: "可用账号",
+                        description: "至少一项能力可用，可继续接收对应任务",
+                        count: filteredAccountUsabilityStats.available,
+                        rows: paginatedAccountGroups.available
+                      }),
+                      accountGroupSection({
+                        key: "disabled",
+                        title: "已停用账号",
+                        description: "不会参与任务分配",
+                        count: filteredAccountUsabilityStats.disabled,
+                        rows: paginatedAccountGroups.disabled,
+                        collapsible: true
+                      })
+                    ].filter(Boolean))
                   : h("div", { className: "account-list-empty", key: "empty" }, h(Empty, {
                       description: !channels.length
                         ? "还没有渠道，先新增渠道"
@@ -11114,6 +11671,7 @@
                 ])
               : null
           ]),
+          renderBatchRenewalModal(),
           renderProxyAssignModal()
         ]);
       }

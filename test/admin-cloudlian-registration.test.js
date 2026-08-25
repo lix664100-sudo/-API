@@ -20,6 +20,15 @@ const parseCloudlianRegistrationText = vm.runInNewContext(`(() => {
   return parseCloudlianRegistrationText;
 })()`, { URL });
 
+const batchRenewalHelpers = vm.runInNewContext(`(() => {
+  ${functionSource("chatAccountActivationAvailable", "abilityStatus")}
+  ${functionSource("batchRenewalStatus", "batchRenewalEligible")}
+  ${functionSource("batchRenewalEligible", "parseBatchRenewalCodes")}
+  ${functionSource("parseBatchRenewalCodes", "createBatchRenewalPreview")}
+  ${functionSource("createBatchRenewalPreview", "parseProxyAssignText")}
+  return { batchRenewalEligible, parseBatchRenewalCodes, createBatchRenewalPreview };
+})()`, { URL });
+
 test("批量注册文本按每行的激活码和 IP 解析", () => {
   const parsed = parseCloudlianRegistrationText([
     "CODE-1 1.1.1.1:8080",
@@ -52,4 +61,38 @@ test("管理页面提供批量注册和账号激活续期入口", () => {
   assert.match(html, /激活\/续期/);
   assert.match(html, /\/api\/channels\/\$\{encodeURIComponent\(selectedChannel\.id\)\}\/cloudlian\/register-batch/);
   assert.match(html, /\/api\/accounts\/\$\{encodeURIComponent\(accountToActivate\.id\)\}\/activate/);
+  assert.match(html, /批量续费/);
+  assert.match(html, /\/api\/channels\/\$\{encodeURIComponent\(selectedChannel\.id\)\}\/accounts\/activate-batch/);
+});
+
+test("批量续费只随机匹配当前渠道的启用待续费账号", () => {
+  const channel = { id: "channel-1", type: "chatplus", settings: { baseUrl: "https://chat.example.com" } };
+  const accounts = [
+    { id: "expired", channelId: channel.id, enabled: true, status: "subscription_expired" },
+    { id: "missing", channelId: channel.id, enabled: true, meta: { abilities: { chatplus: { status: "subscription_missing" } } } },
+    { id: "ready", channelId: channel.id, enabled: true, status: "ok" },
+    { id: "disabled", channelId: channel.id, enabled: false, status: "subscription_expired" }
+  ];
+  const eligible = accounts.filter((account) => batchRenewalHelpers.batchRenewalEligible(account, channel));
+  assert.deepEqual(eligible.map((account) => account.id), ["expired", "missing"]);
+
+  const preview = batchRenewalHelpers.createBatchRenewalPreview("CODE-1\nCODE-2", eligible, () => 0);
+  assert.equal(preview.error, "");
+  assert.equal(preview.rows.length, 2);
+  assert.equal(new Set(preview.rows.map((row) => row.accountId)).size, 2);
+  assert.ok(preview.rows.every((row) => row.status === "valid"));
+});
+
+test("批量续费预览标出重复激活码和数量多出的项目", () => {
+  const duplicate = batchRenewalHelpers.parseBatchRenewalCodes("CODE-1\ncode-1");
+  assert.equal(duplicate.rows[1].status, "duplicate");
+
+  const preview = batchRenewalHelpers.createBatchRenewalPreview(
+    "CODE-1\nCODE-2",
+    [{ id: "expired" }],
+    () => 0
+  );
+  assert.equal(preview.rows[0].accountId, "expired");
+  assert.equal(preview.rows[1].status, "failed");
+  assert.match(preview.rows[1].message, /没有更多待续费账号/);
 });
