@@ -77,6 +77,15 @@ test("task pages return the newest matching records without returning the full h
   assert.equal(secondPage.hasMore, false);
   assert.deepEqual(secondPage.items.map((task) => task.id), ["task-middle-chat", "task-old-drawing"]);
 
+  const mixed = await listTaskPage({ page: 1, pageSize: 2, mixKinds: true });
+  assert.deepEqual(
+    mixed.items.map((task) => [task.id, task.taskType]),
+    [
+      ["task-concurrency-limited", "img2img"],
+      ["task-middle-chat", "chat"]
+    ]
+  );
+
   const filtered = await listTaskPage({
     keyword: "batch_draw_old",
     accountId: "account-a",
@@ -126,6 +135,9 @@ test("content-policy failures have a separate safety-review status", async () =>
       code: "content_policy",
       message: "The prompt may violate our content policies."
     },
+    requestJson: {
+      files: [{ previewUrl: "/uploads/previews/safety-review-source.png" }]
+    },
     raw: { submitted: true },
     createdAt: new Date(now).toISOString()
   });
@@ -148,6 +160,7 @@ test("content-policy failures have a separate safety-review status", async () =>
       ["task-safety-review-message", "safety_review"]
     ]
   );
+  assert.deepEqual(reviewed.items[0].inputImageUrls, ["/uploads/previews/safety-review-source.png"]);
 });
 
 test("old active tasks remain visible without bringing back old completed history", async () => {

@@ -137,6 +137,12 @@ function taskFileJson(file) {
   };
 }
 
+function taskFilePreviewUrls(files = []) {
+  return [...new Set((Array.isArray(files) ? files : [])
+    .map((file) => String(file?.previewUrl || "").trim())
+    .filter(Boolean))];
+}
+
 function failedRequestJson(input = {}, files = [], sourceTaskId = "") {
   const { file: _file, files: _files, ...fields } = input || {};
   const requestJson = { ...fields };
@@ -210,7 +216,10 @@ async function persistReturnedErrorTask(error, context, payload, status) {
     ratio: existing?.ratio || context.input?.ratio_label || context.input?.ratio || "",
     imageCount: existing?.imageCount ?? Number(context.input?.image_count || context.input?.n || 1),
     imageUrls: Array.isArray(existing?.imageUrls) ? existing.imageUrls : [],
-    inputImageUrls: Array.isArray(existing?.inputImageUrls) ? existing.inputImageUrls : [],
+    inputImageUrls: [...new Set([
+      ...(Array.isArray(existing?.inputImageUrls) ? existing.inputImageUrls : []),
+      ...taskFilePreviewUrls(context.files)
+    ])],
     upstreamText: payload.upstreamText || existing?.upstreamText || "",
     errorMessage: payload.message,
     statusCode: status,
@@ -1280,7 +1289,8 @@ app.get("/api/tasks/page", async (request) => ({
     sourceChannelId: request.query?.sourceChannelId,
     channel: request.query?.channel,
     status: request.query?.status,
-    kind: request.query?.kind
+    kind: request.query?.kind,
+    mixKinds: request.query?.mixKinds
   })
 }));
 

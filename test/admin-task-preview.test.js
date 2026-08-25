@@ -153,6 +153,13 @@ test("历史任务没有原图时返回空列表，界面显示明确提示", ()
   assert.match(adminHtml, /暂无生成结果/);
 });
 
+test("安全审核任务显示原图，并明确区分请求图片和实际结果", () => {
+  assert.match(serverSource, /\.\.\.taskFilePreviewUrls\(context\.files\)/);
+  assert.match(adminHtml, /安全审核未生成图片/);
+  assert.match(adminHtml, /`请求 \$\{requestedCount\} 张 · 结果 \$\{resultCount\} 张`/);
+  assert.match(adminHtml, /task-thumb task-thumb-empty/);
+});
+
 test("对话记录始终显示本地任务ID，并单独显示调用方任务ID", () => {
   const { taskIdentityItems } = loadTaskIdHelpers();
 
@@ -286,6 +293,11 @@ test("任务列表只加载轻量摘要，完整记录和 JSON 点击后再读�
   assert.match(adminHtml, /open \? h\("div", \{ className: "task-json-grid"/);
   assert.match(adminHtml, /图片内容已省略/);
   assert.doesNotMatch(adminHtml, /setTasks\(\[\]\);\s*setTaskTotal\(0\)/);
+});
+
+test("全部记录请求生图和对话混合排列", () => {
+  assert.match(adminHtml, /if \(normalized\.kind === "all"\) params\.set\("mixKinds", "1"\)/);
+  assert.match(serverSource, /mixKinds: request\.query\?\.mixKinds/);
 });
 
 test("处理中任务自动刷新只合并更新结果，不再重复下载整页", () => {

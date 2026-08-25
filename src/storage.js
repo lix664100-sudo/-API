@@ -1854,6 +1854,14 @@ function safeTaskListImageUrls(value) {
     .slice(0, 4);
 }
 
+function taskListInputImageUrls(task = {}) {
+  const requestFiles = Array.isArray(task.requestJson?.files) ? task.requestJson.files : [];
+  return safeTaskListImageUrls([
+    ...(Array.isArray(task.inputImageUrls) ? task.inputImageUrls : []),
+    ...requestFiles.map((file) => file?.previewUrl)
+  ]);
+}
+
 function taskInputImageCount(task = {}) {
   const request = task.requestJson || {};
   const messages = Array.isArray(request.messages) ? request.messages : [];
@@ -1942,6 +1950,7 @@ function taskListSummary(task = {}) {
   const prompt = String(task.prompt || "");
   const responseText = String(task.responseText || "");
   const inputImageCount = taskInputImageCount(task);
+  const inputImageUrls = taskListInputImageUrls(task);
   return {
     id: task.id,
     sourceTaskId: taskSourceTaskId(task),
@@ -1955,7 +1964,7 @@ function taskListSummary(task = {}) {
     ratio: task.ratio,
     imageCount: task.imageCount,
     imageUrls: safeTaskListImageUrls(task.imageUrls),
-    inputImageUrls: safeTaskListImageUrls(task.inputImageUrls),
+    inputImageUrls,
     inputImageCount,
     prompt: taskListPreviewText(prompt),
     responseText: taskListPreviewText(responseText),
@@ -2037,7 +2046,8 @@ export async function listTaskPage({
   sourceChannelId = "",
   channel = "",
   status = "",
-  kind = ""
+  kind = "",
+  mixKinds = false
 } = {}) {
   const requestedPage = Math.max(1, Math.floor(Number(page) || 1));
   const normalizedPageSize = Math.min(100, Math.max(1, Math.floor(Number(pageSize) || 30)));
@@ -2054,6 +2064,9 @@ export async function listTaskPage({
     ? String(kind).trim().toLowerCase()
     : "";
   filters.kind = normalizedKind;
+  const shouldMixKinds = !normalizedKind && (
+    mixKinds === true || Number(mixKinds) === 1 || String(mixKinds).trim().toLowerCase() === "true"
+  );
 
   const database = await getStorageDatabase();
   const cutoff = Date.now() - taskHistoryDays * 24 * 60 * 60 * 1000;
@@ -2098,17 +2111,35 @@ export async function listTaskPage({
   const pageCount = Math.ceil(total / normalizedPageSize);
   const normalizedPage = Math.min(requestedPage, Math.max(1, pageCount));
   const start = (normalizedPage - 1) * normalizedPageSize;
-  const rows = database.prepare(withEligible(`
-    SELECT tasks.payload
-    FROM tasks
-    WHERE tasks.id IN (
-      SELECT id
-      FROM eligible
-      ${pageWhere.sql}
-    )
-    ORDER BY tasks.created_time DESC
-    LIMIT ? OFFSET ?
-  `)).all(...eligibleParams, ...pageWhere.params, normalizedPageSize, start);
+  const rowsSql = shouldMixKinds
+    ? `
+      SELECT tasks.payload
+      FROM (
+        SELECT id, created_time, record_kind,
+          ROW_NUMBER() OVER (
+            PARTITION BY record_kind
+            ORDER BY created_time DESC, id DESC
+          ) AS kind_position
+        FROM eligible
+        ${pageWhere.sql}
+      ) AS ranked
+      JOIN tasks ON tasks.id = ranked.id
+      ORDER BY ranked.kind_position, ranked.created_time DESC, ranked.id DESC
+      LIMIT ? OFFSET ?
+    `
+    : `
+      SELECT tasks.payload
+      FROM tasks
+      WHERE tasks.id IN (
+        SELECT id
+        FROM eligible
+        ${pageWhere.sql}
+      )
+      ORDER BY tasks.created_time DESC, tasks.id DESC
+      LIMIT ? OFFSET ?
+    `;
+  const rows = database.prepare(withEligible(rowsSql))
+    .all(...eligibleParams, ...pageWhere.params, normalizedPageSize, start);
   const items = rows.flatMap((row) => {
     try {
       return [taskListSummary(JSON.parse(row.payload))];
