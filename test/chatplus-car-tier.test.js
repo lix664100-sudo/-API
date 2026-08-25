@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 
-const { ChatplusClient } = await import("../src/channels/chatplus.js");
+const { ChatplusClient, normalizeImageCarCooldown } = await import("../src/channels/chatplus.js");
 
 function car(overrides = {}) {
   return {
@@ -84,6 +84,18 @@ function clientForGemini(chatModel = {}) {
     sessionLock: async (work) => work()
   });
 }
+
+test("legacy conversation busy freezes are shortened to 30 seconds", () => {
+  const normalized = normalizeImageCarCooldown({
+    carId: "legacy-busy-car",
+    reason: "conversation_not_created",
+    message: "对话过快或您当前有多个任务执行中，请稍后重试",
+    updatedAt: "2026-08-25T10:00:00.000Z",
+    cooldownUntil: "2026-08-26T10:00:00.000Z"
+  });
+
+  assert.equal(normalized.cooldownUntil, "2026-08-25T10:00:30.000Z");
+});
 
 test("chatplus auto car tier skips Ultra cars", async () => {
   const client = clientForGemini();
@@ -694,6 +706,79 @@ test("a successful concurrent submission refreshes the reusable login session", 
     assert.equal(carListReads, 1);
     assert.equal(carEntries, 1);
     assert.equal(reused.snapshot.cookies.includes("session=fresh"), true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("concurrent GPT tasks stagger conversation creation on the same car", async () => {
+  const client = clientForGpt({ accountId: "account-staggered-submit" });
+  const selected = { carId: "shared-submit-car", carType: "chatgpt" };
+  const startedAt = [];
+  let active = 0;
+  let maxActive = 0;
+
+  await Promise.all([1, 2, 3].map(() => client.runConversationSubmit(selected, async () => {
+    startedAt.push(Date.now());
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    active -= 1;
+  })));
+
+  assert.equal(maxActive, 1);
+  assert.ok(startedAt[1] - startedAt[0] >= 1900);
+  assert.ok(startedAt[2] - startedAt[1] >= 1900);
+});
+
+test("GPT conversation busy responses briefly freeze the car and switch without a 24 hour lock", async () => {
+  const cooldowns = [];
+  const requestedCars = [];
+  const server = createServer((request, response) => {
+    const selectedCar = String(request.headers.cookie || "").match(/car=([^;]+)/)?.[1] || "";
+    if (request.method === "POST" && request.url === "/backend-api/conversation") {
+      requestedCars.push(selectedCar);
+    }
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (selectedCar === "busy-conversation-car") {
+      response.end("data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"parts\":[\"对话过快或您当前有多个任务执行中，请稍后重试\"]}}}\n\ndata: [DONE]\n\n");
+      return;
+    }
+    response.end("data: {\"conversation_id\":\"conversation-after-busy-car\"}\n\ndata: [DONE]\n\n");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const client = clientForGpt({
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    accountId: "account-conversation-busy",
+    onImageCarCooldown: async (cooldown) => cooldowns.push(cooldown)
+  });
+  client.fetchCars = async () => [
+    car({ id: "busy-conversation-car", imageRemaining: 10, count: 0 }),
+    car({ id: "healthy-conversation-car", imageRemaining: 9, count: 1 })
+  ];
+  client.enterCar = async (carId, carType) => {
+    client.portalLoggedIn = true;
+    client.carId = carId;
+    client.carType = carType;
+    client.cookies = [`car=${carId}`];
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+
+  const startedAt = Date.now();
+  try {
+    const result = await client.createTextTask({
+      prompt: "对话拥挤后自动换车",
+      concurrentSubmit: true,
+      waitForImages: false
+    });
+
+    assert.equal(result.externalId, "conversation-after-busy-car");
+    assert.deepEqual(requestedCars, ["busy-conversation-car", "healthy-conversation-car"]);
+    assert.equal(cooldowns.length, 1);
+    assert.equal(cooldowns[0].reason, "conversation_busy");
+    const freezeMs = Date.parse(cooldowns[0].cooldownUntil) - startedAt;
+    assert.ok(freezeMs >= 20_000 && freezeMs <= 35_000);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

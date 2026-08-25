@@ -7,13 +7,13 @@ const adminHtml = await readFile(new URL("../admin/index.html", import.meta.url)
 const fixedNow = Date.parse("2026-08-23T00:00:00+08:00");
 
 const quotaPairFunctionMatch = adminHtml.match(
-  /function quotaPairText\(quota, balance\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function quotaColumnTitle/
+  /function quotaPairText\(quota, balance\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function quotaTextCell/
 );
 
 assert.ok(quotaPairFunctionMatch, "管理后台中应存在统一额度显示方法");
 
 const quotaPairFunctionSource = quotaPairFunctionMatch[0].replace(
-  /\r?\n\r?\n      function quotaColumnTitle$/,
+  /\r?\n\r?\n      function quotaTextCell$/,
   ""
 );
 const quotaPairText = vm.runInNewContext(
@@ -637,8 +637,8 @@ test("账号额度时间会显示核验失败和套餐过期", () => {
   assert.equal(accountQuotaResetText(expired, channel, fixedNow), "绘图 套餐已过期");
 });
 
-test("账号表格使用额度重置时间列名", () => {
-  assert.match(adminHtml, /title: "额度重置时间"/);
+test("账号信息块显示额度重置时间", () => {
+  assert.match(adminHtml, /accountCardField\("额度重置"/);
   assert.match(adminHtml, /accountQuotaResetCell\(/);
   assert.match(adminHtml, /h\(Tag, \{/);
   assert.match(adminHtml, /className: `quota-reset-tag/);

@@ -36,6 +36,8 @@ const MAX_CHAT_CAR_ATTEMPTS = 8;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
 const PRO_CAR_RECHECK_MS = 6 * 60 * 60 * 1000;
 const UNCONFIRMED_CAR_TTL_MS = 24 * 60 * 60 * 1000;
+const CONVERSATION_BUSY_CAR_TTL_MS = 30 * 1000;
+const CONVERSATION_SUBMIT_MIN_INTERVAL_MS = 2 * 1000;
 const MAX_UNCONFIRMED_CAR_ATTEMPTS = 2;
 const IMAGE_CAR_RECHECK_MS = 5 * 60 * 1000;
 const RECENT_IMAGE_SUCCESS_TTL_MS = 6 * 60 * 60 * 1000;
@@ -389,8 +391,28 @@ function isRetryableImageSubmissionRejection(error) {
 
 function shouldQuarantineImageSubmissionCar(error) {
   if (error?.imageSubmissionAttempted !== true) return false;
+  if (error?.conversationBusy === true) return false;
   const status = Number(error?.status || error?.statusCode || 0);
   return status >= 500 || error?.code === "INVALID_UPSTREAM_RESPONSE";
+}
+
+export function isConversationBusyText(value) {
+  return /对话过快|当前有多个任务执行中|已有任务(?:正在)?(?:执行|处理)|多个任务(?:正在)?(?:执行|处理)|conversation.{0,20}too fast|too many.{0,20}(?:tasks?|requests?)|another.{0,20}(?:task|request).{0,20}(?:running|progress)/i
+    .test(String(value || "").replace(/\s+/g, " "));
+}
+
+export function normalizeImageCarCooldown(cooldown = {}, now = Date.now()) {
+  const normalized = { ...(cooldown || {}) };
+  const originalUntil = Date.parse(normalized.cooldownUntil || "");
+  const legacyBusyFreeze = normalized.reason === "conversation_not_created"
+    && isConversationBusyText(normalized.message);
+  if (!legacyBusyFreeze || !Number.isFinite(originalUntil)) return normalized;
+
+  const updatedAt = Date.parse(normalized.updatedAt || "");
+  const correctedUntil = Number.isFinite(updatedAt)
+    ? Math.min(originalUntil, updatedAt + CONVERSATION_BUSY_CAR_TTL_MS)
+    : Math.min(originalUntil, Number(now));
+  return { ...normalized, cooldownUntil: new Date(correctedUntil).toISOString() };
 }
 
 function isInvalidCarError(error) {
@@ -2295,7 +2317,8 @@ function savedImageCarCooldowns(account = {}, channel = {}) {
 function restoreSavedImageCarCooldowns(account = {}, channel = {}) {
   const accountId = account?.id;
   if (!accountId) return;
-  for (const cooldown of Object.values(savedImageCarCooldowns(account, channel))) {
+  for (const savedCooldown of Object.values(savedImageCarCooldowns(account, channel))) {
+    const cooldown = normalizeImageCarCooldown(savedCooldown);
     const carId = String(cooldown?.carId || "").trim();
     const carType = String(cooldown?.carType || "chatgpt").trim();
     const until = Date.parse(cooldown?.cooldownUntil || "");
@@ -2413,6 +2436,8 @@ export class ChatplusClient {
     this.portalDirectoryLoader = portalDirectoryLoader;
     this.contextSignature = this.makeContextSignature({ channel, account });
     this.accountWorks = new Map();
+    this.conversationSubmitWorks = new Map();
+    this.conversationSubmitStartedAt = new Map();
     this.concurrentChatSessions = new Map();
     this.completedConversationSyncs = new Map();
     this.imageTaskIds = new Map();
@@ -3112,6 +3137,42 @@ export class ChatplusClient {
     return this.runAccountWork(work, this.chatRouteForInput(input).key);
   }
 
+  async runConversationSubmit(selected = {}, work) {
+    const carId = String(selected.carId || "").trim();
+    const carType = String(selected.carType || "chatgpt").trim();
+    const key = `${carType}:${carId}`;
+    const previous = this.conversationSubmitWorks.get(key) || Promise.resolve();
+    const current = previous.catch(() => {}).then(async () => {
+      if (isBadCar(this.account?.id, carType, carId)) {
+        const error = new Error(`车位 ${carId} 正在临时冻结，已切换其他车位。`);
+        error.code = "IMAGE_CAR_COOLDOWN";
+        error.carCooldown = true;
+        throw error;
+      }
+
+      const waitMs = Math.max(
+        0,
+        (this.conversationSubmitStartedAt.get(key) || 0) + CONVERSATION_SUBMIT_MIN_INTERVAL_MS - Date.now()
+      );
+      if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+      if (isBadCar(this.account?.id, carType, carId)) {
+        const error = new Error(`车位 ${carId} 正在临时冻结，已切换其他车位。`);
+        error.code = "IMAGE_CAR_COOLDOWN";
+        error.carCooldown = true;
+        throw error;
+      }
+
+      this.conversationSubmitStartedAt.set(key, Date.now());
+      return work();
+    });
+    this.conversationSubmitWorks.set(key, current);
+    try {
+      return await current;
+    } finally {
+      if (this.conversationSubmitWorks.get(key) === current) this.conversationSubmitWorks.delete(key);
+    }
+  }
+
   chatRouteForInput(input = {}) {
     let resolvedRoute = resolveChatModelRoute(this.channel?.settings || {}, requestedChatModel(input));
     if (resolvedRoute.key === "gemini") {
@@ -3460,13 +3521,8 @@ export class ChatplusClient {
     };
   }
 
-  rememberAuthFailedCar(selected) {
-    rememberBadCar(this.account?.id, selected?.carType, selected?.carId);
-  }
-
-  async rememberUnconfirmedCar(selected, error = null) {
+  async rememberCarCooldown(selected, retryAt, reason, message = "") {
     if (!String(selected?.carId || "").trim()) return 0;
-    const retryAt = Date.now() + UNCONFIRMED_CAR_TTL_MS;
     rememberBadCar(this.account?.id, selected?.carType, selected?.carId, retryAt);
     if (this.onImageCarCooldown) {
       try {
@@ -3474,14 +3530,50 @@ export class ChatplusClient {
           carId: String(selected.carId),
           carType: String(selected.carType || "chatgpt"),
           cooldownUntil: new Date(retryAt).toISOString(),
-          reason: "conversation_not_created",
-          message: String(error?.message || "上游没有创建对话")
+          reason,
+          message: String(message || "").replace(/\s+/g, " ").trim()
         });
       } catch (persistError) {
-        console.error("保存失效车位失败：", persistError);
+        console.error("保存车位冻结状态失败：", persistError);
       }
     }
     return retryAt;
+  }
+
+  async rememberAuthFailedCar(selected, error = null) {
+    const text = `${error?.message || ""} ${error?.body || ""}`;
+    const reason = isChatSubscriptionExpiredText(text)
+      ? "subscription_expired"
+      : isChatSubscriptionMissingText(text)
+        ? "subscription_missing"
+        : isCarPlanMismatchError(error)
+          ? "car_plan_mismatch"
+          : "car_auth";
+    return this.rememberCarCooldown(
+      selected,
+      Date.now() + BAD_CAR_TTL_MS,
+      reason,
+      error?.message || "车位登录状态异常"
+    );
+  }
+
+  async rememberUnconfirmedCar(selected, error = null) {
+    const retryAt = Date.now() + UNCONFIRMED_CAR_TTL_MS;
+    return this.rememberCarCooldown(
+      selected,
+      retryAt,
+      "conversation_not_created",
+      error?.message || "上游没有创建对话"
+    );
+  }
+
+  async rememberConversationBusyCar(selected, error = null) {
+    return this.rememberCarCooldown(
+      selected,
+      Date.now() + CONVERSATION_BUSY_CAR_TTL_MS,
+      "conversation_busy",
+      error?.upstreamText || error?.message || "上游提示对话过快或已有任务正在处理"
+    );
   }
 
   async rememberImageFailedCar(selected, error = null) {
@@ -3491,20 +3583,12 @@ export class ChatplusClient {
     const retryAt = Number.isFinite(parsedResetAt) && parsedResetAt > Date.now()
       ? parsedResetAt
       : Date.now() + (cooldownMs || IMAGE_CAR_RECHECK_MS);
-    rememberBadCar(this.account?.id, selected?.carType, selected?.carId, retryAt);
-    if (this.onImageCarCooldown) {
-      try {
-        await this.onImageCarCooldown({
-          carId: String(selected?.carId || ""),
-          carType: String(selected?.carType || "chatgpt"),
-          cooldownUntil: new Date(retryAt).toISOString(),
-          reason: error?.imageCarQuotaExhausted === true ? "image_quota" : "image_failure"
-        });
-      } catch (persistError) {
-        console.error("保存车位暂停时间失败：", persistError);
-      }
-    }
-    return retryAt;
+    return this.rememberCarCooldown(
+      selected,
+      retryAt,
+      error?.imageCarQuotaExhausted === true ? "image_quota" : "image_failure",
+      error?.message || (error?.imageCarQuotaExhausted === true ? "车位生图额度已用完" : "车位生图失败")
+    );
   }
 
   async rememberImageSuccessfulCar(selected) {
@@ -3610,7 +3694,7 @@ export class ChatplusClient {
           || isCarPlanMismatchError(error);
         if (retryableCarError) {
           await this.rememberProCarsUnavailable(error);
-          this.rememberAuthFailedCar(selected);
+          await this.rememberAuthFailedCar(selected, error);
           await this.sessionLock(async () => this.resetSession());
         }
         if (route.key === "gemini" && !retryableCarError) {
@@ -4460,47 +4544,64 @@ export class ChatplusClient {
             });
         }
 
-        if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.started = true;
-        const response = await measureTaskStage(requestInput.taskStageRecorder, {
+        const submission = await measureTaskStage(requestInput.taskStageRecorder, {
           key: "upstream_generation",
           label: "等待上游处理",
           carId: selected?.carId,
           carType: selected?.carType
-        }, async () => runSubmitStep(() => submitClient.http("/backend-api/conversation", {
-          method: "POST",
-          body,
-          abortWhen: requestInput.imageGeneration === true
-            ? (chunk) => isImageGenerationLimitMessage(chunk) ? imageCarQuotaError(chunk) : null
-            : null,
-          headers: {
-            accept: "text/event-stream",
-            referer: `${this.baseUrl}/`
+        }, async () => this.runConversationSubmit(selected, async () => {
+          if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.started = true;
+          const response = await runSubmitStep(() => submitClient.http("/backend-api/conversation", {
+            method: "POST",
+            body,
+            abortWhen: requestInput.imageGeneration === true
+              ? (chunk) => isImageGenerationLimitMessage(chunk) ? imageCarQuotaError(chunk) : null
+              : null,
+            headers: {
+              accept: "text/event-stream",
+              referer: `${this.baseUrl}/`
+            }
+          }));
+          if (response.status < 200 || response.status >= 300) {
+            const error = conversationSubmitError(response);
+            if (isConversationBusyText(response.body)) {
+              error.code = "UPSTREAM_CONVERSATION_BUSY";
+              error.conversationBusy = true;
+              await this.rememberConversationBusyCar(selected, error);
+            }
+            throw error;
           }
-        })));
-        if (response.status < 200 || response.status >= 300) {
-          throw conversationSubmitError(response);
-        }
-        if (isChatUsageLimitMessage(response.body)) {
-          const usage = chatUsageLimitFromText(response.body) || {};
-          throw chatUsageLimitError(
-            `当前 GPT 账号的使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`,
-            usage
-          );
-        }
+          if (isChatUsageLimitMessage(response.body)) {
+            const usage = chatUsageLimitFromText(response.body) || {};
+            throw chatUsageLimitError(
+              `当前 GPT 账号的使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`,
+              usage
+            );
+          }
 
-        const events = parseSse(response.body);
-        throwIfImageGenerationLimit(events, { car: requestInput.imageGeneration === true });
-        let conversationId = "";
-        for (const event of events) {
-          if (event.conversation_id) conversationId = event.conversation_id;
-        }
-        if (!conversationId) {
-          throw conversationNotCreatedError(
-            selected,
-            "GPT 没有返回对话编号",
-            response.body
-          );
-        }
+          const events = parseSse(response.body);
+          throwIfImageGenerationLimit(events, { car: requestInput.imageGeneration === true });
+          let conversationId = "";
+          for (const event of events) {
+            if (event.conversation_id) conversationId = event.conversation_id;
+          }
+          if (!conversationId) {
+            const error = conversationNotCreatedError(
+              selected,
+              "GPT 没有返回对话编号",
+              response.body
+            );
+            if (isConversationBusyText(response.body)) {
+              error.code = "UPSTREAM_CONVERSATION_BUSY";
+              error.conversationBusy = true;
+              error.message = "当前车位上游提示对话过快或已有任务正在处理。";
+              await this.rememberConversationBusyCar(selected, error);
+            }
+            throw error;
+          }
+          return { events, conversationId };
+        }));
+        const { events, conversationId } = submission;
         if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.confirmed = true;
         const upstreamTaskId = requestInput.imageGeneration === true
           ? submitClient.rememberImageTaskId(conversationId, imageTaskIdFrom(events, conversationId))
@@ -4540,12 +4641,16 @@ export class ChatplusClient {
             error.selectedCarType ||= selected.carType;
           }
           if (selected && shouldQuarantineImageSubmissionCar(error)) {
-            await this.rememberImageFailedCar(selected);
+            await this.rememberImageFailedCar(selected, error);
           }
         }
         if (isConfirmedChatUsageLimitError(error)) {
           error.quotaModel = activeRoute?.key || "";
           throw error;
+        }
+        if (selected && error.conversationBusy === true) {
+          recordCarError("上游提示对话过快或已有任务正在处理，车位已短暂冻结并自动切换。");
+          continue;
         }
         if (
           selected
@@ -4612,7 +4717,7 @@ export class ChatplusClient {
           continue;
         }
         if (selected && isRetryableImageSubmissionRejection(error)) {
-          this.rememberAuthFailedCar(selected);
+          await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
           recordCarError(error.message || "上游拒绝了当前聊天车位");
           continue;
@@ -4626,14 +4731,14 @@ export class ChatplusClient {
         const retryableCarError = selected && (isAuthSessionError(error) || isCarPlanMismatchError(error));
         if (retryableCarError) {
           await this.rememberProCarsUnavailable(error);
-          this.rememberAuthFailedCar(selected);
+          await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
           recordCarError(error.message || "调用失败");
           continue;
         }
         if (Number(error.status || error.statusCode || 0) === 400) throw error;
         if (isAuthSessionError(error)) {
-          this.rememberAuthFailedCar(selected);
+          await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
         }
         recordCarError(error.message || "调用失败");

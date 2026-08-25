@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { ChatplusClient, isChatImageIntermediateResponse, isImagePolicyFailureMessage } from "./channels/chatplus.js";
+import {
+  ChatplusClient,
+  isChatImageIntermediateResponse,
+  isImagePolicyFailureMessage,
+  normalizeImageCarCooldown
+} from "./channels/chatplus.js";
 import {
   DrawingClient,
   drawingBalanceInsufficient,
@@ -940,6 +945,7 @@ async function clearProCarRestriction(channel, account) {
 
 function activeImageCarCooldowns(value = {}, now = Date.now()) {
   const entries = Object.values(value && typeof value === "object" && !Array.isArray(value) ? value : {})
+    .map((item) => normalizeImageCarCooldown(item, now))
     .filter((item) => {
       const until = Date.parse(item?.cooldownUntil || "");
       return String(item?.carId || "").trim() && Number.isFinite(until) && until > now;
