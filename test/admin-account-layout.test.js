@@ -54,10 +54,11 @@ test("账号信息块保留原有管理操作和分页", () => {
   assert.match(adminHtml, /pageSizeOptions: \[20, 50, 100\]/);
 });
 
-test("账号卡片不展示车位冻结提示", () => {
-  assert.doesNotMatch(adminHtml, /accountCarFreezeContent/);
-  assert.doesNotMatch(adminHtml, /冻结车位|部分车位暂时冻结/);
-  assert.doesNotMatch(adminHtml, /\.account-car-freeze/);
+test("账号卡片仅在有冻结车位时显示一行提醒", () => {
+  assert.match(adminHtml, /accountCarFreezeNotice\(row, rowChannel\)/);
+  assert.match(adminHtml, /className: "account-car-freeze-summary"/);
+  assert.match(adminHtml, /if \(!freezes\.length\) return null;/);
+  assert.doesNotMatch(adminHtml, /h\("details", \{ className: "account-freeze-details"/);
 });
 
 test("账号卡片在宽屏自动多列排列并使用完整可用宽度", () => {

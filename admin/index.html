@@ -939,6 +939,109 @@
         opacity: 0.82;
       }
 
+      .account-car-freeze-summary {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        width: 100%;
+        min-width: 0;
+        padding: 7px 9px;
+        border: 1px solid #fedf89;
+        border-radius: 6px;
+        background: #fffaeb;
+        color: #93370d;
+        cursor: pointer;
+        font: inherit;
+        font-size: 12px;
+        line-height: 1.4;
+        text-align: left;
+      }
+
+      .account-car-freeze-summary:hover {
+        border-color: #fdb022;
+        background: #fef0c7;
+      }
+
+      .account-car-freeze-summary:focus-visible {
+        outline: 2px solid rgba(247, 144, 9, 0.45);
+        outline-offset: 2px;
+      }
+
+      .account-car-freeze-dot {
+        flex: 0 0 7px;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #f79009;
+      }
+
+      .account-car-freeze-summary strong {
+        flex: 0 0 auto;
+        font-weight: 720;
+      }
+
+      .account-car-freeze-summary-text {
+        min-width: 0;
+        overflow: hidden;
+        color: #b54708;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .account-car-freeze-summary-action {
+        flex: 0 0 auto;
+        margin-left: auto;
+        color: #7a2e0e;
+        font-weight: 680;
+      }
+
+      .account-car-freeze-list {
+        display: grid;
+        width: min(360px, calc(100vw - 64px));
+        max-height: 360px;
+        overflow-y: auto;
+      }
+
+      .account-car-freeze-item {
+        display: grid;
+        gap: 4px;
+        min-width: 0;
+        padding: 10px 0;
+      }
+
+      .account-car-freeze-item:first-child {
+        padding-top: 2px;
+      }
+
+      .account-car-freeze-item:last-child {
+        padding-bottom: 2px;
+      }
+
+      .account-car-freeze-item + .account-car-freeze-item {
+        border-top: 1px solid #f2f4f7;
+      }
+
+      .account-car-freeze-name {
+        overflow-wrap: anywhere;
+        color: #101828;
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.4;
+      }
+
+      .account-car-freeze-reason,
+      .account-car-freeze-time {
+        overflow-wrap: anywhere;
+        color: #475467;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .account-car-freeze-time {
+        color: #b54708;
+        font-variant-numeric: tabular-nums;
+      }
+
       .account-card-enable {
         display: inline-flex;
         align-items: center;
@@ -3131,6 +3234,7 @@
         Modal,
         Pagination,
         Popconfirm,
+        Popover,
         Progress,
         Row,
         Segmented,
@@ -4447,6 +4551,65 @@
 
       function abilityStatus(account, key) {
         return account?.meta?.abilities?.[key] || {};
+      }
+
+      function conversationBusyFreezeText(value) {
+        return /对话过快|当前有多个任务执行中|已有任务(?:正在)?(?:执行|处理)|多个任务(?:正在)?(?:执行|处理)/
+          .test(String(value || ""));
+      }
+
+      function accountCarFreezes(account, channel, now = Date.now()) {
+        const stored = channel?.type === "shareai"
+          ? abilityStatus(account, "chatplus")?.meta?.imageCarCooldowns
+          : account?.meta?.chatplusImageCarCooldowns;
+        const currentTime = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+        return Object.values(stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {})
+          .map((item) => {
+            const originalUntil = Date.parse(item?.cooldownUntil || "");
+            const legacyBusyFreeze = item?.reason === "conversation_not_created"
+              && conversationBusyFreezeText(item?.message);
+            const updatedAt = Date.parse(item?.updatedAt || "");
+            const correctedUntil = legacyBusyFreeze && Number.isFinite(originalUntil)
+              ? Math.min(originalUntil, Number.isFinite(updatedAt) ? updatedAt + 30_000 : currentTime)
+              : originalUntil;
+            return { ...(item || {}), cooldownUntil: correctedUntil };
+          })
+          .filter((item) => String(item.carId || "").trim() && Number.isFinite(item.cooldownUntil) && item.cooldownUntil > currentTime)
+          .sort((left, right) => left.cooldownUntil - right.cooldownUntil);
+      }
+
+      function carFreezeReason(cooldown = {}) {
+        if (cooldown.reason === "conversation_busy" || conversationBusyFreezeText(cooldown.message)) {
+          return "上游任务繁忙，等待自动重试";
+        }
+        const reasons = {
+          conversation_not_created: "上游没有创建对话",
+          image_quota: "该车位生图额度已用完",
+          image_failure: "该车位生图失败，等待自动复查",
+          car_auth: "该车位登录状态异常",
+          car_plan_mismatch: "当前账号不能使用该车位套餐",
+          subscription_missing: "该车位没有可用套餐",
+          subscription_expired: "该车位套餐已到期"
+        };
+        return reasons[cooldown.reason] || "该车位暂时不可用";
+      }
+
+      function carTypeName(carType) {
+        const names = { chatgpt: "GPT", gemini: "Gemini", grok: "Grok" };
+        return names[String(carType || "chatgpt").toLowerCase()] || "聊天";
+      }
+
+      function carFreezeRecoveryText(value, now = Date.now()) {
+        const until = Number(value);
+        const currentTime = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+        const remainingMs = until - currentTime;
+        if (!Number.isFinite(until) || remainingMs <= 0) return "";
+        const totalMinutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+        if (totalMinutes < 60) return `${totalMinutes} 分钟后恢复`;
+        const hours = Math.floor(totalMinutes / 60);
+        const minutes = totalMinutes % 60;
+        if (hours < 24) return `${hours} 小时${minutes ? ` ${minutes} 分钟` : ""}后恢复`;
+        return `${formatDateTime(until)} 恢复`;
       }
 
       function quotaProtectionSettings(value = {}) {
@@ -9818,6 +9981,45 @@
           ]);
         }
 
+        function accountCarFreezeDetails(freezes) {
+          return h("div", { className: "account-car-freeze-list" }, freezes.map((cooldown) =>
+            h("div", {
+              className: "account-car-freeze-item",
+              key: `${cooldown.carType || "chatgpt"}:${cooldown.carId}`
+            }, [
+              h("div", { className: "account-car-freeze-name", key: "name" },
+                `${carTypeName(cooldown.carType)} 车位 ${cooldown.carId}`
+              ),
+              h("div", { className: "account-car-freeze-reason", key: "reason" }, carFreezeReason(cooldown)),
+              h("div", { className: "account-car-freeze-time", key: "time" },
+                `${formatDateTime(cooldown.cooldownUntil)} 自动恢复`
+              )
+            ])
+          ));
+        }
+
+        function accountCarFreezeNotice(row, rowChannel) {
+          const freezes = accountCarFreezes(row, rowChannel, nowTick);
+          if (!freezes.length) return null;
+          const recoveryText = carFreezeRecoveryText(freezes[0].cooldownUntil, nowTick);
+          return h(Popover, {
+            title: "冻结车位详情",
+            content: accountCarFreezeDetails(freezes),
+            placement: "bottomLeft",
+            trigger: ["hover", "click"],
+            destroyOnHidden: true
+          }, h("button", {
+            className: "account-car-freeze-summary",
+            type: "button",
+            "aria-label": `查看 ${freezes.length} 个冻结车位详情`
+          }, [
+            h("span", { className: "account-car-freeze-dot", "aria-hidden": true, key: "dot" }),
+            h("strong", { key: "count" }, `${freezes.length} 个车位冻结`),
+            h("span", { className: "account-car-freeze-summary-text", key: "time" }, `· 最早 ${recoveryText}`),
+            h("span", { className: "account-car-freeze-summary-action", key: "action" }, "查看")
+          ]));
+        }
+
         function accountCard(row) {
           const rowChannel = channels.find((item) => item.id === row.channelId);
           const health = accountCardHealth(row);
@@ -9832,7 +10034,8 @@
                   accountChannelContent(row, rowChannel)
                 ])
               ]),
-              accountCardHealthContent(health)
+              accountCardHealthContent(health),
+              accountCarFreezeNotice(row, rowChannel)
             ]),
             h("div", { className: "account-card-primary", key: "primary" }, [
               accountCardSection("剩余额度", quotaTextCell(
