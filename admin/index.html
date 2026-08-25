@@ -1051,6 +1051,14 @@
         font-size: 12px;
       }
 
+      .task-trend-controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+
       .task-trend-chart {
         width: 100%;
         height: 300px;
@@ -1990,6 +1998,10 @@
         .task-trend-header {
           align-items: stretch;
           flex-direction: column;
+        }
+
+        .task-trend-controls {
+          justify-content: flex-start;
         }
 
         .task-record-context {
@@ -5417,6 +5429,7 @@
 
       function Dashboard({ adminUser, onLogout }) {
         const [config, setConfig] = useState(null);
+        const configSnapshotRef = useRef("");
         const [tasks, setTasks] = useState([]);
         const [taskTotal, setTaskTotal] = useState(0);
         const [allTaskTotal, setAllTaskTotal] = useState(0);
@@ -5465,8 +5478,13 @@
         const [taskSearchLoading, setTaskSearchLoading] = useState(false);
         const taskRequestIdRef = useRef(0);
         const taskPageAbortRef = useRef(null);
+        const taskPageCacheRef = useRef(new Map());
+        const taskPrefetchRef = useRef(new Map());
+        const taskCacheRevisionRef = useRef(0);
+        const taskVisibleQueryRef = useRef("");
         const taskManualActionAtRef = useRef(0);
         const [taskTrendDays, setTaskTrendDays] = useState(30);
+        const [taskTrendKind, setTaskTrendKind] = useState("image");
         const [taskTrendHoverDay, setTaskTrendHoverDay] = useState("");
         const [productivityDateRange, setProductivityDateRange] = useState(() => {
           const today = dateKeyInShanghai(Date.now());
@@ -5873,6 +5891,7 @@
         }, [tasks, accounts, taskKind, taskAccountFilter, taskSourceChannelFilter, taskChannelFilter, taskStatusFilter, taskKeyword]);
 
         function addSubmittedTask(task) {
+          invalidateTaskPageCache();
           setAllTaskTotal((current) => current + 1);
           const kind = taskRecordKind(task);
           const matches = taskMatchesListFilters(task) && taskMatchesKeyword(task, taskKeyword);
@@ -5886,19 +5905,23 @@
 
         const filteredStatRecords = useMemo(() => {
           return statRecords.filter((record) => {
-            if (!taskRecordKindMatches(record, taskKind)) return false;
             const accountOk = taskAccountFilter === "all" || record.accountId === taskAccountFilter;
             const sourceChannelOk = taskSourceChannelMatches(record, taskSourceChannelFilter, accounts);
             const channelOk = taskChannelFilter === "all" || record.channelGroup === taskChannelFilter;
             const statusOk = taskStatusFilter === "all" || record.status === taskStatusFilter;
             return accountOk && sourceChannelOk && channelOk && statusOk;
           });
-        }, [statRecords, accounts, taskKind, taskAccountFilter, taskSourceChannelFilter, taskChannelFilter, taskStatusFilter]);
+        }, [statRecords, accounts, taskAccountFilter, taskSourceChannelFilter, taskChannelFilter, taskStatusFilter]);
 
-        const taskStats = useMemo(() => summarizeTasks(filteredStatRecords), [filteredStatRecords]);
+        const taskStatsByKind = useMemo(() => ({
+          image: summarizeTasks(filteredStatRecords.filter((record) => taskRecordKindMatches(record, "image"))),
+          chat: summarizeTasks(filteredStatRecords.filter((record) => taskRecordKindMatches(record, "chat")))
+        }), [filteredStatRecords]);
+        const taskDashboardKind = taskKind === "all" ? taskTrendKind : taskKind;
+        const taskStats = taskStatsByKind[taskDashboardKind] || taskStatsByKind.image;
         const trendData = useMemo(() => (
-          taskTrendData(dailyStats, taskTrendDays, taskAccountFilter, taskSourceChannelFilter, taskChannelFilter, accounts, taskKind)
-        ), [dailyStats, taskTrendDays, taskAccountFilter, taskSourceChannelFilter, taskChannelFilter, accounts, taskKind]);
+          taskTrendData(dailyStats, taskTrendDays, taskAccountFilter, taskSourceChannelFilter, taskChannelFilter, accounts, taskDashboardKind)
+        ), [dailyStats, taskTrendDays, taskAccountFilter, taskSourceChannelFilter, taskChannelFilter, accounts, taskDashboardKind]);
         const trendHasData = trendData.some((item) => item.tasks > 0 || item.successTasks > 0 || item.failedTasks > 0);
         const taskRangeStats = useMemo(() => summarizeTrendRows(trendData), [trendData]);
         const taskHoveredStats = useMemo(() => (
@@ -5967,7 +5990,7 @@
 
         useEffect(() => {
           setTaskTrendHoverDay("");
-        }, [taskTrendDays, taskAccountFilter, taskChannelFilter]);
+        }, [taskTrendDays, taskDashboardKind, taskAccountFilter, taskChannelFilter]);
 
         useEffect(() => {
           if (
@@ -6067,15 +6090,130 @@
           return error?.message || fallback;
         }
 
+        function taskPageQuery({
+          page = 1,
+          keyword = taskKeyword,
+          accountId = taskAccountFilter,
+          sourceChannelId = taskSourceChannelFilter,
+          channel = taskChannelFilter,
+          status = taskStatusFilter,
+          kind = taskKind
+        } = {}) {
+          const normalized = {
+            page: Math.max(1, numberValue(page) || 1),
+            keyword: String(keyword || "").trim(),
+            accountId: accountId || "all",
+            sourceChannelId: sourceChannelId || "all",
+            channel: channel || "all",
+            status: status || "all",
+            kind: ["image", "chat"].includes(kind) ? kind : "all"
+          };
+          const params = new URLSearchParams({ page: String(normalized.page), pageSize: "30" });
+          if (normalized.keyword) params.set("keyword", normalized.keyword);
+          if (normalized.accountId !== "all") params.set("accountId", normalized.accountId);
+          if (normalized.sourceChannelId !== "all") params.set("sourceChannelId", normalized.sourceChannelId);
+          if (normalized.channel !== "all") params.set("channel", normalized.channel);
+          if (normalized.status !== "all") params.set("status", normalized.status);
+          if (normalized.kind !== "all") params.set("kind", normalized.kind);
+          return {
+            ...normalized,
+            key: params.toString(),
+            url: `/api/tasks/page?${params.toString()}`
+          };
+        }
+
+        function applyTaskPageData(data, { append = false } = {}) {
+          const items = Array.isArray(data?.items) ? data.items : [];
+          setTasks((current) => {
+            if (!append) return items;
+            const seen = new Set();
+            return [...current, ...items].filter((item) => {
+              const id = String(item?.id || "");
+              if (!id || seen.has(id)) return false;
+              seen.add(id);
+              return true;
+            });
+          });
+          setTaskTotal(Math.max(0, numberValue(data?.total)));
+          setTaskPage(Math.max(1, numberValue(data?.page) || 1));
+          setAllTaskTotal(Math.max(0, numberValue(data?.allTotal)));
+          setTaskKindTotals({
+            image: Math.max(0, numberValue(data?.kindTotals?.image)),
+            chat: Math.max(0, numberValue(data?.kindTotals?.chat))
+          });
+        }
+
+        function invalidateTaskPageCache() {
+          taskCacheRevisionRef.current += 1;
+          taskPageCacheRef.current.clear();
+          taskPrefetchRef.current.clear();
+        }
+
+        function cacheTaskPage(query, data, revision = taskCacheRevisionRef.current) {
+          if (revision !== taskCacheRevisionRef.current) return;
+          const cache = taskPageCacheRef.current;
+          cache.delete(query.key);
+          cache.set(query.key, { data, cachedAt: Date.now() });
+          while (cache.size > 30) cache.delete(cache.keys().next().value);
+        }
+
+        function prefetchTaskPage(query, { force = false } = {}) {
+          const cached = taskPageCacheRef.current.get(query.key);
+          if (!force && cached && Date.now() - cached.cachedAt < 15_000) {
+            return Promise.resolve(cached.data);
+          }
+          const existing = taskPrefetchRef.current.get(query.key);
+          if (existing) return existing;
+          const revision = taskCacheRevisionRef.current;
+          const request = api(query.url, { timeoutMs: 15_000 })
+            .then((data) => {
+              cacheTaskPage(query, data, revision);
+              return data;
+            })
+            .finally(() => {
+              if (taskPrefetchRef.current.get(query.key) === request) {
+                taskPrefetchRef.current.delete(query.key);
+              }
+            });
+          taskPrefetchRef.current.set(query.key, request);
+          return request;
+        }
+
+        function prefetchOtherTaskKinds(query) {
+          if (query.page !== 1) return;
+          ["all", "image", "chat"]
+            .filter((kind) => kind !== query.kind)
+            .forEach((kind) => {
+              prefetchTaskPage(taskPageQuery({ ...query, kind })).catch(() => {});
+            });
+        }
+
+        function refreshCachedTaskPage(query) {
+          prefetchTaskPage(query, { force: true })
+            .then((data) => {
+              if (taskVisibleQueryRef.current === query.key) applyTaskPageData(data);
+            })
+            .catch(() => {});
+        }
+
         async function refreshRuntimeStatus() {
           const runtimeData = await api("/api/admin/runtime").catch(() => null);
           if (runtimeData) setRuntimeStatus(runtimeData);
           return runtimeData;
         }
 
+        function applyConfig(nextConfig) {
+          if (!nextConfig) return false;
+          const snapshot = JSON.stringify(nextConfig);
+          if (snapshot === configSnapshotRef.current) return false;
+          configSnapshotRef.current = snapshot;
+          setConfig(nextConfig);
+          return true;
+        }
+
         async function refreshAccountStatus() {
           const nextConfig = await api("/api/config").catch(() => null);
-          if (nextConfig) setConfig(nextConfig);
+          applyConfig(nextConfig);
           return nextConfig;
         }
 
@@ -6089,45 +6227,46 @@
           status = taskStatusFilter,
           kind = taskKind,
           showLoading = true,
-          background = false
+          background = false,
+          preferCache = false,
+          forceRefresh = false
         } = {}) {
           if (background && taskListRequestActive()) return null;
+          const query = taskPageQuery({ page, keyword, accountId, sourceChannelId, channel, status, kind });
+          const cacheRevision = taskCacheRevisionRef.current;
+          if (!append) taskVisibleQueryRef.current = query.key;
           const requestId = ++taskRequestIdRef.current;
+          if (!background && taskListRequestActive()) {
+            taskPageAbortRef.current.abort();
+            taskPageAbortRef.current = null;
+          }
+
+          const cached = !append && preferCache && !forceRefresh
+            ? taskPageCacheRef.current.get(query.key)
+            : null;
+          if (cached) {
+            applyTaskPageData(cached.data);
+            setTaskListLoading(false);
+            prefetchOtherTaskKinds(query);
+            if (Date.now() - cached.cachedAt >= 5_000) refreshCachedTaskPage(query);
+            return cached.data;
+          }
+
           const controller = new AbortController();
-          if (!background && taskListRequestActive()) taskPageAbortRef.current.abort();
           taskPageAbortRef.current = controller;
-          const params = new URLSearchParams({ page: String(page), pageSize: "30" });
-          if (String(keyword || "").trim()) params.set("keyword", String(keyword).trim());
-          if (accountId && accountId !== "all") params.set("accountId", accountId);
-          if (sourceChannelId && sourceChannelId !== "all") params.set("sourceChannelId", sourceChannelId);
-          if (channel && channel !== "all") params.set("channel", channel);
-          if (status && status !== "all") params.set("status", status);
-          if (kind && kind !== "all") params.set("kind", kind);
           if (showLoading) setTaskListLoading(true);
           try {
-            const data = await api(`/api/tasks/page?${params.toString()}`, {
-              signal: controller.signal,
-              timeoutMs: background ? 8000 : 15000
-            });
+            const prefetched = taskPrefetchRef.current.get(query.key);
+            const data = prefetched
+              ? await prefetched
+              : await api(query.url, {
+                  signal: controller.signal,
+                  timeoutMs: background ? 8000 : 15000
+                });
             if (controller.signal.aborted || requestId !== taskRequestIdRef.current) return null;
-            const items = Array.isArray(data?.items) ? data.items : [];
-            setTasks((current) => {
-              if (!append) return items;
-              const seen = new Set();
-              return [...current, ...items].filter((item) => {
-                const id = String(item?.id || "");
-                if (!id || seen.has(id)) return false;
-                seen.add(id);
-                return true;
-              });
-            });
-            setTaskTotal(Math.max(0, numberValue(data?.total)));
-            setTaskPage(Math.max(1, numberValue(data?.page) || 1));
-            setAllTaskTotal(Math.max(0, numberValue(data?.allTotal)));
-            setTaskKindTotals({
-              image: Math.max(0, numberValue(data?.kindTotals?.image)),
-              chat: Math.max(0, numberValue(data?.kindTotals?.chat))
-            });
+            cacheTaskPage(query, data, cacheRevision);
+            applyTaskPageData(data, { append });
+            if (!append) prefetchOtherTaskKinds(query);
             return data;
           } catch (error) {
             if (error?.code === "REQUEST_ABORTED") return null;
@@ -6164,6 +6303,7 @@
             .filter((task) => task?.id)
             .map((task) => [String(task.id), task]));
           if (!updates.size) return;
+          invalidateTaskPageCache();
           setTasks((current) => current.map((task) => updates.has(String(task.id))
             ? { ...task, ...updates.get(String(task.id)) }
             : task));
@@ -6220,9 +6360,10 @@
               body: {},
               timeoutMs: 90000
             });
+            invalidateTaskPageCache();
             setTasks((current) => current.map((item) => String(item.id) === String(result?.id) ? result : item));
             await Promise.all([
-              loadTaskPage({ page: 1, showLoading: false, background: true }),
+              loadTaskPage({ page: 1, showLoading: false, background: true, forceRefresh: true }),
               refreshRuntimeStatus().catch(() => null)
             ]);
             if (result?.status === "success") message.success("已查到生成结果。");
@@ -6255,7 +6396,7 @@
           api("/api/admin/image-storage").then(setImageStorageStats).catch(() => {});
           api("/api/admin/runtime").then(setRuntimeStatus).catch(() => {});
           const nextConfig = await configPromise;
-          setConfig(nextConfig);
+          applyConfig(nextConfig);
           globalForm.setFieldsValue(nextConfig);
           chatForm.setFieldsValue({
             accountId: "auto",
@@ -6278,7 +6419,7 @@
           setTaskKeyword(keyword);
           setTaskSearchLoading(true);
           try {
-            const data = await loadTaskPage({ page: 1, keyword });
+            const data = await loadTaskPage({ page: 1, keyword, preferCache: true });
             if (!data) return;
             if (!keyword) return;
             const recordName = taskKind === "chat" ? "对话" : taskKind === "image" ? "生图" : "任务";
@@ -6301,7 +6442,7 @@
           if (type === "sourceChannelId") setTaskSourceChannelFilter(value);
           if (type === "channel") setTaskChannelFilter(value);
           if (type === "status") setTaskStatusFilter(value);
-          loadTaskPage({ page: 1, [type]: value }).catch((error) => {
+          loadTaskPage({ page: 1, [type]: value, preferCache: true }).catch((error) => {
             const text = taskListErrorMessage(error, "刷新任务记录失败");
             if (text) message.error(text);
           });
@@ -6413,6 +6554,7 @@
 
         useEffect(() => {
           const timer = setInterval(() => {
+            if (shouldPauseTaskAutoRefresh()) return;
             refreshAccountStatus().catch(() => {});
           }, 5000);
           return () => clearInterval(timer);
@@ -6458,10 +6600,10 @@
               if (shouldPauseTaskAutoRefresh()) return;
               mergeRefreshedTasks(results);
               if (taskStatusFilter !== "all") {
-                await loadTaskPage({ page: 1, showLoading: false, background: true });
+                await loadTaskPage({ page: 1, showLoading: false, background: true, forceRefresh: true });
               }
               const nextConfig = await api("/api/config").catch(() => null);
-              if (nextConfig) setConfig(nextConfig);
+              applyConfig(nextConfig);
               await refreshRuntimeStatus();
             } catch (_error) {
               // 下一轮继续刷新，避免临时网络波动打断页面。
@@ -6495,7 +6637,7 @@
           setLoading(true);
           try {
             const nextConfig = await api("/api/config", { method: "POST", body: values });
-            setConfig(nextConfig);
+            applyConfig(nextConfig);
             globalForm.setFieldsValue(nextConfig);
             await refreshImageStorage();
             message.success("设置已保存");
@@ -6508,7 +6650,7 @@
 
         async function patchChannel(channel, patch) {
           try {
-            setConfig(await api(`/api/channels/${channel.id}`, { method: "POST", body: patch }));
+            applyConfig(await api(`/api/channels/${channel.id}`, { method: "POST", body: patch }));
             await refreshRuntimeStatus();
             message.success("渠道已更新");
           } catch (error) {
@@ -6606,7 +6748,7 @@
             const beforeIds = new Set(channels.map((item) => item.id));
             const path = editingChannel ? `/api/channels/${editingChannel.id}` : "/api/channels";
             const nextConfig = await api(path, { method: "POST", body: payload });
-            setConfig(nextConfig);
+            applyConfig(nextConfig);
             const added = nextConfig.channels.find((item) => !beforeIds.has(item.id));
             setSelectedChannelId(editingChannel?.id || added?.id || selectedChannelId);
             setChannelModalOpen(false);
@@ -6624,7 +6766,7 @@
           setLoading(true);
           try {
             const nextConfig = await api(`/api/channels/${id}`, { method: "DELETE" });
-            setConfig(nextConfig);
+            applyConfig(nextConfig);
             setSelectedChannelId(nextConfig.channels[0]?.id || null);
             await refreshRuntimeStatus();
             message.success("渠道已删除");
@@ -6655,7 +6797,7 @@
             const channelId = editingAccount?.channelId || values.channelId || selectedChannel?.id;
             const payload = { ...editingAccount, ...values, channelId };
             const nextConfig = await api("/api/accounts", { method: "POST", body: payload });
-            setConfig(nextConfig);
+            applyConfig(nextConfig);
             setSelectedChannelId(channelId || selectedChannelId);
             setAccountModalOpen(false);
             setEditingAccount(null);
@@ -6706,7 +6848,7 @@
                 }))
               }
             });
-            setConfig(response.config);
+            applyConfig(response.config);
             await refreshRuntimeStatus();
             const result = response.result || {};
             const byId = new Map((result.results || []).map((row) => [String(row.rowId), row]));
@@ -6742,7 +6884,7 @@
               method: "POST",
               body: { activationCode: values.activationCode }
             });
-            setConfig(response.config);
+            applyConfig(response.config);
             await refreshRuntimeStatus();
             const result = response.result || {};
             if (["ready", "already_bound"].includes(result.status)) {
@@ -6824,7 +6966,7 @@
                 }))
               }
             });
-            setConfig(response.config);
+            applyConfig(response.config);
             setSelectedChannelId(selectedChannel.id);
             setAccountImportOpen(false);
             await refreshRuntimeStatus();
@@ -6930,7 +7072,7 @@
                 }))
               }
             });
-            setConfig(response.config);
+            applyConfig(response.config);
             setProxyAssignOpen(false);
             setProxyAssignPreview(null);
             await refreshRuntimeStatus();
@@ -6967,7 +7109,7 @@
             ? numberValue(taskKindTotals.image) + numberValue(taskKindTotals.chat)
             : numberValue(taskKindTotals[kind]));
           setTaskPage(1);
-          loadTaskPage({ page: 1, kind }).catch((error) => {
+          loadTaskPage({ page: 1, kind, preferCache: true }).catch((error) => {
             const text = taskListErrorMessage(error, "切换任务记录失败");
             if (text) message.error(text);
           });
@@ -7007,7 +7149,7 @@
                   method: "POST",
                   body: { channelIds: selectedChannelIds, snapshot }
                 });
-                setConfig(response.config);
+                applyConfig(response.config);
                 setProxyAssignOpen(false);
                 setProxyAssignPreview(null);
                 await refreshRuntimeStatus();
@@ -7240,7 +7382,7 @@
 
         async function deleteAccount(id) {
           try {
-            setConfig(await api(`/api/accounts/${id}`, { method: "DELETE" }));
+            applyConfig(await api(`/api/accounts/${id}`, { method: "DELETE" }));
             await refreshRuntimeStatus();
             message.success("账号已删除");
           } catch (error) {
@@ -7267,7 +7409,7 @@
           setClearingCooldownAccountIds((current) => current.includes(id) ? current : [...current, id]);
           try {
             const nextConfig = await api(`/api/accounts/${id}/clear-cooldown`, { method: "POST" });
-            setConfig(nextConfig);
+            applyConfig(nextConfig);
             message.success("绘图冷却已解除");
           } catch (error) {
             await refresh().catch(() => {});
@@ -7517,7 +7659,7 @@
             }
             mergeRefreshedTasks(results);
             await Promise.all([
-              loadTaskPage({ page: 1 }),
+              loadTaskPage({ page: 1, forceRefresh: true }),
               refreshAccountStatus().catch(() => null),
               refreshRuntimeStatus().catch(() => null),
               refreshStatsSummary().catch(() => null)
@@ -8179,8 +8321,27 @@
           const isChat = kind === "chat";
           const isAll = kind === "all";
           const recordName = isAll ? "任务" : isChat ? "对话" : "生图";
-          const summarySubject = isAll ? "任务" : "生图";
-          const trendTitle = isAll ? "每日任务结果" : "每日生图结果";
+          const dashboardKind = isAll ? taskTrendKind : kind;
+          const dashboardIsChat = dashboardKind === "chat";
+          const summarySubject = dashboardIsChat ? "对话" : "生图";
+          const trendTitle = dashboardIsChat ? "每日对话结果" : "每日生图结果";
+          const summaryItems = isAll
+            ? [
+                ["今日生图任务", taskStatsByKind.image.today.tasks],
+                ["今日成功生图", taskStatsByKind.image.today.successTasks],
+                ["生图成功率", taskSuccessRateText(taskStatsByKind.image.today)],
+                ["今日对话任务", taskStatsByKind.chat.today.tasks],
+                ["今日成功对话", taskStatsByKind.chat.today.successTasks],
+                ["对话成功率", taskSuccessRateText(taskStatsByKind.chat.today)]
+              ]
+            : [
+                [`今日接收${summarySubject}`, taskStats.today.tasks],
+                [`今日成功${summarySubject}`, taskStats.today.successTasks],
+                ["今日处理成功率", taskSuccessRateText(taskStats.today)],
+                [`${taskRangeTitle}接收${summarySubject}`, taskRangeDisplay.tasks],
+                [`${taskRangeTitle}成功${summarySubject}`, taskRangeDisplay.successTasks],
+                [`${taskRangeTitle}处理成功率`, taskSuccessRateText(taskRangeDisplay)]
+              ];
           return h("div", { className: "task-record-panel" }, [
             h("div", { className: "task-record-context", key: "context" }, [
               h("div", { key: "copy" }, [
@@ -8193,32 +8354,12 @@
               ]),
               h("div", { className: "toolbar-note", key: "total" }, `当前筛选 ${taskTotal.toLocaleString("zh-CN")} 条`)
             ]),
-            !isChat ? h("div", { className: "task-summary-grid", key: "summary" }, [
-              h("div", { className: "task-summary-item" }, [
-                h("div", { className: "task-summary-label" }, `今日接收${summarySubject}`),
-                h("div", { className: "task-summary-value" }, taskStats.today.tasks)
-              ]),
-              h("div", { className: "task-summary-item" }, [
-                h("div", { className: "task-summary-label" }, `今日成功${summarySubject}`),
-                h("div", { className: "task-summary-value" }, taskStats.today.successTasks)
-              ]),
-              h("div", { className: "task-summary-item" }, [
-                h("div", { className: "task-summary-label" }, "今日处理成功率"),
-                h("div", { className: "task-summary-value" }, taskSuccessRateText(taskStats.today))
-              ]),
-              h("div", { className: "task-summary-item" }, [
-                h("div", { className: "task-summary-label" }, `${taskRangeTitle}接收${summarySubject}`),
-                h("div", { className: "task-summary-value" }, taskRangeDisplay.tasks)
-              ]),
-              h("div", { className: "task-summary-item" }, [
-                h("div", { className: "task-summary-label" }, `${taskRangeTitle}成功${summarySubject}`),
-                h("div", { className: "task-summary-value" }, taskRangeDisplay.successTasks)
-              ]),
-              h("div", { className: "task-summary-item" }, [
-                h("div", { className: "task-summary-label" }, `${taskRangeTitle}处理成功率`),
-                h("div", { className: "task-summary-value" }, taskSuccessRateText(taskRangeDisplay))
+            h("div", { className: "task-summary-grid", key: "summary" }, summaryItems.map(([label, value]) => (
+              h("div", { className: "task-summary-item", key: label }, [
+                h("div", { className: "task-summary-label" }, label),
+                h("div", { className: "task-summary-value" }, value)
               ])
-            ]) : null,
+            ))),
             h("div", { className: "task-filters", key: "filters" }, [
               h(Input.Search, {
                 allowClear: true,
@@ -8265,21 +8406,34 @@
                   }, "加载更多")
                 : null
             ]),
-            !isChat ? h("div", { className: "task-trend", key: "trend" }, [
+            h("div", { className: "task-trend", key: "trend" }, [
               h("div", { className: "task-trend-header" }, [
                 h("div", null, [
                   h("h3", { className: "task-trend-title" }, trendTitle),
-                  h("div", { className: "task-trend-desc" }, "按任务完成日期统计接收任务、成功任务和处理成功率")
+                  h("div", { className: "task-trend-desc" }, `按完成日期统计${summarySubject}任务、成功任务和处理成功率`)
                 ]),
-                h(Segmented, {
-                  value: taskTrendDays,
-                  onChange: setTaskTrendDays,
-                  options: [
-                    { label: "近7天", value: 7 },
-                    { label: "近30天", value: 30 }
-                  ],
-                  size: "small"
-                })
+                h("div", { className: "task-trend-controls" }, [
+                  isAll ? h(Segmented, {
+                    key: "kind",
+                    value: taskTrendKind,
+                    onChange: setTaskTrendKind,
+                    options: [
+                      { label: "生图", value: "image" },
+                      { label: "对话", value: "chat" }
+                    ],
+                    size: "small"
+                  }) : null,
+                  h(Segmented, {
+                    key: "days",
+                    value: taskTrendDays,
+                    onChange: setTaskTrendDays,
+                    options: [
+                      { label: "近7天", value: 7 },
+                      { label: "近30天", value: 30 }
+                    ],
+                    size: "small"
+                  })
+                ].filter(Boolean))
               ]),
               trendHasData
                 ? h(TaskTrendChart, { data: trendData, onHoverDay: setTaskTrendHoverDay })
@@ -8287,7 +8441,7 @@
                     image: Empty.PRESENTED_IMAGE_SIMPLE,
                     description: `所选范围暂无已完成的${summarySubject}`
                   }))
-            ]) : null,
+            ]),
             h("div", { className: "task-toolbar", key: "toolbar" }, [
               h("span", { className: "toolbar-note" }, isAll
                 ? "生图和对话任务按最新时间排列；处理中和等待上游的记录会自动查询"

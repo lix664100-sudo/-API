@@ -106,6 +106,14 @@ test("task pages return the newest matching records without returning the full h
   const chatTasks = await listTaskPage({ kind: "chat" });
   assert.equal(chatTasks.total, 1);
   assert.deepEqual(chatTasks.items.map((task) => task.id), ["task-middle-chat"]);
+
+  const accountImageTasks = await listTaskPage({ accountId: "account-a", kind: "image" });
+  assert.equal(accountImageTasks.total, 3);
+  assert.deepEqual(accountImageTasks.kindTotals, { image: 3, chat: 0 });
+
+  const accountChatTasks = await listTaskPage({ accountId: "account-b", kind: "chat" });
+  assert.equal(accountChatTasks.total, 1);
+  assert.deepEqual(accountChatTasks.kindTotals, { image: 0, chat: 1 });
 });
 
 test("content-policy failures have a separate safety-review status", async () => {
