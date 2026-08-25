@@ -171,18 +171,19 @@ test("对话记录始终显示本地任务ID，并单独显示调用方任务ID"
 });
 
 test("任务缩略图打开原图与生成结果弹窗，并支持多图放大和窄屏排列", () => {
-  assert.match(adminHtml, /aria-label": "查看原图和生成结果"/);
+  assert.match(adminHtml, /"aria-label": isChat \? "查看对话图片" : "查看原图和生成结果"/);
   assert.match(adminHtml, /\? "对话图片" : "原图与生成结果"/);
   assert.match(adminHtml, /Image\.PreviewGroup/);
   assert.match(adminHtml, /\.task-compare-grid[\s\S]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
   assert.match(adminHtml, /@media \(max-width: 780px\)[\s\S]*\.task-compare-grid[\s\S]*grid-template-columns: 1fr/);
 });
 
-test("生图和对话记录独立展示，表格固定列宽避免长内容撑坏页面", () => {
+test("全部、生图和对话记录均可查看，表格固定列宽避免长内容撑坏页面", () => {
+  assert.match(adminHtml, /taskRecordTabLabel\("all", "全部记录"/);
   assert.match(adminHtml, /taskRecordTabLabel\("image", "生图记录"/);
   assert.match(adminHtml, /taskRecordTabLabel\("chat", "对话记录"/);
   assert.match(adminHtml, /tableLayout: "fixed"/);
-  assert.match(adminHtml, /scroll: \{ x: isChat \? 1680 : 1690 \}/);
+  assert.match(adminHtml, /scroll: \{ x: isAll \? 1880 : isChat \? 1680 : 1690 \}/);
   assert.match(adminHtml, /\.task-copy-full[\s\S]*max-height: 320px/);
   assert.match(adminHtml, /\.task-copy-preview[\s\S]*-webkit-line-clamp: 5/);
   assert.doesNotMatch(adminHtml, /h\("div", \{ className: "task-response" \}, row\.responseText\)/);
