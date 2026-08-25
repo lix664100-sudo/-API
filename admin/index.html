@@ -680,16 +680,16 @@
 
       .account-list {
         display: grid;
-        gap: 12px;
+        gap: 14px;
         min-width: 0;
-        padding: 14px 18px 18px;
+        padding: 16px 18px 20px;
       }
 
       .account-card {
         min-width: 0;
         overflow: hidden;
         border: 1px solid var(--line);
-        border-radius: 8px;
+        border-radius: 10px;
         background: #fff;
       }
 
@@ -697,30 +697,40 @@
         background: #fafafa;
       }
 
+      .account-card.is-disabled .account-card-column,
+      .account-card.is-disabled .account-card-section {
+        background: #fafafa;
+      }
+
       .account-card-header {
         display: flex;
         align-items: flex-start;
         justify-content: space-between;
-        gap: 12px 18px;
-        padding: 14px 16px;
-        border-bottom: 1px solid var(--line);
+        gap: 16px 24px;
+        padding: 18px;
       }
 
       .account-card-summary {
         display: grid;
-        grid-template-columns: minmax(180px, 1fr) minmax(150px, 0.8fr) minmax(240px, 1.35fr);
+        grid-template-columns: minmax(220px, 0.85fr) minmax(320px, 1.15fr);
         align-items: start;
-        gap: 14px 24px;
+        gap: 18px 32px;
         flex: 1 1 640px;
+        min-width: 0;
+      }
+
+      .account-card-overview {
+        display: grid;
+        gap: 10px;
         min-width: 0;
       }
 
       .account-card-controls {
         display: flex;
-        align-items: flex-start;
+        align-items: center;
         justify-content: flex-end;
         flex-wrap: wrap;
-        gap: 8px 12px;
+        gap: 8px 10px;
         flex: 0 1 auto;
       }
 
@@ -743,30 +753,43 @@
 
       .account-card-body {
         display: grid;
-        grid-template-columns: minmax(150px, 0.7fr) minmax(340px, 1.7fr) minmax(145px, 0.65fr) minmax(280px, 1.35fr);
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1px;
         min-width: 0;
+        border-top: 1px solid var(--line);
+        background: var(--line);
+      }
+
+      .account-card-column {
+        display: grid;
+        align-content: start;
+        min-width: 0;
+        background: #fff;
       }
 
       .account-card-section {
         min-width: 0;
-        padding: 14px 16px;
+        padding: 16px 18px 17px;
       }
 
       .account-card-section + .account-card-section {
-        border-left: 1px solid var(--line);
+        border-top: 1px solid var(--line);
       }
 
       .account-card-label,
       .account-card-field-label {
-        color: var(--muted);
-        font-size: 11px;
-        font-weight: 650;
-        line-height: 1.35;
+        color: #475467;
+        font-size: 12px;
+        font-weight: 680;
+        line-height: 1.4;
       }
 
       .account-card-content {
         min-width: 0;
         margin-top: 8px;
+        color: #344054;
+        font-size: 13px;
+        line-height: 1.55;
       }
 
       .account-card-fields {
@@ -777,7 +800,7 @@
 
       .account-card-field {
         display: grid;
-        gap: 4px;
+        gap: 5px;
         min-width: 0;
       }
 
@@ -846,8 +869,13 @@
       .account-identity,
       .account-channel-cell {
         display: grid;
-        gap: 3px;
+        gap: 4px;
         min-width: 0;
+      }
+
+      .account-card-overview .account-channel-cell {
+        padding-top: 10px;
+        border-top: 1px solid #f0f2f5;
       }
 
       .account-identity-name,
@@ -855,19 +883,24 @@
         min-width: 0;
         overflow: hidden;
         color: var(--ink);
-        font-size: 13px;
+        font-size: 14px;
         font-weight: 720;
         text-overflow: ellipsis;
         white-space: nowrap;
+      }
+
+      .account-identity-name {
+        font-size: 15px;
+        font-weight: 760;
       }
 
       .account-identity-login,
       .account-channel-state {
         min-width: 0;
         overflow: hidden;
-        color: var(--muted);
-        font-size: 11px;
-        line-height: 1.35;
+        color: #667085;
+        font-size: 12px;
+        line-height: 1.45;
         text-overflow: ellipsis;
         white-space: nowrap;
       }
@@ -1411,14 +1444,14 @@
 
       .account-status {
         display: grid;
-        gap: 4px;
+        gap: 6px;
         min-width: 0;
       }
 
       .account-status-tags {
         display: flex;
         flex-wrap: wrap;
-        gap: 4px;
+        gap: 6px;
       }
 
       .account-status-tags .ant-tag {
@@ -1426,28 +1459,81 @@
       }
 
       .account-status-time {
-        color: var(--muted);
-        font-size: 11px;
-        line-height: 1.3;
+        color: #667085;
+        font-size: 12px;
+        line-height: 1.4;
         white-space: nowrap;
       }
 
       .account-car-freezes {
         display: grid;
-        gap: 3px;
+        gap: 7px;
+        min-width: 0;
         margin-top: 2px;
+        padding: 9px 10px;
+        border-radius: 6px;
+        background: #fffaeb;
       }
 
       .account-car-freeze {
-        color: #b54708;
-        font-size: 11px;
-        line-height: 1.4;
+        color: #7a2e0e;
+        font-size: 12px;
+        line-height: 1.5;
         overflow-wrap: anywhere;
       }
 
       .account-car-freeze strong {
-        color: #93370d;
+        color: #7a2e0e;
+        font-weight: 680;
+      }
+
+      .account-car-freeze.is-preview {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .account-freeze-details {
+        min-width: 0;
+      }
+
+      .account-freeze-details summary {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: #175cd3;
+        cursor: pointer;
+        font-size: 12px;
         font-weight: 650;
+        list-style: none;
+        user-select: none;
+      }
+
+      .account-freeze-details summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .account-freeze-details summary:focus-visible {
+        border-radius: 4px;
+        outline: 2px solid rgba(22, 119, 255, 0.4);
+        outline-offset: 2px;
+      }
+
+      .account-freeze-chevron {
+        display: inline-flex;
+        transition: transform 180ms cubic-bezier(0.23, 1, 0.32, 1);
+      }
+
+      .account-freeze-details[open] .account-freeze-chevron {
+        transform: rotate(180deg);
+      }
+
+      .account-freeze-list {
+        display: grid;
+        gap: 6px;
+        margin-top: 8px;
+        padding-top: 8px;
+        border-top: 1px solid #fde68a;
       }
 
       .routing-weight-control {
@@ -2540,18 +2626,6 @@
           grid-template-columns: repeat(2, minmax(0, 1fr));
         }
 
-        .account-card-section + .account-card-section {
-          border-left: 0;
-        }
-
-        .account-card-section:nth-child(even) {
-          border-left: 1px solid var(--line);
-        }
-
-        .account-card-section:nth-child(n + 3) {
-          border-top: 1px solid var(--line);
-        }
-
         .productivity-chart-grid {
           grid-template-columns: 1fr;
         }
@@ -2714,12 +2788,6 @@
           grid-template-columns: 1fr;
         }
 
-        .account-card-section + .account-card-section,
-        .account-card-section:nth-child(even) {
-          border-left: 0;
-          border-top: 1px solid var(--line);
-        }
-
         .account-card-actions {
           justify-content: flex-start;
         }
@@ -2795,8 +2863,10 @@
       }
 
       @media (prefers-reduced-motion: reduce) {
-        .page-surface {
+        .page-surface,
+        .account-freeze-chevron {
           animation: none;
+          transition: none;
         }
       }
     </style>
@@ -2812,6 +2882,7 @@
         ConfigProvider,
         DatePicker,
         Drawer,
+        Dropdown,
         Empty,
         Form,
         Image,
@@ -8724,17 +8795,38 @@
           ]);
         }
 
+        function accountCarFreezeLine(cooldown, key, preview = false) {
+          const carName = `${carTypeName(cooldown.carType)} 车位 ${cooldown.carId}`;
+          const detail = `${carFreezeReason(cooldown)}；${formatDateTime(cooldown.cooldownUntil)} 自动解除`;
+          return h("div", {
+            className: `account-car-freeze${preview ? " is-preview" : ""}`,
+            key,
+            title: preview ? `${carName}：${detail}` : undefined
+          }, [
+            h("strong", { key: "car" }, carName),
+            h("span", { key: "reason" }, `：${detail}`)
+          ]);
+        }
+
         function accountCarFreezeContent(freezes) {
           if (!freezes.length) return null;
-          return h("div", { className: "account-car-freezes", key: "car-freezes" }, freezes.map((cooldown) =>
-            h("div", {
-              className: "account-car-freeze",
-              key: `${cooldown.carType || "chatgpt"}:${cooldown.carId}`
-            }, [
-              h("strong", { key: "car" }, `${carTypeName(cooldown.carType)} 车位 ${cooldown.carId}`),
-              h("span", { key: "reason" }, `：${carFreezeReason(cooldown)}；${formatDateTime(cooldown.cooldownUntil)} 自动解除`)
-            ])
-          ));
+          const [firstFreeze, ...remainingFreezes] = freezes;
+          return h("div", { className: "account-car-freezes", key: "car-freezes" }, [
+            accountCarFreezeLine(firstFreeze, "preview", true),
+            remainingFreezes.length
+              ? h("details", { className: "account-freeze-details", key: "details" }, [
+                  h("summary", { key: "summary" }, [
+                    h("span", { key: "text" }, `查看全部 ${freezes.length} 条冻结记录`),
+                    h("span", { className: "account-freeze-chevron", "aria-hidden": true, key: "icon" },
+                      Icon.DownOutlined ? h(Icon.DownOutlined) : null
+                    )
+                  ]),
+                  h("div", { className: "account-freeze-list", key: "list" }, remainingFreezes.map((cooldown) =>
+                    accountCarFreezeLine(cooldown, `${cooldown.carType || "chatgpt"}:${cooldown.carId}`)
+                  ))
+                ])
+              : null
+          ].filter(Boolean));
         }
 
         function accountStatusContent(row, rowChannel) {
@@ -8882,57 +8974,85 @@
           return h("div", { className: "account-usage" }, items.length ? items : "-");
         }
 
+        function confirmAccountCooldownClear(row) {
+          Modal.confirm({
+            title: "确认解除绘图冷却？",
+            content: "解除后，该账号会立即参与绘图任务分配。",
+            okText: "确认解除",
+            cancelText: "取消",
+            onOk: () => clearDrawingCooldown(row.id)
+          });
+        }
+
+        function confirmAccountDelete(row) {
+          Modal.confirm({
+            title: "删除这个账号？",
+            content: "删除后无法恢复，请确认不再需要这个账号。",
+            okText: "确认删除",
+            okButtonProps: { danger: true },
+            cancelText: "取消",
+            onOk: () => deleteAccount(row.id)
+          });
+        }
+
         function accountActionsContent(row, rowChannel) {
           const cooling = drawingAccountIsCooling(row);
+          const busy = checkingAll || checkingAccountIds.includes(row.id);
+          const menuItems = [
+            chatAccountActivationAvailable(rowChannel)
+              ? {
+                  key: "activate",
+                  label: "激活或续期",
+                  icon: Icon.KeyOutlined ? h(Icon.KeyOutlined) : null
+                }
+              : null,
+            cooling
+              ? {
+                  key: "clear-cooldown",
+                  label: "解除绘图冷却",
+                  disabled: busy || clearingCooldownAccountIds.includes(row.id),
+                  icon: Icon.UnlockOutlined ? h(Icon.UnlockOutlined) : null
+                }
+              : null,
+            {
+              key: "edit",
+              label: "编辑账号",
+              icon: Icon.EditOutlined ? h(Icon.EditOutlined) : null
+            },
+            {
+              key: "delete",
+              label: "删除账号",
+              danger: true,
+              icon: Icon.DeleteOutlined ? h(Icon.DeleteOutlined) : null
+            }
+          ].filter(Boolean);
+
+          function handleMoreAction({ key }) {
+            if (key === "activate") openAccountActivation(row);
+            else if (key === "clear-cooldown") confirmAccountCooldownClear(row);
+            else if (key === "edit") openAccountModal(row);
+            else if (key === "delete") confirmAccountDelete(row);
+          }
+
           return h("div", { className: "account-card-actions" }, [
             h(Button, {
               size: "small",
               onClick: () => testAccount(row.id),
-              loading: checkingAll || checkingAccountIds.includes(row.id),
+              loading: busy,
               icon: Icon.CheckCircleOutlined ? h(Icon.CheckCircleOutlined) : null,
               key: "check"
             }, "检测"),
-            chatAccountActivationAvailable(rowChannel)
-              ? h(Button, {
-                  key: "activate",
-                  size: "small",
-                  onClick: () => openAccountActivation(row),
-                  icon: Icon.KeyOutlined ? h(Icon.KeyOutlined) : null
-                }, "激活/续期")
-              : null,
-            cooling
-              ? h(Popconfirm, {
-                  key: "clear-cooldown",
-                  title: "确认解除绘图冷却？",
-                  description: "解除后该账号会立即参与绘图任务分配。",
-                  okText: "解除",
-                  cancelText: "取消",
-                  onConfirm: () => clearDrawingCooldown(row.id)
-                }, h(Button, {
-                  size: "small",
-                  loading: clearingCooldownAccountIds.includes(row.id),
-                  disabled: checkingAll || checkingAccountIds.includes(row.id),
-                  icon: Icon.UnlockOutlined ? h(Icon.UnlockOutlined) : null
-                }, "解除冷却"))
-              : null,
-            h(Button, {
-              size: "small",
-              onClick: () => openAccountModal(row),
-              icon: Icon.EditOutlined ? h(Icon.EditOutlined) : null,
-              key: "edit"
-            }, "编辑"),
-            h(Popconfirm, {
-              title: "删除这个账号？",
-              okText: "删除",
-              cancelText: "取消",
-              onConfirm: () => deleteAccount(row.id),
-              key: "delete"
+            h(Dropdown, {
+              menu: { items: menuItems, onClick: handleMoreAction },
+              placement: "bottomRight",
+              trigger: ["click"],
+              key: "more"
             }, h(Button, {
               size: "small",
-              danger: true,
-              icon: Icon.DeleteOutlined ? h(Icon.DeleteOutlined) : null
-            }, "删除"))
-          ].filter(Boolean));
+              icon: Icon.MoreOutlined ? h(Icon.MoreOutlined) : null,
+              "aria-label": "更多账号操作"
+            }, "更多"))
+          ]);
         }
 
         function accountCardField(label, content, key) {
@@ -8957,8 +9077,10 @@
           }, [
             h("header", { className: "account-card-header", key: "header" }, [
               h("div", { className: "account-card-summary", key: "summary" }, [
-                accountIdentityContent(row),
-                accountChannelContent(row, rowChannel),
+                h("div", { className: "account-card-overview", key: "overview" }, [
+                  accountIdentityContent(row),
+                  accountChannelContent(row, rowChannel)
+                ]),
                 accountStatusContent(row, rowChannel)
               ]),
               h("div", { className: "account-card-controls", key: "controls" }, [
@@ -8974,16 +9096,20 @@
               ])
             ]),
             h("div", { className: "account-card-body", key: "body" }, [
-              accountCardSection("代理", proxyCell(row.proxyUrl, row), "proxy"),
-              accountCardSection(h(Tooltip, {
-                title: "每种能力独立统计。目标表示当前可用账号的计划比例；今日表示系统自动分配且已提交给上游的实际比例。指定账号不计入今日比例。"
-              }, h("span", null, "分流情况")), accountRoutingContent(row, rowChannel), "routing"),
-              accountCardSection("并发", accountConcurrencyContent(row, rowChannel), "concurrency"),
-              accountCardSection("额度与时间", h("div", { className: "account-card-fields" }, [
-                accountCardField("额度（剩余 / 总额）", quotaTextCell(accountQuotaText(row, rowChannel)), "quota"),
-                accountCardField("额度重置", accountQuotaResetCell(row, rowChannel, nowTick), "reset"),
-                accountCardField("套餐到期", accountExpireText(row, rowChannel), "expire")
-              ]), "timing")
+              h("div", { className: "account-card-column", key: "account-column" }, [
+                accountCardSection("代理", proxyCell(row.proxyUrl, row), "proxy"),
+                accountCardSection("额度与时间", h("div", { className: "account-card-fields" }, [
+                  accountCardField("额度（剩余 / 总额）", quotaTextCell(accountQuotaText(row, rowChannel)), "quota"),
+                  accountCardField("额度重置", accountQuotaResetCell(row, rowChannel, nowTick), "reset"),
+                  accountCardField("套餐到期", accountExpireText(row, rowChannel), "expire")
+                ]), "timing")
+              ]),
+              h("div", { className: "account-card-column", key: "routing-column" }, [
+                accountCardSection(h(Tooltip, {
+                  title: "每种能力独立统计。目标表示当前可用账号的计划比例；今日表示系统自动分配且已提交给上游的实际比例。指定账号不计入今日比例。"
+                }, h("span", null, "分流情况")), accountRoutingContent(row, rowChannel), "routing"),
+                accountCardSection("并发", accountConcurrencyContent(row, rowChannel), "concurrency")
+              ])
             ])
           ]);
         }
