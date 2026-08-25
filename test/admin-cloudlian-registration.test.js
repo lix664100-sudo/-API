@@ -22,6 +22,8 @@ const parseCloudlianRegistrationText = vm.runInNewContext(`(() => {
 
 const batchRenewalHelpers = vm.runInNewContext(`(() => {
   ${functionSource("chatAccountActivationAvailable", "abilityStatus")}
+  ${functionSource("chatModelKey", "chatModelsForChannel")}
+  ${functionSource("chatSubscriptionExpired", "accountQuotaResetCell")}
   ${functionSource("batchRenewalStatus", "batchRenewalEligible")}
   ${functionSource("batchRenewalEligible", "parseBatchRenewalCodes")}
   ${functionSource("parseBatchRenewalCodes", "createBatchRenewalPreview")}
@@ -81,6 +83,34 @@ test("批量续费只随机匹配当前渠道的启用待续费账号", () => {
   assert.equal(preview.rows.length, 2);
   assert.equal(new Set(preview.rows.map((row) => row.accountId)).size, 2);
   assert.ok(preview.rows.every((row) => row.status === "valid"));
+});
+
+test("批量续费会匹配实际到期但状态尚未更新的账号", () => {
+  const channel = { id: "channel-1", type: "chatplus", settings: { baseUrl: "https://chat.example.com" } };
+  const past = new Date(Date.now() - 60_000).toISOString();
+  const future = new Date(Date.now() + 60_000).toISOString();
+  const accounts = [
+    {
+      id: "expired-by-time",
+      channelId: channel.id,
+      enabled: true,
+      status: "ok",
+      meta: { abilities: { chatplus: { status: "ok", meta: { chatModel: "gemini", referenceUsage: { gemini: { expireAt: past } } } } } }
+    },
+    {
+      id: "future",
+      channelId: channel.id,
+      enabled: true,
+      status: "ok",
+      meta: { abilities: { chatplus: { status: "ok", meta: { chatModel: "gemini", referenceUsage: { gemini: { expireAt: future } } } } } }
+    },
+    { id: "quota-empty", channelId: channel.id, enabled: true, status: "quota_empty" },
+    { id: "proxy-failed", channelId: channel.id, enabled: true, status: "ok", meta: { proxyCheck: { status: "failed" } } },
+    { id: "disabled-expired", channelId: channel.id, enabled: false, expireAt: past }
+  ];
+
+  const eligible = accounts.filter((account) => batchRenewalHelpers.batchRenewalEligible(account, channel));
+  assert.deepEqual(eligible.map((account) => account.id), ["expired-by-time"]);
 });
 
 test("批量续费预览标出重复激活码和数量多出的项目", () => {

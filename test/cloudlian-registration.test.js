@@ -486,6 +486,50 @@ test("批量续费只接受当前渠道中启用的待续费账号", async () =>
   assert.match(result.results[3].message, /不需要续费/);
 });
 
+test("批量续费接受套餐时间已到但状态尚未更新的账号", () => {
+  const now = Date.now();
+  const past = new Date(now - 60_000).toISOString();
+  const future = new Date(now + 60_000).toISOString();
+  const expiredByTime = {
+    enabled: true,
+    status: "ok",
+    meta: {
+      abilities: {
+        chatplus: {
+          status: "ok",
+          meta: {
+            chatModel: "gemini",
+            referenceUsage: { gemini: { expireAt: past } }
+          }
+        }
+      }
+    }
+  };
+
+  assert.equal(accountNeedsActivationRenewal(expiredByTime, now), true);
+  assert.equal(accountNeedsActivationRenewal({ ...expiredByTime, enabled: false }, now), false);
+  assert.equal(accountNeedsActivationRenewal({
+    enabled: true,
+    status: "quota_empty",
+    meta: {
+      abilities: {
+        chatplus: {
+          status: "quota_empty",
+          meta: {
+            chatModel: "gemini",
+            referenceUsage: { gemini: { expireAt: future } }
+          }
+        }
+      }
+    }
+  }, now), false);
+  assert.equal(accountNeedsActivationRenewal({
+    enabled: true,
+    status: "ok",
+    meta: { proxyCheck: { status: "failed" } }
+  }, now), false);
+});
+
 test("批量续费拦截重复激活码和重复账号并限制同时处理数量", async () => {
   const channel = {
     id: "renewal-channel",

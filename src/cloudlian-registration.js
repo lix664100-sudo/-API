@@ -780,18 +780,32 @@ export function createChatAccountActivationService(overrides = {}) {
 
 export const activateChatAccount = createChatAccountActivationService();
 
-export function accountNeedsActivationRenewal(account = {}) {
+function activationSubscriptionExpired(status = {}, now = Date.now()) {
+  if (status.status === "subscription_expired") return true;
+  const modelKey = String(status.meta?.chatModel || status.quotaModel || "gpt").trim().toLowerCase() || "gpt";
+  const expireAt = status.meta?.referenceUsage?.[modelKey]?.expireAt || status.expireAt || "";
+  const expireTime = Date.parse(expireAt);
+  return Number.isFinite(expireTime) && expireTime <= now;
+}
+
+export function accountNeedsActivationRenewal(account = {}, now = Date.now()) {
   if (account.enabled === false) return false;
   const statuses = [
     account.status,
     account.meta?.registration?.status,
     ...Object.values(account.meta?.abilities || {}).map((ability) => ability?.status)
   ];
-  return statuses.some((status) => [
+  if (statuses.some((status) => [
     "subscription_expired",
     "subscription_missing",
     "activation_required"
-  ].includes(status));
+  ].includes(status))) return true;
+  const expirySources = [
+    account,
+    account.meta?.registration,
+    ...Object.values(account.meta?.abilities || {})
+  ].filter(Boolean);
+  return expirySources.some((status) => activationSubscriptionExpired(status, now));
 }
 
 export function createChatAccountBatchActivationService(overrides = {}) {
