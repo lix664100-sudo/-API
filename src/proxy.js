@@ -97,7 +97,7 @@ export function safeProxyEndpoint(value) {
   }
 }
 
-function proxyExpired(expiresAt) {
+export function proxyExpired(expiresAt) {
   if (!expiresAt) return false;
   const dateText = /^\d{4}-\d{2}-\d{2}$/.test(expiresAt)
     ? `${expiresAt}T23:59:59+08:00`

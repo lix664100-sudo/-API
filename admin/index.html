@@ -9152,15 +9152,21 @@
           let ok = 0;
           let failed = 0;
           let skipped = 0;
-          for (const account of related) {
-            try {
-              const result = await api(`/api/accounts/${account.id}/test`, { method: "POST" });
-              if (result?.checkSkipped) skipped += 1;
-              else ok += 1;
-            } catch (_error) {
-              failed += 1;
+          let nextIndex = 0;
+          async function worker() {
+            while (nextIndex < related.length) {
+              const account = related[nextIndex];
+              nextIndex += 1;
+              try {
+                const result = await api(`/api/accounts/${account.id}/test`, { method: "POST" });
+                if (result?.checkSkipped) skipped += 1;
+                else ok += 1;
+              } catch (_error) {
+                failed += 1;
+              }
             }
           }
+          await Promise.all(Array.from({ length: Math.min(3, related.length) }, () => worker()));
           await refresh().catch(() => {});
           setCheckingChannelIds((current) => current.filter((item) => item !== channelId));
           message.info(`检测完成：${ok} 个完成，${skipped} 个使用中已跳过，${failed} 个需处理`);

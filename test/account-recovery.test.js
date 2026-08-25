@@ -705,7 +705,7 @@ test("Gemini 未订阅套餐时检测正常完成并退出任务分配", async (
   }
 });
 
-test("账号检测步骤超时后会自动重试并使用二十秒等待时间", async () => {
+test("账号检测步骤超时后立即结束本次检测并使用二十秒等待时间", async () => {
   const client = new ChatplusClient({
     config: {},
     channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gemini" } },
@@ -716,39 +716,16 @@ test("账号检测步骤超时后会自动重试并使用二十秒等待时间",
   client.loadAccountUsages = async (options) => {
     usageAttempts += 1;
     assert.equal(options.timeoutSec, 20);
-    if (usageAttempts === 1) {
-      const error = new Error("聊天站响应慢，代理可能可用但请求超时。");
-      error.status = 504;
-      throw error;
-    }
-    return {
-      gemini: {
-        quota: 70,
-        used: 1,
-        balance: 69,
-        quotaResetAt: "",
-        expireAt: activeSubscriptionExpireAt,
-        period: "24h"
-      }
-    };
-  };
-  client.prepareChatSession = async (input) => {
-    assert.equal(input.checkTimeoutSec, 20);
-    return {
-      route: { key: "gemini", model: "gemini" },
-      init: {},
-      selected: { carId: "gemini-car", carType: "gemini", strategy: "balanced" }
-    };
+    const error = new Error("聊天站响应慢，代理可能可用但请求超时。");
+    error.status = 504;
+    throw error;
   };
 
-  const result = await client.check();
-
-  assert.equal(usageAttempts, 2);
-  assert.equal(result.status, "ok");
-  assert.equal(result.meta.selectedCarId, "gemini-car");
+  await assert.rejects(client.check(), (error) => error.code === "ACCOUNT_CHECK_TIMEOUT");
+  assert.equal(usageAttempts, 1);
 });
 
-test("账号检测连续两次请求超时会记录具体失败步骤", async () => {
+test("账号检测请求超时会记录具体失败步骤", async () => {
   const client = new ChatplusClient({
     config: {},
     channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gemini" } },
@@ -773,7 +750,7 @@ test("账号检测连续两次请求超时会记录具体失败步骤", async ()
       return true;
     }
   );
-  assert.equal(usageAttempts, 2);
+  assert.equal(usageAttempts, 1);
 });
 
 test("读取旧任务遇到登录失效会重新登录并回到原车位", async () => {

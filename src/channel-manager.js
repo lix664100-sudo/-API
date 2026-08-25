@@ -17,12 +17,10 @@ import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "./image-limits.js"
 import { createFastTaskRefresher } from "./fast-task-refresher.js";
 import { subscribeChatplusConversationUpdates } from "./chatplus-conversation-updates.js";
 import {
-  checkProxyReachability,
   isProxyConnectionError,
   normalizeProxyUrl,
+  proxyExpired,
   proxyCircuitState,
-  recordProxyCircuitFailure,
-  resetProxyCircuit,
   runWithProxyCircuit,
   safeProxyEndpoint
 } from "./proxy.js";
@@ -64,11 +62,12 @@ const activeChatQuotaProbes = new Set();
 const clientCache = new Map();
 const accountRecoveryTasks = new Map();
 const accountRecoveryRetryAt = new Map();
-const activeProxyChecks = new Map();
+const activeAccountChecks = new Map();
 const persistedProxyStatuses = new Map();
 const proxyStatusWrites = new Map();
 const taskSlotWaiters = new Set();
 const ACCOUNT_RECOVERY_RETRY_MS = 30 * 1000;
+const ACCOUNT_CHECK_CONCURRENCY = 3;
 const CHAT_USAGE_RECOVERY_CHECK_MS = 60 * 60 * 1000;
 const CHAT_USAGE_OBSERVATION_MS = 5 * 60 * 1000;
 const DRAWING_QUOTA_RECOVERY_CHECK_MS = 60 * 60 * 1000;
@@ -174,17 +173,6 @@ function proxyCheckMeta(result) {
     cooldownUntil: result.cooldownUntil || "",
     attemptCount: Number(result.attemptCount || 0),
     latencyMs: Number(result.latencyMs || 0)
-  };
-}
-
-function withProxyCheckMeta(status, proxyResult) {
-  if (!proxyResult) return status;
-  return {
-    ...status,
-    meta: {
-      ...(status.meta || {}),
-      proxyCheck: proxyCheckMeta(proxyResult)
-    }
   };
 }
 
@@ -4101,11 +4089,6 @@ function scheduleDrawingQuotaRefresh(account, channel) {
   runInBackground(() => refreshDrawingQuota(account, channel));
 }
 
-function proxyTargetUrl(channel = {}) {
-  return channel.settings?.baseUrl
-    || (channel.type === "drawing" ? "https://drawing.aishare.icu" : "https://www.chatplus.cc");
-}
-
 async function saveProxyCheck(account, result, options = {}) {
   const proxyValue = accountProxyValue(account);
   const proxyKey = normalizeProxyUrl(proxyValue) || `account:${account.id}`;
@@ -4179,7 +4162,7 @@ async function runAccountProxyWork(account, work) {
   const before = proxyCircuitState(proxyValue);
   try {
     const value = await runWithProxyCircuit(proxyValue, work);
-    if (before.status !== "closed" || account.meta?.proxyCheck?.status === "failed") {
+    if (before.status !== "closed" || account.meta?.proxyCheck?.status !== "ok") {
       await saveAutomaticProxyCheck(account, automaticProxyCheckResult(account, true));
     }
     return value;
@@ -4192,15 +4175,6 @@ async function runAccountProxyWork(account, work) {
   }
 }
 
-function proxyCheckCacheKey(proxyValue, channel) {
-  const targetUrl = proxyTargetUrl(channel);
-  try {
-    return `${normalizeProxyUrl(proxyValue)}::${new URL(targetUrl).origin}`;
-  } catch {
-    return `${normalizeProxyUrl(proxyValue)}::${targetUrl}`;
-  }
-}
-
 function checkedProxyError(result) {
   const error = new Error(result.message || "代理不可用");
   error.code = "PROXY_CHECK_FAILED";
@@ -4210,46 +4184,27 @@ function checkedProxyError(result) {
   return error;
 }
 
-async function checkAccountProxy(account, channel, sharedChecks = null) {
+async function validateAccountProxy(account) {
   const proxyValue = accountProxyValue(account);
   if (!String(proxyValue).trim()) return null;
-
-  const cacheKey = proxyCheckCacheKey(proxyValue, channel);
-  let pendingCheck = sharedChecks?.get(cacheKey);
-  if (!pendingCheck) {
-    pendingCheck = activeProxyChecks.get(cacheKey);
-    if (!pendingCheck) {
-      pendingCheck = (async () => {
-        const checked = await checkProxyReachability(proxyValue, proxyTargetUrl(channel));
-        if (checked.ok) {
-          resetProxyCircuit(proxyValue);
-          const result = { ...checked, cooldownUntil: "" };
-          await saveProxyCheck(account, result, { force: true });
-          return result;
-        }
-
-        const failure = checkedProxyError(checked);
-        const state = await recordProxyCircuitFailure(
-          proxyValue,
-          failure,
-          checked.attemptCount || 2
-        );
-        const result = { ...checked, cooldownUntil: state.retryAt || "" };
-        await saveProxyCheck(account, result, { force: true });
-        return result;
-      })();
-      activeProxyChecks.set(cacheKey, pendingCheck);
-      const clearActiveCheck = () => {
-        if (activeProxyChecks.get(cacheKey) === pendingCheck) activeProxyChecks.delete(cacheKey);
-      };
-      pendingCheck.then(clearActiveCheck, clearActiveCheck);
-    }
-    sharedChecks?.set(cacheKey, pendingCheck);
-  }
-
-  const result = await pendingCheck;
-  if (!result.ok) throw checkedProxyError(result);
-  return result;
+  const endpoint = safeProxyEndpoint(proxyValue);
+  const message = !endpoint.proxyHost
+    ? "代理 IP 格式不正确"
+    : proxyExpired(endpoint.expiresAt)
+      ? "代理 IP 已到期"
+      : "";
+  if (!message) return null;
+  const result = {
+    ok: false,
+    ...endpoint,
+    realIp: "",
+    checkedAt: new Date().toISOString(),
+    attemptCount: 0,
+    latencyMs: 0,
+    message
+  };
+  await saveProxyCheck(account, result, { force: true });
+  throw checkedProxyError(result);
 }
 
 async function ensureTargetReady(config, target, taskType, attempts, options = {}) {
@@ -5709,7 +5664,7 @@ function accountCheckTimeoutStatus(currentStatus = {}, error) {
   const preservePreviousStatus = consecutiveTimeouts < 2
     && ["ok", "quota_empty", "cooldown"].includes(String(currentStatus.status || "").toLowerCase());
   const message = preservePreviousStatus
-    ? `${step}超时，已自动复查一次；暂时沿用上次状态。`
+    ? `${step}超时，暂时沿用上次状态。`
     : `${step}连续两次检测超时，请稍后再次检测。`;
 
   return {
@@ -5897,7 +5852,13 @@ function preserveAccountMetadata(account, status) {
   };
 }
 
-export async function checkAccount(accountId, options = {}) {
+async function preserveLatestAccountMetadata(account, status) {
+  const config = await loadConfig();
+  const latest = config.accounts.find((item) => item.id === account.id) || account;
+  return preserveAccountMetadata(latest, status);
+}
+
+async function performAccountCheck(accountId) {
   const config = await loadRuntimeConfig();
   const account = config.accounts.find((item) => item.id === accountId);
   if (!account) throw new Error("账号不存在。");
@@ -5945,14 +5906,7 @@ export async function checkAccount(accountId, options = {}) {
       activeSlots
     };
   }
-  const proxyAbility = channel.type === "shareai"
-    ? channelAbilityEnabled(channel, "drawing") ? "drawing" : "chatplus"
-    : "";
-  const proxyResult = await checkAccountProxy(
-    account,
-    channel.type === "shareai" ? shareAIAbilityChannel(channel, proxyAbility) : channel,
-    options.proxyChecks
-  );
+  await validateAccountProxy(account);
   if (channel.type === "shareai") {
     const abilities = ["drawing", "chatplus"].filter((ability) => channelAbilityEnabled(channel, ability));
     const checked = await Promise.all(abilities.map(async (ability) => [
@@ -5960,9 +5914,9 @@ export async function checkAccount(accountId, options = {}) {
       await checkShareAIAbility(config, channel, account, ability)
     ]));
     const results = Object.fromEntries(checked);
-    const status = preserveAccountMetadata(account, preserveDrawingCooldown(
+    const status = await preserveLatestAccountMetadata(account, preserveDrawingCooldown(
       account,
-      withProxyCheckMeta(combinedEnabledShareAIStatus(results), proxyResult)
+      combinedEnabledShareAIStatus(results)
     ));
     await updateAccountStatus(account.id, status);
     if (!["ok", "subscription_missing"].includes(status.status)) throw new Error(status.message || "检测失败");
@@ -5978,18 +5932,15 @@ export async function checkAccount(accountId, options = {}) {
       ? preserveConfirmedChatQuota(account, checked)
       : checked;
     const status = applyCheckedQuotaProtection(channel, account, checkedStatus, account);
-    const nextStatus = preserveAccountMetadata(account, withProxyCheckMeta({
+    const nextStatus = await preserveLatestAccountMetadata(account, {
       ...status,
       cooldownUntil: status.status === "ok" ? null : status.cooldownUntil
-    }, proxyResult));
+    });
     await updateAccountStatus(account.id, nextStatus);
     return nextStatus;
   } catch (error) {
     if (channel.type === "chatplus" && isAccountCheckTimeoutError(error)) {
-      const status = preserveAccountMetadata(
-        account,
-        withProxyCheckMeta(accountCheckTimeoutStatus(account, error), proxyResult)
-      );
+      const status = await preserveLatestAccountMetadata(account, accountCheckTimeoutStatus(account, error));
       await updateAccountStatus(account.id, status);
       if (status.status === "error") throw new Error(status.message);
       return status;
@@ -6006,37 +5957,56 @@ export async function checkAccount(accountId, options = {}) {
       expireAt: "",
       message
     };
-    const status = preserveAccountMetadata(account, withProxyCheckMeta(
+    const status = await preserveLatestAccountMetadata(account,
       channel.type === "chatplus"
         ? preserveConfirmedChatQuota(account, checkedStatus)
-        : checkedStatus,
-      proxyResult
-    ));
+        : checkedStatus
+    );
     await updateAccountStatus(account.id, status);
     if (status.status === "subscription_missing") return status;
     throw new Error(message);
   }
 }
 
+export function checkAccount(accountId) {
+  const key = String(accountId || "").trim();
+  const active = activeAccountChecks.get(key);
+  if (active) return active;
+  const check = performAccountCheck(key).finally(() => {
+    if (activeAccountChecks.get(key) === check) activeAccountChecks.delete(key);
+  });
+  activeAccountChecks.set(key, check);
+  return check;
+}
+
 export async function checkAllAccounts() {
   const config = await loadRuntimeConfig();
-  const results = [];
-  const proxyChecks = new Map();
-  for (const account of config.accounts) {
-    if (account.enabled === false) {
-      results.push({ accountId: account.id, ok: false, skipped: true, message: "账号已停用，已跳过检测。" });
-      continue;
-    }
-    try {
-      results.push({
-        accountId: account.id,
-        ok: true,
-        data: await checkAccount(account.id, { proxyChecks })
-      });
-    } catch (error) {
-      results.push({ accountId: account.id, ok: false, message: error.message });
+  const results = new Array(config.accounts.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < config.accounts.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const account = config.accounts[index];
+      if (account.enabled === false) {
+        results[index] = { accountId: account.id, ok: false, skipped: true, message: "账号已停用，已跳过检测。" };
+        continue;
+      }
+      try {
+        results[index] = {
+          accountId: account.id,
+          ok: true,
+          data: await checkAccount(account.id)
+        };
+      } catch (error) {
+        results[index] = { accountId: account.id, ok: false, message: error.message };
+      }
     }
   }
+  await Promise.all(Array.from(
+    { length: Math.min(ACCOUNT_CHECK_CONCURRENCY, config.accounts.length) },
+    () => worker()
+  ));
   return results;
 }
 

@@ -34,7 +34,7 @@ function createHarness(options = {}) {
   };
   const registered = new Set();
   const usages = new Map();
-  const calls = { register: [], exchange: [], proxy: [] };
+  const calls = { register: [], exchange: [], proxy: [], activationTimeouts: [] };
   let usernameIndex = 0;
   config.accounts.forEach((account) => {
     registered.add(account.username);
@@ -53,6 +53,9 @@ function createHarness(options = {}) {
 
   const createClient = ({ account }) => ({
     async json(path, request = {}) {
+      if (["/frontend-api/getLoginConfig", "/frontend-api/exchange"].includes(path)) {
+        calls.activationTimeouts.push(request.timeoutSec);
+      }
       if (path === "/frontend-api/getLoginConfig") {
         return {
           code: 1,
@@ -85,10 +88,12 @@ function createHarness(options = {}) {
       }
       throw new Error(`unexpected path: ${path}`);
     },
-    async performPortalLogin() {
+    async performPortalLogin(request = {}) {
+      calls.activationTimeouts.push(request.timeoutSec);
       if (!registered.has(account.username)) throw new Error("账号不存在");
     },
-    async loadAccountUsages() {
+    async loadAccountUsages(request = {}) {
+      calls.activationTimeouts.push(request.timeoutSec);
       if (!registered.has(account.username)) throw new Error("账号不存在");
       return clone(usages.get(account.username));
     }
@@ -292,6 +297,7 @@ test("套餐到期账号可以用新激活码续期并保留账号配置", async
   assert.equal(saved.status, "unknown");
   assert.equal(saved.meta.abilities.chatplus.status, "unknown");
   assert.equal(JSON.stringify(saved).includes("RENEW-CODE"), false);
+  assert.equal(harness.calls.activationTimeouts.every((value) => value === 20), true);
 });
 
 test("未激活账号兑换失败时继续保留，换正确激活码后恢复", async () => {

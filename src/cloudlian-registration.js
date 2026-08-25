@@ -12,6 +12,7 @@ const MAX_BATCH_REGISTRATIONS = 500;
 const BATCH_REGISTRATION_CONCURRENCY = 3;
 const MAX_BATCH_ACCOUNT_ACTIVATIONS = 500;
 const BATCH_ACCOUNT_ACTIVATION_CONCURRENCY = 3;
+const ACTIVATION_REQUEST_TIMEOUT_SEC = 20;
 const COMPLETED_STATES = new Set(["completed"]);
 const REGISTERED_STATES = new Set(["registered", "activating", "activation_required", "activation_uncertain"]);
 const activeActivationOperations = new Map();
@@ -188,10 +189,10 @@ function loginConfigClient(dependencies, config, channel, account, baseUrl) {
   });
 }
 
-async function loginWithOptionalUsages(client) {
-  await client.performPortalLogin();
+async function loginWithOptionalUsages(client, options = {}) {
+  await client.performPortalLogin(options);
   try {
-    return await client.loadAccountUsages();
+    return await client.loadAccountUsages(options);
   } catch {
     return null;
   }
@@ -690,12 +691,13 @@ export function createChatAccountActivationService(overrides = {}) {
     const releaseExchangeCode = reserveExchangeCode(baseUrl, activationCode, account.id);
     try {
       const client = loginConfigClient(dependencies, config, channel, account, baseUrl);
-      const loginConfig = await client.json("/frontend-api/getLoginConfig");
+      const requestOptions = { timeoutSec: ACTIVATION_REQUEST_TIMEOUT_SEC };
+      const loginConfig = await client.json("/frontend-api/getLoginConfig", requestOptions);
       assertExchangeEnabled(loginConfig);
 
       let usages;
       try {
-        usages = await loginWithOptionalUsages(client);
+        usages = await loginWithOptionalUsages(client, requestOptions);
       } catch (error) {
         throw inputError(`账号登录失败：${shortMessage(error?.message, "请检查账号和密码。")}`, 409);
       }
@@ -726,6 +728,7 @@ export function createChatAccountActivationService(overrides = {}) {
       try {
         const payload = await client.json("/frontend-api/exchange", {
           method: "POST",
+          timeoutSec: ACTIVATION_REQUEST_TIMEOUT_SEC,
           body: {
             userToken: account.username,
             redemptionCode: activationCode
@@ -739,7 +742,7 @@ export function createChatAccountActivationService(overrides = {}) {
       } catch (error) {
         try {
           const verificationClient = loginConfigClient(dependencies, config, channel, account, baseUrl);
-          const refreshed = await loginWithOptionalUsages(verificationClient);
+          const refreshed = await loginWithOptionalUsages(verificationClient, requestOptions);
           const refreshedHash = refreshed ? usageHash(refreshed) : "";
           if (attempt.baselineHash && refreshedHash && attempt.baselineHash !== refreshedHash) {
             return saveSuccessfulActivation(channel, account, baseUrl, activationCode);

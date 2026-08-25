@@ -116,23 +116,18 @@ function isAccountCheckRequestTimeout(error) {
 }
 
 async function runAccountCheckStep(step, work) {
-  let lastError;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      return await work();
-    } catch (error) {
-      if (!isAccountCheckRequestTimeout(error)) throw error;
-      lastError = error;
-    }
+  try {
+    return await work();
+  } catch (cause) {
+    if (!isAccountCheckRequestTimeout(cause)) throw cause;
+    const error = new Error(`${step}超时，聊天站没有及时响应。`);
+    error.status = 504;
+    error.code = "ACCOUNT_CHECK_TIMEOUT";
+    error.accountCheckTimeout = true;
+    error.accountCheckStep = step;
+    error.cause = cause;
+    throw error;
   }
-
-  const error = new Error(`${step}超时，聊天站连续两次没有及时响应。`);
-  error.status = 504;
-  error.code = "ACCOUNT_CHECK_TIMEOUT";
-  error.accountCheckTimeout = true;
-  error.accountCheckStep = step;
-  error.cause = lastError;
-  throw error;
 }
 
 function curlProcessError(code, stderr) {

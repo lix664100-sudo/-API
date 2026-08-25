@@ -1044,6 +1044,22 @@ async function verifyBoundAccounts(results, concurrency = 3) {
   return verified;
 }
 
+const backgroundAccountChecks = new Map();
+
+function scheduleBoundAccountVerification(result) {
+  if (!["ready", "already_bound"].includes(result?.status) || !result.accountId) return result;
+  const accountId = String(result.accountId);
+  if (!backgroundAccountChecks.has(accountId)) {
+    const check = checkAccount(accountId)
+      .catch((error) => app.log.warn({ error, accountId }, "background account verification failed"))
+      .finally(() => {
+        if (backgroundAccountChecks.get(accountId) === check) backgroundAccountChecks.delete(accountId);
+      });
+    backgroundAccountChecks.set(accountId, check);
+  }
+  return { ...result, verified: false, verifying: true, warning: "" };
+}
+
 app.post("/api/channels/:id/cloudlian/register", async (request, reply) => {
   try {
     const registered = await registerCloudlianAccount({
@@ -1090,7 +1106,7 @@ app.post("/api/accounts/:id/activate", async (request, reply) => {
       accountId: request.params.id,
       activationCode: request.body?.activationCode
     });
-    const result = await verifyBoundAccount(activated);
+    const result = scheduleBoundAccountVerification(activated);
     return {
       ok: true,
       data: {
@@ -1109,7 +1125,7 @@ app.post("/api/channels/:id/accounts/activate-batch", async (request, reply) => 
       channelId: request.params.id,
       rows: request.body?.rows
     });
-    const results = await verifyBoundAccounts(batch.results);
+    const results = batch.results.map(scheduleBoundAccountVerification);
     const successfulStatuses = new Set(["ready", "already_bound"]);
     const pendingStatuses = new Set(["activation_uncertain"]);
     return {
@@ -1607,6 +1623,7 @@ function scheduleRuntimeStats() {
 }
 
 app.addHook("onClose", async () => {
+  await Promise.allSettled(backgroundAccountChecks.values());
   erpMediaCatalog.close();
   await closeStorage();
 });

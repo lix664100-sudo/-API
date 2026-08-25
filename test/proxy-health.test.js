@@ -13,7 +13,7 @@ const {
   checkProxyReachability,
   createProxyCircuitProtection
 } = await import("../src/proxy.js");
-const { checkAllAccounts, createTextTask } = await import("../src/channel-manager.js");
+const { checkAccount, checkAllAccounts, createTextTask } = await import("../src/channel-manager.js");
 const { DrawingClient } = await import("../src/channels/drawing.js");
 const { closeStorage, loadConfig, saveConfig } = await import("../src/storage.js");
 
@@ -189,9 +189,11 @@ test("代理线路连续失败两次后暂停，恢复时只放行一个尝试",
   assert.equal(protection.state(proxyUrl).status, "closed");
 });
 
-test("检测全部账号时，共用同一代理的账号只检测一次代理", async () => {
+test("检测全部账号时不再额外探测代理，并同时处理多个账号", async () => {
   let targetChecks = 0;
   let exitIpConnects = 0;
+  let activeChecks = 0;
+  let maxActiveChecks = 0;
   const { server, proxyUrl } = await listen((request, response) => {
     targetChecks += 1;
     response.writeHead(204);
@@ -203,12 +205,18 @@ test("检测全部账号时，共用同一代理的账号只检测一次代理",
   });
 
   const originalCheck = DrawingClient.prototype.check;
-  DrawingClient.prototype.check = async () => ({
-    status: "ok",
-    quota: 100,
-    balance: 80,
-    message: "绘图账号可用"
-  });
+  DrawingClient.prototype.check = async () => {
+    activeChecks += 1;
+    maxActiveChecks = Math.max(maxActiveChecks, activeChecks);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    activeChecks -= 1;
+    return {
+      status: "ok",
+      quota: 100,
+      balance: 80,
+      message: "绘图账号可用"
+    };
+  };
 
   try {
     const config = await loadConfig();
@@ -239,22 +247,68 @@ test("检测全部账号时，共用同一代理的账号只检测一次代理",
       }))
     });
 
-    const [results, concurrentResults] = await Promise.all([
-      checkAllAccounts(),
-      checkAllAccounts()
-    ]);
+    const results = await checkAllAccounts();
     const stored = await loadConfig();
 
     assert.equal(results.length, 2);
     assert.equal(results.every((item) => item.ok), true);
-    assert.equal(concurrentResults.length, 2);
-    assert.equal(concurrentResults.every((item) => item.ok), true);
-    assert.equal(targetChecks, 1);
-    assert.equal(exitIpConnects, 1);
+    assert.equal(maxActiveChecks, 2);
+    assert.equal(targetChecks, 0);
+    assert.equal(exitIpConnects, 0);
     assert.equal(stored.accounts.every((account) => account.meta.proxyCheck.status === "ok"), true);
   } finally {
     DrawingClient.prototype.check = originalCheck;
     await closeServer(server);
+  }
+});
+
+test("同时重复检测同一个账号时只登录一次", async () => {
+  const originalCheck = DrawingClient.prototype.check;
+  let checkCalls = 0;
+  DrawingClient.prototype.check = async () => {
+    checkCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return { status: "ok", quota: 100, balance: 80, message: "绘图账号可用" };
+  };
+
+  try {
+    const config = await loadConfig();
+    await saveConfig({
+      ...config,
+      defaultChannel: "deduplicated-check",
+      channels: [{
+        id: "deduplicated-check",
+        name: "重复检测保护",
+        type: "shareai",
+        enabled: true,
+        priority: 1,
+        settings: {
+          drawingBaseUrl: "https://drawing.example.test",
+          enabledAbilities: { drawing: true, chatplus: false }
+        }
+      }],
+      accounts: [{
+        id: "deduplicated-account",
+        channelId: "deduplicated-check",
+        name: "重复检测账号",
+        username: "deduplicated@example.test",
+        password: "password",
+        enabled: true,
+        status: "ok",
+        meta: { abilities: { drawing: { status: "ok", quota: 100, balance: 80 } } }
+      }]
+    });
+
+    const [first, second] = await Promise.all([
+      checkAccount("deduplicated-account"),
+      checkAccount("deduplicated-account")
+    ]);
+
+    assert.equal(first.status, "ok");
+    assert.equal(second.status, "ok");
+    assert.equal(checkCalls, 1);
+  } finally {
+    DrawingClient.prototype.check = originalCheck;
   }
 });
 
