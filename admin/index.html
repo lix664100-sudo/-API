@@ -815,7 +815,7 @@
 
       .account-list {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
         align-items: start;
         gap: 14px;
         min-width: 0;
@@ -959,68 +959,20 @@
       .account-card-primary {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 10px;
+        gap: 1px;
         min-width: 0;
-        padding: 0 14px 14px;
-        background: #fff;
+        padding-top: 1px;
+        background: var(--line);
       }
 
       .account-card-primary .account-card-section {
-        padding: 11px 12px 12px;
-        border-radius: 8px;
-        background: #f8fafc;
+        padding: 12px 14px 13px;
+        background: #fbfcfe;
       }
 
-      .account-card-primary .account-card-section:last-child {
-        grid-column: 1 / -1;
-      }
-
-      .account-card-details {
+      .account-card-operations {
         min-width: 0;
         border-top: 1px solid var(--line);
-      }
-
-      .account-card-details > summary {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 10px;
-        min-height: 42px;
-        padding: 10px 16px;
-        color: #344054;
-        background: #fff;
-        cursor: pointer;
-        font-size: 12px;
-        font-weight: 680;
-        list-style: none;
-        user-select: none;
-      }
-
-      .account-card-details > summary::-webkit-details-marker {
-        display: none;
-      }
-
-      .account-card-details > summary:focus-visible {
-        outline: 2px solid rgba(22, 119, 255, 0.4);
-        outline-offset: -2px;
-      }
-
-      .account-card-details-chevron {
-        display: inline-flex;
-        color: #667085;
-        transition: transform 180ms cubic-bezier(0.23, 1, 0.32, 1);
-      }
-
-      .account-card-details[open] .account-card-details-chevron {
-        transform: rotate(180deg);
-      }
-
-      .account-card-details-body {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 1px;
-        min-width: 0;
-        background: var(--line);
       }
 
       .account-card-section {
@@ -1029,8 +981,9 @@
         background: #fff;
       }
 
-      .account-card-details-body .account-card-section:first-child {
-        grid-column: 1 / -1;
+      .account-card-operations .account-card-section + .account-card-section {
+        border-top: 1px solid var(--line);
+        background: #fbfcfe;
       }
 
       .account-card-label {
@@ -1046,6 +999,37 @@
         color: #344054;
         font-size: 14px;
         line-height: 1.55;
+      }
+
+      .account-expiry {
+        display: grid;
+        gap: 3px;
+        min-width: 0;
+      }
+
+      .account-expiry strong {
+        overflow-wrap: anywhere;
+        color: #101828;
+        font-size: 14px;
+        font-weight: 720;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.35;
+      }
+
+      .account-expiry span {
+        color: #667085;
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .account-expiry.is-warning strong,
+      .account-expiry.is-warning span {
+        color: #b54708;
+      }
+
+      .account-expiry.is-expired strong,
+      .account-expiry.is-expired span {
+        color: #b42318;
       }
 
       .account-card-footer {
@@ -1067,13 +1051,11 @@
         max-width: 100%;
       }
 
-      .account-card .routing-comparison-item {
-        grid-template-columns: 62px 105px minmax(110px, 1fr);
-        gap: 6px;
-      }
-
-      .account-card .routing-comparison-item.is-target-only {
-        grid-template-columns: 62px minmax(0, 1fr);
+      .account-card-operations .account-usage {
+        display: flex;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 4px 14px;
       }
 
       .account-list-empty {
@@ -1487,13 +1469,15 @@
 
       .routing-overview {
         display: grid;
-        gap: 8px;
-        min-width: 350px;
+        gap: 10px;
+        min-width: 0;
       }
 
       .routing-overview-meta {
         display: flex;
         align-items: baseline;
+        justify-content: space-between;
+        flex-wrap: wrap;
         gap: 10px;
         color: var(--muted);
         font-size: 12px;
@@ -1513,10 +1497,9 @@
 
       .routing-comparison-item {
         display: grid;
-        grid-template-columns: 70px 125px minmax(150px, 1fr);
-        align-items: baseline;
-        gap: 8px;
-        padding: 7px 0;
+        gap: 7px;
+        min-width: 0;
+        padding: 11px 0;
         border-bottom: 1px solid #f0f2f5;
         font-size: 13px;
         line-height: 1.45;
@@ -1531,14 +1514,18 @@
         border-bottom: 0;
       }
 
-      .routing-comparison-item.is-target-only {
-        grid-template-columns: 70px minmax(0, 1fr);
+      .routing-comparison-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        min-width: 0;
       }
 
       .routing-comparison-label {
         color: var(--ink);
         font-size: 13px;
-        font-weight: 650;
+        font-weight: 720;
         white-space: nowrap;
       }
 
@@ -1552,20 +1539,70 @@
         color: #b54708;
       }
 
-      .routing-comparison-today {
+      .routing-comparison-measure {
+        display: grid;
+        grid-template-columns: 86px minmax(0, 1fr);
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+      }
+
+      .routing-comparison-current {
+        display: grid;
+        gap: 1px;
+        min-width: 0;
+        color: #667085;
+        font-size: 11px;
+        line-height: 1.2;
+      }
+
+      .routing-comparison-current strong {
+        color: #175cd3;
+        font-size: 20px;
+        font-weight: 760;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.2;
+        white-space: nowrap;
+      }
+
+      .routing-comparison-current strong.is-empty {
+        color: #667085;
+        font-size: 15px;
+        font-weight: 680;
+      }
+
+      .routing-progress-track {
+        position: relative;
+        min-width: 0;
+      }
+
+      .routing-progress {
+        display: block;
+        width: 100%;
+        margin: 0;
+        line-height: 1;
+      }
+
+      .routing-target-marker {
+        position: absolute;
+        top: 50%;
+        width: 2px;
+        height: 14px;
+        border-radius: 1px;
+        background: #344054;
+        box-shadow: 0 0 0 1px #fff;
+        pointer-events: none;
+        transform: translate(-1px, -50%);
+      }
+
+      .routing-comparison-meta {
         display: flex;
         align-items: baseline;
         flex-wrap: wrap;
-        gap: 3px 8px;
+        gap: 3px 12px;
+        padding-left: 98px;
         color: #667085;
         font-size: 12px;
-      }
-
-      .routing-comparison-share {
-        color: #175cd3;
-        font-weight: 650;
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
       }
 
       .routing-comparison-count,
@@ -1581,6 +1618,10 @@
       .routing-comparison-explicit,
       .routing-comparison-empty {
         color: var(--muted);
+      }
+
+      .routing-comparison-item.is-unavailable .routing-comparison-current strong {
+        color: #667085;
       }
 
       .routing-overview-compact {
@@ -2973,22 +3014,17 @@
         }
 
         .account-list,
-        .account-card-primary,
-        .account-card-details-body {
+        .account-card-primary {
           grid-template-columns: 1fr;
         }
 
-        .account-card-details-body .account-card-section:first-child {
-          grid-column: auto;
+        .routing-comparison-measure {
+          grid-template-columns: 76px minmax(0, 1fr);
+          gap: 10px;
         }
 
-        .account-card-primary .account-card-section:last-child {
-          grid-column: auto;
-        }
-
-        .account-card-details-body .account-card-section + .account-card-section,
-        .account-card-primary .account-card-section + .account-card-section {
-          border-top: 0;
+        .routing-comparison-meta {
+          padding-left: 86px;
         }
 
         .account-pagination {
@@ -3062,10 +3098,13 @@
       }
 
       @media (prefers-reduced-motion: reduce) {
-        .page-surface,
-        .account-card-details-chevron {
+        .page-surface {
           animation: none;
           transition: none;
+        }
+
+        .routing-progress * {
+          transition: none !important;
         }
       }
     </style>
@@ -7484,7 +7523,7 @@
         }
 
         function routingSubmittedPercent(slot, state) {
-          if (!state) return 0;
+          if (!state) return null;
           const modelKey = state.modelKey || "";
           const total = selectedAccounts.reduce((sum, account) => {
             const accountState = accountRoutingSlot(account.id, slot);
@@ -7492,31 +7531,73 @@
             return sum + numberValue(accountState.submitted?.auto);
           }, 0);
           const current = numberValue(state.submitted?.auto);
-          return total > 0 ? Math.round((current / total) * 100) : 0;
+          return total > 0 ? Math.round((current / total) * 100) : null;
         }
 
-        function routingComparisonItem(label, slot, state, account, unit, key, targetOnly = false) {
+        function routingComparisonItem(label, slot, state, account, unit, key) {
           const available = account.enabled !== false && state?.available === true;
           const reason = account.enabled === false ? "已停用" : state?.reason || "状态待确认";
           const automatic = numberValue(state?.submitted?.auto);
           const explicit = numberValue(state?.submitted?.explicit);
-          const todayItems = automatic > 0
-            ? [
-                h("span", { className: "routing-comparison-share", key: "share" }, `今日 ${routingSubmittedPercent(slot, state)}%`),
-                h("span", { className: "routing-comparison-count", key: "automatic" }, `自动分流 ${automatic} ${unit}`)
-              ]
-            : [h("span", { className: "routing-comparison-empty", key: "empty" }, "今日无自动分流")];
+          const submittedPercent = available ? routingSubmittedPercent(slot, state) : null;
+          const targetPercent = Math.max(0, Math.min(100, numberValue(state?.targetPercent)));
+          const currentText = submittedPercent === null ? "暂无" : `${submittedPercent}%`;
+          const todayItems = [
+            h("span", {
+              className: automatic > 0 ? "routing-comparison-count" : "routing-comparison-empty",
+              key: "automatic"
+            }, automatic > 0 ? `自动分配 ${automatic} ${unit}` : "今日无自动分流")
+          ];
           if (explicit > 0) {
             todayItems.push(h("span", { className: "routing-comparison-explicit", key: "explicit" }, `指定账号 ${explicit} ${unit}`));
           }
-          return h("div", { className: `routing-comparison-item${targetOnly ? " is-target-only" : ""}`, key }, [
-            h("strong", { className: "routing-comparison-label", key: "label" }, label),
-            h("span", {
-              className: `routing-comparison-target${available ? "" : " is-unavailable"}`,
-              key: "target"
-            }, available ? `目标 ${numberValue(state.targetPercent)}%` : `不参与 · ${reason}`),
-            targetOnly ? null : h("div", { className: "routing-comparison-today", key: "today" }, todayItems)
-          ].filter(Boolean));
+          return h("div", {
+            className: `routing-comparison-item${available ? "" : " is-unavailable"}`,
+            key
+          }, [
+            h("div", { className: "routing-comparison-head", key: "head" }, [
+              h("strong", { className: "routing-comparison-label", key: "label" }, label),
+              h("span", {
+                className: `routing-comparison-target${available ? "" : " is-unavailable"}`,
+                key: "target"
+              }, available ? `目标 ${targetPercent}%` : `不参与 · ${reason}`)
+            ]),
+            h("div", { className: "routing-comparison-measure", key: "measure" }, [
+              h("div", { className: "routing-comparison-current", key: "current" }, [
+                h("span", { key: "label" }, "今日分流"),
+                h("strong", {
+                  className: submittedPercent === null ? "is-empty" : "",
+                  key: "value"
+                }, currentText)
+              ]),
+              h("div", {
+                className: "routing-progress-track",
+                "aria-label": available
+                  ? `${label}今日分流${currentText}，目标${targetPercent}%`
+                  : `${label}不参与分流，${reason}`,
+                key: "track"
+              }, [
+                h(Progress, {
+                  className: "routing-progress",
+                  percent: submittedPercent ?? 0,
+                  showInfo: false,
+                  size: ["100%", 8],
+                  strokeColor: available ? "#1677ff" : "#98a2b3",
+                  trailColor: "#e4e7ec",
+                  strokeLinecap: "butt",
+                  key: "progress"
+                }),
+                available ? h("span", {
+                  className: "routing-target-marker",
+                  style: { left: `${targetPercent}%` },
+                  title: `目标 ${targetPercent}%`,
+                  "aria-hidden": true,
+                  key: "marker"
+                }) : null
+              ].filter(Boolean))
+            ]),
+            h("div", { className: "routing-comparison-meta", key: "meta" }, todayItems)
+          ]);
         }
 
         function markTaskListInteraction() {
@@ -9530,22 +9611,21 @@
             ]);
           }
 
-          const targetOnly = !hasAutomaticRouting && !hasExplicitRouting;
           const items = states.map((entry) => routingComparisonItem(
             entry.label,
             entry.slot,
             entry.state,
             row,
             entry.unit,
-            entry.key,
-            targetOnly
+            entry.key
           ));
           return h("div", { className: "routing-overview" }, [
-            h("div", { className: "routing-overview-meta", key: "meta" }, [
-              h("span", { className: "routing-overview-weight", key: "weight" }, `权重 ${weight} 份`),
-              targetOnly ? h("span", { key: "empty" }, "今日无自动分流") : null
-            ].filter(Boolean)),
-            h("div", { className: "routing-comparison-list", key: "items" }, items.length ? items : "-")
+            h("div", { className: "routing-overview-meta", key: "meta" },
+              h("span", { className: "routing-overview-weight", key: "weight" }, `分流权重 ${weight} 份`)
+            ),
+            h("div", { className: "routing-comparison-list", key: "items" },
+              items.length ? items : "该渠道未启用分流能力"
+            )
           ]);
         }
 
@@ -9650,6 +9730,47 @@
           ]);
         }
 
+        function accountExpiryContent(row, rowChannel, now = Date.now()) {
+          const text = accountExpireText(row, rowChannel);
+          let displayText = text;
+          let detail = "";
+          let tone = "normal";
+
+          if (text === "-" || !text) {
+            displayText = "未提供";
+            detail = "暂未获取到期时间";
+          } else if (text.includes("过期")) {
+            tone = "expired";
+            detail = "请及时续期";
+          } else if (text === "未订阅") {
+            tone = "expired";
+            detail = "激活后显示到期时间";
+          } else {
+            const match = text.match(/^(\d{4})-(\d{2})-(\d{2}),?\s+(\d{2}):(\d{2})$/);
+            const expireTime = match
+              ? Date.parse(`${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:00+08:00`)
+              : Number.NaN;
+            if (Number.isFinite(expireTime)) {
+              const remainingMs = expireTime - now;
+              if (remainingMs <= 0) {
+                displayText = "已过期";
+                detail = "请及时续期";
+                tone = "expired";
+              } else if (remainingMs <= 24 * 60 * 60 * 1000) {
+                detail = "24 小时内到期";
+                tone = "warning";
+              } else {
+                detail = `剩余 ${Math.ceil(remainingMs / (24 * 60 * 60 * 1000))} 天`;
+              }
+            }
+          }
+
+          return h("div", { className: `account-expiry is-${tone}` }, [
+            h("strong", { key: "date" }, displayText),
+            detail ? h("span", { key: "detail" }, detail) : null
+          ].filter(Boolean));
+        }
+
         function accountCardHealth(row) {
           const availability = accountAvailabilityInfo(row);
           if (availability.state === "disabled") {
@@ -9718,23 +9839,15 @@
                 accountQuotaText(row, rowChannel),
                 accountQuotaProtectionItems(row, rowChannel)
               ), "quota"),
+              accountCardSection("套餐到期", accountExpiryContent(row, rowChannel, nowTick), "expire"),
               accountCardSection("代理 IP", proxyCell(row.proxyUrl, row), "proxy"),
               accountCardSection("额度刷新", accountQuotaResetCell(row, rowChannel, nowTick), "reset")
             ]),
-            h("details", { className: "account-card-details", key: "details" }, [
-              h("summary", { key: "summary" }, [
-                h("span", { key: "text" }, "查看分流、并发和套餐"),
-                h("span", { className: "account-card-details-chevron", "aria-hidden": true, key: "icon" },
-                  Icon.DownOutlined ? h(Icon.DownOutlined) : null
-                )
-              ]),
-              h("div", { className: "account-card-details-body", key: "body" }, [
-                accountCardSection("套餐到期", accountExpireText(row, rowChannel), "expire"),
-                accountCardSection(h(Tooltip, {
-                  title: "每种能力独立统计。目标表示当前可用账号的计划比例；今日表示系统自动分配且已提交给上游的实际比例。指定账号不计入今日比例。"
-                }, h("span", null, "分流情况")), accountRoutingContent(row, rowChannel), "routing"),
-                accountCardSection("并发", accountConcurrencyContent(row, rowChannel), "concurrency")
-              ])
+            h("div", { className: "account-card-operations", key: "operations" }, [
+              accountCardSection(h(Tooltip, {
+                title: "每种任务独立统计。目标表示当前计划比例；今日分流表示系统自动分配且已提交的实际比例。指定账号的任务不计入今日分流。"
+              }, h("span", null, "分流概况")), accountRoutingContent(row, rowChannel), "routing"),
+              accountCardSection("并发上限", accountConcurrencyContent(row, rowChannel), "concurrency")
             ]),
             h("footer", { className: "account-card-footer", key: "footer" }, [
               h("label", { className: "account-card-enable", key: "enable" }, [

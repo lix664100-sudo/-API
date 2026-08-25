@@ -17,6 +17,15 @@ assert.ok(usabilityFunctionMatch, "管理后台中应存在账号可用性分组
 const accountUsabilityGroup = vm.runInNewContext(`(${usabilityFunctionMatch[0]})`, {
   accountAvailabilityInfo: (account) => account
 });
+const expiryContentFunctionMatch = adminHtml.match(
+  /function accountExpiryContent\(row, rowChannel, now = Date\.now\(\)\) \{[\s\S]*?\r?\n        \}\r?\n\r?\n        function accountCardHealth/
+);
+assert.ok(expiryContentFunctionMatch, "账号卡片应提供套餐到期可视信息");
+const accountExpiryContent = vm.runInNewContext(`(${expiryContentFunctionMatch[0]
+  .replace(/\r?\n\r?\n        function accountCardHealth$/, "")})`, {
+  accountExpireText: (row) => row.expiryText,
+  h: (tag, props, children) => ({ tag, props: props || {}, children })
+});
 
 test("账号管理使用独立信息块并移除横向宽表", () => {
   assert.match(adminHtml, /function accountGroupSection\(/);
@@ -25,7 +34,7 @@ test("账号管理使用独立信息块并移除横向宽表", () => {
   assert.match(adminHtml, /className: `account-card is-\$\{health\.tone\}/);
   assert.match(adminHtml, /accountCardSection\("代理 IP"/);
   assert.match(adminHtml, /accountCardSection\("额度刷新"/);
-  assert.match(adminHtml, /accountCardSection\("并发"/);
+  assert.match(adminHtml, /accountCardSection\("并发上限"/);
   assert.match(adminHtml, /accountCardSection\("套餐到期"/);
   assert.doesNotMatch(adminHtml, /scroll: \{ x: 2450 \}/);
   assert.doesNotMatch(adminHtml, /account-table-wrap/);
@@ -54,7 +63,7 @@ test("账号卡片不展示车位冻结提示", () => {
 test("账号卡片在宽屏自动多列排列并使用完整可用宽度", () => {
   assert.match(adminHtml, /className: `content\$\{activePage === "accounts" \? " is-accounts-page" : ""\}`/);
   assert.match(adminHtml, /\.content\.is-accounts-page \{[\s\S]*?width: calc\(100% - 32px\);[\s\S]*?max-width: none;/);
-  assert.match(adminHtml, /\.account-list \{[\s\S]*?grid-template-columns: repeat\(auto-fill, minmax\(360px, 1fr\)\);/);
+  assert.match(adminHtml, /\.account-list \{[\s\S]*?grid-template-columns: repeat\(auto-fit, minmax\(420px, 1fr\)\);/);
 });
 
 test("账号概览按可用、业务暂停、真正异常和停用分层", () => {
@@ -75,11 +84,40 @@ test("账号概览按可用、业务暂停、真正异常和停用分层", () =>
   assert.match(adminHtml, /return \{ tone: "info", headline: "部分可用"/);
   assert.match(adminHtml, /\.account-card-health\.is-info/);
   assert.match(adminHtml, /\.account-card-health\.is-warning/);
-  assert.match(adminHtml, /h\("details", \{ className: "account-card-details"/);
-  assert.match(adminHtml, /"查看分流、并发和套餐"/);
+  assert.match(adminHtml, /className: "account-card-operations"/);
+  assert.doesNotMatch(adminHtml, /"查看分流、并发和套餐"/);
   assert.match(adminHtml, /\.account-card-primary \{[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
   assert.match(adminHtml, /\.account-identity-name \{[\s\S]*?font-size: 16px;/);
   assert.match(adminHtml, /\.account-card-label \{[\s\S]*?font-size: 12px;/);
+});
+
+test("套餐、分流和并发默认可见并提供分流进度", () => {
+  assert.match(adminHtml, /accountCardSection\("套餐到期", accountExpiryContent\(/);
+  assert.match(adminHtml, /"分流概况"/);
+  assert.match(adminHtml, /"今日分流"/);
+  assert.match(adminHtml, /h\(Progress, \{/);
+  assert.match(adminHtml, /className: "routing-target-marker"/);
+  assert.match(adminHtml, /accountCardSection\("并发上限"/);
+  assert.doesNotMatch(adminHtml, /className: "account-card-details"/);
+});
+
+test("套餐到期信息同时显示准确时间和剩余天数", () => {
+  const normal = accountExpiryContent(
+    { expiryText: "2026-09-17 01:56" },
+    {},
+    Date.parse("2026-08-26T12:00:00+08:00")
+  );
+  assert.equal(normal.props.className, "account-expiry is-normal");
+  assert.equal(normal.children[0].children, "2026-09-17 01:56");
+  assert.equal(normal.children[1].children, "剩余 22 天");
+
+  const expired = accountExpiryContent({ expiryText: "已过期" }, {});
+  assert.equal(expired.props.className, "account-expiry is-expired");
+  assert.equal(expired.children[1].children, "请及时续期");
+
+  const missing = accountExpiryContent({ expiryText: "-" }, {});
+  assert.equal(missing.children[0].children, "未提供");
+  assert.equal(missing.children[1].children, "暂未获取到期时间");
 });
 
 test("异常账号优先展示，已停用账号排在最后", () => {
@@ -128,5 +166,5 @@ test("渠道概览分别统计绘图和聊天能力", () => {
 
 test("账号信息块在窄屏改为单列", () => {
   assert.match(adminHtml, /@media \(max-width: 780px\)/);
-  assert.match(adminHtml, /\.account-list,\s*\.account-card-primary,\s*\.account-card-details-body \{\s*grid-template-columns: 1fr;/);
+  assert.match(adminHtml, /\.account-list,\s*\.account-card-primary \{\s*grid-template-columns: 1fr;/);
 });
