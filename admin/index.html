@@ -6152,14 +6152,42 @@
         function cacheTaskPage(query, data, revision = taskCacheRevisionRef.current) {
           if (revision !== taskCacheRevisionRef.current) return;
           const cache = taskPageCacheRef.current;
+          const items = Array.isArray(data?.items) ? data.items : [];
           cache.delete(query.key);
-          cache.set(query.key, { data, cachedAt: Date.now() });
+          cache.set(query.key, {
+            data: { ...data, items },
+            cachedAt: Date.now()
+          });
           while (cache.size > 30) cache.delete(cache.keys().next().value);
+        }
+
+        function mergeTaskPageCache(updates) {
+          const cache = taskPageCacheRef.current;
+          for (const [key, entry] of cache.entries()) {
+            const status = new URLSearchParams(key).get("status");
+            if (status && status !== "all") {
+              cache.delete(key);
+              continue;
+            }
+            let changed = false;
+            const items = (Array.isArray(entry?.data?.items) ? entry.data.items : []).map((task) => {
+              const update = updates.get(String(task?.id || ""));
+              if (!update) return task;
+              changed = true;
+              return { ...task, ...update };
+            });
+            if (changed) {
+              cache.set(key, {
+                ...entry,
+                data: { ...entry.data, items }
+              });
+            }
+          }
         }
 
         function prefetchTaskPage(query, { force = false } = {}) {
           const cached = taskPageCacheRef.current.get(query.key);
-          if (!force && cached && Date.now() - cached.cachedAt < 15_000) {
+          if (!force && cached && Date.now() - cached.cachedAt < 30_000) {
             return Promise.resolve(cached.data);
           }
           const existing = taskPrefetchRef.current.get(query.key);
@@ -6248,7 +6276,7 @@
             applyTaskPageData(cached.data);
             setTaskListLoading(false);
             prefetchOtherTaskKinds(query);
-            if (Date.now() - cached.cachedAt >= 5_000) refreshCachedTaskPage(query);
+            if (Date.now() - cached.cachedAt >= 30_000) refreshCachedTaskPage(query);
             return cached.data;
           }
 
@@ -6303,7 +6331,7 @@
             .filter((task) => task?.id)
             .map((task) => [String(task.id), task]));
           if (!updates.size) return;
-          invalidateTaskPageCache();
+          mergeTaskPageCache(updates);
           setTasks((current) => current.map((task) => updates.has(String(task.id))
             ? { ...task, ...updates.get(String(task.id)) }
             : task));

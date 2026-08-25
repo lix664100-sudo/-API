@@ -150,6 +150,30 @@ test("content-policy failures have a separate safety-review status", async () =>
   );
 });
 
+test("old active tasks remain visible without bringing back old completed history", async () => {
+  const oldCreatedAt = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+  await upsertTask({
+    id: "task-old-active-chat",
+    sourceTaskId: "old_active_chat_unique",
+    status: "processing",
+    taskType: "chat",
+    createdAt: oldCreatedAt
+  });
+  await upsertTask({
+    id: "task-old-completed-chat",
+    sourceTaskId: "old_completed_chat_unique",
+    status: "success",
+    taskType: "chat",
+    createdAt: oldCreatedAt
+  });
+
+  const active = await listTaskPage({ keyword: "old_active_chat_unique", kind: "chat" });
+  const completed = await listTaskPage({ keyword: "old_completed_chat_unique", kind: "chat" });
+
+  assert.deepEqual(active.items.map((task) => task.id), ["task-old-active-chat"]);
+  assert.equal(completed.total, 0);
+});
+
 test("task list keeps the marker for a request rejected before an upstream call", async () => {
   await upsertTask({
     id: "task-returned-before-call",

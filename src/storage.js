@@ -2057,18 +2057,30 @@ export async function listTaskPage({
   const database = await getStorageDatabase();
   const cutoff = Date.now() - taskHistoryDays * 24 * 60 * 60 * 1000;
   const activeStatuses = ["processing", "queued", "pending", "unknown", "waiting_upstream"];
+  const eligibleColumns = "id, account_id, channel_id, channel_group, record_kind, list_status, search_text, created_time";
   const eligibleSql = `
-    SELECT id, account_id, channel_id, channel_group, record_kind, list_status, search_text, created_time
-    FROM tasks
-    WHERE created_time >= ? OR status IN (${activeStatuses.map(() => "?").join(", ")})
+    SELECT ${eligibleColumns}
+    FROM (
+      SELECT ${eligibleColumns}
+      FROM tasks
+      WHERE created_time >= ?
+      UNION ALL
+      SELECT ${eligibleColumns}
+      FROM tasks
+      WHERE created_time < ?
+        AND status IN (${activeStatuses.map(() => "?").join(", ")})
+    )
     ORDER BY created_time DESC
     LIMIT ?
   `;
-  const eligibleParams = [cutoff, ...activeStatuses, taskHistoryLimit];
+  const eligibleParams = [cutoff, cutoff, ...activeStatuses, taskHistoryLimit];
   const baseWhere = taskPageWhere(filters, false);
   const pageWhere = taskPageWhere(filters, true);
   const withEligible = (sql) => `WITH eligible AS (${eligibleSql}) ${sql}`;
-  const allTotal = Number(database.prepare(withEligible("SELECT COUNT(*) FROM eligible")).pluck().get(...eligibleParams) || 0);
+  let allTotal = 0;
+  if (baseWhere.sql) {
+    allTotal = Number(database.prepare(withEligible("SELECT COUNT(*) FROM eligible")).pluck().get(...eligibleParams) || 0);
+  }
   let filteredTotal = 0;
   const kindTotals = database.prepare(withEligible(`
     SELECT record_kind AS kind, COUNT(*) AS total
@@ -2080,6 +2092,7 @@ export async function listTaskPage({
     if (row.kind === "image" || row.kind === "chat") totals[row.kind] = Number(row.total || 0);
     return totals;
   }, { image: 0, chat: 0 });
+  if (!baseWhere.sql) allTotal = filteredTotal;
   const total = normalizedKind ? kindTotals[normalizedKind] : filteredTotal;
   const pageCount = Math.ceil(total / normalizedPageSize);
   const normalizedPage = Math.min(requestedPage, Math.max(1, pageCount));

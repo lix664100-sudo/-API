@@ -51,9 +51,11 @@ test("全部记录分别显示今日生图和对话，对话记录也有完整�
 test("任务标签复用已加载记录并在后台预取其他类型", () => {
   assert.match(adminHtml, /const taskPageCacheRef = useRef\(new Map\(\)\)/);
   assert.match(adminHtml, /function prefetchOtherTaskKinds\(query\)/);
+  assert.match(adminHtml, /function mergeTaskPageCache\(updates\)/);
+  assert.match(adminHtml, /mergeTaskPageCache\(updates\);\s*setTasks/);
   assert.match(adminHtml, /\["all", "image", "chat"\]/);
   assert.match(adminHtml, /loadTaskPage\(\{ page: 1, kind, preferCache: true \}\)/);
-  assert.match(adminHtml, /if \(Date\.now\(\) - cached\.cachedAt >= 5_000\) refreshCachedTaskPage\(query\)/);
+  assert.match(adminHtml, /if \(Date\.now\(\) - cached\.cachedAt >= 30_000\) refreshCachedTaskPage\(query\)/);
 });
 
 test("账号状态没有变化时不会重复刷新整个页面", () => {
