@@ -64,7 +64,8 @@ test("账号卡片仅在有冻结车位时显示一行提醒", () => {
 test("账号卡片在宽屏保持稳定宽度，不因账号少而撑满整行", () => {
   assert.match(adminHtml, /className: `content\$\{activePage === "accounts" \? " is-accounts-page" : ""\}`/);
   assert.match(adminHtml, /\.content\.is-accounts-page \{[\s\S]*?width: calc\(100% - 32px\);[\s\S]*?max-width: none;/);
-  assert.match(adminHtml, /\.account-list \{[\s\S]*?grid-template-columns: repeat\(auto-fill, minmax\(420px, 520px\)\);[\s\S]*?justify-content: start;/);
+  assert.match(adminHtml, /\.account-list \{[\s\S]*?grid-template-columns: repeat\(auto-fill, minmax\(340px, 375px\)\);[\s\S]*?justify-content: start;/);
+  assert.match(adminHtml, /\.account-list \{[\s\S]*?gap: 12px;/);
 });
 
 test("账号概览按可用、业务暂停、真正异常和停用分层", () => {
@@ -75,7 +76,7 @@ test("账号概览按可用、业务暂停、真正异常和停用分层", () =>
   assert.match(adminHtml, /headline: "部分异常"/);
   assert.match(adminHtml, /headline: "账号异常"/);
   assert.match(adminHtml, /protection: "额度保护"/);
-  assert.match(adminHtml, /quota_empty: "额度用完"/);
+  assert.match(adminHtml, /quota_empty: "额度已用完"/);
   assert.match(adminHtml, /subscription_expired: "套餐到期"/);
   assert.match(adminHtml, /headline: "已停用"/);
   assert.match(adminHtml, /`\$\{label\}线路掉线`/);
@@ -85,6 +86,9 @@ test("账号概览按可用、业务暂停、真正异常和停用分层", () =>
   assert.match(adminHtml, /return \{ tone: "info", headline: "部分可用"/);
   assert.match(adminHtml, /\.account-card-health\.is-info/);
   assert.match(adminHtml, /\.account-card-health\.is-warning/);
+  assert.match(adminHtml, /className: "account-card-recovery"/);
+  assert.match(adminHtml, /className: "account-card-recovery-main"/);
+  assert.match(adminHtml, /className: "account-card-recovery-exact"/);
   assert.match(adminHtml, /className: "account-card-operations"/);
   assert.doesNotMatch(adminHtml, /"查看分流、并发和套餐"/);
   assert.match(adminHtml, /\.account-card-primary \{[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);

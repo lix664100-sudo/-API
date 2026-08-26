@@ -815,10 +815,10 @@
 
       .account-list {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(420px, 520px));
+        grid-template-columns: repeat(auto-fill, minmax(340px, 375px));
         align-items: start;
         justify-content: start;
-        gap: 14px;
+        gap: 12px;
         min-width: 0;
       }
 
@@ -923,6 +923,7 @@
       .account-card-health-copy {
         display: grid;
         gap: 3px;
+        width: 100%;
         min-width: 0;
         font-size: 13px;
         line-height: 1.45;
@@ -938,6 +939,28 @@
         overflow-wrap: anywhere;
         color: currentColor;
         opacity: 0.82;
+      }
+
+      .account-card-recovery {
+        display: grid;
+        gap: 2px;
+        margin-top: 4px;
+        padding-top: 7px;
+        border-top: 1px solid rgba(71, 84, 103, 0.18);
+      }
+
+      .account-card-recovery .account-card-recovery-main {
+        color: currentColor;
+        font-size: 13px;
+        font-weight: 750;
+        opacity: 1;
+      }
+
+      .account-card-recovery .account-card-recovery-exact {
+        color: currentColor;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        opacity: 0.78;
       }
 
       .account-car-freeze-summary {
@@ -4641,6 +4664,58 @@
         const enabled = channel?.settings?.enabledAbilities;
         if (!enabled || typeof enabled !== "object") return true;
         return enabled[ability] !== false;
+      }
+
+      function quotaCapabilityResetAt(account, channel, capability = {}) {
+        if (channel?.type === "shareai") {
+          if (capability.key === "drawing") return abilityStatus(account, "drawing").quotaResetAt || "";
+          if (String(capability.key || "").startsWith("chatplus-")) {
+            const modelKey = String(capability.key).slice("chatplus-".length);
+            const chatplus = abilityStatus(account, "chatplus");
+            const usage = chatplus.meta?.referenceUsage?.[modelKey] || {};
+            const activeModelKey = chatModelKey(chatplus.quotaModel || chatplus.meta?.chatModel);
+            return usage.quotaResetAt || (activeModelKey === modelKey ? chatplus.quotaResetAt || "" : "");
+          }
+          return "";
+        }
+        if (channel?.type === "chatplus") {
+          const activeModelKey = chatModelKey(account.quotaModel || account.meta?.chatModel);
+          return account.meta?.referenceUsage?.[activeModelKey]?.quotaResetAt || account.quotaResetAt || "";
+        }
+        return account?.quotaResetAt || "";
+      }
+
+      function accountQuotaRecoveryInfo(account, channel, capabilities = [], now = Date.now()) {
+        const emptyCapabilities = capabilities.filter((item) => item.status === "quota_empty");
+        if (!emptyCapabilities.length) return null;
+
+        const recoveries = emptyCapabilities
+          .map((item) => {
+            const resetAt = quotaCapabilityResetAt(account, channel, item);
+            const resetTime = Date.parse(resetAt || "");
+            return Number.isFinite(resetTime) ? { label: item.label || "额度", resetAt, resetTime } : null;
+          })
+          .filter(Boolean)
+          .sort((left, right) => left.resetTime - right.resetTime);
+        const future = recoveries.find((item) => item.resetTime > Number(now));
+        if (future) {
+          const remaining = formatRemainingTime(future.resetAt, now).replace(/后重置$/, "后恢复");
+          return {
+            summary: `${future.label}预计 ${remaining}`,
+            exact: `恢复时间 ${formatDateTime(future.resetAt).replace(/,\s*/g, " ")}`
+          };
+        }
+        if (recoveries.length) {
+          const latest = recoveries[recoveries.length - 1];
+          return {
+            summary: `${latest.label}正在核验是否恢复`,
+            exact: `原定恢复时间 ${formatDateTime(latest.resetAt).replace(/,\s*/g, " ")}`
+          };
+        }
+        return {
+          summary: `${emptyCapabilities.map((item) => item.label || "额度").join("、")}恢复时间待确认`,
+          exact: ""
+        };
       }
 
       function shareAIAbilityDefaults(settings = {}) {
@@ -10226,6 +10301,13 @@
 
         function accountCardHealth(row) {
           const availability = accountAvailabilityInfo(row);
+          const rowChannel = channels.find((item) => item.id === row.channelId);
+          const recovery = accountQuotaRecoveryInfo(
+            row,
+            rowChannel,
+            availability.capabilities || [],
+            nowTick
+          );
           if (availability.state === "disabled") {
             return { tone: "muted", headline: "已停用", detail: "账号已停用" };
           }
@@ -10236,20 +10318,20 @@
             return { tone: "normal", headline: "可用", detail: availability.reasons.join(" · ") };
           }
           if (availability.state === "partial") {
-            return { tone: "info", headline: "部分可用", detail: availability.reasons.join(" · ") };
+            return { tone: "info", headline: "部分可用", detail: availability.reasons.join(" · "), recovery };
           }
           if (availability.state === "partial_error") {
-            return { tone: "danger", headline: "部分异常", detail: availability.reasons.join(" · ") };
+            return { tone: "danger", headline: "部分异常", detail: availability.reasons.join(" · "), recovery };
           }
           const businessHeadlines = {
             protection: "额度保护",
-            quota_empty: "额度用完",
+            quota_empty: "额度已用完",
             subscription_expired: "套餐到期",
             subscription_missing: "未订阅",
             activation_required: "未激活"
           };
           if (businessHeadlines[availability.state]) {
-            return { tone: "warning", headline: businessHeadlines[availability.state], detail: availability.reasons.join(" · ") };
+            return { tone: "warning", headline: businessHeadlines[availability.state], detail: availability.reasons.join(" · "), recovery };
           }
           if (availability.state === "unknown") {
             return { tone: "muted", headline: "未检测", detail: availability.reasons.join(" · ") };
@@ -10266,8 +10348,14 @@
             h("span", { className: "account-card-health-dot", "aria-hidden": true, key: "dot" }),
             h("div", { className: "account-card-health-copy", key: "copy" }, [
               h("strong", { key: "headline" }, health.headline),
-              h("span", { key: "detail" }, health.detail)
-            ])
+              h("span", { key: "detail" }, health.detail),
+              health.recovery ? h("div", { className: "account-card-recovery", key: "recovery" }, [
+                h("span", { className: "account-card-recovery-main", key: "summary" }, health.recovery.summary),
+                health.recovery.exact
+                  ? h("span", { className: "account-card-recovery-exact", key: "exact" }, health.recovery.exact)
+                  : null
+              ].filter(Boolean)) : null
+            ].filter(Boolean))
           ]);
         }
 

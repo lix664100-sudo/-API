@@ -170,6 +170,21 @@ const accountQuotaResetText = vm.runInNewContext(
   }
 );
 
+const recoveryFunctionMatch = adminHtml.match(
+  /function accountQuotaRecoveryInfo\(account, channel, capabilities = \[\], now = Date\.now\(\)\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function shareAIAbilityDefaults/
+);
+
+assert.ok(recoveryFunctionMatch, "管理后台中应存在额度恢复时间提示方法");
+
+const accountQuotaRecoveryInfo = vm.runInNewContext(`(${recoveryFunctionMatch[0]
+  .replace(/\r?\n\r?\n      function shareAIAbilityDefaults$/, "")})`, {
+  quotaCapabilityResetAt: (account, _channel, capability) => (
+    account.resets?.[capability.key] || ""
+  ),
+  formatRemainingTime,
+  formatDateTime: (value) => value
+});
+
 const expireFunctionMatch = adminHtml.match(
   /function accountExpireText\(account, channel\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function channelAbilityEnabled/
 );
@@ -546,6 +561,24 @@ test("额度重置时间覆盖未来、临近和已到时间", () => {
   assert.equal(formatRemainingTime("2026-08-23T00:00:59+08:00", fixedNow), "不到1分钟后重置");
   assert.equal(formatRemainingTime("2026-08-22T23:59:59+08:00", fixedNow), "");
   assert.equal(formatRemainingTime("错误时间", fixedNow), "");
+});
+
+test("额度用完时同时显示倒计时和准确恢复时间", () => {
+  assert.deepEqual(structuredClone(accountQuotaRecoveryInfo({
+    resets: { "chatplus-gemini": "2026-08-23T15:38:00+08:00" }
+  }, {}, [{ key: "chatplus-gemini", label: "Gemini", status: "quota_empty" }], fixedNow)), {
+    summary: "Gemini预计 15小时38分后恢复",
+    exact: "恢复时间 2026-08-23T15:38:00+08:00"
+  });
+});
+
+test("额度用完但上游没给时间时明确显示待确认", () => {
+  assert.deepEqual(structuredClone(accountQuotaRecoveryInfo({}, {}, [
+    { key: "chatplus-gemini", label: "Gemini", status: "quota_empty" }
+  ], fixedNow)), {
+    summary: "Gemini恢复时间待确认",
+    exact: ""
+  });
 });
 
 test("只有真实刷新请求进行中才显示正在刷新", () => {
