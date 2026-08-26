@@ -440,7 +440,6 @@ export function createCloudlianRegistrationService(overrides = {}) {
         const payload = await client.json("/frontend-api/exchange", {
           method: "POST",
           body: {
-            userToken: account.username,
             redemptionCode: activationCode
           }
         });
@@ -730,7 +729,6 @@ export function createChatAccountActivationService(overrides = {}) {
           method: "POST",
           timeoutSec: ACTIVATION_REQUEST_TIMEOUT_SEC,
           body: {
-            userToken: account.username,
             redemptionCode: activationCode
           }
         });

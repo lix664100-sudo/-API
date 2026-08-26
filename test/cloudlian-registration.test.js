@@ -170,7 +170,6 @@ test("随机账号注册成功后兑换激活码并自动启用", async () => {
     token: ""
   }]);
   assert.deepEqual(harness.calls.exchange, [{
-    userToken: "cltest1",
     redemptionCode: "CODE-OK"
   }]);
   const [account] = harness.config().accounts;
@@ -289,7 +288,9 @@ test("套餐到期账号可以用新激活码续期并保留账号配置", async
 
   assert.equal(result.status, "ready");
   assert.equal(harness.calls.register.length, 0);
-  assert.equal(harness.calls.exchange.length, 1);
+  assert.deepEqual(harness.calls.exchange, [{
+    redemptionCode: "RENEW-CODE"
+  }]);
   const saved = harness.config().accounts[0];
   assert.equal(saved.id, account.id);
   assert.equal(saved.proxyUrl, account.proxyUrl);
