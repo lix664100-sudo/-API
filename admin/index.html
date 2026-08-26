@@ -6977,7 +6977,8 @@
                 ? "subscription_expired"
                 : baseStatus;
               if (!["error", "failed", "disconnected", "subscription_expired", "subscription_missing", "activation_required", "disabled"].includes(modelStatus)) {
-                if (knownNumber(usage.balance)) modelStatus = Number(usage.balance) <= 0 ? "quota_empty" : "ok";
+                if (baseStatus === "quota_empty" && (!activeModelKey || model.key === activeModelKey)) modelStatus = "quota_empty";
+                else if (knownNumber(usage.balance)) modelStatus = Number(usage.balance) <= 0 ? "quota_empty" : "ok";
                 else if (baseStatus === "quota_empty" && activeModelKey && model.key !== activeModelKey) modelStatus = "unknown";
               }
               capabilities.push({

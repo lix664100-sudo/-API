@@ -116,6 +116,35 @@ const drawingDisplayStatus = vm.runInNewContext(
   `(${drawingDisplayStatusFunctionSource.replace(/^function /, "function ")})`
 );
 
+const capabilityStatesFunctionMatch = adminHtml.match(
+  /function accountCapabilityStates\(account, channel\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function summarizeAccountCapabilities/
+);
+
+assert.ok(capabilityStatesFunctionMatch, "管理后台中应存在账号分项状态判断方法");
+
+const accountCapabilityStates = vm.runInNewContext(`(${capabilityStatesFunctionMatch[0]
+  .replace(/\r?\n\r?\n      function summarizeAccountCapabilities$/, "")})`, {
+  accountQuotaProtectionItems: () => [],
+  abilityStatus: (account, key) => account?.meta?.abilities?.[key] || {},
+  channelAbilityEnabled: (channel, ability) => channel?.settings?.enabledAbilities?.[ability] !== false,
+  capabilityStatusWithProtection: (status) => status,
+  drawingDisplayStatus,
+  chatDisplayStatus: (status = {}) => {
+    if (status.status === "subscription_missing") return "subscription_missing";
+    if (status.status === "subscription_expired") return "subscription_expired";
+    if (confirmedChatQuotaEmpty(status)) return "quota_empty";
+    if (status.status === "quota_empty") return "ok";
+    return status.status || "unknown";
+  },
+  chatModelKey: (value) => String(value || "").trim().toLowerCase(),
+  chatModelsForChannel: (channel) => channel?.settings?.chatModels || [],
+  knownNumber: (value) => value !== null
+    && value !== undefined
+    && String(value).trim() !== ""
+    && Number.isFinite(Number(value)),
+  Date
+});
+
 const functionMatch = adminHtml.match(
   /function aggregateChatReferenceUsage\(accounts, channelType, modelKeys\) \{[\s\S]*?\r?\n      \}\r?\n\r?\n      function chatQuotaText/
 );
@@ -431,6 +460,40 @@ test("上游已确认额度用完时忽略过期的正数余额", () => {
     }
   );
   assert.equal(chatQuotaText(null, {}, exhausted.meta.abilities.chatplus), "Gemini 0/70");
+});
+
+test("上游已确认额度用完时账号卡片不能被旧余额标成可用", () => {
+  const account = shareAIAccount({
+    referenceUsage: {
+      gemini: {
+        quota: 70,
+        balance: 56,
+        quotaResetAt: "2026-08-27T00:00:00+08:00",
+        expireAt: "2026-09-25T05:16:10+08:00"
+      }
+    }
+  });
+  Object.assign(account.meta.abilities.chatplus, {
+    status: "quota_empty",
+    quotaReason: "chat_usage_limit",
+    quotaModel: "gemini",
+    quotaConfirmedByUpstream: true,
+    meta: {
+      chatModel: "gemini",
+      referenceUsage: account.meta.abilities.chatplus.meta.referenceUsage
+    }
+  });
+  const channel = {
+    type: "shareai",
+    settings: {
+      enabledAbilities: { drawing: false, chatplus: true },
+      chatModels: [{ key: "gemini", name: "Gemini", enabled: true, default: true }]
+    }
+  };
+
+  assert.deepEqual(structuredClone(accountCapabilityStates(account, channel)), [
+    { key: "chatplus-gemini", label: "Gemini", status: "quota_empty", protection: undefined }
+  ]);
 });
 
 test("后台明确显示当前模型剩余为零时账号状态显示额度不足", () => {
