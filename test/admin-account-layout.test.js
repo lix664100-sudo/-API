@@ -99,7 +99,7 @@ test("套餐、分流和并发默认可见并提供分流进度", () => {
   assert.match(adminHtml, /h\(Progress, \{/);
   assert.match(adminHtml, /className: "routing-target-marker"/);
   assert.match(adminHtml, /className: "routing-comparison-item is-unavailable is-compact"/);
-  assert.match(adminHtml, /"不参与分流"/);
+  assert.match(adminHtml, /不参与分流/);
   assert.match(adminHtml, /accountCardSection\("并发上限"/);
   assert.doesNotMatch(adminHtml, /className: "account-card-details"/);
 });

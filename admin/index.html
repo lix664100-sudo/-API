@@ -1594,6 +1594,87 @@
         font-weight: 650;
       }
 
+      .routing-completion {
+        display: grid;
+        gap: 7px;
+        padding: 8px 0 10px;
+        border-bottom: 1px solid #f0f2f5;
+      }
+
+      .routing-completion-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 3px 10px;
+      }
+
+      .routing-completion-title {
+        color: #344054;
+        font-size: 12px;
+        font-weight: 680;
+      }
+
+      .routing-completion-note,
+      .routing-completion-status {
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.4;
+      }
+
+      .routing-completion-note.is-warning,
+      .routing-completion-status.is-warning {
+        color: #b54708;
+      }
+
+      .routing-completion-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 1px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--line);
+      }
+
+      .routing-completion-metric {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+        padding: 7px 8px 8px;
+        background: #f8fafc;
+      }
+
+      .routing-completion-metric span {
+        overflow: hidden;
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.25;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .routing-completion-metric strong {
+        color: #101828;
+        font-size: 16px;
+        font-variant-numeric: tabular-nums;
+        font-weight: 760;
+        line-height: 1.2;
+        white-space: nowrap;
+      }
+
+      .routing-completion-metric small {
+        margin-left: 2px;
+        color: #667085;
+        font-size: 11px;
+        font-weight: 600;
+      }
+
+      .routing-completion-metric.is-danger strong,
+      .routing-completion-metric.is-danger small {
+        color: #b42318;
+      }
+
       .routing-comparison-list {
         display: grid;
         gap: 0;
@@ -3209,6 +3290,10 @@
 
         .routing-comparison-meta {
           padding-left: 86px;
+        }
+
+        .routing-completion-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
         }
 
         .account-pagination {
@@ -6017,6 +6102,17 @@
         return productivityRangeData(daily, accounts, day, day, accountFilter, channelFilter);
       }
 
+      function productivityAccountCompletion(row = {}) {
+        const imageTasks = numberValue(row.imageTasks);
+        const chatTasks = numberValue(row.chatTasks);
+        return {
+          totalTasks: imageTasks + chatTasks,
+          successImages: numberValue(row.successImages),
+          successChats: numberValue(row.chatSuccessTasks),
+          failedTasks: numberValue(row.imageFailedTasks) + numberValue(row.chatFailedTasks)
+        };
+      }
+
       function productivityRuntimeData(concurrency, startDay, endDay) {
         const rows = (Array.isArray(concurrency?.days) ? concurrency.days : [])
           .filter((item) => item.day >= startDay && item.day <= endDay && numberValue(item.samples) > 0);
@@ -7060,6 +7156,7 @@
         const [taskListLoading, setTaskListLoading] = useState(false);
         const [statRecords, setStatRecords] = useState([]);
         const [dailyStats, setDailyStats] = useState({ days: [], records: [] });
+        const [statsSummaryState, setStatsSummaryState] = useState({ ready: false, error: false });
         const [concurrencyStats, setConcurrencyStats] = useState({ days: [] });
         const [intradayStats, setIntradayStats] = useState({
           day: dateKeyInShanghai(Date.now()),
@@ -7729,6 +7826,13 @@
         const productivityChatPeakDay = productivityTrend.reduce((best, row) => (
           !best || row.totalChats > best.totalChats ? row : best
         ), null);
+        const todayKey = dateKeyInShanghai(nowTick);
+        const todayProductivity = useMemo(() => (
+          productivityDayData(dailyStats, accounts, todayKey)
+        ), [dailyStats, accounts, todayKey]);
+        const todayProductivityByAccount = useMemo(() => new Map(
+          todayProductivity.rows.map((row) => [String(row.id), row])
+        ), [todayProductivity]);
 
         const activePageMeta = dashboardPages.find((item) => item.key === activePage) || dashboardPages[0];
         const navigationItems = [
@@ -7836,7 +7940,7 @@
           }
           if (!available) {
             const historyText = [
-              automatic > 0 ? `今日自动分配 ${automatic} ${unit}` : "",
+              automatic > 0 ? `今日自动分配 ${automatic} ${unit}` : "今日无自动分流",
               explicit > 0 ? `指定账号 ${explicit} ${unit}` : ""
             ].filter(Boolean).join(" · ");
             return h("div", {
@@ -7844,9 +7948,9 @@
               key
             }, [
               h("strong", { className: "routing-comparison-label", key: "label" }, label),
-              h("span", { className: "routing-comparison-compact-reason", key: "reason" }, `不参与 · ${reason}`),
-              historyText ? h("span", { className: "routing-comparison-compact-count", key: "history" }, historyText) : null
-            ].filter(Boolean));
+              h("span", { className: "routing-comparison-compact-reason", key: "reason" }, `不参与分流 · ${reason}`),
+              h("span", { className: "routing-comparison-compact-count", key: "history" }, historyText)
+            ]);
           }
           return h("div", {
             className: "routing-comparison-item",
@@ -8236,14 +8340,20 @@
         }
 
         async function refreshStatsSummary() {
-          const statsData = await api("/api/stats?summary=1");
-          setStatRecords(Array.isArray(statsData?.records) ? statsData.records : []);
-          setDailyStats(statsData?.daily && Array.isArray(statsData.daily.days) && Array.isArray(statsData.daily.records)
-            ? statsData.daily
-            : { days: [], records: [] });
-          setConcurrencyStats(statsData?.concurrency && Array.isArray(statsData.concurrency.days)
-            ? statsData.concurrency
-            : { days: [] });
+          try {
+            const statsData = await api("/api/stats?summary=1");
+            setStatRecords(Array.isArray(statsData?.records) ? statsData.records : []);
+            setDailyStats(statsData?.daily && Array.isArray(statsData.daily.days) && Array.isArray(statsData.daily.records)
+              ? statsData.daily
+              : { days: [], records: [] });
+            setConcurrencyStats(statsData?.concurrency && Array.isArray(statsData.concurrency.days)
+              ? statsData.concurrency
+              : { days: [] });
+            setStatsSummaryState({ ready: true, error: false });
+          } catch (error) {
+            setStatsSummaryState((current) => ({ ...current, error: true }));
+            throw error;
+          }
         }
 
         async function refresh() {
@@ -8456,6 +8566,9 @@
               const results = await api("/api/tasks/refresh-processing", { method: "POST", body: {}, timeoutMs: 15000 }).catch(() => null);
               if (shouldPauseTaskAutoRefresh()) return;
               mergeRefreshedTasks(results);
+              if ((Array.isArray(results) ? results : []).some((item) => ["success", "failed"].includes(item?.task?.status))) {
+                refreshStatsSummary().catch(() => {});
+              }
               if (taskStatusFilter !== "all") {
                 await loadTaskPage({ page: 1, showLoading: false, background: true, forceRefresh: true });
               }
@@ -9879,6 +9992,45 @@
           ].filter(Boolean));
         }
 
+        function accountCompletionContent(row) {
+          if (!statsSummaryState.ready) {
+            return h("div", {
+              className: `routing-completion-status${statsSummaryState.error ? " is-warning" : ""}`
+            }, statsSummaryState.error ? "今日完成统计暂未读取，请刷新重试" : "今日完成统计加载中");
+          }
+
+          const completion = productivityAccountCompletion(
+            todayProductivityByAccount.get(String(row.id))
+          );
+          const metrics = [
+            { label: "处理任务", value: completion.totalTasks, unit: "个" },
+            { label: "成功图片", value: completion.successImages, unit: "张" },
+            { label: "成功对话", value: completion.successChats, unit: "次" },
+            { label: "失败任务", value: completion.failedTasks, unit: "个", danger: completion.failedTasks > 0 }
+          ];
+          return h("div", { className: "routing-completion" }, [
+            h("div", { className: "routing-completion-head", key: "head" }, [
+              h("span", { className: "routing-completion-title", key: "title" }, "今日完成"),
+              h("span", {
+                className: `routing-completion-note${statsSummaryState.error ? " is-warning" : ""}`,
+                key: "note"
+              }, statsSummaryState.error ? "显示上次结果，刷新失败" : "按最终结果统计")
+            ]),
+            h("div", { className: "routing-completion-grid", key: "metrics" }, metrics.map((item) => (
+              h("div", {
+                className: `routing-completion-metric${item.danger ? " is-danger" : ""}`,
+                key: item.label
+              }, [
+                h("span", { key: "label" }, item.label),
+                h("strong", { key: "value" }, [
+                  item.value.toLocaleString("zh-CN"),
+                  h("small", { key: "unit" }, item.unit)
+                ])
+              ])
+            )))
+          ]);
+        }
+
         function accountRoutingContent(row, rowChannel) {
           if (!runtimeStatus?.routing) return "统计加载中";
           const weight = routingWeightValue(row.routingWeight);
@@ -9911,22 +10063,6 @@
             ]);
           }
 
-          const allUnavailable = states.length > 0
-            && states.every((entry) => row.enabled === false || entry.state?.available !== true);
-          if (allUnavailable) {
-            const reasons = [...new Set(states.map((entry) => entry.state?.reason || "状态待确认"))];
-            return h("div", { className: "routing-overview routing-overview-compact" }, [
-              h("div", { className: "routing-overview-meta", key: "meta" },
-                h("span", { className: "routing-overview-weight" }, `分流权重 ${weight} 份`)
-              ),
-              h("div", { className: "routing-overview-status", key: "status" }, [
-                h("strong", { key: "unavailable" }, "不参与分流"),
-                h("span", { key: "reason" }, reasons.join(" · ")),
-                h("span", { key: "history" }, hasAutomaticRouting || hasExplicitRouting ? "今日有历史分流记录" : "今日无自动分流")
-              ])
-            ]);
-          }
-
           const items = states.map((entry) => routingComparisonItem(
             entry.label,
             entry.slot,
@@ -9939,6 +10075,7 @@
             h("div", { className: "routing-overview-meta", key: "meta" },
               h("span", { className: "routing-overview-weight", key: "weight" }, `分流权重 ${weight} 份`)
             ),
+            accountCompletionContent(row),
             h("div", { className: "routing-comparison-list", key: "items" },
               items.length ? items : "该渠道未启用分流能力"
             )

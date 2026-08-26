@@ -17,7 +17,7 @@ function loadProductivityHelpers() {
     taskRecordKind: (record) => record?.recordKind || (record?.taskType === "chat" ? "chat" : "image")
   };
   vm.runInNewContext(
-    `${adminHtml.slice(start, end)}\nthis.helpers = { productivityDayData, productivityRangeData, productivityRuntimeData, productivityTrendData };`,
+    `${adminHtml.slice(start, end)}\nthis.helpers = { productivityDayData, productivityRangeData, productivityRuntimeData, productivityTrendData, productivityAccountCompletion };`,
     context
   );
   return context.helpers;
@@ -26,6 +26,25 @@ function loadProductivityHelpers() {
 function localValue(value) {
   return JSON.parse(JSON.stringify(value));
 }
+
+test("账号卡片同时展示今日完成任务、图片、对话和失败数", () => {
+  const { productivityAccountCompletion } = loadProductivityHelpers();
+  const result = localValue(productivityAccountCompletion({
+    imageTasks: 7,
+    successImages: 12,
+    imageFailedTasks: 2,
+    chatTasks: 5,
+    chatSuccessTasks: 4,
+    chatFailedTasks: 1
+  }));
+
+  assert.deepEqual(result, {
+    totalTasks: 12,
+    successImages: 12,
+    successChats: 4,
+    failedTasks: 3
+  });
+});
 
 test("未分配请求不会成为账号，也不会拉低账号平均产值", () => {
   const { productivityDayData } = loadProductivityHelpers();
