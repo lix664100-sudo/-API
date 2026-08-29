@@ -2940,13 +2940,8 @@ function requestedAccountIdForInput(input = {}) {
   return String(input.accountId || input.account_id || "").trim();
 }
 
-function strictAccountRequested(input = {}) {
-  const value = input.strict_account ?? input.strictAccount;
-  return value === true || value === 1 || /^(?:true|1)$/i.test(String(value || "").trim());
-}
-
 function strictAccountIdForInput(input = {}) {
-  return strictAccountRequested(input) ? requestedAccountIdForInput(input) : "";
+  return requestedAccountIdForInput(input);
 }
 
 function targetMatchesRequestedModel(target, taskType, input = {}) {
@@ -4923,7 +4918,11 @@ async function keepSubmittedTaskRecoverable(task, error, attempts = []) {
 async function runQueuedTextTask(task, input, reserved = null, options = {}) {
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
-  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { input });
+  const requestedAccountId = requestedAccountIdForInput(input);
+  const targets = await selectReadyTargets(config, requestedChannel, "text2img", {
+    accountId: requestedAccountId,
+    input
+  });
   let taskReservation = reserved;
   let latestTask = task;
   if (!taskReservation && options.waitForSlot === true) {
@@ -5414,8 +5413,19 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   }
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
-  const targets = await selectReadyTargets(config, requestedChannel, "text2img", { input });
-  if (!targets.length) throw noUsableTargetError("text2img", { config, requestedChannel, input });
+  const requestedAccountId = requestedAccountIdForInput(input);
+  const targets = await selectReadyTargets(config, requestedChannel, "text2img", {
+    accountId: requestedAccountId,
+    input
+  });
+  if (!targets.length) {
+    throw noUsableTargetError("text2img", {
+      config,
+      requestedChannel,
+      accountId: requestedAccountId,
+      input
+    });
+  }
 
   const reserved = await reserveFirstAvailableTarget(targets, "text2img", { input });
   const target = reserved.target;

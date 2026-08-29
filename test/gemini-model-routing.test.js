@@ -111,7 +111,7 @@ test("Gemini 账号额度用完后换账号仍保留请求模型和强度", asyn
   }
 });
 
-test("普通调用指定的 Gemini 账号额度用完后自动换到可用账号", async () => {
+test("普通调用指定的 Gemini 账号额度用完后不会换到其他账号", async () => {
   const originalCreateChatCompletion = ChatplusClient.prototype.createChatCompletion;
   const attempts = [];
   ChatplusClient.prototype.createChatCompletion = async function createChatCompletionStub(input) {
@@ -136,20 +136,22 @@ test("普通调用指定的 Gemini 账号额度用完后自动换到可用账号
   };
 
   try {
-    const result = await createChatCompletion({
-      accountId: "gemini-account-a",
-      model: "gemini-3.1-pro",
-      messages: [{ role: "user", content: "指定账号额度换号测试" }]
-    });
+    await assert.rejects(
+      createChatCompletion({
+        accountId: "gemini-account-a",
+        model: "gemini-3.1-pro",
+        messages: [{ role: "user", content: "指定账号不换号测试" }]
+      }),
+      /使用次数已用完|所有对话渠道都失败/
+    );
 
-    assert.deepEqual(attempts, ["gemini-account-a", "gemini-account-b"]);
-    assert.equal(result.choices[0].message.content, "换账号成功");
+    assert.deepEqual(attempts, ["gemini-account-a"]);
   } finally {
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
   }
 });
 
-test("普通调用指定了已知无额度账号时不会再向该账号发送请求", async () => {
+test("普通调用指定了已知无额度账号时不会改用其他账号", async () => {
   const config = await loadConfig();
   const resetAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
   await saveConfig({
@@ -195,14 +197,16 @@ test("普通调用指定了已知无额度账号时不会再向该账号发送�
   };
 
   try {
-    const result = await createChatCompletion({
-      accountId: "gemini-account-a",
-      model: "gemini-3.1-pro",
-      messages: [{ role: "user", content: "已知无额度账号跳过测试" }]
-    });
+    await assert.rejects(
+      createChatCompletion({
+        accountId: "gemini-account-a",
+        model: "gemini-3.1-pro",
+        messages: [{ role: "user", content: "已知无额度账号固定测试" }]
+      }),
+      /聊天额度已用完|使用次数已用完/
+    );
 
-    assert.deepEqual(attempts, ["gemini-account-b"]);
-    assert.equal(result.choices[0].message.content, "直接使用可用账号");
+    assert.deepEqual(attempts, []);
   } finally {
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
   }
