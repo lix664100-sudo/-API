@@ -4821,6 +4821,7 @@ export class ChatplusClient {
       const ignoredCarIds = new Set();
       const quotaErrors = [];
       let lastUpstreamModel = "";
+      let lastQuotaModel = "";
       for (let attempt = 0; attempt < 5; attempt += 1) {
         let conversation = null;
         try {
@@ -4832,7 +4833,8 @@ export class ChatplusClient {
           if (conversation?.selected && error.imageCarQuotaExhausted === true) {
             ignoredCarIds.add(conversation.selected.carId);
             await this.rememberImageFailedCar(conversation.selected, error);
-            quotaErrors.push(error.message || "当前车位图片生成额度已用完。");
+            lastQuotaModel = conversation.route?.key || lastQuotaModel;
+            quotaErrors.push(error);
             continue;
           }
           if (conversation) {
@@ -4842,9 +4844,18 @@ export class ChatplusClient {
           throw error;
         }
       }
-      const error = new Error(`已自动尝试 ${quotaErrors.length} 个生图车位，但图片生成额度都已用完。`);
-      error.imageCarQuotaExhausted = true;
+      const resetTime = Math.min(...quotaErrors
+        .map((error) => Date.parse(error.quotaResetAt || ""))
+        .filter((time) => Number.isFinite(time) && time > Date.now()));
+      const resetAt = Number.isFinite(resetTime) ? new Date(resetTime).toISOString() : "";
+      const lastQuotaError = quotaErrors.at(-1);
+      const error = imageQuotaError(`已自动尝试 ${quotaErrors.length} 个生图车位，但图片生成额度都已用完。`);
+      error.quotaResetAt = resetAt;
+      error.cooldownUntil = resetAt || null;
+      error.quotaModel = lastQuotaModel;
+      error.upstreamText = lastQuotaError?.upstreamText || lastQuotaError?.message || "";
       error.imageSubmissionAttempted = true;
+      error.imageSubmissionConfirmed = false;
       error.status = 429;
       error.upstreamModel = lastUpstreamModel;
       throw error;

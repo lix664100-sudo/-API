@@ -935,6 +935,44 @@ test("GPT conversation busy responses briefly freeze the car and switch without 
   }
 });
 
+test("all exhausted image cars pause the account until the earliest reset", async () => {
+  const client = clientForGpt();
+  const resetAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  let attemptCount = 0;
+  client.sendConversation = async () => {
+    attemptCount += 1;
+    return {
+      selected: { carId: `quota-car-${attemptCount}`, carType: "chatgpt" },
+      route: { key: "gpt", model: "gpt-image-test" },
+      upstreamModel: "gpt-image-test"
+    };
+  };
+  client.rememberImageFailedCar = async () => {};
+
+  await assert.rejects(
+    () => client.withImageQuotaFallback("account quota exhausted", { imageGeneration: true }, async () => {
+      const error = new Error("current car image quota exhausted");
+      error.imageCarQuotaExhausted = true;
+      error.quotaResetAt = resetAt;
+      error.upstreamText = "image generation limit";
+      error.status = 429;
+      throw error;
+    }),
+    (error) => {
+      assert.equal(attemptCount, 5);
+      assert.equal(error.imageQuotaExhausted, true);
+      assert.equal(error.quotaEmpty, true);
+      assert.equal(error.quotaReason, "image_quota");
+      assert.equal(error.quotaConfirmedByUpstream, true);
+      assert.equal(error.quotaResetAt, resetAt);
+      assert.equal(error.cooldownUntil, resetAt);
+      assert.equal(error.imageSubmissionAttempted, true);
+      assert.equal(error.imageSubmissionConfirmed, false);
+      return true;
+    }
+  );
+});
+
 test("an in-flight task keeps its original car when the next task switches cars", async () => {
   const client = clientForGemini();
   client.fetchCars = async () => [

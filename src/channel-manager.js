@@ -5768,10 +5768,12 @@ function reconcileChatUsageResetTimes(currentStatus = {}, nextStatus = {}) {
 
 function successfulChatAccountCheckStatus(currentStatus = {}, status = {}) {
   const nextStatus = reconcileChatUsageResetTimes(currentStatus, successfulAccountCheckStatus(status));
-  const restriction = status.meta?.proCarRestriction;
-  if (!restriction || typeof restriction !== "object") return nextStatus;
-
   const meta = { ...(nextStatus.meta || {}) };
+  delete meta.proxyRestricted;
+  delete meta.upstreamMessage;
+  const restriction = status.meta?.proCarRestriction;
+  if (!restriction || typeof restriction !== "object") return { ...nextStatus, meta };
+
   delete meta.proCarRestriction;
   if (restriction.active === true && Date.parse(restriction.until || "") > Date.now()) {
     meta.proCarsUnavailable = true;

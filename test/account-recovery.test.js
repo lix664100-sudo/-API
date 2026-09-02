@@ -462,6 +462,8 @@ test("手动检测确认 PRO 可用后会彻底清除旧限制", async () => {
             status: "error",
             message: "PRO 暂不可用",
             meta: {
+              proxyRestricted: true,
+              upstreamMessage: "用户不存在或密码错误",
               proCarsUnavailable: true,
               proCarsUnavailableReason: "plan_mismatch",
               proCarsUnavailableUntil: new Date(Date.now() + 60 * 60 * 1000).toISOString()
@@ -504,6 +506,8 @@ test("手动检测确认 PRO 可用后会彻底清除旧限制", async () => {
     assert.equal(chatMeta.proCarsUnavailableReason, undefined);
     assert.equal(chatMeta.proCarsUnavailableUntil, undefined);
     assert.equal(chatMeta.proCarRestriction, undefined);
+    assert.equal(chatMeta.proxyRestricted, undefined);
+    assert.equal(chatMeta.upstreamMessage, undefined);
   } finally {
     ChatplusClient.prototype.check = originalChatCheck;
     DrawingClient.prototype.check = originalDrawingCheck;
