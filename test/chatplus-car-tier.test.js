@@ -16,6 +16,7 @@ function car(overrides = {}) {
     imageRemainingKnown: Object.hasOwn(overrides, "imageRemaining"),
     isIQ: false,
     isPro: false,
+    isPlus: false,
     isUltra: false,
     isSuper: false,
     isVirtual: false,
@@ -114,6 +115,33 @@ test("chatplus auto car tier skips Ultra cars", async () => {
 
   assert.equal(selected.carId, "pro-car");
   assert.equal(selected.carTier, "pro");
+});
+
+test("chatplus plus car tier only selects PLUS cars", async () => {
+  const client = clientForGemini({ strategy: "speed", carTier: "plus" });
+  client.loginPortal = async () => {};
+  client.json = async () => ({
+    code: 1,
+    data: {
+      list: [
+        { carID: "ultra-car", label: "Ultra", isUltra: true },
+        { carID: "pro-car", label: "PRO", isPro: true },
+        { carID: "plus-car", label: "PLUS" },
+        { carID: "regular-car", label: "Free" }
+      ]
+    }
+  });
+
+  const selected = await client.selectCar({
+    key: "gemini",
+    name: "Gemini",
+    carType: "gemini",
+    strategy: "speed",
+    carTier: "plus"
+  });
+
+  assert.equal(selected.carId, "plus-car");
+  assert.equal(selected.carTier, "plus");
 });
 
 test("chatplus retries another car when upstream rejects an Ultra-only car", async () => {

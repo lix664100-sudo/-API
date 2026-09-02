@@ -566,7 +566,7 @@ function normalizeChatModelKey(value) {
 
 function normalizeCarTier(value) {
   const tier = String(value || "").trim().toLowerCase();
-  return ["auto", "pro", "ultra", "any"].includes(tier) ? tier : "auto";
+  return ["auto", "pro", "plus", "ultra", "any"].includes(tier) ? tier : "auto";
 }
 
 function normalizeImageStorage(value = {}) {

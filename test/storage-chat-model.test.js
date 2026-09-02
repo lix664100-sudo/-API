@@ -42,3 +42,22 @@ test("legacy pinned GPT model is migrated to the upstream default", async () => 
   assert.equal(settings.chatModels.find((item) => item.key === "gpt").model, "");
   assert.equal(Object.hasOwn(settings, "model"), false);
 });
+
+test("PLUS car tier is preserved when channel settings are saved", async () => {
+  const config = await loadConfig();
+  const channel = config.channels[0];
+  const saved = await saveConfig({
+    ...config,
+    channels: [{
+      ...channel,
+      settings: {
+        ...channel.settings,
+        chatModels: channel.settings.chatModels.map((item) => (
+          item.key === "gpt" ? { ...item, carTier: "plus" } : item
+        ))
+      }
+    }]
+  });
+
+  assert.equal(saved.channels[0].settings.chatModels.find((item) => item.key === "gpt").carTier, "plus");
+});

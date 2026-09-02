@@ -1942,7 +1942,7 @@ function defaultRouteForKey(key) {
 
 function normalizeCarTier(value) {
   const tier = String(value || "").trim().toLowerCase();
-  return ["auto", "pro", "ultra", "any"].includes(tier) ? tier : "auto";
+  return ["auto", "pro", "plus", "ultra", "any"].includes(tier) ? tier : "auto";
 }
 
 function effectiveCarTier(route = {}) {
@@ -2038,6 +2038,13 @@ function carIsPro(raw = {}, desc = "", label = "", isUltra = false) {
   return /\bpro\b|\bteam\b|\u4e13\u4e1a/i.test(text);
 }
 
+function carIsPlus(raw = {}, desc = "", label = "", isPro = false, isUltra = false) {
+  if (isPro || isUltra) return false;
+  const explicit = raw.isPlus ?? raw.is_plus ?? raw.plus;
+  if (explicit !== null && explicit !== undefined && explicit !== "") return truthyFlag(explicit);
+  return /\bplus\b/i.test(rawCarText(raw, desc, label));
+}
+
 function normalizeCar(raw = {}, carType = "chatgpt") {
   const realCarIDs = Array.isArray(raw.realCarIDs)
     ? raw.realCarIDs
@@ -2051,6 +2058,7 @@ function normalizeCar(raw = {}, carType = "chatgpt") {
   const desc = String(raw.desc || raw.statusText || raw.label || "").trim();
   const label = String(raw.label || "").trim();
   const isUltra = carIsUltra(raw, desc, label);
+  const isPro = carIsPro(raw, desc, label, isUltra);
   const rawImageRemaining = raw.usage?.image_gen?.remaining ?? raw.model_limits?.image_gen?.remaining;
   return {
     id: String(raw.carID || raw.carId || raw.car_id || raw.id || "").trim(),
@@ -2063,7 +2071,8 @@ function normalizeCar(raw = {}, carType = "chatgpt") {
     imageRemaining: numeric(rawImageRemaining, 0),
     imageRemainingKnown: rawImageRemaining !== undefined && rawImageRemaining !== null && rawImageRemaining !== "",
     isIQ: Boolean(raw.isIQ || raw.is_iq),
-    isPro: carIsPro(raw, desc, label, isUltra),
+    isPro,
+    isPlus: carIsPlus(raw, desc, label, isPro, isUltra),
     isUltra,
     isSuper: Boolean(raw.isSuper || raw.isPlus || raw.isTeam),
     isVirtual: Boolean(raw.isVirtual || raw.is_virtual),
@@ -2113,11 +2122,13 @@ function rankedCars(cars, strategy, context = {}) {
 
 function carMatchesTier(car, tier) {
   if (tier === "any") return true;
+  if (tier === "plus") return car.isPlus;
   if (tier === "ultra") return car.isUltra;
   return !car.isUltra;
 }
 
 function carTierDisplayName(tier) {
+  if (tier === "plus") return " PLUS";
   if (tier === "ultra") return " Ultra";
   if (tier === "any") return "";
   return " PRO 及以下";
