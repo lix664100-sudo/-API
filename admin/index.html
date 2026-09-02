@@ -3467,7 +3467,8 @@
       const proxyAssignmentTargetOptions = [
         { label: "当前 IP 可用的账号", value: "usable" },
         { label: "当前 IP 已到期的账号", value: "expired" },
-        { label: "当前没有 IP 的账号", value: "empty" }
+        { label: "当前没有 IP 的账号", value: "empty" },
+        { label: "当前 IP 被限制的账号", value: "restricted" }
       ];
       const channelTypeLabels = {
         shareai: "ShareAI账号",
@@ -5086,6 +5087,7 @@
         }
         if (status.status === "unknown" || !status.status) return `${modelName} 未检测`;
         if (status.status === "activation_required") return `${modelName} 未激活`;
+        if (status.status === "proxy_restricted") return `${modelName} IP 被限制`;
         if (["error", "failed", "disconnected", "disabled"].includes(status.status)) return `${modelName} 暂不可用`;
         return `${modelName} 额度未获取`;
       }
@@ -5184,6 +5186,7 @@
           subscription_missing: ["default", "未订阅"],
           subscription_expired: ["error", "套餐已过期"],
           disconnected: ["warning", "自动换线中"],
+          proxy_restricted: ["error", "IP 被限制"],
           quota_empty: ["warning", "额度不足"],
           check_timeout: ["warning", "检测超时"],
           error: ["error", "异常"],
@@ -7006,7 +7009,7 @@
 
       function summarizeAccountCapabilities(capabilities = []) {
         const statuses = capabilities.map((item) => item.status || "unknown");
-        const errorStatuses = ["disconnected", "error", "failed", "check_timeout"];
+        const errorStatuses = ["disconnected", "proxy_restricted", "error", "failed", "check_timeout"];
         const availableCount = statuses.filter((status) => status === "ok").length;
         const hasError = statuses.some((status) => errorStatuses.includes(status));
         if (availableCount === statuses.length && statuses.length) return { state: "available", group: "ok" };
@@ -7024,6 +7027,7 @@
           subscription_expired: `${label}套餐到期`,
           subscription_missing: `${label}未订阅`,
           disconnected: `${label}线路掉线`,
+          proxy_restricted: `${label}IP 被限制`,
           error: `${label}异常`,
           failed: `${label}异常`,
           check_timeout: `${label}检测超时`,
@@ -7081,6 +7085,7 @@
         if (statuses.includes("subscription_expired")) return "subscription_expired";
         if (statuses.includes("subscription_missing")) return "subscription_missing";
         if (statuses.includes("disconnected")) return "disconnected";
+        if (statuses.includes("proxy_restricted")) return "proxy_restricted";
         if (statuses.some((status) => status === "error" || status === "failed")) return "error";
         if (statuses.includes("ok")) return "ok";
         if (statuses.includes("quota_empty")) return "quota_empty";

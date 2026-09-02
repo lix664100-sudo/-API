@@ -31,9 +31,12 @@ function account(id, channelId, options = {}) {
     password: "password",
     proxyUrl: options.proxyUrl || "",
     enabled: options.enabled !== false,
-    status: "ok",
+    status: options.status || "ok",
     meta: options.proxyUrl
-      ? { proxyCheck: { status: "ok", realIp: "203.0.113.10" } }
+      ? {
+          proxyCheck: { status: "ok", realIp: "203.0.113.10" },
+          ...(options.meta || {})
+        }
       : {}
   };
 }
@@ -110,6 +113,39 @@ test("到期 IP 分类和无 IP 分类互不影响", async () => {
     allowReuse: true
   });
   assert.deepEqual(emptyPreview.rows.map((row) => row.accountId).sort(), ["a-new", "b-new"]);
+});
+
+test("IP 被限制分类只替换被限制的启用账号", async () => {
+  await seedConfig([
+    account("restricted", "channel-a", {
+      proxyUrl: oldProxy,
+      meta: { abilities: { chatplus: { status: "proxy_restricted" } } }
+    }),
+    account("normal", "channel-a", { proxyUrl: proxyA }),
+    account("no-proxy", "channel-a")
+  ]);
+
+  const preview = await previewAccountProxyAssignments({
+    channelIds: ["channel-a"],
+    proxies: [proxyB],
+    targetType: "restricted",
+    allowReuse: false
+  });
+  assert.deepEqual(preview.rows.map((row) => row.accountId), ["restricted"]);
+
+  await applyAccountProxyAssignments({
+    channelIds: preview.channelIds,
+    proxies: preview.proxies,
+    targetType: preview.targetType,
+    allowReuse: preview.allowReuse,
+    snapshot: preview.snapshot,
+    assignments: preview.rows.map((row) => ({ accountId: row.accountId, proxyUrl: proxyB }))
+  });
+
+  const stored = await loadConfig();
+  assert.equal(stored.accounts.find((item) => item.id === "restricted").proxyUrl, proxyB);
+  assert.equal(stored.accounts.find((item) => item.id === "normal").proxyUrl, proxyA);
+  assert.equal(stored.accounts.find((item) => item.id === "no-proxy").proxyUrl, "");
 });
 
 test("每个 IP 只用一次时会避开其他类型账号正在使用的 IP", async () => {

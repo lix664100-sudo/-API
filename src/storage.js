@@ -901,6 +901,8 @@ function finalizeShareAIAccount(account) {
   const activationRequired = [drawing.status, chatplus.status].includes("activation_required")
     || account.meta?.registration?.status === "activation_required";
   const disconnected = [drawing.status, chatplus.status].includes("disconnected");
+  const proxyRestricted = [drawing.status, chatplus.status].includes("proxy_restricted")
+    || account.status === "proxy_restricted";
   const ok = [drawing.status, chatplus.status].includes("ok");
   const failed = [drawing.status, chatplus.status].some((status) => ["error", "failed"].includes(status));
   const quotaEmpty = [drawing.status, chatplus.status].includes("quota_empty");
@@ -908,7 +910,7 @@ function finalizeShareAIAccount(account) {
     ...account,
     channelId: account.channelId || "shareai",
     name: account.name || account.username || "ShareAI账号",
-    status: subscriptionExpired ? "subscription_expired" : subscriptionMissing ? "subscription_missing" : activationRequired ? "activation_required" : disconnected ? "disconnected" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : account.status || "unknown",
+    status: subscriptionExpired ? "subscription_expired" : subscriptionMissing ? "subscription_missing" : activationRequired ? "activation_required" : disconnected ? "disconnected" : proxyRestricted ? "proxy_restricted" : failed ? "error" : ok ? "ok" : quotaEmpty ? "quota_empty" : account.status || "unknown",
     lastCheckAt: account.lastCheckAt || drawing.lastCheckAt || chatplus.lastCheckAt || null,
     cooldownUntil: chatplus.cooldownUntil || null,
     quota: drawing.quota ?? account.quota ?? null,
@@ -1278,7 +1280,7 @@ function proxyBatchExpiryTime(value) {
   return Number.isFinite(time) ? time : Number.NaN;
 }
 
-const proxyAssignmentTargetTypes = new Set(["usable", "expired", "empty"]);
+const proxyAssignmentTargetTypes = new Set(["usable", "expired", "empty", "restricted"]);
 
 function normalizeProxyAssignmentTargetType(value) {
   const targetType = String(value || "").trim();
@@ -1299,6 +1301,14 @@ function proxyAssignmentTargetMatches(account, targetType) {
   if (account.enabled === false) return false;
   const hasProxy = Boolean(String(account.proxyUrl || "").trim());
   if (targetType === "empty") return !hasProxy;
+  if (targetType === "restricted") {
+    return hasProxy && (
+      account.status === "proxy_restricted"
+      || account.meta?.proxyRestricted === true
+      || account.meta?.abilities?.chatplus?.status === "proxy_restricted"
+      || account.meta?.abilities?.chatplus?.meta?.proxyRestricted === true
+    );
+  }
   if (!hasProxy) return false;
   return targetType === "expired" ? accountProxyExpired(account) : !accountProxyExpired(account);
 }

@@ -5804,13 +5804,16 @@ async function checkShareAIAbility(config, channel, account, ability) {
         data: accountCheckTimeoutStatus(currentStatus, error)
       };
     }
-    const errorStatus = ability === "chatplus"
-      ? accountStatusFromError(error, { explicitChatQuotaOnly: true })
-      : accountStatusFromError(error);
+    const proxyRestricted = ability === "chatplus" && isProxyRestrictedLoginError(error, account);
+    const errorStatus = proxyRestricted
+      ? proxyRestrictedStatus(error)
+      : ability === "chatplus"
+        ? accountStatusFromError(error, { explicitChatQuotaOnly: true })
+        : accountStatusFromError(error);
     const data = ability === "chatplus"
       ? preserveConfirmedChatQuota(currentStatus, {
           ...errorStatus,
-          message: readableCheckErrorMessage(error),
+          message: proxyRestricted ? "IP 被限制" : readableCheckErrorMessage(error),
           expireAt: ""
         })
       : {
@@ -5851,6 +5854,31 @@ function readableCheckErrorMessage(error) {
     return "目标网站打不开，可能是服务器 IP 被限制或代理不可用。";
   }
   return message || "检测失败";
+}
+
+function isProxyRestrictedLoginError(error, account) {
+  if (!String(accountProxyValue(account) || "").trim()) return false;
+  if (error?.portalAccountRejected !== true) return false;
+  return /用户不存在或密码错误|账号或密码错误|账号密码错误/.test(String(error?.message || ""));
+}
+
+function proxyRestrictedStatus(error) {
+  return {
+    status: "proxy_restricted",
+    quota: null,
+    balance: null,
+    used: null,
+    quotaResetAt: "",
+    expireAt: "",
+    cooldownUntil: null,
+    quotaReason: "proxy_restricted",
+    quotaConfirmedByUpstream: false,
+    message: "IP 被限制",
+    meta: {
+      proxyRestricted: true,
+      upstreamMessage: String(error?.message || "")
+    }
+  };
 }
 
 function combinedShareAIStatus(results) {
@@ -6046,10 +6074,13 @@ async function performAccountCheck(accountId) {
       if (status.status === "error") throw new Error(status.message);
       return status;
     }
-    const message = readableCheckErrorMessage(error);
-    const errorStatus = accountStatusFromError(error, {
-      explicitChatQuotaOnly: channel.type === "chatplus"
-    });
+    const proxyRestricted = channel.type === "chatplus" && isProxyRestrictedLoginError(error, account);
+    const message = proxyRestricted ? "IP 被限制" : readableCheckErrorMessage(error);
+    const errorStatus = proxyRestricted
+      ? proxyRestrictedStatus(error)
+      : accountStatusFromError(error, {
+          explicitChatQuotaOnly: channel.type === "chatplus"
+        });
     const checkedStatus = {
       ...errorStatus,
       quota: channel.type === "chatplus" ? null : errorStatus.quota ?? null,
