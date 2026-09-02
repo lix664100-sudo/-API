@@ -1086,6 +1086,81 @@ test("提交结果无法确认时不会换账号重发，并准确标记为未�
   }
 });
 
+test("上游先创建会话后生图失败时会保存会话编号并标记已提交", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    imageStorage: { mode: "never", autoCleanup: false, retentionDays: 7 },
+    channels: [{
+      id: "shareai",
+      type: "shareai",
+      name: "ShareAI",
+      enabled: true,
+      settings: {
+        chatBaseUrl: "https://chat.example.test",
+        enabledAbilities: { drawing: false, chatplus: true },
+        defaultChatModel: "gpt"
+      }
+    }],
+    accounts: [{
+      id: "confirmed-image-failure",
+      channelId: "shareai",
+      name: "Confirmed image failure",
+      username: "confirmed-image-failure@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  ChatplusClient.prototype.createImageTask = async () => {
+    const error = new Error("图片生成次数已达到限制");
+    error.code = "UPSTREAM_IMAGE_LIMIT";
+    error.status = 429;
+    error.imageSubmissionAttempted = true;
+    error.imageSubmissionConfirmed = true;
+    error.conversationId = "conversation-confirmed-image-failure";
+    error.upstreamExplicitFailure = true;
+    error.upstreamText = "图片生成次数已达到限制，请稍后重试";
+    throw error;
+  };
+
+  try {
+    await assert.rejects(
+      () => createImageTask({
+        input: { channel: "chatplus", model: "gpt", prompt: "先创建会话再失败" },
+        files: [{ filename: "source.png", mimetype: "image/png" }],
+        wait: true
+      }),
+      (error) => {
+        assert.equal(error.task.status, "failed");
+        assert.equal(error.task.externalId, "conversation-confirmed-image-failure");
+        assert.equal(error.task.raw.conversationId, "conversation-confirmed-image-failure");
+        assert.equal(error.task.raw.submitted, true);
+        assert.equal(error.task.responseJson.failureType, "upstream_no_image");
+        assert.equal(error.task.responseJson.submissionConfirmed, true);
+        assert.match(error.task.responseJson.message, /^上游生成失败：/);
+        assert.deepEqual(
+          error.task.submissionChannels.map((item) => [item.channelId, item.accountId]),
+          [["shareai:chatplus", "confirmed-image-failure"]]
+        );
+        assert.deepEqual(error.task.generationChannels, []);
+        return true;
+      }
+    );
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+    await saveConfig(config);
+  }
+});
+
 test("账户额度明确用完后切换账户，并在恢复时间前不再使用", async () => {
   const config = await loadConfig();
   const resetAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();

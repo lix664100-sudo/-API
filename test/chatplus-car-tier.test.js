@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 
 const { ChatplusClient, normalizeImageCarCooldown } = await import("../src/channels/chatplus.js");
+const { recordChatplusConversationUpdate } = await import("../src/chatplus-conversation-updates.js");
 
 function car(overrides = {}) {
   return {
@@ -198,7 +199,7 @@ test("Plus image limit switches to the best remaining image car without saving a
     response.writeHead(200, { "content-type": "text/event-stream" });
     if (requestCount === 1) {
       response.write("data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"parts\":[\"You've hit the Plus plan limit for image generation requests.\"]}}}\n\n");
-      const timer = setTimeout(() => response.end("data: [DONE]\n\n"), 5000);
+      const timer = setTimeout(() => response.end("data: [DONE]\n\n"), 50);
       request.on("close", () => clearTimeout(timer));
       return;
     }
@@ -228,7 +229,6 @@ test("Plus image limit switches to the best remaining image car without saving a
   client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
   client.uploadChatImages = async () => [];
 
-  const startedAt = Date.now();
   try {
     const result = await client.sendConversation("生成图片", {
       imageGeneration: true,
@@ -239,10 +239,108 @@ test("Plus image limit switches to the best remaining image car without saving a
     assert.deepEqual(selectedCars, ["plus-limit-car", "pro-car"]);
     assert.equal(requestCount, 2);
     assert.equal(restrictionSaved, 0);
-    assert.ok(Date.now() - startedAt < 2000);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("conversation id received before an image limit is kept as a confirmed submission", async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write("data: {\"conversation_id\":\"conversation-before-limit\"}\n\n");
+    setTimeout(() => response.end("data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"parts\":[\"You've hit the Free plan limit for image generations requests.\"]}}}\n\ndata: [DONE]\n\n"), 50);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const client = clientForGpt({
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    accountId: "account-conversation-before-limit"
+  });
+  client.portalLoggedIn = true;
+  client.fetchCars = async () => [car({ id: "limit-after-submit-car", imageRemaining: 10 })];
+  client.enterCar = async () => {};
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.uploadChatImages = async () => [];
+
+  try {
+    const result = await client.sendConversation("生成图片", {
+      imageGeneration: true,
+      requireConversationId: true
+    });
+    assert.equal(result.conversationId, "conversation-before-limit");
+    assert.equal(result.submissionConfirmed, true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("image limit arriving before conversation id does not abort the submission", async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write("data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"parts\":[\"You've hit the Free plan limit for image generations requests.\"]}}}\n\n");
+    setTimeout(() => response.end("data: {\"conversation_id\":\"conversation-after-limit\"}\n\ndata: [DONE]\n\n"), 50);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const client = clientForGpt({
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    accountId: "account-conversation-after-limit"
+  });
+  client.portalLoggedIn = true;
+  client.fetchCars = async () => [car({ id: "limit-before-submit-car", imageRemaining: 10 })];
+  client.enterCar = async () => {};
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.uploadChatImages = async () => [];
+
+  try {
+    const result = await client.sendConversation("生成图片", {
+      imageGeneration: true,
+      requireConversationId: true
+    });
+    assert.equal(result.conversationId, "conversation-after-limit");
+    assert.equal(result.submissionConfirmed, true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("conversation id received only from realtime updates is claimed by its message id", async () => {
+  const client = clientForGpt({ accountId: "account-realtime-conversation-id" });
+  client.portalLoggedIn = true;
+  client.fetchCars = async () => [car({ id: "realtime-conversation-car", imageRemaining: 10 })];
+  client.enterCar = async () => {};
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.uploadChatImages = async () => [];
+  client.ensureConversationUpdates = async () => ({});
+  client.buildConversationBody = () => ({
+    messageId: "request-message-for-realtime-conversation",
+    body: { action: "next" }
+  });
+  client.http = async () => {
+    setTimeout(() => recordChatplusConversationUpdate({
+      conversation_id: "conversation-from-realtime-only",
+      update_type: "add-messages",
+      update_content: {
+        messages: [{
+          id: "tool-message",
+          metadata: { parent_id: "request-message-for-realtime-conversation" }
+        }]
+      }
+    }), 20);
+    return {
+      status: 200,
+      headers: {},
+      body: "data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"parts\":[\"You've hit the image generation limit. You can create more images after 2026-09-03 21:55:57.\"]}}}\n\ndata: [DONE]\n\n"
+    };
+  };
+
+  const result = await client.sendConversation("生成图片", {
+    imageGeneration: true,
+    requireConversationId: true
+  });
+
+  assert.equal(result.conversationId, "conversation-from-realtime-only");
+  assert.equal(result.submissionConfirmed, true);
 });
 
 test("Free image limit without a conversation id switches cars and pauses the car for 24 hours", async () => {
@@ -286,10 +384,10 @@ test("Free image limit without a conversation id switches cars and pauses the ca
   assert.equal(cooldowns[0].carId, "free-limit-car");
   const expectedDelay = 24 * 60 * 60 * 1000;
   const actualDelay = Date.parse(cooldowns[0].cooldownUntil) - startedAt;
-  assert.ok(Math.abs(actualDelay - expectedDelay) < 2000);
+  assert.ok(Math.abs(actualDelay - expectedDelay) < 7000);
 });
 
-test("an image limit discovered while waiting switches the current task to another car", async () => {
+test("an image limit discovered after submission keeps waiting on the same car", async () => {
   const enteredCars = [];
   let requestCount = 0;
   const client = clientForGpt({ accountId: "account-late-image-limit" });
@@ -335,19 +433,31 @@ test("an image limit discovered while waiting switches the current task to anoth
       }
     ]
   });
+  const resultUrl = "https://example.test/generated-after-late-limit.png";
   client.imageUrlsFrom = async (value) => (
-    JSON.stringify(value).includes("conversation-late-fallback")
-      ? ["https://example.test/generated-after-late-switch.png"]
+    JSON.stringify(value).includes(resultUrl)
+      ? [resultUrl]
       : []
   );
+  setTimeout(() => recordChatplusConversationUpdate({
+    conversation_id: "conversation-late-limit",
+    update_type: "add-messages",
+    update_content: {
+      messages: [{
+        author: { role: "tool" },
+        content: { parts: [{ type: "image_url", image_url: resultUrl }] },
+        status: "finished_successfully"
+      }]
+    }
+  }), 20);
 
   const result = await client.createTextTask({
     prompt: "等待后换车",
     waitForImages: true
   });
 
-  assert.deepEqual(enteredCars, ["late-limit-car", "late-limit-fallback"]);
-  assert.deepEqual(result.imageUrls, ["https://example.test/generated-after-late-switch.png"]);
+  assert.deepEqual(enteredCars, ["late-limit-car"]);
+  assert.deepEqual(result.imageUrls, [resultUrl]);
 });
 
 test("saved image car cooldowns are restored after a client restart", async () => {

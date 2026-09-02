@@ -7,6 +7,7 @@ import {
   chatplusConversationUpdates,
   chatplusConversationUpdateVersion,
   getChatplusConversationConnection,
+  subscribeChatplusConversationUpdates,
   waitForChatplusConversationUpdate
 } from "../chatplus-conversation-updates.js";
 import { assertInputImageCount, MAX_INPUT_IMAGE_COUNT } from "../image-limits.js";
@@ -4571,6 +4572,15 @@ export class ChatplusClient {
             }, async () => runSubmitStep(() => submitClient.uploadChatImages(sourceFiles)))
           : [];
         const { body, messageId } = submitClient.buildConversationBody(prompt, model, imageAssets);
+        let resolvePushedConversationId;
+        const pushedConversationId = new Promise((resolve) => {
+          resolvePushedConversationId = resolve;
+        });
+        const unsubscribeConversationUpdates = requestInput.imageGeneration === true
+          ? subscribeChatplusConversationUpdates(({ conversationId, payload }) => {
+              if (JSON.stringify(payload).includes(messageId)) resolvePushedConversationId(conversationId);
+            })
+          : () => {};
         let resultChannelReady = false;
         let resultChannelError = "";
         if (requestInput.imageGeneration === true) {
@@ -4593,15 +4603,6 @@ export class ChatplusClient {
           const response = await runSubmitStep(() => submitClient.http("/backend-api/conversation", {
             method: "POST",
             body,
-            abortWhen: requestInput.imageGeneration === true
-              ? (chunk) => {
-                  if (!isImageGenerationLimitMessage(chunk)) return null;
-                  // Once a conversation exists, the final image may still be
-                  // streamed after the quota metadata; keep reading it.
-                  if (/conversation_id\s*["']?\s*:/i.test(chunk)) return null;
-                  return imageCarQuotaError(chunk);
-                }
-              : null,
             headers: {
               accept: "text/event-stream",
               referer: `${this.baseUrl}/`
@@ -4625,10 +4626,26 @@ export class ChatplusClient {
           }
 
           const events = parseSse(response.body);
-          throwIfImageGenerationLimit(events, { car: requestInput.imageGeneration === true });
           let conversationId = "";
           for (const event of events) {
             if (event.conversation_id) conversationId = event.conversation_id;
+          }
+          const imageLimitContent = imageGenerationLimitContent(events);
+          if (!conversationId && requestInput.imageGeneration === true && imageLimitContent) {
+            conversationId = await Promise.race([
+              pushedConversationId,
+              new Promise((resolve) => {
+                const timer = setTimeout(() => resolve(""), 5000);
+                timer.unref?.();
+              })
+            ]);
+          }
+          if (imageLimitContent && !conversationId) {
+            const error = requestInput.imageGeneration === true
+              ? imageCarQuotaError(imageLimitContent)
+              : imageQuotaError();
+            error.upstreamText = imageLimitContent;
+            throw error;
           }
           if (!conversationId) {
             const error = conversationNotCreatedError(
@@ -4645,7 +4662,7 @@ export class ChatplusClient {
             throw error;
           }
           return { events, conversationId };
-        }));
+        })).finally(unsubscribeConversationUpdates);
         const { events, conversationId } = submission;
         if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.confirmed = true;
         const upstreamTaskId = requestInput.imageGeneration === true
@@ -4927,7 +4944,6 @@ export class ChatplusClient {
           shouldCheckImageTasks ||= hasAsyncImageTaskMarker(pushedUpdates);
           imageUrls = await this.imageUrlsFrom(pushedUpdates, { generatedOnly: true });
           if (imageUrls.length) return imageUrls;
-          throwIfImageGenerationLimit(pushedUpdates, { car: true });
           const pushedState = imageAssistantResponseState(pushedUpdates);
           if (!pushedState.inProgress) {
             throwIfTerminalImageFailure(pushedState.content);
@@ -4965,9 +4981,6 @@ export class ChatplusClient {
         const responseState = imageAssistantResponseState(detail);
         const content = responseState.content;
         const intermediateResponse = isChatImageIntermediateResponse(content);
-        if (!intermediateResponse || imageGenerationLimitContent(detail)) {
-          throwIfImageGenerationLimit(detail, { car: true });
-        }
         if (!intermediateResponse && !responseState.inProgress) {
           throwIfTerminalImageFailure(content);
           throwIfTextImageResponse(content);
@@ -5262,7 +5275,6 @@ export class ChatplusClient {
       }, async (conversation) => {
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "text2img"));
         await this.captureImageTaskRegistration(conversation, input, prompt, "text2img");
-        throwIfImageGenerationLimit(conversation.events, { car: true });
         if (conversation.route?.key === "gemini") {
           let imageUrls = conversation.imageUrls || [];
           if (!imageUrls.length) {
@@ -5346,7 +5358,6 @@ export class ChatplusClient {
       }, async (conversation) => {
         await notifyImageSubmitted(input, submittedImageTask(conversation, input, prompt, "img2img", files.length));
         await this.captureImageTaskRegistration(conversation, input, prompt, "img2img", files.length);
-        throwIfImageGenerationLimit(conversation.events, { car: true });
         if (conversation.route?.key === "gemini") {
           let imageUrls = conversation.imageUrls || [];
           if (!imageUrls.length) {

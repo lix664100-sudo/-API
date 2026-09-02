@@ -54,6 +54,13 @@ test("账号信息块保留原有管理操作和分页", () => {
   assert.match(adminHtml, /pageSizeOptions: \[20, 50, 100\]/);
 });
 
+test("测试工具允许选择停用账号并带管理员测试标记", () => {
+  assert.match(adminHtml, /accountSupportsAbility\(account, "chatplus"\)/);
+  assert.match(adminHtml, /accountSupportsImageTest\(account\)/);
+  assert.match(adminHtml, /account\.enabled === false \? "（已停用）"/);
+  assert.match(adminHtml, /"x-admin-test": "true"/);
+});
+
 test("账号卡片仅在有冻结车位时显示一行提醒", () => {
   assert.match(adminHtml, /accountCarFreezeNotice\(row, rowChannel\)/);
   assert.match(adminHtml, /className: "account-car-freeze-summary"/);

@@ -371,11 +371,11 @@ function imageAdmissionInput(request, requestMeta = {}, parsedInput = null) {
   const bodyInput = parsedInput
     ? normalizeFields(parsedInput)
     : isMultipartRequest(request) ? {} : normalizeFields(request.body || {});
-  return {
+  return withAdminDisabledAccountTest(request, {
     ...queryInput,
     ...bodyInput,
     ...(requestMeta.sourceTaskId ? { sourceTaskId: requestMeta.sourceTaskId } : {})
-  };
+  });
 }
 
 async function reserveImageRequestAdmission(request, requestMeta = {}, parsedInput = null) {
@@ -527,6 +527,15 @@ function normalizeFields(input = {}) {
   if (typeof next.messages === "string") next.messages = parseJsonField(next.messages, []);
   if (typeof next.stream === "string") next.stream = next.stream === "true";
   return next;
+}
+
+function withAdminDisabledAccountTest(request, input = {}) {
+  const adminTest = String(request.headers["x-admin-test"] || "").toLowerCase() === "true"
+    || String(request.url || "").split("?")[0] === "/api/draw/edit";
+  return adminTest
+    && Boolean(getAdminSession(request))
+    ? { ...input, allowDisabledAccountTest: true }
+    : input;
 }
 
 function imageExtension(mimetype, filename = "") {
@@ -1372,7 +1381,7 @@ app.post("/api/draw/edit", async (request, reply) => {
   try {
     const reserveBeforeImageRead = async (partialInput = {}) => {
       if (admission) return;
-      input = { ...input, ...partialInput };
+      input = { ...input, ...partialInput, allowDisabledAccountTest: true };
       requestMeta = mergeInputSourceTaskId(requestMeta, partialInput);
       admission = await reserveImageRequestAdmission(request, requestMeta, partialInput);
     };
@@ -1381,7 +1390,7 @@ app.post("/api/draw/edit", async (request, reply) => {
       savePreview: true,
       beforeImageRead: reserveBeforeImageRead
     });
-    input = parsed.input;
+    input = { ...parsed.input, allowDisabledAccountTest: true };
     files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest(`请上传 1 到 ${MAX_INPUT_IMAGE_COUNT} 张源图，字段名用 image。`);
@@ -1463,7 +1472,9 @@ app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, 
   try {
     let requestMeta = apiRequestMeta(request);
     if (isMultipartRequest(request)) {
-      const { input, files } = await readMultipartInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
+      const parsed = await readMultipartInput(request, { maxFiles: MAX_INPUT_IMAGE_COUNT, savePreview: true });
+      const input = withAdminDisabledAccountTest(request, parsed.input);
+      const files = parsed.files;
       const inputImageUrls = await saveMessageImagePreviews(input, {
         maxFiles: MAX_INPUT_IMAGE_COUNT,
         existingFileCount: files.length
@@ -1476,7 +1487,7 @@ app.post("/v1/chat/completions", { preHandler: requireApiKey }, async (request, 
       const completion = await createChatCompletion({ ...input, files }, requestMeta, { inputImageUrls });
       return input.stream === true ? sendChatCompletionStream(reply, completion) : completion;
     }
-    const input = normalizeFields(request.body || {});
+    const input = withAdminDisabledAccountTest(request, normalizeFields(request.body || {}));
     const inputImageUrls = await saveMessageImagePreviews(input, {
       maxFiles: MAX_INPUT_IMAGE_COUNT
     });
@@ -1496,7 +1507,7 @@ app.post("/v1/images/generations", { preHandler: requireApiKey }, async (request
   let requestMeta = apiRequestMeta(request);
   let input = {};
   try {
-    input = normalizeFields(request.body || {});
+    input = withAdminDisabledAccountTest(request, normalizeFields(request.body || {}));
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     const task = request.query?.wait === "0"
       ? await queueTextTask(input, requestMeta)
@@ -1522,7 +1533,7 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
   try {
     const reserveBeforeImageRead = async (partialInput = {}) => {
       if (admission) return;
-      input = { ...input, ...partialInput };
+      input = withAdminDisabledAccountTest(request, { ...input, ...partialInput });
       requestMeta = mergeInputSourceTaskId(requestMeta, partialInput);
       admission = await reserveImageRequestAdmission(request, requestMeta, partialInput);
     };
@@ -1531,7 +1542,7 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
       savePreview: true,
       beforeImageRead: reserveBeforeImageRead
     });
-    input = parsed.input;
+    input = withAdminDisabledAccountTest(request, parsed.input);
     files = parsed.files;
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest(`请上传 1 到 ${MAX_INPUT_IMAGE_COUNT} 张源图，字段名用 image。`);

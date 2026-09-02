@@ -7471,9 +7471,9 @@
           return [
             { label: "自动选择", value: "auto" },
             ...accounts
-              .filter((account) => account.enabled !== false && accountSupportsAbility(account, "chatplus"))
+              .filter((account) => accountSupportsAbility(account, "chatplus"))
               .map((account) => ({
-                label: `${account.name || account.username || "未命名账号"} / ${channelName(config, account.channelId)}`,
+                label: `${account.name || account.username || "未命名账号"}${account.enabled === false ? "（已停用）" : ""} / ${channelName(config, account.channelId)}`,
                 value: account.id
               }))
           ];
@@ -7482,9 +7482,9 @@
         const imageAccountOptions = useMemo(() => [
           { label: "自动选择", value: "auto" },
           ...accounts
-            .filter((account) => account.enabled !== false && accountSupportsImageTest(account))
+            .filter((account) => accountSupportsImageTest(account))
             .map((account) => ({
-              label: `${account.name || account.username || "未命名账号"} / ${channelName(config, account.channelId)}`,
+              label: `${account.name || account.username || "未命名账号"}${account.enabled === false ? "（已停用）" : ""} / ${channelName(config, account.channelId)}`,
               value: account.id
             }))
         ], [accounts, channels, config]);
@@ -9877,7 +9877,10 @@
               message.warning("这个账号不能用于对话测试。");
               return;
             }
-            const headers = { Authorization: `Bearer ${config?.apiKey || ""}` };
+            const headers = {
+              Authorization: `Bearer ${config?.apiKey || ""}`,
+              "x-admin-test": "true"
+            };
             const body = chatFileList.length
               ? (() => {
                   const form = new FormData();
@@ -9950,7 +9953,11 @@
             const params = new URLSearchParams();
             params.set("channel", target.channel || "auto");
             if (target.accountId) params.set("accountId", target.accountId);
-            const task = await api(`/api/draw/edit?${params.toString()}`, { method: "POST", body: form });
+            const task = await api(`/api/draw/edit?${params.toString()}`, {
+              method: "POST",
+              headers: { "x-admin-test": "true" },
+              body: form
+            });
             addSubmittedTask(task);
             await refreshRuntimeStatus();
             message.success(`已提交到 ${task.channelName}，后台生成中`);

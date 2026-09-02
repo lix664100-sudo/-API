@@ -626,10 +626,16 @@ function targetImageModelKey(target = {}, input = {}) {
     : drawingModelFamily(target?.channel?.settings?.defaultModelId) || "gpt";
 }
 
+function providerInput(input = {}) {
+  const { allowDisabledAccountTest: _allowDisabledAccountTest, ...providerInput } = input;
+  return providerInput;
+}
+
 function imageInputForTarget(target = {}, input = {}) {
-  if (target?.channel?.type !== "chatplus") return input;
+  const cleanedInput = providerInput(input);
+  if (target?.channel?.type !== "chatplus") return cleanedInput;
   return {
-    ...input,
+    ...cleanedInput,
     model: targetImageModelKey(target, input)
   };
 }
@@ -1270,6 +1276,7 @@ function imageSubmissionFailure(error) {
   failure.upstreamExplicitFailure = policyFailure || error?.upstreamExplicitFailure === true;
   failure.selectedCarId = error?.selectedCarId || "";
   failure.selectedCarType = error?.selectedCarType || "";
+  failure.conversationId = error?.conversationId || error?.externalId || "";
   failure.carAttempts = Array.isArray(error?.carAttempts) ? error.carAttempts : [];
   return failure;
 }
@@ -1958,16 +1965,19 @@ function resultHasGeneratedImage(result = {}) {
     && (usableImageResultUrls(result.imageUrls).length > 0 || Number(result.imageCount || 0) > 0);
 }
 
-function markTaskSubmissionAttempt(task, channel, account) {
+function markTaskSubmissionAttempt(task, channel, account, externalId = "") {
   const now = new Date().toISOString();
+  const conversationId = String(externalId || task.externalId || "").trim();
   return {
     ...task,
+    ...(conversationId ? { externalId: conversationId } : {}),
     submissionChannels: mergeTaskRoutes(task.submissionChannels, [taskRouteEntry(channel, account)]),
     raw: {
       ...(task.raw || {}),
       queued: false,
       submitted: true,
-      submittedAt: task.raw?.submittedAt || now
+      submittedAt: task.raw?.submittedAt || now,
+      ...(conversationId ? { conversationId } : {})
     }
   };
 }
@@ -3065,6 +3075,8 @@ function orderTargetsByImageSource(config, taskType, targets) {
 
 function selectTargets(config, requestedChannel = "auto", taskType = "text2img", options = {}) {
   const requestedAccountId = String(options.accountId || "").trim();
+  const allowDisabledAccountTest = options.allowDisabledAccountTest === true
+    || options.input?.allowDisabledAccountTest === true;
   const channels = config.channels
     .filter((channel) => channel.enabled !== false)
     .filter((channel) => channelMatchesRequest(channel, requestedChannel))
@@ -3074,7 +3086,7 @@ function selectTargets(config, requestedChannel = "auto", taskType = "text2img",
   const targets = [];
   for (const channel of channels) {
     const accounts = config.accounts
-      .filter((account) => account.enabled !== false && accountMatchesChannel(account, channel))
+      .filter((account) => (allowDisabledAccountTest || account.enabled !== false) && accountMatchesChannel(account, channel))
       .filter((account) => !requestedAccountId || account.id === requestedAccountId)
       .sort((a, b) => Number(a.priority || 99) - Number(b.priority || 99));
     if (channel.type === "shareai") {
@@ -3355,11 +3367,12 @@ function targetAbilityCooling(target, input = {}) {
   return statusCooling(targetQuotaStatusForTask(target, input));
 }
 
-function targetKnownUnavailable(target, input = {}) {
+function targetKnownUnavailable(target, input = {}, options = {}) {
   const status = String(targetQuotaStatus(target).status || "unknown").toLowerCase();
   return targetSubscriptionMissing(target, input)
     || targetSubscriptionExpired(target, input)
-    || ["activation_required", "error", "failed", "disconnected", "disabled"].includes(status);
+    || ["activation_required", "error", "failed", "disconnected"].includes(status)
+    || (status === "disabled" && options.allowDisabledAccountTest !== true);
 }
 
 function targetQuotaEmpty(target) {
@@ -3509,7 +3522,7 @@ function confirmedQuotaBlockedError(target, input = {}) {
 
 function admissionTargets(targets, taskType, options = {}) {
   return targets.filter((target) => !(
-    targetKnownUnavailable(target, options.input)
+    targetKnownUnavailable(target, options.input, options)
       || targetQuotaProtectionBlocksTask(target, options.input)
       || (taskType !== "chat" && targetDrawingBalanceInsufficient(target))
       || (
@@ -3787,11 +3800,14 @@ export async function recoverUnavailableChatAccounts() {
 }
 
 async function selectReadyTargets(config, requestedChannel, taskType, options = {}) {
+  const allowDisabledAccountTest = options.allowDisabledAccountTest === true
+    || options.input?.allowDisabledAccountTest === true;
   const targets = selectTargets(config, requestedChannel, taskType, {
     ...options,
+    allowDisabledAccountTest,
     includeCooling: true
   });
-  const ready = admissionTargets(targets, taskType, options).filter((target) => {
+  const ready = admissionTargets(targets, taskType, { ...options, allowDisabledAccountTest }).filter((target) => {
     const taskStatus = targetQuotaStatusForTask(target, options.input);
     const taskQuotaEmpty = String(taskStatus.status || "").toLowerCase() === "quota_empty"
       && taskStatus.quotaConfirmedByUpstream === true;
@@ -3807,7 +3823,7 @@ async function selectReadyTargets(config, requestedChannel, taskType, options = 
         )
     );
   });
-  const recoveryTargets = options.skipRecovery
+  const recoveryTargets = options.skipRecovery || allowDisabledAccountTest
     ? []
     : targets.filter((target) => targetNeedsRecovery(target, options.input) && !ready.some((item) => sameTarget(item, target)));
   if (!recoveryTargets.length) return ready;
@@ -3995,6 +4011,7 @@ function noUsableTargetError(taskType, options = {}) {
 }
 
 function shouldRefreshQuotaBeforeUse(target, taskType, input = {}) {
+  if (input.allowDisabledAccountTest === true) return false;
   if (target.channel.type === "chatplus") {
     return targetQuotaProtectionNeedsInitialCheck(target, input)
       || targetQuotaProtectionNearLimit(target, input);
@@ -4508,7 +4525,7 @@ function taskFileJson(file) {
 }
 
 function taskRequestJson(input = {}) {
-  const { file, files, ...fields } = input || {};
+  const { file, files, allowDisabledAccountTest: _allowDisabledAccountTest, ...fields } = input || {};
   const requestJson = jsonValue(fields) || {};
   const fileItems = imageFiles(files || file).map(taskFileJson);
   if (fileItems.length) {
@@ -5003,7 +5020,12 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
             upstreamText: failure.upstreamText || ""
           });
           if (failure.imageSubmissionConfirmed === true) {
-            taskState = markTaskSubmissionAttempt(taskState, channel, account);
+            taskState = markTaskSubmissionAttempt(
+              taskState,
+              channel,
+              account,
+              failure.conversationId || error.conversationId
+            );
           }
           if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
             await updateTargetStatusAfterError(account, channel, error);
@@ -5188,7 +5210,12 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
             upstreamText: failure.upstreamText || ""
           });
           if (failure.imageSubmissionConfirmed === true) {
-            taskState = markTaskSubmissionAttempt(taskState, channel, account);
+            taskState = markTaskSubmissionAttempt(
+              taskState,
+              channel,
+              account,
+              failure.conversationId || error.conversationId
+            );
           }
           if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
             await updateTargetStatusAfterError(account, channel, error);
@@ -5328,7 +5355,7 @@ async function runChatCompletionTask(task, input, reserved = null, options = {})
             latestTask = taskState;
           };
           const upstreamResult = await client.createChatCompletion({
-            ...input,
+            ...providerInput(input),
             onStageStart,
             onStage,
             ...(channel.type === "chatplus" ? { concurrentSubmit: true } : {})

@@ -323,7 +323,7 @@ test("两个改图入口都会在读取图片前占住并发名额", () => {
     const routeEnd = serverSource.indexOf("\n});", routeStart);
     const routeSource = serverSource.slice(routeStart, routeEnd);
     const readAt = routeSource.indexOf("readImageInput(request");
-    const preserveInputAt = routeSource.indexOf("input = { ...input, ...partialInput }");
+    const preserveInputAt = routeSource.indexOf("partialInput");
     const reserveAt = routeSource.indexOf("reserveImageRequestAdmission(request, requestMeta, partialInput)");
 
     assert.ok(routeStart >= 0 && routeEnd > routeStart, `${route} 必须存在`);

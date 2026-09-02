@@ -65,6 +65,51 @@ test("停用账号单独检测不会登录", async () => {
   }
 });
 
+test("管理员测试标记允许指定停用账号执行生图", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-disabled-image-test",
+      channelId: "shareai",
+      name: "停用生图测试账号",
+      username: "disabled-image-test@example.com",
+      password: "test",
+      enabled: false,
+      status: "ok",
+      balance: 10,
+      quota: 10,
+      meta: {
+        abilities: {
+          drawing: { status: "ok", balance: 10, quota: 10 },
+          chatplus: { status: "quota_empty", balance: 0, quota: 0 }
+        }
+      }
+    }]
+  });
+
+  const originalCreateTextTask = DrawingClient.prototype.createTextTask;
+  DrawingClient.prototype.createTextTask = async (input) => ({
+    status: "success",
+    prompt: input.prompt,
+    imageCount: 1,
+    imageUrls: ["https://images.example.test/disabled-test.png"]
+  });
+  try {
+    const task = await createTextTask({
+      channel: "shareai:drawing",
+      accountId: "account-disabled-image-test",
+      prompt: "停用账号测试",
+      allowDisabledAccountTest: true
+    }, true);
+    assert.equal(task.accountId, "account-disabled-image-test");
+    assert.equal(task.status, "success");
+  } finally {
+    DrawingClient.prototype.createTextTask = originalCreateTextTask;
+  }
+});
+
 test("未激活账号检测时保持未激活且不会登录", async () => {
   const config = await loadConfig();
   await saveConfig({
