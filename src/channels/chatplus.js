@@ -529,6 +529,8 @@ function scanForImageRefs(value, baseUrl, output = { urls: new Set(), fileIds: n
     const text = value.trim();
     const directMatches = text.match(/https?:\/\/[^\s"'<>]+?\.(?:png|jpg|jpeg|webp)(?:\?[^\s"'<>]*)?/gi) || [];
     directMatches.forEach((url) => output.urls.add(url));
+    const generatedPathMatches = text.match(/https?:\/\/[^\s"'<>]+\/(?:image_generation_content|backend-api\/files\/[^\s"'<>]+\/download)(?:[^\s"'<>]*)/gi) || [];
+    generatedPathMatches.forEach((url) => output.urls.add(url.replace(/[),.;]+$/, "")));
     const localMatches = text.match(/\/backend-api\/[^\s"'<>]+/gi) || [];
     localMatches.forEach((url) => output.urls.add(`${baseUrl}${url}`));
     const fileMatches = text.matchAll(/(?:file-service|sediment):\/\/(file[-_][A-Za-z0-9_-]+)/g);
@@ -1282,7 +1284,7 @@ function textFromAssistantContent(content) {
 function isImageGenerationLimitMessage(content) {
   const text = String(content || "").replace(/\s+/g, " ").trim();
   return /(?:(?:you(?:'|’)ve|you have) hit )?(?:the )?(?:[a-z][\w-]* ){0,3}plan limit for image generations?(?: requests?)?/i.test(text)
-    || /image generation (?:request )?(?:limit|quota).*(?:reset|exhausted|reached)/i.test(text)
+    || /image generation (?:request )?(?:limit|quota).*(?:reset|exhausted|reached|after)/i.test(text)
     || /(?:图片|图像).{0,12}(?:生成).{0,24}(?:额度|配额|上限|限制).{0,16}(?:用完|耗尽|达到|已满)/.test(text);
 }
 
@@ -4592,7 +4594,13 @@ export class ChatplusClient {
             method: "POST",
             body,
             abortWhen: requestInput.imageGeneration === true
-              ? (chunk) => isImageGenerationLimitMessage(chunk) ? imageCarQuotaError(chunk) : null
+              ? (chunk) => {
+                  if (!isImageGenerationLimitMessage(chunk)) return null;
+                  // Once a conversation exists, the final image may still be
+                  // streamed after the quota metadata; keep reading it.
+                  if (/conversation_id\s*["']?\s*:/i.test(chunk)) return null;
+                  return imageCarQuotaError(chunk);
+                }
               : null,
             headers: {
               accept: "text/event-stream",
@@ -4897,15 +4905,13 @@ export class ChatplusClient {
     const initialResponse = imageAssistantResponseState(events);
     const initialContent = initialResponse.content;
     const initialIntermediateResponse = isChatImageIntermediateResponse(initialContent);
-    if (!initialIntermediateResponse || imageGenerationLimitContent(events)) {
-      throwIfImageGenerationLimit(events, { car: true });
-    }
     let imageUrls = await this.imageUrlsFrom(events, { generatedOnly: options.generatedOnly });
     if (imageUrls.length || !conversationId) return imageUrls;
+    const initialImageLimit = imageGenerationLimitContent(events);
     const initialTaskId = options.upstreamTaskId || imageTaskIdFrom(events, conversationId);
     this.rememberImageTaskId(conversationId, initialTaskId);
     let shouldCheckImageTasks = Boolean(initialTaskId) || hasAsyncImageTaskMarker(events);
-    if (!initialIntermediateResponse && !initialResponse.inProgress) {
+    if (!initialIntermediateResponse && !initialResponse.inProgress && !initialImageLimit) {
       throwIfTerminalImageFailure(initialContent);
       throwIfTextImageResponse(initialContent);
     }

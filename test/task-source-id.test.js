@@ -979,6 +979,55 @@ test("chatplus image wait treats search tool output as an intermediate response"
   assert.equal(imageReadCount, 2);
 });
 
+test("chatplus image wait checks conversation detail before treating quota metadata as failure", async () => {
+  const resultUrl = "https://one.example.test/generated-after-quota-metadata.png";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-quota-metadata-account", username: "quota@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  client.imageUrlsFrom = async (value) => (
+    value?.mapping ? [resultUrl] : []
+  );
+  client.conversationDetail = async () => ({
+    mapping: {
+      assistant: {
+        message: {
+          author: { role: "assistant" },
+          content: { parts: ["图片生成完成"] }
+        }
+      }
+    }
+  });
+
+  const imageUrls = await client.waitForConversationImages([{
+    metadata: { async_source: "image_gen" },
+    author: { role: "assistant" },
+    content: { parts: ["You've hit the image generation limit. You can create more images after 2026-09-02 21:55:57."] }
+  }], "conversation-with-quota-metadata", 30, { generatedOnly: true });
+
+  assert.deepEqual(imageUrls, [resultUrl]);
+});
+
+test("chatplus image wait recognizes generated image URLs without file extensions", async () => {
+  const resultUrl = "https://cdn.example.test/image_generation_content/generated-123";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-extensionless-image-account", username: "image@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  const imageUrls = await client.waitForConversationImages([{
+    author: { role: "assistant" },
+    content: { parts: [`生成结果：${resultUrl}`] }
+  }], "conversation-with-extensionless-image", 30, { generatedOnly: true });
+
+  assert.deepEqual(imageUrls, [resultUrl]);
+});
+
 test("chatplus image wait keeps waiting for a non-final progress message", async () => {
   const progressMessage = "正在查询商品资料并准备图片。";
   const resultUrl = "https://one.example.test/generated-after-progress.png";

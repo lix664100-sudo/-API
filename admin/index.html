@@ -7805,9 +7805,18 @@
           return taskRecordKindMatches(task, taskKind) && taskMatchesListFilters(task);
         }
 
+        function taskKeywordHandledByVisibleQuery() {
+          const visibleQuery = String(taskVisibleQueryRef.current || "").trim();
+          if (!visibleQuery) return false;
+          const serverKeyword = new URLSearchParams(visibleQuery).get("keyword") || "";
+          return normalizeTaskSearchKeyword(serverKeyword) === normalizeTaskSearchKeyword(taskKeyword);
+        }
+
         const filteredTasks = useMemo(() => {
+          const serverFilteredByKeyword = taskKeywordHandledByVisibleQuery();
           return tasks.filter((task) => {
-            return taskMatchesCurrentFilters(task) && taskMatchesKeyword(task, taskKeyword);
+            return taskMatchesCurrentFilters(task)
+              && (serverFilteredByKeyword || taskMatchesKeyword(task, taskKeyword));
           });
         }, [tasks, accounts, taskKind, taskAccountFilter, taskSourceChannelFilter, taskChannelFilter, taskStatusFilter, taskKeyword]);
 
