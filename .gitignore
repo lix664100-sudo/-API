@@ -16,5 +16,5 @@ Thumbs.db
 .DS_Store
 
 # 仅保留在本地的说明文件
-/README.md
+/服务器信息.md
 /PRODUCT.md
