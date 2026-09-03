@@ -2693,6 +2693,7 @@ async function refreshTaskOnce(taskId, options = {}) {
     refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
       carId: task.raw?.selectedCarId,
       carType: task.raw?.selectedCarType,
+      imageTask: task.taskType === "text2img" || task.taskType === "img2img",
       upstreamTaskId: task.raw?.upstreamTaskId,
       persistedUpdates,
       timeoutSec: FAST_TASK_REFRESH_TIMEOUT_SEC,

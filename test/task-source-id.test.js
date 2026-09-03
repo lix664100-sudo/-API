@@ -1069,6 +1069,81 @@ test("chatplus image wait keeps waiting for a non-final progress message", async
   assert.equal(imageReadCount, 2);
 });
 
+test("chatplus image wait discovers a task when the initial response is empty", async () => {
+  const resultUrl = "https://one.example.test/generated-from-empty-response.png";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-empty-image-account", username: "empty-image@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+
+  client.imageUrlsFrom = async () => [];
+  client.conversationDetail = async () => ({ async_status: null, mapping: {} });
+  client.imageGenerationTaskState = async () => ({
+    taskId: "upstream-task-empty-response",
+    task: null,
+    imageUrls: [resultUrl],
+    failure: null
+  });
+
+  const imageUrls = await client.waitForConversationImages(
+    [],
+    "conversation-empty-image-response",
+    30,
+    { generatedOnly: true }
+  );
+
+  assert.deepEqual(imageUrls, [resultUrl]);
+});
+
+test("chatplus image task refresh checks task list when async status is empty", async () => {
+  const conversationId = "conversation-empty-async-status";
+  const upstreamTaskId = "upstream-task-empty-async-status";
+  const resultUrl = "https://one.example.test/generated-from-empty-async-status.png";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-empty-async-status-account", username: "empty-async-status@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.ensureConversationUpdates = async () => null;
+  client.conversationDetail = async () => ({ async_status: null, mapping: {} });
+  client.conversationStreamStatus = async () => ({ status: "IN_PROGRESS" });
+
+  const requests = [];
+  client.json = async (pathName) => {
+    requests.push(pathName);
+    assert.equal(pathName, "/backend-api/tasks");
+    return {
+      cursor: null,
+      tasks: [{
+        task_id: upstreamTaskId,
+        conversation_id: conversationId,
+        status: "completed",
+        image_gen_message: {
+          author: { role: "tool" },
+          content: {
+            content_type: "multimodal_text",
+            parts: [{ type: "image_url", image_url: resultUrl }]
+          }
+        }
+      }]
+    };
+  };
+
+  const task = await client.getTask(conversationId, {
+    imageTask: true,
+    timeoutSec: 30
+  });
+
+  assert.equal(task.status, "success");
+  assert.deepEqual(task.imageUrls, [resultUrl]);
+  assert.equal(task.raw.upstreamTaskId, upstreamTaskId);
+  assert.deepEqual(requests, ["/backend-api/tasks"]);
+});
+
 test("chatplus task refresh keeps search tool output in progress", async () => {
   const searchAction = "search(\"商品资料\")";
   const client = new ChatplusClient({

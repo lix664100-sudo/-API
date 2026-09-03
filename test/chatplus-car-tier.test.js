@@ -118,6 +118,27 @@ test("chatplus auto car tier skips Ultra cars", async () => {
   assert.equal(selected.carTier, "pro");
 });
 
+test("chatplus image routing downranks a car after repeated slow results", async () => {
+  const client = clientForGpt({ accountId: "account-slow-image-car" });
+  client.fetchCars = async () => [
+    car({ id: "slow-image-car", imageRemaining: 10 }),
+    car({ id: "fast-image-car", imageRemaining: 10 })
+  ];
+
+  client.rememberImageSlowCar({ carId: "slow-image-car", carType: "chatgpt" }, 61 * 1000);
+  client.rememberImageSlowCar({ carId: "slow-image-car", carType: "chatgpt" }, 62 * 1000);
+
+  const selected = await client.selectCar({
+    key: "gpt",
+    name: "GPT",
+    carType: "chatgpt",
+    strategy: "image",
+    carTier: "auto"
+  });
+
+  assert.equal(selected.carId, "fast-image-car");
+});
+
 test("chatplus plus car tier only selects PLUS cars", async () => {
   const client = clientForGemini({ strategy: "speed", carTier: "plus" });
   client.loginPortal = async () => {};
@@ -458,6 +479,108 @@ test("an image limit discovered after submission keeps waiting on the same car",
 
   assert.deepEqual(enteredCars, ["late-limit-car"]);
   assert.deepEqual(result.imageUrls, [resultUrl]);
+});
+
+test("a temporary image restriction with a recovery time freezes the car and switches cars", async () => {
+  const cooldowns = [];
+  const enteredCars = [];
+  let requestCount = 0;
+  const client = clientForGpt({
+    accountId: "account-temporary-image-restriction",
+    onImageCarCooldown: async (cooldown) => cooldowns.push(cooldown)
+  });
+  client.portalLoggedIn = true;
+  client.fetchCars = async () => [
+    car({ id: "temporarily-restricted-car", imageRemaining: 100 }),
+    car({ id: "temporary-restriction-fallback", imageRemaining: 1 })
+  ];
+  client.enterCar = async (carId) => {
+    enteredCars.push(carId);
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.uploadChatImages = async () => [];
+  client.createSubmitClient = () => client;
+  client.http = async () => {
+    requestCount += 1;
+    return {
+      status: 200,
+      headers: {},
+      body: requestCount === 1
+        ? ["data: {\"conversation_id\":\"conversation-temporary-restriction\"}", "", "data: [DONE]", ""].join("\n")
+        : ["data: {\"conversation_id\":\"conversation-temporary-fallback\"}", "", "data: [DONE]", ""].join("\n")
+    };
+  };
+  const resultUrl = "https://example.test/generated-after-temporary-restriction.png";
+  client.conversationDetail = async (conversationId) => ({
+    messages: [{
+      author: { role: "assistant" },
+      content: {
+        parts: [conversationId === "conversation-temporary-restriction"
+          ? "功能将受限至 15:57。回答质量可能会降低。"
+          : resultUrl]
+      }
+    }]
+  });
+  client.imageUrlsFrom = async (value) => (
+    JSON.stringify(value).includes(resultUrl) ? [resultUrl] : []
+  );
+
+  const result = await client.createTextTask({
+    prompt: "临时受限后换车",
+    waitForImages: true
+  });
+
+  assert.deepEqual(enteredCars, ["temporarily-restricted-car", "temporary-restriction-fallback"]);
+  assert.deepEqual(result.imageUrls, [resultUrl]);
+  assert.equal(cooldowns.length, 1);
+  assert.equal(cooldowns[0].carId, "temporarily-restricted-car");
+  assert.equal(cooldowns[0].reason, "image_temporary_restriction");
+  assert.equal(new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Shanghai",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).format(new Date(cooldowns[0].cooldownUntil)), "15:57");
+});
+
+test("a content policy refusal does not freeze a car or switch cars", async () => {
+  const cooldowns = [];
+  const enteredCars = [];
+  const client = clientForGpt({
+    accountId: "account-policy-no-car-switch",
+    onImageCarCooldown: async (cooldown) => cooldowns.push(cooldown)
+  });
+  client.portalLoggedIn = true;
+  client.fetchCars = async () => [
+    car({ id: "policy-refusal-car", imageRemaining: 100 }),
+    car({ id: "policy-refusal-fallback", imageRemaining: 1 })
+  ];
+  client.enterCar = async (carId) => {
+    enteredCars.push(carId);
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.uploadChatImages = async () => [];
+  client.createSubmitClient = () => client;
+  client.http = async () => ({
+    status: 200,
+    headers: {},
+    body: ["data: {\"conversation_id\":\"conversation-policy-refusal\"}", "", "data: [DONE]", ""].join("\n")
+  });
+  client.conversationDetail = async () => ({
+    messages: [{
+      author: { role: "assistant" },
+      content: { parts: ["We're sorry, but this image request may violate our content policies."] }
+    }]
+  });
+  client.imageUrlsFrom = async () => [];
+
+  await assert.rejects(
+    () => client.createTextTask({ prompt: "内容安全失败不换车", waitForImages: true }),
+    /content policies/i
+  );
+
+  assert.deepEqual(enteredCars, ["policy-refusal-car"]);
+  assert.deepEqual(cooldowns, []);
 });
 
 test("saved image car cooldowns are restored after a client restart", async () => {

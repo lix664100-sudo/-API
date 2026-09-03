@@ -42,6 +42,10 @@ const CONVERSATION_SUBMIT_MIN_INTERVAL_MS = 2 * 1000;
 const MAX_UNCONFIRMED_CAR_ATTEMPTS = 2;
 const IMAGE_CAR_RECHECK_MS = 5 * 60 * 1000;
 const RECENT_IMAGE_SUCCESS_TTL_MS = 6 * 60 * 60 * 1000;
+const IMAGE_SLOW_RESULT_THRESHOLD_MS = 60 * 1000;
+const IMAGE_SLOW_RESULT_WINDOW_MS = 30 * 60 * 1000;
+const IMAGE_SLOW_RESULT_COOLDOWN_MS = 10 * 60 * 1000;
+const IMAGE_SLOW_RESULT_LIMIT = 2;
 const GEMINI_REQUEST_PATH = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
 const GEMINI_UPLOAD_PREFLIGHT_PATH = "/_/BardChatUi/data/batchexecute";
 const GEMINI_UPLOAD_PREFLIGHT_RPC_ID = "ESY5D";
@@ -89,6 +93,7 @@ const GROK_STATSIG_SEED = Buffer.from(
 const GROK_STATSIG_FINGERPRINT = "3bab9506b851eb851eb840e8f5c28f5c28f80e8f5c28f5c28f806b851eb851eb8400";
 const badCarUntil = new Map();
 const recentImageCarSuccessAt = new Map();
+const slowImageCarStats = new Map();
 const imageTaskListCaches = new Map();
 
 function trimSlash(value) {
@@ -359,6 +364,30 @@ function recentImageCarSuccess(accountId, carType, carId) {
   const succeededAt = recentImageCarSuccessAt.get(key) || 0;
   if (succeededAt > Date.now() - RECENT_IMAGE_SUCCESS_TTL_MS) return succeededAt;
   if (succeededAt) recentImageCarSuccessAt.delete(key);
+  return 0;
+}
+
+function rememberSlowImageCar(accountId, carType, carId, durationMs, now = Date.now()) {
+  if (!carId || Number(durationMs || 0) < IMAGE_SLOW_RESULT_THRESHOLD_MS) return null;
+  const key = badCarKey(accountId, carType, carId);
+  const previous = slowImageCarStats.get(key);
+  const count = previous && now - previous.lastAt <= IMAGE_SLOW_RESULT_WINDOW_MS
+    ? previous.count + 1
+    : 1;
+  const cooldownUntil = count >= IMAGE_SLOW_RESULT_LIMIT
+    ? now + IMAGE_SLOW_RESULT_COOLDOWN_MS
+    : previous?.cooldownUntil || 0;
+  const next = { count, lastAt: now, lastDurationMs: Number(durationMs), cooldownUntil };
+  slowImageCarStats.set(key, next);
+  return next;
+}
+
+function slowImageCarCooldown(accountId, carType, carId, now = Date.now()) {
+  const key = badCarKey(accountId, carType, carId);
+  const value = slowImageCarStats.get(key);
+  if (!value) return 0;
+  if (value.cooldownUntil > now) return value.cooldownUntil;
+  if (now - value.lastAt > IMAGE_SLOW_RESULT_WINDOW_MS) slowImageCarStats.delete(key);
   return 0;
 }
 
@@ -1325,6 +1354,25 @@ function imageCarQuotaRetryAt(content, now = Date.now()) {
     if (Number.isFinite(parsed) && parsed > now) return parsed;
   }
 
+  const timeOfDay = text.match(/(?:至|到|直到|until)\s*(\d{1,2}):(\d{2})(?::\d{2})?/i);
+  if (timeOfDay) {
+    const hour = Number(timeOfDay[1]);
+    const minute = Number(timeOfDay[2]);
+    if (hour <= 23 && minute <= 59) {
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Shanghai",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+      }).formatToParts(new Date(now));
+      const part = (type) => parts.find((item) => item.type === type)?.value || "";
+      const date = `${part("year")}-${part("month")}-${part("day")}`;
+      let retryAt = Date.parse(`${date}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00+08:00`);
+      if (Number.isFinite(retryAt) && retryAt <= now) retryAt += 24 * 60 * 60 * 1000;
+      if (Number.isFinite(retryAt)) return retryAt;
+    }
+  }
+
   const delayMs = relativeImageCarQuotaDelay(text);
   return delayMs > 0 ? now + delayMs : 0;
 }
@@ -1339,6 +1387,49 @@ function imageCarQuotaError(content = "") {
   error.quotaResetAt = retryAt ? new Date(retryAt).toISOString() : "";
   error.status = 429;
   return error;
+}
+
+function isTemporaryImageCarRestrictionMessage(content) {
+  const text = String(content || "").replace(/\s+/g, " ").trim();
+  if (!text || isImagePolicyFailureMessage(text) || isImageRateLimitMessage(text) || isImageGenerationLimitMessage(text)) return false;
+  const restrictedFeature = /(?:功能|图片(?:生成)?|图像(?:生成)?|image(?:\s+generation)?).{0,40}(?:受限|限制|暂不可用|暂时不可用|暂时无法|暂时不能|limited|unavailable|restricted)/i.test(text);
+  const recoveryHint = /(?:至|到|直到|恢复|后|重试|再试|until|after|try again)/i.test(text);
+  return restrictedFeature && recoveryHint;
+}
+
+function temporaryImageCarRestrictionContent(content) {
+  if (typeof content === "string") return isTemporaryImageCarRestrictionMessage(content) ? content : "";
+  if (!content || typeof content !== "object") return "";
+  const patchText = collectPatchText(content).join("").trim();
+  const candidates = [patchText, ...collectAssistantText(content)].filter(Boolean);
+  return candidates.find((candidate) => isTemporaryImageCarRestrictionMessage(candidate)) || "";
+}
+
+function imageCarTemporaryRestrictionError(content = "") {
+  const retryAt = imageCarQuotaRetryAt(content);
+  const recoveryText = retryAt
+    ? new Date(retryAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })
+    : "稍后";
+  const error = new Error(
+    retryAt
+      ? `当前车位暂时无法生成图片，将在 ${recoveryText} 恢复，正在切换其他车位。`
+      : "当前车位暂时无法生成图片，正在切换其他车位。"
+  );
+  error.imageCarTemporaryUnavailable = true;
+  error.retryableImageCar = true;
+  error.upstreamExplicitFailure = true;
+  error.upstreamStatus = "restricted";
+  error.upstreamText = String(content || "").replace(/\s+/g, " ").trim();
+  error.quotaResetAt = retryAt ? new Date(retryAt).toISOString() : "";
+  error.cooldownUntil = error.quotaResetAt || null;
+  error.status = 503;
+  error.code = "IMAGE_CAR_TEMPORARILY_RESTRICTED";
+  return error;
+}
+
+function throwIfTemporaryImageCarRestriction(content) {
+  const restrictionContent = temporaryImageCarRestrictionContent(content);
+  if (restrictionContent) throw imageCarTemporaryRestrictionError(restrictionContent);
 }
 
 function imageQuotaError(message = "图片生成额度已用完。") {
@@ -2108,6 +2199,11 @@ function carScore(car, strategy = "balanced", context = {}) {
     else if (succeededAt) score += 12000 + Math.min(1000, (succeededAt - (Date.now() - RECENT_IMAGE_SUCCESS_TTL_MS)) / 1000);
     else if (knownRemaining) score += 8000 + Math.min(car.imageRemaining, 200) * 8;
     else score += 2000;
+    if (candidateIds.some((carId) => slowImageCarCooldown(
+      context.accountId,
+      car.carType || context.carType,
+      carId
+    ))) score -= 9000;
   }
   if (strategy === "thinking") score += (car.isIQ ? 140 : 0) + (car.isPro ? 80 : 0) + (car.isSuper ? 30 : 0);
   if (strategy === "balanced") score += Math.random() * 40;
@@ -2392,6 +2488,16 @@ function createTaskStageRecorder(input = {}) {
 
 function taskStageSnapshot(recorder) {
   return Array.isArray(recorder?.entries) ? recorder.entries.map((entry) => ({ ...entry })) : [];
+}
+
+function taskStageDuration(recorder, key) {
+  const entries = Array.isArray(recorder?.entries) ? recorder.entries : [];
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (entries[index]?.key !== key) continue;
+    const durationMs = Number(entries[index]?.durationMs);
+    return Number.isFinite(durationMs) ? durationMs : 0;
+  }
+  return 0;
 }
 
 async function measureTaskStage(recorder, stage, work) {
@@ -2972,7 +3078,9 @@ export class ChatplusClient {
   }
 
   async refreshCompletedConversation(conversationId, detail, options = {}) {
-    if (!conversationId || detail?.async_status === null || detail?.async_status === undefined) return detail;
+    if (!conversationId) return detail;
+    const hasAsyncStatus = detail?.async_status !== null && detail?.async_status !== undefined;
+    if (!hasAsyncStatus && options.force !== true) return detail;
 
     let completed = this.completedConversationSyncs.get(conversationId);
     if (!completed) {
@@ -3626,8 +3734,25 @@ export class ChatplusClient {
     return this.rememberCarCooldown(
       selected,
       retryAt,
-      error?.imageCarQuotaExhausted === true ? "image_quota" : "image_failure",
-      error?.message || (error?.imageCarQuotaExhausted === true ? "车位生图额度已用完" : "车位生图失败")
+      error?.imageCarQuotaExhausted === true
+        ? "image_quota"
+        : error?.imageCarTemporaryUnavailable === true
+          ? "image_temporary_restriction"
+          : "image_failure",
+      error?.message || (error?.imageCarQuotaExhausted === true
+        ? "车位生图额度已用完"
+        : error?.imageCarTemporaryUnavailable === true
+          ? "车位暂时无法生成图片"
+          : "车位生图失败")
+    );
+  }
+
+  rememberImageSlowCar(selected, durationMs) {
+    return rememberSlowImageCar(
+      this.account?.id,
+      selected?.carType,
+      selected?.carId,
+      durationMs
     );
   }
 
@@ -4820,6 +4945,7 @@ export class ChatplusClient {
     if (input.imageGeneration === true) {
       const ignoredCarIds = new Set();
       const quotaErrors = [];
+      const temporaryRestrictionErrors = [];
       let lastUpstreamModel = "";
       let lastQuotaModel = "";
       for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -4830,11 +4956,18 @@ export class ChatplusClient {
           return await work(conversation);
         } catch (error) {
           if (conversation) error.upstreamModel ||= conversation.upstreamModel || conversation.route?.model || "";
-          if (conversation?.selected && error.imageCarQuotaExhausted === true) {
+          if (conversation?.selected && (
+            error.imageCarQuotaExhausted === true
+            || error.imageCarTemporaryUnavailable === true
+          )) {
             ignoredCarIds.add(conversation.selected.carId);
             await this.rememberImageFailedCar(conversation.selected, error);
             lastQuotaModel = conversation.route?.key || lastQuotaModel;
-            quotaErrors.push(error);
+            if (error.imageCarTemporaryUnavailable === true) {
+              temporaryRestrictionErrors.push(error);
+            } else {
+              quotaErrors.push(error);
+            }
             continue;
           }
           if (conversation) {
@@ -4844,11 +4977,22 @@ export class ChatplusClient {
           throw error;
         }
       }
-      const resetTime = Math.min(...quotaErrors
+      const allCarErrors = [...quotaErrors, ...temporaryRestrictionErrors];
+      const resetTime = Math.min(...allCarErrors
         .map((error) => Date.parse(error.quotaResetAt || ""))
         .filter((time) => Number.isFinite(time) && time > Date.now()));
       const resetAt = Number.isFinite(resetTime) ? new Date(resetTime).toISOString() : "";
-      const lastQuotaError = quotaErrors.at(-1);
+      const lastQuotaError = allCarErrors.at(-1);
+      if (temporaryRestrictionErrors.length) {
+        const error = imageCarTemporaryRestrictionError(lastQuotaError?.upstreamText || lastQuotaError?.message || "");
+        error.message = `已自动尝试 ${allCarErrors.length} 个生图车位，但当前都暂时无法生成图片。`;
+        error.quotaResetAt = resetAt;
+        error.cooldownUntil = resetAt || null;
+        error.upstreamModel = lastUpstreamModel;
+        error.imageSubmissionAttempted = true;
+        error.imageSubmissionConfirmed = false;
+        throw error;
+      }
       const error = imageQuotaError(`已自动尝试 ${quotaErrors.length} 个生图车位，但图片生成额度都已用完。`);
       error.quotaResetAt = resetAt;
       error.cooldownUntil = resetAt || null;
@@ -4919,6 +5063,7 @@ export class ChatplusClient {
         if (imageUrls.length) return imageUrls;
         const content = extractGeminiHistoryText(detail.payloads);
         throwIfImageGenerationLimit(content, { car: true });
+        throwIfTemporaryImageCarRestriction(content);
         throwIfTerminalImageFailure(content);
       } catch (error) {
         if (error.imageCarQuotaExhausted || error.imageQuotaExhausted || error.upstreamExplicitFailure) throw error;
@@ -4940,12 +5085,15 @@ export class ChatplusClient {
     this.rememberImageTaskId(conversationId, initialTaskId);
     let shouldCheckImageTasks = Boolean(initialTaskId) || hasAsyncImageTaskMarker(events);
     if (!initialIntermediateResponse && !initialResponse.inProgress && !initialImageLimit) {
+      throwIfTemporaryImageCarRestriction(initialContent);
       throwIfTerminalImageFailure(initialContent);
       throwIfTextImageResponse(initialContent);
     }
 
     const timeoutMs = Math.max(5, Number(timeoutSec || this.config.waitTimeoutSec || DEFAULT_CHAT_HTTP_TIMEOUT_SEC)) * 1000;
     const deadline = Date.now() + timeoutMs;
+    let nextTaskProbeAt = 0;
+    let nextStreamStatusProbeAt = 0;
     while (Date.now() < deadline) {
       const observedUpdateVersion = chatplusConversationUpdateVersion(conversationId);
       try {
@@ -4957,6 +5105,7 @@ export class ChatplusClient {
           if (imageUrls.length) return imageUrls;
           const pushedState = imageAssistantResponseState(pushedUpdates);
           if (!pushedState.inProgress) {
+            throwIfTemporaryImageCarRestriction(pushedState.content);
             throwIfTerminalImageFailure(pushedState.content);
             throwIfTextImageResponse(pushedState.content);
           }
@@ -4973,11 +5122,14 @@ export class ChatplusClient {
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
         shouldCheckImageTasks ||= hasAsyncImageTaskMarker(detail);
-        if (shouldCheckImageTasks) {
+        const shouldProbeImageTasks = shouldCheckImageTasks || Date.now() >= nextTaskProbeAt;
+        if (shouldProbeImageTasks) {
+          nextTaskProbeAt = Date.now() + (shouldCheckImageTasks ? 2000 : 5000);
           const imageTaskState = await this.imageGenerationTaskState(conversationId, {
             upstreamTaskId: options.upstreamTaskId || this.imageTaskIds.get(conversationId),
             timeoutSec: Math.min(30, Math.max(5, Math.ceil((deadline - Date.now()) / 1000)))
           });
+          shouldCheckImageTasks ||= Boolean(imageTaskState?.taskId);
           if (imageTaskState?.imageUrls.length) return imageTaskState.imageUrls;
           if (imageTaskState?.failure) {
             const error = new Error(imageTaskState.failure.message);
@@ -4986,13 +5138,23 @@ export class ChatplusClient {
             throw error;
           }
         }
-        detail = await this.refreshCompletedConversation(conversationId, detail);
+        const forceStreamStatus = detail?.async_status === null
+          || detail?.async_status === undefined
+            ? Date.now() >= nextStreamStatusProbeAt
+            : false;
+        if (forceStreamStatus) nextStreamStatusProbeAt = Date.now() + 5000;
+        detail = await this.refreshCompletedConversation(
+          conversationId,
+          detail,
+          forceStreamStatus ? { force: true } : {}
+        );
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
         const responseState = imageAssistantResponseState(detail);
         const content = responseState.content;
         const intermediateResponse = isChatImageIntermediateResponse(content);
         if (!intermediateResponse && !responseState.inProgress) {
+          throwIfTemporaryImageCarRestriction(content);
           throwIfTerminalImageFailure(content);
           throwIfTextImageResponse(content);
         }
@@ -5122,13 +5284,26 @@ export class ChatplusClient {
         ? { geminiHistory: true }
         : { generatedOnly: true });
     }
+    const preRefreshState = imageAssistantResponseState([detail, ...pushedUpdates]);
+    const likelyImageTask = !geminiTask && (
+      context.imageTask === true
+      || Boolean(context.upstreamTaskId || observedTaskId)
+      || hasAsyncImageTaskMarker(detail)
+      || hasAsyncImageTaskMarker(pushedUpdates)
+      || preRefreshState.inProgress
+      || isChatImageIntermediateResponse(preRefreshState.content)
+    );
     if (!geminiTask && !imageUrls.length) {
       const refreshReader = typeof taskReader.refreshCompletedConversation === "function" ? taskReader : this;
-      detail = await refreshReader.refreshCompletedConversation(externalId, detail, requestOptions);
+      detail = await refreshReader.refreshCompletedConversation(
+        externalId,
+        detail,
+        likelyImageTask ? { ...requestOptions, force: true } : requestOptions
+      );
       imageUrls = await imageReader.imageUrlsFrom(detail, { generatedOnly: true });
     }
     let imageTaskState = null;
-    const shouldCheckImageTasks = Boolean(context.upstreamTaskId || observedTaskId)
+    const shouldCheckImageTasks = likelyImageTask
       || hasAsyncImageTaskMarker(detail)
       || hasAsyncImageTaskMarker(pushedUpdates);
     if (
@@ -5176,6 +5351,25 @@ export class ChatplusClient {
     }
     if (geminiTask) {
       const content = extractGeminiHistoryText(detail.payloads);
+      if (isTemporaryImageCarRestrictionMessage(content)) {
+        const restrictionError = imageCarTemporaryRestrictionError(content);
+        await this.rememberImageFailedCar({
+          carId: context.carId || this.carId,
+          carType: context.carType || this.carType
+        }, restrictionError);
+        return {
+          externalId,
+          status: "failed",
+          imageCount: 0,
+          imageUrls: [],
+          errorMessage: restrictionError.message,
+          raw: {
+            ...detail,
+            imageCarTemporaryUnavailable: true,
+            imageCarCooldownUntil: restrictionError.quotaResetAt || ""
+          }
+        };
+      }
       if (isImageGenerationLimitMessage(content)) {
         return {
           externalId,
@@ -5228,6 +5422,26 @@ export class ChatplusClient {
           ...rawDetail,
           imageCarQuotaExhausted: true,
           imageCarCooldownUntil: quotaError.quotaResetAt || ""
+        }
+      };
+    }
+    const temporaryRestrictionContent = temporaryImageCarRestrictionContent(resultState);
+    if (temporaryRestrictionContent) {
+      const restrictionError = imageCarTemporaryRestrictionError(temporaryRestrictionContent);
+      await this.rememberImageFailedCar({
+        carId: context.carId || this.carId,
+        carType: context.carType || this.carType
+      }, restrictionError);
+      return {
+        externalId,
+        status: "failed",
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: restrictionError.message,
+        raw: {
+          ...rawDetail,
+          imageCarTemporaryUnavailable: true,
+          imageCarCooldownUntil: restrictionError.quotaResetAt || ""
         }
       };
     }
@@ -5289,6 +5503,7 @@ export class ChatplusClient {
         if (conversation.route?.key === "gemini") {
           let imageUrls = conversation.imageUrls || [];
           if (!imageUrls.length) {
+            throwIfTemporaryImageCarRestriction(conversation.directContent);
             try {
               throwIfTerminalImageFailure(conversation.directContent);
             } catch (error) {
@@ -5330,6 +5545,10 @@ export class ChatplusClient {
       });
       const { events, conversationId, model, upstreamModel, route, selected, imageUrls } = result;
       const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
+      const resultWaitMs = taskStageDuration(taskStageRecorder, "result_wait");
+      const slowCarState = imageUrls.length && resultWaitMs
+        ? this.rememberImageSlowCar(selected, resultWaitMs)
+        : null;
       if (imageUrls.length) await this.rememberImageSuccessfulCar(selected);
 
       return {
@@ -5346,7 +5565,20 @@ export class ChatplusClient {
           carId: selected?.carId,
           carType: selected?.carType
         }),
-        raw: { conversationId, eventCount: events.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy, ...resultChannelMetadata(result, route), ...geminiRouteMetadata(route), stageTimings: taskStageSnapshot(taskStageRecorder) }
+        raw: {
+          conversationId,
+          eventCount: events.length,
+          upstreamModel,
+          chatModel: route?.key,
+          selectedCarId: selected?.carId,
+          selectedCarType: selected?.carType,
+          strategy: selected?.strategy,
+          ...(resultWaitMs > 0 ? { resultWaitMs } : {}),
+          ...(slowCarState?.count ? { slowResultCount: slowCarState.count } : {}),
+          ...resultChannelMetadata(result, route),
+          ...geminiRouteMetadata(route),
+          stageTimings: taskStageSnapshot(taskStageRecorder)
+        }
       };
     });
   }
@@ -5372,6 +5604,7 @@ export class ChatplusClient {
         if (conversation.route?.key === "gemini") {
           let imageUrls = conversation.imageUrls || [];
           if (!imageUrls.length) {
+            throwIfTemporaryImageCarRestriction(conversation.directContent);
             try {
               throwIfTerminalImageFailure(conversation.directContent);
             } catch (error) {
@@ -5413,6 +5646,10 @@ export class ChatplusClient {
       });
       const { events, conversationId, model, upstreamModel, route, selected, imageUrls } = result;
       const downloadClient = result.submitSessionSnapshot ? this.createSubmitClient(result) : this;
+      const resultWaitMs = taskStageDuration(taskStageRecorder, "result_wait");
+      const slowCarState = imageUrls.length && resultWaitMs
+        ? this.rememberImageSlowCar(selected, resultWaitMs)
+        : null;
       if (imageUrls.length) await this.rememberImageSuccessfulCar(selected);
 
       return {
@@ -5429,7 +5666,21 @@ export class ChatplusClient {
           carId: selected?.carId,
           carType: selected?.carType
         }),
-        raw: { conversationId, eventCount: events.length, sourceImageCount: files.length, upstreamModel, chatModel: route?.key, selectedCarId: selected?.carId, selectedCarType: selected?.carType, strategy: selected?.strategy, ...resultChannelMetadata(result, route), ...geminiRouteMetadata(route), stageTimings: taskStageSnapshot(taskStageRecorder) }
+        raw: {
+          conversationId,
+          eventCount: events.length,
+          sourceImageCount: files.length,
+          upstreamModel,
+          chatModel: route?.key,
+          selectedCarId: selected?.carId,
+          selectedCarType: selected?.carType,
+          strategy: selected?.strategy,
+          ...(resultWaitMs > 0 ? { resultWaitMs } : {}),
+          ...(slowCarState?.count ? { slowResultCount: slowCarState.count } : {}),
+          ...resultChannelMetadata(result, route),
+          ...geminiRouteMetadata(route),
+          stageTimings: taskStageSnapshot(taskStageRecorder)
+        }
       };
     });
   }
