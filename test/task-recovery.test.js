@@ -1044,6 +1044,33 @@ test("chatplus policy refusal is returned as a failed task with the original mes
   assert.equal(result.errorMessage, message);
 });
 
+test("chatplus cancelled image task notice is returned as cancelled", async () => {
+  const message = "The above image generation task was cancelled by the user and therefore the generated image is incomplete. The image will not finish generating and is not completed or successful.";
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 300 },
+    channel: { id: "shareai:chatplus", settings: { baseUrl: "https://www.chatplus.cc" } },
+    account: { id: "account-cancelled-image", username: "cancelled@example.com" },
+    sessionLock: async (work) => work()
+  });
+  client.loginPortal = async () => {};
+  client.json = async () => ({
+    mapping: {
+      result: {
+        message: {
+          author: { role: "assistant" },
+          content: { parts: [message] }
+        }
+      }
+    }
+  });
+  client.imageUrlsFrom = async () => [];
+
+  const result = await client.getTask("conversation-cancelled-image");
+
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorMessage, message);
+});
+
 test("submitted relay policy refusal is returned as content policy without retrying another account", async () => {
   const config = await loadConfig();
   await saveConfig({

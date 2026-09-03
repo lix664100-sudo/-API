@@ -1463,6 +1463,14 @@ function isImageRateLimitMessage(content) {
     || /(?:速率限制|请求过于频繁)/.test(text);
 }
 
+function isUpstreamImageTaskCancelledMessage(content) {
+  const text = String(content || "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  return /(?:the\s+above\s+)?image\s+generation\s+task\s+was\s+cancelled\s+by\s+the\s+user/i.test(text)
+    || /image\s+generation\s+task\s+(?:was\s+)?cancelled(?:\s+and\s+will\s+not\s+(?:finish|complete))?/i.test(text)
+    || /(?:图片生成|生图)任务(?:已被用户|被用户|已)?取消(?:了)?(?:，|,|。|\.)?(?:不会完成|未完成|不成功)?/.test(text);
+}
+
 function isTerminalImageFailureMessage(content) {
   const text = String(content || "").replace(/\s+/g, " ").trim();
   if (!text) return false;
@@ -5412,6 +5420,16 @@ export class ChatplusClient {
     }
     if (geminiTask) {
       const content = extractGeminiHistoryText(detail.payloads);
+      if (isUpstreamImageTaskCancelledMessage(content)) {
+        return {
+          externalId,
+          status: "cancelled",
+          imageCount: 0,
+          imageUrls: [],
+          errorMessage: content,
+          raw: detail
+        };
+      }
       if (isTemporaryImageCarRestrictionMessage(content)) {
         const restrictionError = imageCarTemporaryRestrictionError(content);
         await this.rememberImageFailedCar({
@@ -5466,6 +5484,16 @@ export class ChatplusClient {
     const responseState = imageAssistantResponseState(resultState);
     const content = responseState.content;
     const intermediateResponse = isChatImageIntermediateResponse(content);
+    if (isUpstreamImageTaskCancelledMessage(content)) {
+      return {
+        externalId,
+        status: "cancelled",
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: content,
+        raw: rawDetail
+      };
+    }
     const quotaContent = imageGenerationLimitContent(resultState);
     if (quotaContent) {
       const quotaError = imageCarQuotaError(quotaContent);
