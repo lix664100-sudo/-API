@@ -19,6 +19,13 @@ import {
   useAvailableShareAiPortal
 } from "../shareai-portal-router.js";
 import { isImagePolicyFailureMessage } from "../task-error-policy.js";
+import {
+  adoptPortalSession,
+  invalidatePortalSession,
+  portalSessionKey,
+  savePortalSession,
+  shareSessionFromCookies
+} from "../portal-session-pool.js";
 
 export { isImagePolicyFailureMessage } from "../task-error-policy.js";
 
@@ -34,6 +41,9 @@ const CONVERSATION_READ_HEADERS = Object.freeze({
   pragma: "no-cache"
 });
 const MAX_CHAT_CAR_ATTEMPTS = 8;
+const AUTH_KICK_FAST_FAIL_LIMIT = 3;
+const CHAT_IMAGE_UPLOAD_CACHE_TTL_MS = 10 * 60 * 1000;
+const CHAT_IMAGE_UPLOAD_CACHE_MAX = 200;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
 const PRO_CAR_RECHECK_MS = 6 * 60 * 60 * 1000;
 const UNCONFIRMED_CAR_TTL_MS = 24 * 60 * 60 * 1000;
@@ -401,11 +411,62 @@ function isExplicitAuthSessionError(error) {
   return /\b401\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|聊天记录.{0,12}(?:删除|已删除)|换车继续聊|unauthorized|session expired/i.test(text);
 }
 
+// 只有"账号被挤下线"这类账号级别的故障才触发快速失败；
+// 共享车位自己的认证失败(401/403)仍然按车位故障处理，不能冒充账号掉线。
+function isAccountKickError(error) {
+  if (error?.authScope === "car" || error?.carPoolUnavailable === true) return false;
+  const text = `${error?.message || ""} ${error?.body || ""} ${error?.upstreamText || ""}`;
+  return /其他设备登|在其他设备|被挤下线|挤下线/.test(text);
+}
+
 function tagCarPoolUnavailable(error) {
   error.code ||= "CHAT_CAR_POOL_UNAVAILABLE";
   error.carPoolUnavailable = true;
   error.authScope = "car";
   return error;
+}
+
+function accountSessionContentionError(attemptMessages = []) {
+  const error = new Error(
+    `账号被其他登录占用，连续 ${Math.max(attemptMessages.length, AUTH_KICK_FAST_FAIL_LIMIT)} 次被挤下线，已停止自动重试。请检查该账号是否在其他设备或系统登录，或稍后再试。`
+  );
+  error.code = "ACCOUNT_SESSION_CONTENDED";
+  error.status = 409;
+  error.authScope = "account";
+  error.noRetry = true;
+  error.carAttempts = [...attemptMessages];
+  return error;
+}
+
+const chatImageUploadCache = new Map();
+
+function chatImageUploadCacheKey(accountId, carId, revision, digest) {
+  return `${accountId || "account"}::${carId || ""}::${revision}::${digest}`;
+}
+
+function readChatImageUploadCache(key) {
+  const entry = chatImageUploadCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at > CHAT_IMAGE_UPLOAD_CACHE_TTL_MS) {
+    chatImageUploadCache.delete(key);
+    return null;
+  }
+  return entry.asset;
+}
+
+function writeChatImageUploadCache(key, asset) {
+  if (chatImageUploadCache.size >= CHAT_IMAGE_UPLOAD_CACHE_MAX) {
+    const oldestKey = chatImageUploadCache.keys().next().value;
+    if (oldestKey !== undefined) chatImageUploadCache.delete(oldestKey);
+  }
+  chatImageUploadCache.set(key, { at: Date.now(), asset });
+}
+
+function cloneUploadAsset(asset = {}) {
+  return {
+    part: { ...(asset.part || {}) },
+    attachment: { ...(asset.attachment || {}) }
+  };
 }
 
 function isRetryableImageSubmissionRejection(error) {
@@ -2653,6 +2714,39 @@ export class ChatplusClient {
     }
   }
 
+  portalSessionPoolKey() {
+    return portalSessionKey({
+      username: this.account?.username,
+      password: this.account?.password,
+      proxyUrl: proxyUrlFor(this.account)
+    });
+  }
+
+  tryAdoptSharedPortalSession() {
+    if (this.portalLoggedIn) return false;
+    const entry = adoptPortalSession(this.portalSessionPoolKey());
+    if (!entry || !entry.cookies.length) return false;
+    if (entry.baseUrl) this.baseUrl = entry.baseUrl;
+    this.cookies = [...entry.cookies];
+    this.portalLoggedIn = true;
+    return true;
+  }
+
+  rememberSharedPortalSession() {
+    if (!this.portalLoggedIn || !this.cookies.length) return;
+    savePortalSession(this.portalSessionPoolKey(), {
+      baseUrl: this.baseUrl,
+      cookies: this.cookies,
+      shareSession: shareSessionFromCookies(this.cookies)
+    });
+  }
+
+  invalidateSharedPortalSession() {
+    invalidatePortalSession(this.portalSessionPoolKey(), {
+      shareSession: shareSessionFromCookies(this.cookies)
+    });
+  }
+
   cookieHeader() {
     return this.cookies.join("; ");
   }
@@ -2919,6 +3013,7 @@ export class ChatplusClient {
         const carId = this.carId;
         const carType = this.carType;
         await this.sessionLock(async () => {
+          this.invalidateSharedPortalSession();
           await this.performPortalLogin({ timeoutSec });
           this.carId = carId;
           this.carType = carType;
@@ -3286,6 +3381,7 @@ export class ChatplusClient {
       sessionLock: async (work) => work()
     });
     client.restoreSession(snapshot);
+    if (Number.isInteger(session.revision)) client.sessionRevision = session.revision;
     return client;
   }
 
@@ -3452,6 +3548,7 @@ export class ChatplusClient {
     let invalidated = false;
     await this.sessionLock(async () => {
       if (revision !== this.sessionRevision) return;
+      this.invalidateSharedPortalSession();
       this.resetSession();
       invalidated = true;
     });
@@ -3464,6 +3561,9 @@ export class ChatplusClient {
       label: "登录账号"
     }, async () => {
       this.assertConfigured();
+      if (options.forceFreshPortalLogin !== true && this.tryAdoptSharedPortalSession()) {
+        return { adoptedSharedSession: true };
+      }
       let selected;
       try {
         selected = await useAvailableShareAiPortal({
@@ -3515,6 +3615,7 @@ export class ChatplusClient {
       }
       this.baseUrl = selected.url;
       this.portalLoggedIn = true;
+      this.rememberSharedPortalSession();
     });
   }
 
@@ -3538,12 +3639,21 @@ export class ChatplusClient {
         ["gpt", "grok", "gemini"].map((key) => [key, chatUsageFromPayload(payload, key)])
       );
     } catch (error) {
+      if (!portalRetried && isAuthSessionError(error)) {
+        await this.sessionLock(async () => {
+          this.invalidateSharedPortalSession();
+          this.resetSession();
+          await this.performPortalLogin(options);
+        });
+        return this.loadAccountUsages(options, true);
+      }
       if (portalRetried || !isShareAiPortalConnectionError(error)) throw error;
       reportShareAiPortalFailure({
         proxyUrl: proxyUrlFor(this.account),
         url: this.baseUrl
       });
       await this.sessionLock(async () => {
+        this.invalidateSharedPortalSession();
         this.resetSession();
         await this.performPortalLogin(options);
       });
@@ -3593,6 +3703,7 @@ export class ChatplusClient {
         proxyUrl: proxyUrlFor(this.account),
         url: this.baseUrl
       });
+      this.invalidateSharedPortalSession();
       this.resetSession();
       await this.performPortalLogin(options);
       this.carId = carId;
@@ -3831,6 +3942,7 @@ export class ChatplusClient {
     const errors = [];
     let subscriptionMissingAttempts = 0;
     let subscriptionExpiredAttempts = 0;
+    let authKickAttempts = 0;
     let recheckProCars = input.recheckProCars === true;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       let selected;
@@ -3883,9 +3995,18 @@ export class ChatplusClient {
           || isAuthSessionError(error)
           || isCarPlanMismatchError(error);
         if (retryableCarError) {
+          if (isAccountKickError(error)) {
+            authKickAttempts += 1;
+            if (authKickAttempts >= AUTH_KICK_FAST_FAIL_LIMIT) {
+              throw accountSessionContentionError(errors);
+            }
+          }
           await this.rememberProCarsUnavailable(error);
           await this.rememberAuthFailedCar(selected, error);
-          await this.sessionLock(async () => this.resetSession());
+          await this.sessionLock(async () => {
+            this.invalidateSharedPortalSession();
+            this.resetSession();
+          });
         }
         if (route.key === "gemini" && !retryableCarError) {
           error.noRetry = true;
@@ -4045,7 +4166,7 @@ export class ChatplusClient {
     };
   }
 
-  async uploadChatImage(file) {
+  async uploadChatImage(file, options = {}) {
     const buffer = await file.toBuffer();
     const mimetype = file.mimetype || "image/png";
     if (!String(mimetype).startsWith("image/")) {
@@ -4055,6 +4176,12 @@ export class ChatplusClient {
     }
     const filename = fileNameFromMime(mimetype, file.filename || `image-${randomUUID()}`);
     const { width, height } = imageDimensions(buffer);
+    const digest = createHash("sha256").update(buffer).digest("hex");
+    const cacheKey = chatImageUploadCacheKey(this.account?.id, this.carId, this.sessionRevision, digest);
+    if (options.forceReupload !== true) {
+      const cachedAsset = readChatImageUploadCache(cacheKey);
+      if (cachedAsset) return cloneUploadAsset(cachedAsset);
+    }
     const upload = await this.json("/backend-api/files", {
       method: "POST",
       body: {
@@ -4065,7 +4192,28 @@ export class ChatplusClient {
     });
     const fileId = upload?.file_id;
     const uploadUrl = upload?.upload_url;
-    if (!fileId || !uploadUrl) throw new Error("聊天图片上传初始化失败。");
+    if (!fileId || !uploadUrl) {
+      const upstreamText = upload?.detail?.message || upload?.message || upload?.msg || "";
+      const authShapedError = new Error(upstreamText || "聊天图片上传初始化失败。");
+      authShapedError.body = JSON.stringify(upload ?? {});
+      if (isAuthSessionError(authShapedError)) {
+        authShapedError.status = 401;
+        throw authShapedError;
+      }
+      if (options.retriedAfterReauth !== true) {
+        // 上传初始化失败通常是登录会话悄悄失效：重新登录一次再上传。
+        await this.sessionLock(async () => {
+          this.invalidateSharedPortalSession();
+          this.resetSession();
+          await this.performPortalLogin({
+            ...(options.timeoutSec ? { timeoutSec: options.timeoutSec } : {}),
+            ...(options.taskStageRecorder ? { taskStageRecorder: options.taskStageRecorder } : {})
+          });
+        });
+        return this.uploadChatImage(file, { ...options, retriedAfterReauth: true });
+      }
+      throw new Error("聊天图片上传初始化失败。");
+    }
 
     const put = await this.http(uploadUrl, {
       method: "PUT",
@@ -4084,7 +4232,7 @@ export class ChatplusClient {
     });
     if (done?.status && done.status !== "success") throw new Error("聊天图片上传未完成。");
 
-    return {
+    const asset = {
       part: {
         content_type: "image_asset_pointer",
         asset_pointer: `file-service://${fileId}`,
@@ -4101,11 +4249,13 @@ export class ChatplusClient {
         height
       }
     };
+    writeChatImageUploadCache(cacheKey, asset);
+    return asset;
   }
 
-  async uploadChatImages(files = []) {
+  async uploadChatImages(files = [], options = {}) {
     const assets = [];
-    for (const file of files) assets.push(await this.uploadChatImage(file));
+    for (const file of files) assets.push(await this.uploadChatImage(file, options));
     return assets;
   }
 
@@ -4673,6 +4823,7 @@ export class ChatplusClient {
     const imageCarQuotaErrors = [];
     const unconfirmedCars = [];
     let carPoolErrorCount = 0;
+    let authKickAttempts = 0;
     let lastError = null;
     let lastUpstreamText = "";
     const runSubmitStep = input.concurrentSubmit === true
@@ -4719,7 +4870,9 @@ export class ChatplusClient {
           ? await measureTaskStage(requestInput.taskStageRecorder, {
               key: "source_upload",
               label: "上传原图"
-            }, async () => runSubmitStep(() => submitClient.uploadChatImages(sourceFiles)))
+            }, async () => runSubmitStep(() => submitClient.uploadChatImages(sourceFiles, {
+              taskStageRecorder: requestInput.taskStageRecorder
+            })))
           : [];
         const { body, messageId } = submitClient.buildConversationBody(prompt, model, imageAssets);
         let resolvePushedConversationId;
@@ -4785,7 +4938,7 @@ export class ChatplusClient {
             conversationId = await Promise.race([
               pushedConversationId,
               new Promise((resolve) => {
-                const timer = setTimeout(() => resolve(""), 5000);
+                const timer = setTimeout(() => resolve(""), 3000);
                 timer.unref?.();
               })
             ]);
@@ -4942,6 +5095,12 @@ export class ChatplusClient {
         }
         const retryableCarError = selected && (isAuthSessionError(error) || isCarPlanMismatchError(error));
         if (retryableCarError) {
+          if (isAccountKickError(error)) {
+            authKickAttempts += 1;
+            if (authKickAttempts >= AUTH_KICK_FAST_FAIL_LIMIT) {
+              throw accountSessionContentionError(errors);
+            }
+          }
           await this.rememberProCarsUnavailable(error);
           await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
@@ -4949,7 +5108,11 @@ export class ChatplusClient {
           continue;
         }
         if (Number(error.status || error.statusCode || 0) === 400) throw error;
-        if (isAuthSessionError(error)) {
+        if (isAccountKickError(error)) {
+          authKickAttempts += 1;
+          if (authKickAttempts >= AUTH_KICK_FAST_FAIL_LIMIT) {
+            throw accountSessionContentionError(errors);
+          }
           await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
         }
@@ -5108,7 +5271,7 @@ export class ChatplusClient {
         if (error.imageCarQuotaExhausted || error.imageQuotaExhausted || error.upstreamExplicitFailure) throw error;
         // Gemini can move a conversation between upstream nodes while the image is finishing.
       }
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await new Promise((resolve) => setTimeout(resolve, 3000));
     }
     return [];
   }
@@ -5168,7 +5331,7 @@ export class ChatplusClient {
         shouldCheckImageTasks ||= hasAsyncImageTaskMarker(detail);
         const shouldProbeImageTasks = shouldCheckImageTasks || Date.now() >= nextTaskProbeAt;
         if (shouldProbeImageTasks) {
-          nextTaskProbeAt = Date.now() + (shouldCheckImageTasks ? 2000 : 5000);
+          nextTaskProbeAt = Date.now() + (shouldCheckImageTasks ? 2000 : 3000);
           const imageTaskState = await this.imageGenerationTaskState(conversationId, {
             upstreamTaskId: options.upstreamTaskId || this.imageTaskIds.get(conversationId),
             timeoutSec: Math.min(30, Math.max(5, Math.ceil((deadline - Date.now()) / 1000)))
@@ -5186,7 +5349,7 @@ export class ChatplusClient {
           || detail?.async_status === undefined
             ? Date.now() >= nextStreamStatusProbeAt
             : false;
-        if (forceStreamStatus) nextStreamStatusProbeAt = Date.now() + 5000;
+        if (forceStreamStatus) nextStreamStatusProbeAt = Date.now() + 3000;
         detail = await this.refreshCompletedConversation(
           conversationId,
           detail,
@@ -5222,7 +5385,7 @@ export class ChatplusClient {
       await waitForChatplusConversationUpdate(
         conversationId,
         observedUpdateVersion,
-        Math.min(5000, Math.max(1, deadline - Date.now()))
+        Math.min(3000, Math.max(1, deadline - Date.now()))
       );
     }
     return [];
@@ -5259,7 +5422,10 @@ export class ChatplusClient {
           const sameCarSession = this.portalLoggedIn
             && this.carId === taskCarId
             && this.carType === taskCarType;
-          if (reset) this.resetSession();
+          if (reset) {
+            this.invalidateSharedPortalSession();
+            this.resetSession();
+          }
           if (!this.portalLoggedIn) await this.performPortalLogin(requestOptions);
           this.carId = taskCarId;
           this.carType = taskCarType;
@@ -5269,7 +5435,12 @@ export class ChatplusClient {
           return this.createSubmitClient({ snapshot: this.sessionSnapshot() });
         });
       }
-      if (reset) await this.sessionLock(async () => this.resetSession());
+      if (reset) {
+        await this.sessionLock(async () => {
+          this.invalidateSharedPortalSession();
+          this.resetSession();
+        });
+      }
       await this.loginPortal(requestOptions);
       if (!this.carId) await this.login(requestOptions);
       return this;

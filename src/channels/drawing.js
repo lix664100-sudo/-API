@@ -5,6 +5,12 @@ import {
   isShareAiPortalAccountRejection,
   useAvailableShareAiPortal
 } from "../shareai-portal-router.js";
+import {
+  adoptPortalSession,
+  invalidatePortalSession,
+  portalSessionKey,
+  savePortalSession
+} from "../portal-session-pool.js";
 
 const ACCOUNT_CHECK_TIMEOUT_MS = 3000;
 const MIN_DRAWING_BALANCE_FOR_IMAGE = 2;
@@ -252,6 +258,7 @@ export class DrawingClient {
     this.mainBaseUrl = this.configuredMainBaseUrl;
     this.drawingBaseUrl = trimSlash(channel?.settings?.baseUrl || config.drawingBaseUrl || "https://drawing.aishare.icu");
     this.accessToken = "";
+    this.portalShareSession = "";
     this.sessionLock = typeof sessionLock === "function" ? sessionLock : async (work) => work();
     this.fetchImpl = fetchImpl;
     this.proxyAgentFactory = proxyAgentFactory;
@@ -283,6 +290,7 @@ export class DrawingClient {
     if (changed) {
       this.contextSignature = nextSignature;
       this.accessToken = "";
+      this.portalShareSession = "";
       this.mainBaseUrl = this.configuredMainBaseUrl;
       this.proxyAgent?.destroy?.();
       this.proxyUrl = proxyUrlFor(account);
@@ -296,8 +304,45 @@ export class DrawingClient {
     }
   }
 
+  portalSessionPoolKey() {
+    return portalSessionKey({
+      username: this.account?.username,
+      password: this.account?.password,
+      proxyUrl: this.proxyUrl
+    });
+  }
+
+  async exchangeShareSessionToken(shareSession, options = {}) {
+    const ssoData = await this.request("/api/v1/auth/external-sso", {
+      method: "POST",
+      auth: false,
+      timeoutMs: options.timeoutMs,
+      body: { "share-token": shareSession }
+    });
+    if (!ssoData?.access_token) throw new Error("绘图站登录失败。");
+    return ssoData;
+  }
+
   async performLogin(options = {}) {
     this.assertConfigured();
+    const poolKey = this.portalSessionPoolKey();
+    const pooled = adoptPortalSession(poolKey);
+    if (pooled?.shareSession) {
+      try {
+        const ssoData = await this.exchangeShareSessionToken(pooled.shareSession, {
+          timeoutMs: options.timeoutMs
+        });
+        this.mainBaseUrl = pooled.baseUrl || this.configuredMainBaseUrl;
+        this.accessToken = ssoData.access_token;
+        this.portalShareSession = pooled.shareSession;
+        return ssoData;
+      } catch (error) {
+        // 账号被拒或网络问题(没有状态码)时不动共享池，直接抛错；
+        // 其余情况(如 401/403 会话失效)作废共享会话，走重新登录。
+        if (error?.portalAccountRejected || !Number(error?.status || 0)) throw error;
+        invalidatePortalSession(poolKey, { shareSession: pooled.shareSession });
+      }
+    }
     let selected;
     try {
       selected = await useAvailableShareAiPortal({
@@ -350,15 +395,16 @@ export class DrawingClient {
     this.mainBaseUrl = selected.url;
     const shareSession = selected.value;
 
-    const ssoData = await this.request("/api/v1/auth/external-sso", {
-      method: "POST",
-      auth: false,
-      timeoutMs: options.timeoutMs,
-      body: { "share-token": shareSession }
+    const ssoData = await this.exchangeShareSessionToken(shareSession, {
+      timeoutMs: options.timeoutMs
     });
-
-    if (!ssoData?.access_token) throw new Error("绘图站登录失败。");
     this.accessToken = ssoData.access_token;
+    this.portalShareSession = shareSession;
+    savePortalSession(poolKey, {
+      baseUrl: selected.url,
+      cookies: [`share-session=${shareSession}`],
+      shareSession
+    });
     return ssoData;
   }
 
