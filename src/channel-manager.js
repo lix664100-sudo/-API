@@ -1252,8 +1252,36 @@ function isTerminalTaskFailureError(error) {
   return Boolean(error?.upstreamExplicitFailure);
 }
 
+function isCancelledTaskError(error) {
+  const status = String(error?.upstreamStatus || error?.status || error?.state || error?.taskStatus || "")
+    .trim()
+    .toLowerCase();
+  return ["cancelled", "canceled"].includes(status)
+    || String(error?.code || "").trim().toLowerCase() === "upstream_task_cancelled"
+    || /上游已取消任务/.test(String(error?.message || ""));
+}
+
 function imageSubmissionFailure(error) {
   if (error?.imageSubmissionAttempted !== true) return error;
+  if (isCancelledTaskError(error)) {
+    const failure = new Error(error?.message || "上游已取消任务。");
+    failure.status = Number(error?.status || error?.statusCode || 0) || 502;
+    failure.code = "UPSTREAM_TASK_CANCELLED";
+    failure.imageTaskCancelled = true;
+    failure.imageSubmissionAttempted = true;
+    failure.imageSubmissionConfirmed = error?.imageSubmissionConfirmed === true;
+    failure.failureType = "upstream_cancelled";
+    failure.failureReason = failure.message;
+    failure.upstreamText = error?.upstreamText || failure.message;
+    failure.upstreamModel = error?.upstreamModel || "";
+    failure.upstreamStatus = "cancelled";
+    failure.upstreamExplicitFailure = true;
+    failure.selectedCarId = error?.selectedCarId || "";
+    failure.selectedCarType = error?.selectedCarType || "";
+    failure.conversationId = error?.conversationId || error?.externalId || "";
+    failure.carAttempts = Array.isArray(error?.carAttempts) ? error.carAttempts : [];
+    return failure;
+  }
   const policyFailure = isImagePolicyFailureMessage(
     error?.failureReason || error?.upstreamText || error?.body || error?.message
   );
@@ -4768,22 +4796,24 @@ function imageFailureRawFields(report) {
 }
 
 async function failQueuedTask(task, error, attempts = [], stageTimings = []) {
+  const cancelled = isCancelledTaskError(error);
   const systemRejection = error?.busy === true
     || error?.quotaEmpty === true
     || ["CONCURRENCY_LIMIT", "QUOTA_EXHAUSTED", "CHAT_USAGE_LIMIT", "QUOTA_PROTECTION"].includes(String(error?.code || ""));
-  const failure = task.taskType !== "chat" && !systemRejection && !isCarPoolUnavailableError(error)
+  const failure = !cancelled && task.taskType !== "chat" && !systemRejection && !isCarPoolUnavailableError(error)
     ? imageFailureReport(task, error)
     : null;
   const responseMessage = failure?.message || error.message || readableAttemptError(attempts) || "任务失败";
-  const statusCode = Number(error.status || error.statusCode || 0) || null;
+  const statusCode = cancelled ? null : Number(error.status || error.statusCode || 0) || null;
   const code = error.code
+    || (cancelled ? "UPSTREAM_TASK_CANCELLED" : "")
     || (statusCode === 429 ? "CONCURRENCY_LIMIT" : "")
     || (failure?.submissionConfirmed ? "UPSTREAM_NO_IMAGE" : failure ? "IMAGE_SUBMISSION_FAILED" : "");
   const upstreamText = failure?.upstreamText || originalFailureText(error.upstreamText || error.body);
   const sourceTaskId = task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson);
   const failedTask = {
     ...task,
-    status: "failed",
+    status: cancelled ? "cancelled" : "failed",
     upstreamText: upstreamText || task.upstreamText || "",
     errorMessage: responseMessage,
     statusCode,
@@ -4792,6 +4822,7 @@ async function failQueuedTask(task, error, attempts = [], stageTimings = []) {
       ok: false,
       message: responseMessage,
       ...(sourceTaskId ? { sourceTaskId } : {}),
+      ...(cancelled ? { taskStatus: "cancelled" } : {}),
       ...(statusCode ? { status: statusCode } : {}),
       ...(code ? { code } : {}),
       ...(failure ? imageFailureResponseFields(failure) : upstreamText ? { upstreamText } : {}),
@@ -4807,6 +4838,7 @@ async function failQueuedTask(task, error, attempts = [], stageTimings = []) {
       ...(error?.upstreamModel ? { upstreamModel: error.upstreamModel } : {}),
       ...(error?.selectedCarId ? { selectedCarId: error.selectedCarId } : {}),
       ...(error?.selectedCarType ? { selectedCarType: error.selectedCarType } : {}),
+      ...(cancelled ? { upstreamStatus: "cancelled", imageTaskCancelled: true } : {}),
       ...(Array.isArray(error?.carAttempts) && error.carAttempts.length
         ? { carAttempts: taskResponseJson(error.carAttempts) }
         : {}),

@@ -181,6 +181,19 @@ function errorUpstreamText(error, responseJson = {}) {
   return text.trim() ? text : "";
 }
 
+function isCancelledTaskError(error, responseJson = {}) {
+  const status = String(
+    error?.upstreamStatus
+      || responseJson?.upstreamStatus
+      || error?.status
+      || responseJson?.taskStatus
+      || ""
+  ).trim().toLowerCase();
+  return ["cancelled", "canceled"].includes(status)
+    || String(error?.code || responseJson?.code || "").trim().toLowerCase() === "upstream_task_cancelled"
+    || error?.imageTaskCancelled === true;
+}
+
 async function persistReturnedErrorTask(error, context, payload, status) {
   if (!shouldPersistReturnedErrorTask(error, payload)) return null;
   const responseJson = error.responseJson || error.task?.responseJson || {};
@@ -190,11 +203,13 @@ async function persistReturnedErrorTask(error, context, payload, status) {
   const attempts = error.attempts || responseJson.attempts || error.task?.attempts || [];
   const existing = error.task || null;
   const firstAttempt = Array.isArray(attempts) ? attempts[0] || {} : {};
+  const cancelled = isCancelledTaskError(error, responseJson);
   const now = new Date().toISOString();
   const responsePayload = {
     ok: false,
     message: payload.message,
     sourceTaskId,
+    ...(cancelled ? { taskStatus: "cancelled" } : {}),
     ...(status ? { status } : {}),
     ...(payload.code ? { code: payload.code } : {}),
     ...(payload.upstreamText ? { upstreamText: payload.upstreamText } : {}),
@@ -210,7 +225,7 @@ async function persistReturnedErrorTask(error, context, payload, status) {
     ...(existing || {}),
     id: existing?.id || `task-${randomUUID()}`,
     sourceTaskId,
-    status: "failed",
+    status: cancelled ? "cancelled" : "failed",
     taskType: existing?.taskType || context.taskType || "",
     prompt: existing?.prompt || context.input?.prompt || context.input?.message || "",
     modelId: existing?.modelId || context.input?.model_id || context.input?.modelId || context.input?.model || "",
@@ -236,7 +251,8 @@ async function persistReturnedErrorTask(error, context, payload, status) {
     raw: {
       ...(existing?.raw || {}),
       returnedError: true,
-      returnedErrorAt: now
+      returnedErrorAt: now,
+      ...(cancelled ? { upstreamStatus: "cancelled", imageTaskCancelled: true } : {})
     },
     completedAt: now,
     createdAt: existing?.createdAt || context.requestMeta?.calledAt || now
@@ -1464,7 +1480,7 @@ app.get("/v1/images/tasks/:id", { preHandler: requireApiKey }, async (request, r
   }
 
   const status = String(task.status || "").toLowerCase();
-  if (!["success", "failed", "interrupted"].includes(status)) reply.code(202);
+  if (!["success", "failed", "cancelled", "interrupted"].includes(status)) reply.code(202);
   return imageEditResponse(task);
 });
 
@@ -1512,7 +1528,9 @@ app.post("/v1/images/generations", { preHandler: requireApiKey }, async (request
     const task = request.query?.wait === "0"
       ? await queueTextTask(input, requestMeta)
       : await createTextTask(input, true, requestMeta);
-    if (task.status !== "success") reply.code(202);
+    if (!["success", "failed", "cancelled", "interrupted"].includes(String(task.status || "").toLowerCase())) {
+      reply.code(202);
+    }
     return imageEditResponse(task);
   } catch (error) {
     return sendError(reply, error, {
@@ -1549,7 +1567,9 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
     await reserveBeforeImageRead(input);
     const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta, admission });
     admissionTransferred = true;
-    if (task.status !== "success") reply.code(202);
+    if (!["success", "failed", "cancelled", "interrupted"].includes(String(task.status || "").toLowerCase())) {
+      reply.code(202);
+    }
     return imageEditResponse(task);
   } catch (error) {
     return sendError(reply, error, { requestMeta, input, files, taskType: "img2img" });

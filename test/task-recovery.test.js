@@ -259,6 +259,113 @@ test("正在执行的同步生图任务不会被刷新误判为结果待确认",
   }
 });
 
+test("上游取消会保存为 cancelled 并保留下游任务编号", async () => {
+  const config = await loadConfig();
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let submitCount = 0;
+  await saveConfig({
+    ...config,
+    defaultChannel: "cancelled-chatplus",
+    channels: [{
+      id: "cancelled-chatplus",
+      type: "chatplus",
+      name: "取消测试聊天渠道",
+      enabled: true,
+      settings: {
+        baseUrl: "https://chat.example.test",
+        defaultChatModel: "gpt",
+        chatModels: [{ key: "gpt", name: "GPT", enabled: true, default: true }]
+      }
+    }],
+    accounts: [{
+      id: "cancelled-chatplus-account",
+      channelId: "cancelled-chatplus",
+      name: "取消测试账号",
+      username: "cancelled@example.test",
+      password: "test",
+      enabled: true,
+      status: "ok"
+    }]
+  });
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    submitCount += 1;
+    await input.onSubmitted?.({
+      externalId: "cancelled-upstream-task",
+      status: "processing",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: "gpt",
+      imageCount: 0,
+      imageUrls: [],
+      raw: { conversationId: "cancelled-upstream-task" }
+    });
+    const error = new Error("上游已取消任务。");
+    error.upstreamExplicitFailure = true;
+    error.upstreamStatus = "cancelled";
+    error.imageSubmissionAttempted = true;
+    error.imageSubmissionConfirmed = true;
+    throw error;
+  };
+
+  try {
+    const sourceTaskId = "cancelled-downstream-task";
+    const result = await createImageTask({
+      input: {
+        channel: "cancelled-chatplus",
+        prompt: "测试上游取消",
+        client_task_id: sourceTaskId
+      },
+      files: [{
+        filename: "source.png",
+        mimetype: "image/png",
+        buffer: Buffer.from("source image")
+      }],
+      wait: true
+    });
+    const stored = await getTask(result.id);
+
+    assert.equal(submitCount, 1);
+    assert.equal(result.status, "cancelled");
+    assert.equal(stored.status, "cancelled");
+    assert.equal(stored.sourceTaskId, sourceTaskId);
+    assert.equal(stored.responseJson.sourceTaskId, sourceTaskId);
+    assert.equal(stored.responseJson.taskStatus, "cancelled");
+    assert.equal(stored.raw.upstreamStatus, "cancelled");
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+    await saveConfig(config);
+  }
+});
+
+test("已取消任务不会被旧的处理中结果覆盖", async () => {
+  const id = "task-cancelled-stale-refresh";
+  const completedAt = new Date().toISOString();
+  await upsertTask({
+    id,
+    status: "cancelled",
+    taskType: "img2img",
+    sourceTaskId: "cancelled-stale-source",
+    errorMessage: "上游已取消任务。",
+    responseJson: { taskStatus: "cancelled" },
+    raw: { queued: false, upstreamStatus: "cancelled" },
+    createdAt: completedAt,
+    completedAt
+  });
+  await upsertTask({
+    id,
+    status: "processing",
+    taskType: "img2img",
+    sourceTaskId: "cancelled-stale-source",
+    raw: { queued: true },
+    createdAt: completedAt,
+    completedAt: null
+  });
+
+  const stored = await getTask(id);
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.raw.upstreamStatus, "cancelled");
+});
+
 test("image fallback stores the real chat image channel before the final image is ready", async () => {
   const config = await loadConfig();
   await saveConfig({

@@ -819,7 +819,7 @@ test("Gemini 返回文字失败时只消耗一次提交并保留回复", async (
   assert.equal(submitted.length, 1);
 });
 
-test("图片上游取消时自动换车并标记被取消的车位", async () => {
+test("图片上游取消时立即结束，不自动换车，并标记被取消的车位", async () => {
   const testClient = client();
   const cars = ["cancelled-image-car", "healthy-image-car"];
   const selectedCars = [];
@@ -852,18 +852,24 @@ test("图片上游取消时自动换车并标记被取消的车位", async () =>
   };
   testClient.rememberImageSuccessfulCar = async () => {};
 
-  const result = await testClient.createTextTask({
-    prompt: "只返回图片",
-    model: "gpt-image-2"
-  });
+  await assert.rejects(
+    () => testClient.createTextTask({
+      prompt: "只返回图片",
+      model: "gpt-image-2"
+    }),
+    (error) => {
+      assert.equal(error.imageTaskCancelled, true);
+      assert.equal(error.upstreamStatus, "cancelled");
+      assert.equal(error.selectedCarId, "cancelled-image-car");
+      return true;
+    }
+  );
 
-  assert.deepEqual(selectedCars, cars);
+  assert.deepEqual(selectedCars, [cars[0]]);
   assert.equal(cooldowns.length, 1);
   assert.equal(cooldowns[0].carId, "cancelled-image-car");
   assert.equal(cooldowns[0].reason, "image_cancelled");
   assert.match(cooldowns[0].message, /上游已取消/);
-  assert.equal(result.status, "success");
-  assert.deepEqual(result.raw.carAttempts.map((item) => item.carId), ["cancelled-image-car"]);
 });
 
 test("Gemini 提交结果无法确认时最多换一个车位重试", async () => {

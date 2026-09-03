@@ -1730,7 +1730,7 @@ export async function listActiveTasks(options = {}) {
   });
 }
 
-const durableFinalTaskStatuses = new Set(["success", "failed"]);
+const durableFinalTaskStatuses = new Set(["success", "failed", "cancelled"]);
 const staleTaskStatuses = new Set(["processing", "queued", "pending", "unknown", "waiting_upstream", "interrupted"]);
 
 function taskSourceTaskId(value = {}) {
@@ -2188,6 +2188,7 @@ function shouldKeepStoredTask(current, incoming) {
   const currentStatus = taskStatus(current);
   const incomingStatus = taskStatus(incoming);
   if (currentStatus === "success" && incomingStatus !== "success") return true;
+  if (currentStatus === "cancelled" && incomingStatus !== "cancelled") return true;
   if (currentStatus === "failed" && staleTaskStatuses.has(incomingStatus)) return true;
   if (!durableFinalTaskStatuses.has(currentStatus)) return false;
   if (incomingStatus === currentStatus) return false;

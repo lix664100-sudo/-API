@@ -4963,7 +4963,6 @@ export class ChatplusClient {
       const ignoredCarIds = new Set();
       const quotaErrors = [];
       const temporaryRestrictionErrors = [];
-      const cancelledCarAttempts = [];
       let lastUpstreamModel = "";
       let lastQuotaModel = "";
       for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -4971,15 +4970,7 @@ export class ChatplusClient {
         try {
           conversation = await this.sendConversation(prompt, input, ignoredCarIds);
           lastUpstreamModel = conversation.upstreamModel || conversation.route?.model || lastUpstreamModel;
-          const result = await work(conversation);
-          if (!cancelledCarAttempts.length) return result;
-          return {
-            ...result,
-            carAttempts: [
-              ...cancelledCarAttempts,
-              ...(Array.isArray(result?.carAttempts) ? result.carAttempts : [])
-            ]
-          };
+          return await work(conversation);
         } catch (error) {
           if (conversation) error.upstreamModel ||= conversation.upstreamModel || conversation.route?.model || "";
           if (conversation?.selected && (
@@ -5006,21 +4997,9 @@ export class ChatplusClient {
             error.imageSubmissionConfirmed = conversation.submissionConfirmed !== false;
             error.selectedCarId ||= carId;
             error.selectedCarType ||= String(selected.carType || "").trim();
-            ignoredCarIds.add(carId);
-            cancelledCarAttempts.push({
-              carId,
-              carType: String(selected.carType || "").trim(),
-              message: `车位 ${carId}：${message}`,
-              upstreamText: String(error?.upstreamText || message).replace(/\s+/g, " ").trim()
-            });
             await this.rememberImageFailedCar(selected, error);
-            continue;
-          }
-          if (cancelledCarAttempts.length) {
-            error.carAttempts = [
-              ...cancelledCarAttempts,
-              ...(Array.isArray(error?.carAttempts) ? error.carAttempts : [])
-            ];
+            error.upstreamText ||= message;
+            throw error;
           }
           if (conversation) {
             error.imageSubmissionAttempted = true;
@@ -5028,28 +5007,6 @@ export class ChatplusClient {
           }
           throw error;
         }
-      }
-      if (
-        cancelledCarAttempts.length
-        && !quotaErrors.length
-        && !temporaryRestrictionErrors.length
-      ) {
-        const lastCancelled = cancelledCarAttempts.at(-1);
-        const error = new Error(
-          `已自动尝试 ${cancelledCarAttempts.length} 个生图车位，但上游都取消了任务。最后一次上游回复：${lastCancelled.message}`
-        );
-        error.status = 502;
-        error.code = "UPSTREAM_TASK_CANCELLED";
-        error.upstreamExplicitFailure = true;
-        error.upstreamStatus = "cancelled";
-        error.upstreamText = lastCancelled.upstreamText || lastCancelled.message;
-        error.selectedCarId = lastCancelled.carId;
-        error.selectedCarType = lastCancelled.carType;
-        error.carAttempts = cancelledCarAttempts;
-        error.imageSubmissionAttempted = true;
-        error.imageSubmissionConfirmed = true;
-        error.upstreamModel = lastUpstreamModel;
-        throw error;
       }
       const allCarErrors = [...quotaErrors, ...temporaryRestrictionErrors];
       const resetTime = Math.min(...allCarErrors
@@ -5065,7 +5022,6 @@ export class ChatplusClient {
         error.upstreamModel = lastUpstreamModel;
         error.imageSubmissionAttempted = true;
         error.imageSubmissionConfirmed = false;
-        if (cancelledCarAttempts.length) error.carAttempts = cancelledCarAttempts;
         throw error;
       }
       const error = imageQuotaError(`已自动尝试 ${quotaErrors.length} 个生图车位，但图片生成额度都已用完。`);
@@ -5075,7 +5031,6 @@ export class ChatplusClient {
       error.upstreamText = lastQuotaError?.upstreamText || lastQuotaError?.message || "";
       error.imageSubmissionAttempted = true;
       error.imageSubmissionConfirmed = false;
-      if (cancelledCarAttempts.length) error.carAttempts = cancelledCarAttempts;
       error.status = 429;
       error.upstreamModel = lastUpstreamModel;
       throw error;
