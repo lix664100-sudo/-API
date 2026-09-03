@@ -2709,7 +2709,9 @@ async function refreshTaskOnce(taskId, options = {}) {
       persistedUpdates,
       timeoutSec: FAST_TASK_REFRESH_TIMEOUT_SEC,
       forceReconnect
-    }));
+    }), {
+      parallel: channel.type === "chatplus" && Boolean(task.raw?.selectedCarId)
+    });
     refreshReadSucceeded = true;
   } catch (error) {
     if (storedMirrorError) {
@@ -2870,24 +2872,47 @@ async function interruptLostLocalImageTask(task) {
 
 export async function refreshProcessingTasks() {
   const tasks = await listActiveTasks({ includeInterrupted: true });
-  const results = [];
-  for (const task of tasks.filter((item) => needsTaskRefresh(item) || autoRetryableInterruptedTask(item))) {
-    try {
-      if (isLostLocalImageTask(task)) {
-        results.push({ id: task.id, ok: true, data: await interruptLostLocalImageTask(task) });
-        continue;
-      }
-      if (isLostLocalChatTask(task)) {
-        results.push({ id: task.id, ok: true, data: await failLostLocalChatTask(task) });
-        continue;
-      }
-      const refreshed = await refreshTask(task.id, { autoRetry: autoRetryableInterruptedTask(task) });
-      scheduleFastTaskRefresh(refreshed);
-      results.push({ id: task.id, ok: true, data: refreshed });
-    } catch (error) {
-      results.push({ id: task.id, ok: false, message: error.message });
-    }
+  const pending = tasks.filter((item) => needsTaskRefresh(item) || autoRetryableInterruptedTask(item));
+  const groups = new Map();
+  for (const task of pending) {
+    const selectedCar = task.channelType === "chatplus"
+      ? `${task.raw?.selectedCarType || "chatgpt"}:${task.raw?.selectedCarId || "default"}`
+      : "default";
+    const key = `${task.channelType || "unknown"}:${task.accountId || task.id}:${selectedCar}`;
+    const group = groups.get(key) || [];
+    group.push(task);
+    groups.set(key, group);
   }
+
+  const results = [];
+  const groupList = [...groups.values()];
+  let nextGroupIndex = 0;
+  const refreshGroup = async (group) => {
+    for (const task of group) {
+      try {
+        if (isLostLocalImageTask(task)) {
+          results.push({ id: task.id, ok: true, data: await interruptLostLocalImageTask(task) });
+          continue;
+        }
+        if (isLostLocalChatTask(task)) {
+          results.push({ id: task.id, ok: true, data: await failLostLocalChatTask(task) });
+          continue;
+        }
+        const refreshed = await refreshTask(task.id, { autoRetry: autoRetryableInterruptedTask(task) });
+        scheduleFastTaskRefresh(refreshed);
+        results.push({ id: task.id, ok: true, data: refreshed });
+      } catch (error) {
+        results.push({ id: task.id, ok: false, message: error.message });
+      }
+    }
+  };
+  const workerCount = Math.min(20, groupList.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextGroupIndex < groupList.length) {
+      const group = groupList[nextGroupIndex++];
+      await refreshGroup(group);
+    }
+  }));
   return results;
 }
 

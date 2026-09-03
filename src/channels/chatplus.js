@@ -5293,11 +5293,16 @@ export class ChatplusClient {
     const restoreConversationSession = async (reset = false) => {
       if (taskCarId) {
         return this.sessionLock(async () => {
+          const sameCarSession = this.portalLoggedIn
+            && this.carId === taskCarId
+            && this.carType === taskCarType;
           if (reset) this.resetSession();
           if (!this.portalLoggedIn) await this.performPortalLogin(requestOptions);
           this.carId = taskCarId;
           this.carType = taskCarType;
-          await this.performEnterCar(taskCarId, taskCarType, requestOptions);
+          if (reset || !sameCarSession) {
+            await this.performEnterCar(taskCarId, taskCarType, requestOptions);
+          }
           return this.createSubmitClient({ snapshot: this.sessionSnapshot() });
         });
       }

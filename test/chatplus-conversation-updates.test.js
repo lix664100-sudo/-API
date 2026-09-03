@@ -116,6 +116,36 @@ function createFakeWebSocket() {
   };
 }
 
+test("查询同一车位的多个任务会复用已进入的车位会话", async () => {
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://chatplus.example.test" } },
+    account: { id: "account-session-reuse", username: "test@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  testClient.portalLoggedIn = true;
+  testClient.carId = "car-reuse";
+  testClient.carType = "chatgpt";
+  testClient.ensureConversationUpdates = async () => null;
+  testClient.conversationDetail = async (conversationId) => ({
+    conversation_id: conversationId,
+    mapping: {}
+  });
+  testClient.imageGenerationTaskState = async () => null;
+  testClient.imageUrlsFrom = async () => [];
+  testClient.refreshCompletedConversation = async (_conversationId, detail) => detail;
+  testClient.createSubmitClient = () => testClient;
+  let enterCount = 0;
+  testClient.performEnterCar = async () => {
+    enterCount += 1;
+  };
+
+  await testClient.getTask("conversation-reuse", { carId: "car-reuse", carType: "chatgpt", imageTask: true });
+  await testClient.getTask("conversation-reuse", { carId: "car-reuse", carType: "chatgpt", imageTask: true });
+
+  assert.equal(enterCount, 0);
+});
+
 async function waitUntil(predicate, timeoutMs = 2000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
