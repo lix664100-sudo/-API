@@ -469,9 +469,16 @@ function cloneUploadAsset(asset = {}) {
   };
 }
 
+function isChatRecordDeletedError(error) {
+  const text = `${error?.message || ""} ${error?.body || ""} ${error?.upstreamText || ""}`;
+  return /聊天记录.{0,12}(?:删除|已删除)|换车继续聊|chat\s+(?:record|log).{0,60}deleted|conversation.{0,24}has been deleted/i.test(text);
+}
+
 function isRetryableImageSubmissionRejection(error) {
   if (error?.imageSubmissionAttempted !== true || error?.upstreamExplicitFailure !== true) return false;
   const status = Number(error?.status || error?.statusCode || 0);
+  // 上游把车位聊天记录删除后返回 404，要求“换车继续聊”，按车位故障换车重试。
+  if (status >= 400 && status < 500 && isChatRecordDeletedError(error)) return true;
   return status === 401 || (status === 403 && isExplicitAuthSessionError(error));
 }
 
@@ -3838,7 +3845,10 @@ export class ChatplusClient {
   }
 
   async rememberUnconfirmedCar(selected, error = null) {
-    const retryAt = Date.now() + UNCONFIRMED_CAR_TTL_MS;
+    // 上游“聊天记录已删除，请换车继续聊”属于临时状态，换车即可恢复，
+    // 不应按 24 小时冻结车位，改用普通车位故障的短暂冷却。
+    const cooldownMs = isChatRecordDeletedError(error) ? BAD_CAR_TTL_MS : UNCONFIRMED_CAR_TTL_MS;
+    const retryAt = Date.now() + cooldownMs;
     return this.rememberCarCooldown(
       selected,
       retryAt,
@@ -5024,6 +5034,14 @@ export class ChatplusClient {
         ) {
           const carId = String(selected.carId || "").trim();
           const reason = String(error?.message || "上游没有创建对话").replace(/\s+/g, " ").trim();
+          if (isChatRecordDeletedError(error)) {
+            // 上游删除了该车位的聊天记录并要求“换车继续聊”，属于临时状态：
+            // 短暂冻结当前车位并换下一个车位重试，不计入“连续两个车位没有创建对话”的失败次数。
+            recordCarError(`车位 ${carId} 的聊天记录已被上游删除，已自动换车重试。`);
+            await this.rememberUnconfirmedCar(selected, error);
+            await this.invalidatePreparedChatSession(preparedSession);
+            continue;
+          }
           const message = error?.conversationNotCreated === true
             ? reason
             : `车位 ${carId} 失效：上游没有创建对话。具体原因：${reason}`;

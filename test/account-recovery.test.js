@@ -1646,6 +1646,56 @@ test("GPT 聊天生图明确返回 401 时会换下一个车位", async () => {
   assert.deepEqual(selectedCars, ["deleted-chat-car", "healthy-chat-car"]);
 });
 
+test("GPT 聊天生图返回 404 聊天记录已删除时会自动换车重试", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-switch-on-404-deleted", username: "test@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  const selectedCars = [];
+  let requestCount = 0;
+  client.prepareChatSession = async (_input, ignoredCarIds) => {
+    const carId = ignoredCarIds.has("deleted-record-car") ? "healthy-record-car" : "deleted-record-car";
+    ignoredCarIds.add(carId);
+    selectedCars.push(carId);
+    return {
+      route: { key: "gpt", model: "" },
+      init: { default_model_slug: "gpt-5-6-thinking" },
+      selected: { carId, carType: "chatgpt" }
+    };
+  };
+  client.uploadChatImages = async () => [];
+  client.http = async () => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return {
+        status: 404,
+        headers: {},
+        body: JSON.stringify({
+          detail: {
+            message: "后端返回错误：404。该车队的聊天记录从官网获取失败，当前记录来自本站服务器，仅供查看。|The backend returned an error: 404, and the chat record of this account has been deleted, and the current record is only for viewing.请点击【换车继续聊】"
+          }
+        })
+      };
+    }
+    return {
+      status: 200,
+      headers: {},
+      body: "data: {\"conversation_id\":\"conversation-after-404-switch\"}\n\ndata: [DONE]\n\n"
+    };
+  };
+
+  const result = await client.sendConversation("404 聊天记录删除换车测试", {
+    imageGeneration: true,
+    requireConversationId: true
+  });
+
+  assert.equal(requestCount, 2);
+  assert.equal(result.conversationId, "conversation-after-404-switch");
+  assert.deepEqual(selectedCars, ["deleted-record-car", "healthy-record-car"]);
+});
+
 test("Grok 和 Gemini 即使返回 403，也会优先识别明确用完提示", async () => {
   const client = new ChatplusClient({
     config: {},
