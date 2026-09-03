@@ -5866,6 +5866,7 @@ function successfulChatAccountCheckStatus(currentStatus = {}, status = {}) {
   const nextStatus = reconcileChatUsageResetTimes(currentStatus, successfulAccountCheckStatus(status));
   const meta = { ...(nextStatus.meta || {}) };
   delete meta.proxyRestricted;
+  delete meta.proxyUnavailable;
   delete meta.upstreamMessage;
   const restriction = status.meta?.proCarRestriction;
   if (!restriction || typeof restriction !== "object") return { ...nextStatus, meta };
@@ -5935,17 +5936,20 @@ async function checkShareAIAbility(config, channel, account, ability) {
       : ability === "chatplus"
         ? accountStatusFromError(error, { explicitChatQuotaOnly: true })
         : accountStatusFromError(error);
+    const markedStatus = !proxyRestricted && isProxyUnavailableError(error, account)
+      ? withProxyUnavailableMark(errorStatus)
+      : errorStatus;
     const data = ability === "chatplus"
       ? preserveConfirmedChatQuota(currentStatus, {
-          ...errorStatus,
+          ...markedStatus,
           message: proxyRestricted ? "IP 被限制" : readableCheckErrorMessage(error),
           expireAt: ""
         })
       : {
-          ...errorStatus,
-          quota: errorStatus.quota ?? null,
-          balance: errorStatus.balance ?? null,
-          quotaResetAt: errorStatus.quotaResetAt || "",
+          ...markedStatus,
+          quota: markedStatus.quota ?? null,
+          balance: markedStatus.balance ?? null,
+          quotaResetAt: markedStatus.quotaResetAt || "",
           expireAt: "",
           message: readableCheckErrorMessage(error)
         };
@@ -6002,6 +6006,25 @@ function proxyRestrictedStatus(error) {
     meta: {
       proxyRestricted: true,
       upstreamMessage: String(error?.message || "")
+    }
+  };
+}
+
+function isProxyUnavailableError(error, account) {
+  if (!String(accountProxyValue(account) || "").trim()) return false;
+  const code = Number(error?.curlCode || 0);
+  if (code === 96 || code === 97) return true;
+  if (String(error?.code || "") === "CURL_PROXY_ERROR") return true;
+  return /User was rejected by the SOCKS\d server|rejected by the SOCKS\d server|SOCKS\d server \(\d|remote proxy host refused/i
+    .test(String(error?.message || ""));
+}
+
+function withProxyUnavailableMark(status) {
+  return {
+    ...status,
+    meta: {
+      ...(status.meta && typeof status.meta === "object" ? status.meta : {}),
+      proxyUnavailable: true
     }
   };
 }
@@ -6206,11 +6229,14 @@ async function performAccountCheck(accountId) {
       : accountStatusFromError(error, {
           explicitChatQuotaOnly: channel.type === "chatplus"
         });
+    const markedStatus = !proxyRestricted && isProxyUnavailableError(error, account)
+      ? withProxyUnavailableMark(errorStatus)
+      : errorStatus;
     const checkedStatus = {
-      ...errorStatus,
-      quota: channel.type === "chatplus" ? null : errorStatus.quota ?? null,
-      balance: channel.type === "chatplus" ? null : errorStatus.balance ?? null,
-      quotaResetAt: errorStatus.quotaResetAt || "",
+      ...markedStatus,
+      quota: channel.type === "chatplus" ? null : markedStatus.quota ?? null,
+      balance: channel.type === "chatplus" ? null : markedStatus.balance ?? null,
+      quotaResetAt: markedStatus.quotaResetAt || "",
       expireAt: "",
       message
     };

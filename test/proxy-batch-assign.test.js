@@ -148,6 +148,50 @@ test("IP 被限制分类只替换被限制的启用账号", async () => {
   assert.equal(stored.accounts.find((item) => item.id === "no-proxy").proxyUrl, "");
 });
 
+test("代理异常账号会被 IP 被限制分类匹配并在换 IP 后清除标记", async () => {
+  await seedConfig([
+    account("proxy-error", "channel-a", {
+      proxyUrl: oldProxy,
+      status: "error",
+      meta: { proxyUnavailable: true }
+    }),
+    account("ability-proxy-error", "channel-a", {
+      proxyUrl: oldProxy,
+      status: "error",
+      meta: { abilities: { chatplus: { meta: { proxyUnavailable: true } } } }
+    }),
+    account("plain-error", "channel-a", { proxyUrl: oldProxy, status: "error" }),
+    account("ok", "channel-a", { proxyUrl: proxyA })
+  ]);
+
+  const preview = await previewAccountProxyAssignments({
+    channelIds: ["channel-a"],
+    proxies: [proxyB],
+    targetType: "restricted",
+    allowReuse: true
+  });
+  assert.deepEqual(preview.rows.map((row) => row.accountId).sort(), ["ability-proxy-error", "proxy-error"]);
+
+  await applyAccountProxyAssignments({
+    channelIds: preview.channelIds,
+    proxies: preview.proxies,
+    targetType: preview.targetType,
+    allowReuse: preview.allowReuse,
+    snapshot: preview.snapshot,
+    assignments: preview.rows.map((row) => ({ accountId: row.accountId, proxyUrl: proxyB }))
+  });
+
+  const stored = await loadConfig();
+  const switched = stored.accounts.find((item) => item.id === "proxy-error");
+  assert.equal(switched.proxyUrl, proxyB);
+  assert.equal(switched.meta.proxyUnavailable, undefined);
+  const abilitySwitched = stored.accounts.find((item) => item.id === "ability-proxy-error");
+  assert.equal(abilitySwitched.proxyUrl, proxyB);
+  assert.equal(abilitySwitched.meta.proxyUnavailable, undefined);
+  assert.equal(stored.accounts.find((item) => item.id === "plain-error").proxyUrl, oldProxy);
+  assert.equal(stored.accounts.find((item) => item.id === "ok").proxyUrl, proxyA);
+});
+
 test("每个 IP 只用一次时会避开其他类型账号正在使用的 IP", async () => {
   const preview = await previewAccountProxyAssignments({
     channelIds: ["channel-a", "channel-b"],

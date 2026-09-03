@@ -1297,6 +1297,26 @@ function accountProxyExpired(account) {
   return Number.isFinite(expiryTime) && expiryTime < Date.now();
 }
 
+const proxyUnavailableMessagePattern = /User was rejected by the SOCKS\d server|rejected by the SOCKS\d server|SOCKS\d server \(\d|remote proxy host refused|Failed to connect to .* proxy|Couldn't connect to server via proxy|CURL_PROXY_ERROR/i;
+
+function accountProxyUnavailableMarked(account) {
+  if (account.meta?.proxyUnavailable === true) return true;
+  if (account.meta?.abilities?.chatplus?.meta?.proxyUnavailable === true) return true;
+  if (account.meta?.abilities?.drawing?.meta?.proxyUnavailable === true) return true;
+  const statuses = [
+    account.status,
+    account.meta?.abilities?.chatplus?.status,
+    account.meta?.abilities?.drawing?.status
+  ].map((status) => String(status || "").toLowerCase());
+  if (!statuses.includes("error")) return false;
+  const messages = [
+    account.message,
+    account.meta?.abilities?.chatplus?.message,
+    account.meta?.abilities?.drawing?.message
+  ].filter(Boolean).join("；");
+  return proxyUnavailableMessagePattern.test(messages);
+}
+
 function proxyAssignmentTargetMatches(account, targetType) {
   if (account.enabled === false) return false;
   const hasProxy = Boolean(String(account.proxyUrl || "").trim());
@@ -1307,6 +1327,9 @@ function proxyAssignmentTargetMatches(account, targetType) {
       || account.meta?.proxyRestricted === true
       || account.meta?.abilities?.chatplus?.status === "proxy_restricted"
       || account.meta?.abilities?.chatplus?.meta?.proxyRestricted === true
+      || account.meta?.abilities?.drawing?.status === "proxy_restricted"
+      || account.meta?.abilities?.drawing?.meta?.proxyRestricted === true
+      || accountProxyUnavailableMarked(account)
     );
   }
   if (!hasProxy) return false;
@@ -1596,6 +1619,8 @@ export async function applyAccountProxyAssignments(input = {}) {
       if (String(account.proxyUrl || "").trim() === proxyUrl) return account;
       const meta = { ...(account.meta || {}) };
       delete meta.proxyCheck;
+      delete meta.proxyRestricted;
+      delete meta.proxyUnavailable;
       return { ...account, proxyUrl, meta };
     });
     const rows = targetAccounts.map((account) => ({
