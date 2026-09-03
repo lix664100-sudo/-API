@@ -1,0 +1,12 @@
+import { readFileSync, writeFileSync } from "node:fs";
+const patchPath = ".codex-tmp/patch-chatplus.mjs";
+let s = readFileSync(patchPath, "utf8");
+const start = s.indexOf("function apply(oldText, newText, label) {");
+if (start === -1) throw new Error("apply() not found");
+const endMarker = "\n}\n";
+const end = s.indexOf(endMarker, start);
+if (end === -1) throw new Error("apply() end not found");
+const newFn = readFileSync(".codex-tmp/newapply.txt", "utf8").replace(/^\uFEFF/, "").trimEnd();
+s = s.slice(0, start) + newFn + "\n" + s.slice(end + endMarker.length);
+writeFileSync(patchPath, s);
+console.log("replaced, new size:", s.length);

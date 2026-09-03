@@ -1,0 +1,36 @@
+import { readFileSync, writeFileSync } from "node:fs";
+const path = ".codex-tmp/patch-chatplus.mjs";
+let s = readFileSync(path, "utf8");
+
+const start = s.indexOf("function apply(oldText, newText, label) {");
+if (start === -1) throw new Error("apply() not found");
+const endMarker = "\n}\n";
+const end = s.indexOf(endMarker, start);
+if (end === -1) throw new Error("apply() end not found");
+const stop = end + endMarker.length;
+
+const newFn = `function escapeRegExpLine(line) {
+  return line.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
+}
+
+function apply(oldText, newText, label) {
+  const needleLines = oldText.replace(/\\r\\n/g, "\\n").split("\\n");
+  const pattern = new RegExp(needleLines.map(escapeRegExpLine).join("\\\\r?\\\\n"), "g");
+  const matches = [...src.matchAll(pattern)];
+  if (matches.length === 0) throw new Error(\`[\${label}] no match found\`);
+  if (matches.length > 1) throw new Error(\`[\${label}] ambiguous: \${matches.length} occurrences\`);
+  const match = matches[0];
+  const matchedText = match[0];
+  const crlfCount = (matchedText.match(/\\r\\n/g) || []).length;
+  const bareLfCount = (matchedText.match(/(?<!\\r)\\n/g) || []).length;
+  const eol = crlfCount > bareLfCount ? "\\r\\n" : "\\n";
+  const replacement = newText.replace(/\\r\\n/g, "\\n").split("\\n").join(eol);
+  src = src.slice(0, match.index) + replacement + src.slice(match.index + matchedText.length);
+  applied += 1;
+  console.log(\`ok: \${label}\`);
+}
+`;
+
+s = s.slice(0, start) + newFn + s.slice(stop);
+writeFileSync(path, s);
+console.log("apply() replaced. new length:", s.length);
