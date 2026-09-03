@@ -2435,6 +2435,72 @@ test("停用账号的等待上游旧任务不会继续登录刷新", async () =>
   }
 });
 
+test("停用账号恢复后会自动重新查询此前中断的上游生图任务", async () => {
+  const originalConfig = await loadConfig();
+  const account = {
+    id: "account-auto-retry-after-recovery",
+    channelId: "shareai",
+    name: "自动恢复测试账号",
+    username: "auto-retry@example.com",
+    password: "test",
+    enabled: false,
+    status: "ok",
+    meta: { abilities: { chatplus: { status: "ok", message: "聊天账号可用" } } }
+  };
+  await saveConfig({ ...originalConfig, defaultChannel: "shareai", accounts: [account] });
+
+  const id = "task-auto-retry-after-recovery";
+  await upsertTask({
+    id,
+    externalId: "conversation-auto-retry-after-recovery",
+    status: "waiting_upstream",
+    taskType: "img2img",
+    prompt: "账号恢复后自动查询",
+    channelId: "shareai:chatplus",
+    channelName: "ShareAI账号/聊天生图",
+    channelType: "chatplus",
+    accountId: account.id,
+    accountName: account.name,
+    raw: { submitted: true, submittedAt: new Date().toISOString() },
+    createdAt: new Date().toISOString(),
+    completedAt: null
+  });
+
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  let getTaskCount = 0;
+  ChatplusClient.prototype.getTask = async (externalId) => {
+    getTaskCount += 1;
+    return {
+      externalId,
+      status: "success",
+      imageCount: 1,
+      imageUrls: ["https://example.test/recovered-image.png"],
+      errorMessage: "",
+      raw: { conversationId: externalId }
+    };
+  };
+
+  try {
+    await refreshProcessingTasks();
+    const interrupted = await getTask(id);
+    assert.equal(getTaskCount, 0);
+    assert.equal(interrupted.status, "interrupted");
+    assert.equal(interrupted.raw.disabledRefreshSkipped, true);
+
+    await saveConfig({ ...originalConfig, defaultChannel: "shareai", accounts: [{ ...account, enabled: true }] });
+    await refreshProcessingTasks();
+    const recovered = await getTask(id);
+    assert.ok(getTaskCount >= 1);
+    assert.equal(recovered.status, "success");
+    assert.equal(recovered.imageCount, 1);
+    assert.equal(recovered.raw.interrupted, false);
+    assert.equal(recovered.raw.manualRefreshAvailable, false);
+  } finally {
+    ChatplusClient.prototype.getTask = originalGetTask;
+    await saveConfig(originalConfig);
+  }
+});
+
 test("旧任务所属账号缺失时会停止自动查询，账号恢复后可手动重查", async () => {
   const config = await loadConfig();
   await saveConfig({

@@ -1801,6 +1801,14 @@ function retryableInterruptedUpstreamTask(task = {}) {
     );
 }
 
+function autoRetryableInterruptedTask(task = {}) {
+  return task.status === "interrupted"
+    && task.raw?.disabledRefreshSkipped === true
+    && task.raw?.manualRefreshAvailable === true
+    && task.raw?.submitted === true
+    && savedTaskExternalId(task);
+}
+
 async function keepUpstreamRefreshRecoverable(task, error, timeoutSec, options = {}) {
   const now = new Date().toISOString();
   const raw = refreshErrorRaw(task, error, now);
@@ -2612,6 +2620,7 @@ async function refreshTaskOnce(taskId, options = {}) {
     return interruptMissingRefreshTarget(task, error);
   }
   if (refreshTargetDisabled(channel, account)) {
+    if (options.autoRetry === true) return task;
     return interruptDisabledRefreshTask(task, channel, account);
   }
   const client = getWorkClient(config, channel, account);
@@ -2846,9 +2855,9 @@ async function interruptLostLocalImageTask(task) {
 }
 
 export async function refreshProcessingTasks() {
-  const tasks = await listActiveTasks();
+  const tasks = await listActiveTasks({ includeInterrupted: true });
   const results = [];
-  for (const task of tasks.filter(needsTaskRefresh)) {
+  for (const task of tasks.filter((item) => needsTaskRefresh(item) || autoRetryableInterruptedTask(item))) {
     try {
       if (isLostLocalImageTask(task)) {
         results.push({ id: task.id, ok: true, data: await interruptLostLocalImageTask(task) });
@@ -2858,7 +2867,7 @@ export async function refreshProcessingTasks() {
         results.push({ id: task.id, ok: true, data: await failLostLocalChatTask(task) });
         continue;
       }
-      const refreshed = await refreshTask(task.id);
+      const refreshed = await refreshTask(task.id, { autoRetry: autoRetryableInterruptedTask(task) });
       scheduleFastTaskRefresh(refreshed);
       results.push({ id: task.id, ok: true, data: refreshed });
     } catch (error) {

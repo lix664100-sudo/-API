@@ -1711,10 +1711,11 @@ export async function listTasks() {
   return tasks;
 }
 
-export async function listActiveTasks() {
+export async function listActiveTasks(options = {}) {
   await tasksWriteQueue.catch(() => {});
   const database = await getStorageDatabase();
   const statuses = ["processing", "queued", "pending", "unknown", "waiting_upstream"];
+  if (options.includeInterrupted === true) statuses.push("interrupted");
   return database.prepare(`
     SELECT payload
     FROM tasks
