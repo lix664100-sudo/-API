@@ -819,6 +819,53 @@ test("Gemini 返回文字失败时只消耗一次提交并保留回复", async (
   assert.equal(submitted.length, 1);
 });
 
+test("图片上游取消时自动换车并标记被取消的车位", async () => {
+  const testClient = client();
+  const cars = ["cancelled-image-car", "healthy-image-car"];
+  const selectedCars = [];
+  const cooldowns = [];
+  testClient.onImageCarCooldown = async (cooldown) => cooldowns.push(cooldown);
+  testClient.sendConversation = async (_prompt, _input, ignoredCarIds) => {
+    const carId = cars.find((item) => !ignoredCarIds.has(item));
+    assert.ok(carId);
+    ignoredCarIds.add(carId);
+    selectedCars.push(carId);
+    return {
+      events: [],
+      conversationId: `conversation-${carId}`,
+      model: "gpt",
+      upstreamModel: "gpt-5-6-thinking",
+      route: { key: "gpt", model: "gpt-5-6-thinking", carType: "chatgpt" },
+      selected: { carId, carType: "chatgpt" },
+      submissionConfirmed: true
+    };
+  };
+  testClient.captureImageTaskRegistration = async () => {};
+  testClient.waitForConversationImages = async (_events, conversationId) => {
+    if (conversationId === "conversation-cancelled-image-car") {
+      const error = new Error("上游已取消任务。");
+      error.upstreamExplicitFailure = true;
+      error.upstreamStatus = "cancelled";
+      throw error;
+    }
+    return ["https://example.test/healthy-generated-image.png"];
+  };
+  testClient.rememberImageSuccessfulCar = async () => {};
+
+  const result = await testClient.createTextTask({
+    prompt: "只返回图片",
+    model: "gpt-image-2"
+  });
+
+  assert.deepEqual(selectedCars, cars);
+  assert.equal(cooldowns.length, 1);
+  assert.equal(cooldowns[0].carId, "cancelled-image-car");
+  assert.equal(cooldowns[0].reason, "image_cancelled");
+  assert.match(cooldowns[0].message, /上游已取消/);
+  assert.equal(result.status, "success");
+  assert.deepEqual(result.raw.carAttempts.map((item) => item.carId), ["cancelled-image-car"]);
+});
+
 test("Gemini 提交结果无法确认时最多换一个车位重试", async () => {
   const testClient = client();
   testClient.geminiSession = {

@@ -80,6 +80,35 @@ test("required image mirroring fails instead of returning a broken upstream link
   assert.equal(attempts, 1);
 });
 
+test("multiple images are mirrored in parallel and keep their input order", async () => {
+  const started = [];
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const urls = [1, 2, 3].map((id) => `https://claude.midjourneye.com/gemini/images/gg-dl/parallel-${id}`);
+
+  const pending = mirrorImageUrls(urls, {
+    publicBaseUrl: "https://api.example.test",
+    imageStorage: { mode: "smart", autoCleanup: false, retentionDays: 7 }
+  }, {
+    attempts: 1,
+    downloadImage: async (source) => {
+      started.push(source);
+      if (started.length === urls.length) release();
+      await gate;
+      return { buffer: Buffer.from([started.indexOf(source) + 1]), contentType: "image/png" };
+    }
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(started.length, urls.length);
+  release();
+  const mirrored = await pending;
+  assert.equal(mirrored.length, urls.length);
+  assert.ok(mirrored.every((url) => url.startsWith("https://api.example.test/uploads/results/")));
+});
+
 test("Gemini image mirroring can use an authenticated channel downloader", async () => {
   const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 5, 6, 7, 8]);
   const calls = [];
@@ -101,4 +130,31 @@ test("Gemini image mirroring can use an authenticated channel downloader", async
   assert.equal(calls[0].options.timeoutMs, 90000);
   const filename = path.basename(new URL(url).pathname);
   assert.deepEqual(await readFile(path.join(resultImageDir, filename)), imageBytes);
+});
+
+test("image mirroring can reject a downloaded copy of the input image", async () => {
+  const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 9, 8, 7, 6]);
+  let validated = 0;
+
+  await assert.rejects(
+    () => mirrorImageUrls([
+      "https://claude.midjourneye.com/gemini/images/gg-dl/duplicate-input"
+    ], {
+      imageStorage: { mode: "smart", autoCleanup: false, retentionDays: 7 }
+    }, {
+      attempts: 1,
+      downloadImage: async () => ({ buffer: imageBytes, contentType: "image/png" }),
+      validateDownload: ({ buffer, source }) => {
+        validated += 1;
+        assert.equal(source, "https://claude.midjourneye.com/gemini/images/gg-dl/duplicate-input");
+        assert.deepEqual(buffer, imageBytes);
+        throw Object.assign(new Error("上游返回的图片与原图相同，等待重新获取最终生成图。"), {
+          code: "DUPLICATE_INPUT_IMAGE_RESULT"
+        });
+      }
+    }),
+    (error) => error.code === "DUPLICATE_INPUT_IMAGE_RESULT"
+  );
+
+  assert.equal(validated, 1);
 });

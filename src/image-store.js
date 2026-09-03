@@ -246,6 +246,9 @@ export async function mirrorImageUrl(url, config = {}, options = {}) {
   const source = String(url || "").trim();
   if (!source || isLocalResultUrl(source, config)) return source;
   const { buffer, contentType } = await downloadImageWithRetry(source, options);
+  if (typeof options.validateDownload === "function") {
+    await options.validateDownload({ buffer, contentType, source });
+  }
   await mkdir(resultImageDir, { recursive: true });
   const filename = `${Date.now()}-${randomUUID()}${extFromContentType(contentType)}`;
   await writeFile(path.join(resultImageDir, filename), buffer);
@@ -254,15 +257,12 @@ export async function mirrorImageUrl(url, config = {}, options = {}) {
 }
 
 export async function mirrorImageUrls(urls = [], config = {}, options = {}) {
-  const results = [];
-  for (const url of Array.isArray(urls) ? urls : []) {
-    if (!shouldMirrorImageUrl(url, config)) {
-      results.push(url);
-      continue;
-    }
-    results.push(await mirrorImageUrl(url, config, options));
-  }
-  return results;
+  const sources = Array.isArray(urls) ? urls : [];
+  return Promise.all(sources.map((url) => (
+    shouldMirrorImageUrl(url, config)
+      ? mirrorImageUrl(url, config, options)
+      : url
+  )));
 }
 
 export function setRuntimePublicBaseUrl(value) {

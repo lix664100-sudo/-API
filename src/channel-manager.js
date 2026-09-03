@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   ChatplusClient,
   isChatImageIntermediateResponse,
@@ -2070,21 +2070,15 @@ async function persistTaskStageStart(task, stage, channel, account) {
   return nextTask;
 }
 
-async function mirrorTaskImageUrls(imageUrls, config, downloadImage) {
-  const mirroredUrls = [];
-
-  for (const imageUrl of imageUrls) {
-    const [mirroredUrl] = await mirrorImageUrls([imageUrl], config, {
-      downloadImage,
-      attempts: 1
-    });
-    mirroredUrls.push(mirroredUrl);
-  }
-
-  return mirroredUrls;
+async function mirrorTaskImageUrls(imageUrls, config, downloadImage, validateDownload) {
+  return mirrorImageUrls(imageUrls, config, {
+    downloadImage,
+    attempts: 1,
+    validateDownload
+  });
 }
 
-async function mirrorTaskImages(result, config, client = null) {
+async function mirrorTaskImages(result, config, client = null, options = {}) {
   const imageUrls = usableImageResultUrls(result?.imageUrls);
   if (!imageUrls.length) return result;
   const downloadImage = typeof result?.downloadImage === "function"
@@ -2098,8 +2092,23 @@ async function mirrorTaskImages(result, config, client = null) {
       : undefined;
   const startedAt = Date.now();
   let mirroredUrls;
+  const inputImageHashes = new Set(
+    (options.inputImageHashes || result?.raw?.inputImageHashes || [])
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter((value) => /^[a-f0-9]{64}$/.test(value))
+  );
+  const validateDownload = inputImageHashes.size && result?.taskType === "img2img"
+    ? ({ buffer }) => {
+        const hash = createHash("sha256").update(buffer).digest("hex");
+        if (!inputImageHashes.has(hash)) return;
+        const error = new Error("上游返回的图片与原图相同，等待重新获取最终生成图。");
+        error.code = "DUPLICATE_INPUT_IMAGE_RESULT";
+        error.retryableImageResult = true;
+        throw error;
+      }
+    : null;
   try {
-    mirroredUrls = await mirrorTaskImageUrls(imageUrls, config, downloadImage);
+    mirroredUrls = await mirrorTaskImageUrls(imageUrls, config, downloadImage, validateDownload);
   } catch (error) {
     error.taskStageTiming = completedTaskStage("result_save", "保存图片", startedAt, "failed", error);
     throw error;
@@ -2661,7 +2670,9 @@ async function refreshTaskOnce(taskId, options = {}) {
           originalImageUrls,
           imageMirrorPending: false
         }
-      }, config, client);
+      }, config, client, {
+        inputImageHashes: task.raw?.inputImageHashes
+      });
       const nextTask = mergeRefreshedTask(task, result, channel, account);
       await upsertTask(nextTask);
       await recordTaskStat(nextTask);
@@ -2753,7 +2764,9 @@ async function refreshTaskOnce(taskId, options = {}) {
 
   let result;
   try {
-    result = await mirrorTaskImages(refreshInput, config, client);
+    result = await mirrorTaskImages(refreshInput, config, client, {
+      inputImageHashes: task.raw?.inputImageHashes
+    });
   } catch (error) {
     const replacementUrls = usableImageResultUrls(refreshInput.imageUrls);
     if (!replacementUrls.length && !storedMirrorError) throw error;
@@ -4441,6 +4454,17 @@ function imageFiles(inputFiles) {
   return Array.isArray(inputFiles) ? inputFiles.filter(Boolean) : inputFiles ? [inputFiles] : [];
 }
 
+async function imageFileHashes(files = []) {
+  const hashes = [];
+  for (const file of imageFiles(files)) {
+    if (typeof file?.toBuffer !== "function") continue;
+    const buffer = await file.toBuffer();
+    if (!buffer?.length) continue;
+    hashes.push(createHash("sha256").update(buffer).digest("hex"));
+  }
+  return hashes;
+}
+
 function assertImageFileCount(files) {
   if (!files.length) {
     const error = new Error("请上传源图。");
@@ -5000,7 +5024,9 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
             result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
           }
-          result = await mirrorTaskImages(result, config, client);
+          result = await mirrorTaskImages(result, config, client, {
+            inputImageHashes: taskState.raw?.inputImageHashes
+          });
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
           taskType: "text2img",
@@ -5190,7 +5216,9 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           if (channel.type === "drawing" && !isFinishedTask(result.status)) {
             result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
           }
-          result = await mirrorTaskImages(result, config, client);
+          result = await mirrorTaskImages(result, config, client, {
+            inputImageHashes: taskState.raw?.inputImageHashes
+          });
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
           taskType: "img2img",
@@ -5500,6 +5528,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   }
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files);
+  const inputImageHashes = await imageFileHashes(files);
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
   const requestedAccountId = String(input.accountId || input.account_id || "").trim();
@@ -5528,7 +5557,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
     taskType: "img2img",
     requestMeta,
     status: "processing",
-    raw: {}
+    raw: inputImageHashes.length ? { inputImageHashes } : {}
   });
   try {
     reserved?.handoff?.();
@@ -6367,6 +6396,7 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
   const files = imageFiles(inputFiles || file);
   assertImageFileCount(files);
   if (!wait) return queueImageTask({ input, files, requestMeta, admission });
+  const inputImageHashes = await imageFileHashes(files);
 
   const config = await loadRuntimeConfig();
   const requestedChannel = requestedChannelForInput(config, input);
@@ -6393,7 +6423,13 @@ export async function createImageTask({ input = {}, file, files: inputFiles, wai
     ? orderedTargets(targets, reserved)
     : await orderTargetsByRoutingUsage(targets, "img2img", input);
 
-  const task = queuedTask({ input: { ...input, files }, target: reserved?.target || executionTargets[0], taskType: "img2img", requestMeta });
+  const task = queuedTask({
+    input: { ...input, files },
+    target: reserved?.target || executionTargets[0],
+    taskType: "img2img",
+    requestMeta,
+    raw: inputImageHashes.length ? { inputImageHashes } : {}
+  });
   try {
     reserved?.handoff?.();
     await upsertTask(task);

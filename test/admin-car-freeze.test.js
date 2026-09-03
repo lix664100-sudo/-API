@@ -60,6 +60,13 @@ test("账号页面只保留仍在生效的冻结车位并按恢复时间排序",
   assert.equal(carFreezeRecoveryText(freezes[0].cooldownUntil, now), "14 分钟后恢复");
 });
 
+test("账号页面明确显示上游取消的生图车位", () => {
+  assert.equal(
+    carFreezeReason({ reason: "image_cancelled" }),
+    "上游取消了图片任务，等待自动复查"
+  );
+});
+
 test("旧记录中的短暂繁忙不会误显示为长时间冻结", () => {
   const now = Date.parse("2026-08-25T18:07:00+08:00");
   const account = {

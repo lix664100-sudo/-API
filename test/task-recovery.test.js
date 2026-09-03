@@ -1911,6 +1911,134 @@ test("图片保存失败后交给后台重试，不在同一轮连续下载", as
   }
 });
 
+test("图生图先返回原图时等待上游的新图，不会把原图保存成结果", async () => {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    publicBaseUrl: "https://api.example.test",
+    imageStorage: { mode: "smart", autoCleanup: false, retentionDays: 7 },
+    accounts: [{
+      id: "account-duplicate-input-result",
+      channelId: "shareai",
+      name: "原图误收测试账号",
+      username: "duplicate-input-result@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+
+  const sourceBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3]);
+  const generatedBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 9, 8, 7, 6]);
+  const duplicateUrl = "https://one.aishare.icu/gemini/images/gg-dl/duplicate-input-result";
+  const generatedUrl = "https://one.aishare.icu/gemini/images/gg-dl/generated-result";
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  const originalDownloadResultImage = ChatplusClient.prototype.downloadResultImage;
+  const downloadedUrls = [];
+  let localFilename = "";
+  let getTaskCalls = 0;
+
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    await input.onSubmitted?.({
+      externalId: "c_duplicate_input_result",
+      status: "processing",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: "gemini",
+      imageCount: 0,
+      imageUrls: [],
+      raw: {
+        conversationId: "c_duplicate_input_result",
+        chatModel: "gemini",
+        selectedCarId: "gemini-car",
+        selectedCarType: "gemini"
+      }
+    });
+    return {
+      externalId: "c_duplicate_input_result",
+      status: "success",
+      taskType: "img2img",
+      prompt: input.prompt,
+      modelId: "gemini",
+      imageCount: 1,
+      imageUrls: [duplicateUrl],
+      raw: {
+        conversationId: "c_duplicate_input_result",
+        chatModel: "gemini",
+        selectedCarId: "gemini-car",
+        selectedCarType: "gemini"
+      }
+    };
+  };
+  ChatplusClient.prototype.getTask = async (externalId) => {
+    getTaskCalls += 1;
+    return {
+      externalId,
+      status: "success",
+      imageCount: 1,
+      imageUrls: [generatedUrl],
+      errorMessage: "",
+      raw: {
+        conversationId: externalId,
+        selectedCarId: "gemini-car",
+        selectedCarType: "gemini"
+      }
+    };
+  };
+  ChatplusClient.prototype.downloadResultImage = async (url) => {
+    downloadedUrls.push(url);
+    return {
+      buffer: url === duplicateUrl ? sourceBytes : generatedBytes,
+      contentType: "image/png"
+    };
+  };
+
+  try {
+    const waiting = await createImageTask({
+      input: {
+        channel: "chatplus",
+        model: "gemini",
+        accountId: "account-duplicate-input-result",
+        prompt: "等待真正的生成图"
+      },
+      files: [{
+        filename: "source.png",
+        mimetype: "image/png",
+        toBuffer: async () => sourceBytes
+      }],
+      wait: true
+    });
+
+    assert.equal(waiting.status, "waiting_upstream");
+    assert.equal(waiting.raw.imageMirrorPending, true);
+    assert.equal(waiting.raw.resultSaveErrorCode, "DUPLICATE_INPUT_IMAGE_RESULT");
+    assert.deepEqual(downloadedUrls, [duplicateUrl]);
+
+    const recovered = await refreshTask(waiting.id);
+    assert.equal(recovered.status, "success");
+    assert.equal(getTaskCalls, 1);
+    assert.deepEqual(downloadedUrls, [duplicateUrl, duplicateUrl, generatedUrl]);
+    assert.equal(recovered.imageCount, 1);
+    assert.match(recovered.imageUrls[0], /^https:\/\/api\.example\.test\/uploads\/results\/.+\.png$/);
+    localFilename = path.basename(new URL(recovered.imageUrls[0]).pathname);
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+    ChatplusClient.prototype.getTask = originalGetTask;
+    ChatplusClient.prototype.downloadResultImage = originalDownloadResultImage;
+    await saveConfig(config);
+    if (localFilename) {
+      await rm(path.join(process.cwd(), "outputs", "results", localFilename), { force: true });
+    }
+  }
+});
+
 test("Gemini 旧图片地址失效后会读取新地址并恢复", async () => {
   const config = await loadConfig();
   await saveConfig({
