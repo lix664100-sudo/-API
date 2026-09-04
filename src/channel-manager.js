@@ -83,6 +83,18 @@ const MAX_TASK_REFRESH_SESSIONS = 5000;
 const UPSTREAM_RESULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS = 20;
+export function imagePreSubmitRetryDelays(value = process.env.IMAGE_PRE_SUBMIT_RETRY_DELAYS_MS) {
+  const configured = String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map(Number)
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .slice(0, 3);
+  return configured.length ? configured : [5000, 15000, 30000];
+}
+
+const IMAGE_PRE_SUBMIT_RETRY_DELAYS_MS = imagePreSubmitRetryDelays();
 const TASK_SLOT_RECHECK_MS = 1000;
 const PROXY_GUARDED_CLIENT_METHODS = new Set([
   "check",
@@ -5342,6 +5354,70 @@ function drawingSubmitWaitTimeoutSec(config = {}) {
   return Math.min(configured, DRAWING_SUBMIT_WAIT_TIMEOUT_SEC);
 }
 
+function retryableImagePreSubmitCarPoolFailure(task, error) {
+  return isCarPoolUnavailableError(error)
+    && error?.imageSubmissionAttempted !== true
+    && error?.imageSubmissionConfirmed !== true
+    && task?.raw?.submitted !== true
+    && !savedTaskExternalId(task);
+}
+
+async function waitForImagePreSubmitRetry(task, error, attempts, retryNumber, delayMs) {
+  const startedAtMs = Date.now();
+  const startedAt = new Date(startedAtMs).toISOString();
+  const retryAt = new Date(startedAtMs + delayMs).toISOString();
+  const delaySeconds = Math.max(0, Math.round(delayMs / 1000));
+  const stage = {
+    id: `stage-${randomUUID()}`,
+    key: "pre_submit_retry_wait",
+    label: `共享车位暂时不可用，${delaySeconds} 秒后自动重试（${retryNumber}/${IMAGE_PRE_SUBMIT_RETRY_DELAYS_MS.length}）`,
+    status: "processing",
+    startedAt
+  };
+  const message = "任务尚未提交上游，系统正在重新连接共享车位，不会重复扣额度。";
+  let nextTask = {
+    ...task,
+    status: "processing",
+    errorMessage: "",
+    attempts,
+    responseJson: attachResponseSourceTaskId(
+      { ok: null, message },
+      task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson)
+    ),
+    completedAt: null,
+    raw: mergeTaskRaw(task.raw, {
+      preSubmitRetryPending: true,
+      preSubmitRetryCount: retryNumber,
+      preSubmitRetryAt: retryAt,
+      preSubmitRetryReason: String(error?.message || "共享车位暂时不可用").replace(/\s+/g, " ").trim().slice(0, 300),
+      activeStage: stage
+    })
+  };
+  await upsertTask(nextTask);
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+
+  const raw = mergeTaskRaw(nextTask.raw, {
+    preSubmitRetryPending: false,
+    preSubmitRetryAt: "",
+    stageTimings: [completedTaskStage(stage.key, stage.label, startedAtMs)]
+  });
+  if (raw.activeStage?.id === stage.id) delete raw.activeStage;
+  nextTask = { ...nextTask, raw };
+  await upsertTask(nextTask);
+  return nextTask;
+}
+
+async function resetImagePreSubmitSession(config, target) {
+  if (target?.channel?.type !== "chatplus") return;
+  const client = getWorkClient(config, target.channel, target.account);
+  const reset = async () => {
+    client.invalidateSharedPortalSession?.();
+    client.resetSession?.();
+  };
+  if (typeof client.sessionLock === "function") await client.sessionLock(reset);
+  else await reset();
+}
+
 async function waitForUpstreamTask(client, result, timeoutSec) {
   if (isFinishedTask(result?.status) || !result?.externalId || typeof client.getTask !== "function") return result;
   const seconds = Math.min(3600, Math.max(30, Number(timeoutSec || 300)));
@@ -5379,123 +5455,143 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
     const executionTargets = Array.isArray(options.orderedTargets)
       ? options.orderedTargets
       : orderedTargets(targets, taskReservation);
-    for (const target of executionTargets) {
-      const { channel, account } = target;
-      let release = null;
-      const usingReserved = reservedRelease && sameTarget(target, taskReservation?.target);
-      if (usingReserved) {
-        release = reservedRelease;
-        reservedRelease = null;
-      }
-      let taskState = latestTask;
-      try {
-        const readyAtAdmission = usingReserved && taskReservation?.readyChecked === true;
-        if (!readyAtAdmission && !(await ensureTargetReady(config, target, "img2img", attempts, {
-          skipQuotaRefresh: options.fastQuotaRefresh || options.noChatplusQueue,
-          input
-        }))) continue;
-        if (!release) {
-          release = await tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target, input);
-          if (!release) {
-            attempts.push(await targetBusyAttempt(target, "img2img", input));
-            continue;
-          }
+    let currentTargets = executionTargets;
+    for (let retryRound = 0; currentTargets.length; retryRound += 1) {
+      const retryTargets = [];
+      let retryError = null;
+      for (const target of currentTargets) {
+        const { channel, account } = target;
+        let release = null;
+        const usingReserved = reservedRelease && sameTarget(target, taskReservation?.target);
+        if (usingReserved) {
+          release = reservedRelease;
+          reservedRelease = null;
         }
-        const finishedTask = await runChatplusAccountWork(channel, account, async () => {
-          const client = getWorkClient(config, channel, account);
-          const onSubmitted = async (submittedResult) => {
-            taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
-            latestTask = taskState;
-          };
-          const onStage = async (stage) => {
-            taskState = await persistTaskStage(taskState, stage);
-            latestTask = taskState;
-          };
-          const chatplusConcurrentSubmit = channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false;
-          const excludedImageCarIds = await submittedImageCarIdsForTarget(target, input);
-          let result = await submitImageTask(client, {
-            ...imageInputForTarget(target, input),
-            onSubmitted,
-            onStage,
-            ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
-            ...(excludedImageCarIds.length ? { excludedImageCarIds } : {}),
-            waitForImages: options.waitForChatplusImages === true
-          }, files);
-          taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
-          latestTask = taskState;
-          scheduleDrawingQuotaRefresh(account, channel);
-          if (channel.type === "drawing" && !isFinishedTask(result.status)) {
-            result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
+        let taskState = latestTask;
+        try {
+          const readyAtAdmission = usingReserved && taskReservation?.readyChecked === true;
+          if (!readyAtAdmission && !(await ensureTargetReady(config, target, "img2img", attempts, {
+            skipQuotaRefresh: options.fastQuotaRefresh || options.noChatplusQueue,
+            input
+          }))) continue;
+          if (!release) {
+            release = await tryReserveTaskSlot(targetTaskSlot(target, "img2img"), target, input);
+            if (!release) {
+              attempts.push(await targetBusyAttempt(target, "img2img", input));
+              continue;
+            }
           }
-          result = await mirrorTaskImages(result, config, client, {
-            inputImageHashes: taskState.raw?.inputImageHashes,
-            onImagePhase: createImageSavePhaseReporter(
-              () => taskState,
-              (next) => { taskState = next; latestTask = next; },
-              channel,
-              account
-            )
+          const finishedTask = await runChatplusAccountWork(channel, account, async () => {
+            const client = getWorkClient(config, channel, account);
+            const onSubmitted = async (submittedResult) => {
+              taskState = await persistSubmittedTask(taskState, submittedResult, channel, account, attempts);
+              latestTask = taskState;
+            };
+            const onStage = async (stage) => {
+              taskState = await persistTaskStage(taskState, stage);
+              latestTask = taskState;
+            };
+            const chatplusConcurrentSubmit = channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false;
+            const excludedImageCarIds = await submittedImageCarIdsForTarget(target, input);
+            let result = await submitImageTask(client, {
+              ...imageInputForTarget(target, input),
+              onSubmitted,
+              onStage,
+              ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
+              ...(excludedImageCarIds.length ? { excludedImageCarIds } : {}),
+              waitForImages: options.waitForChatplusImages === true
+            }, files);
+            taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
+            latestTask = taskState;
+            scheduleDrawingQuotaRefresh(account, channel);
+            if (channel.type === "drawing" && !isFinishedTask(result.status)) {
+              result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
+            }
+            result = await mirrorTaskImages(result, config, client, {
+              inputImageHashes: taskState.raw?.inputImageHashes,
+              onImagePhase: createImageSavePhaseReporter(
+                () => taskState,
+                (next) => { taskState = next; latestTask = next; },
+                channel,
+                account
+              )
+            });
+            return finishQueuedTask(taskState, result, channel, account, attempts);
+          }, {
+            taskType: "img2img",
+            parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
+            noQueue: options.noChatplusQueue,
+            slot: targetTaskSlot(target, "img2img"),
+            modelKey: targetChatModelKey(target, input),
+            quotaProbe: targetConfirmedQuotaBlocksTask(target, "img2img", input)
+              && targetConfirmedQuotaRetryDue(target, input),
+            blockingSlots: ["chatImage"]
           });
-          return finishQueuedTask(taskState, result, channel, account, attempts);
-        }, {
-          taskType: "img2img",
-          parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
-          noQueue: options.noChatplusQueue,
-          slot: targetTaskSlot(target, "img2img"),
-          modelKey: targetChatModelKey(target, input),
-          quotaProbe: targetConfirmedQuotaBlocksTask(target, "img2img", input)
-            && targetConfirmedQuotaRetryDue(target, input),
-          blockingSlots: ["chatImage"]
-        });
-        if (finishedTask) return finishedTask;
-      } catch (error) {
-        latestTask = taskState;
-        if (savedTaskExternalId(taskState)) {
+          if (finishedTask) return finishedTask;
+        } catch (error) {
+          latestTask = taskState;
+          if (savedTaskExternalId(taskState)) {
+            if (isTerminalTaskFailureError(error)) {
+              pushAttempt(attempts, target, error.message || "调用失败", attemptMetadataForError(error));
+              return failQueuedTask(taskState, error, attempts);
+            }
+            return keepSubmittedTaskRecoverable(taskState, error, attempts);
+          }
+          if (await skipAccountAfterConfirmedUsageLimit(target, error, attempts)) continue;
+          if (error.imageSubmissionAttempted === true) {
+            const failure = imageSubmissionFailure(error);
+            pushAttempt(attempts, target, failure.message, {
+              ...attemptMetadataForError(failure),
+              upstreamText: failure.upstreamText || ""
+            });
+            if (failure.imageSubmissionConfirmed === true) {
+              taskState = markTaskSubmissionAttempt(
+                taskState,
+                channel,
+                account,
+                failure.conversationId || error.conversationId
+              );
+            }
+            if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
+              await updateTargetStatusAfterError(account, channel, error);
+            }
+            return failQueuedTask(taskState, failure, attempts);
+          }
           if (isTerminalTaskFailureError(error)) {
             pushAttempt(attempts, target, error.message || "调用失败", attemptMetadataForError(error));
-            return failQueuedTask(taskState, error, attempts);
+            continue;
           }
-          return keepSubmittedTaskRecoverable(taskState, error, attempts);
-        }
-        if (await skipAccountAfterConfirmedUsageLimit(target, error, attempts)) continue;
-        if (error.imageSubmissionAttempted === true) {
-          const failure = imageSubmissionFailure(error);
-          pushAttempt(attempts, target, failure.message, {
-            ...attemptMetadataForError(failure),
-            upstreamText: failure.upstreamText || ""
+          const retryablePreSubmitFailure = retryableImagePreSubmitCarPoolFailure(taskState, error);
+          pushAttempt(attempts, target, error.message || "调用失败", {
+            ...attemptMetadataForError(error),
+            busy: Boolean(error.busy),
+            upstreamText: originalFailureText(error.upstreamText || error.body),
+            quotaEmpty: channel.type === "chatplus"
+              ? isExplicitChatQuotaError(error)
+              : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
           });
-          if (failure.imageSubmissionConfirmed === true) {
-            taskState = markTaskSubmissionAttempt(
-              taskState,
-              channel,
-              account,
-              failure.conversationId || error.conversationId
-            );
+          if (retryablePreSubmitFailure) {
+            retryTargets.push(target);
+            retryError = error;
           }
-          if (channel.type === "chatplus" && isExplicitChatQuotaError(error)) {
+          if (!error.busy && !error.imageCarQuotaExhausted) {
             await updateTargetStatusAfterError(account, channel, error);
           }
-          return failQueuedTask(taskState, failure, attempts);
+        } finally {
+          activeSubmittedTaskIds.delete(taskState.id);
+          release?.();
         }
-        if (isTerminalTaskFailureError(error)) {
-          pushAttempt(attempts, target, error.message || "调用失败", attemptMetadataForError(error));
-          continue;
-        }
-        pushAttempt(attempts, target, error.message || "调用失败", {
-          ...attemptMetadataForError(error),
-          busy: Boolean(error.busy),
-          upstreamText: originalFailureText(error.upstreamText || error.body),
-          quotaEmpty: channel.type === "chatplus"
-            ? isExplicitChatQuotaError(error)
-            : Boolean(error.quotaEmpty || isQuotaEmptyError(error))
-        });
-        if (!error.busy && !error.imageCarQuotaExhausted) {
-          await updateTargetStatusAfterError(account, channel, error);
-        }
-      } finally {
-        activeSubmittedTaskIds.delete(taskState.id);
-        release?.();
       }
+      if (!retryTargets.length || retryRound >= IMAGE_PRE_SUBMIT_RETRY_DELAYS_MS.length) break;
+      latestTask = await waitForImagePreSubmitRetry(
+        latestTask,
+        retryError,
+        attempts,
+        retryRound + 1,
+        IMAGE_PRE_SUBMIT_RETRY_DELAYS_MS[retryRound]
+      );
+      for (const target of retryTargets) await resetImagePreSubmitSession(config, target);
+      currentTargets = retryTargets;
     }
   } finally {
     if (reservedRelease) reservedRelease();

@@ -6,12 +6,28 @@ import path from "node:path";
 
 const dataDir = await mkdtemp(path.join(os.tmpdir(), "shareai-account-recovery-"));
 process.env.DATA_DIR = dataDir;
+process.env.IMAGE_PRE_SUBMIT_RETRY_DELAYS_MS = "5,10,15";
 const activeSubscriptionExpireAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
 const { closeStorage, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
-const { checkAccount, clearAccountCooldown, createChatCompletion, createImageTask, createTextTask, getRuntimeStatus, recoverUnavailableChatAccounts } = await import("../src/channel-manager.js");
+const {
+  checkAccount,
+  clearAccountCooldown,
+  createChatCompletion,
+  createImageTask,
+  createTextTask,
+  getRuntimeStatus,
+  imagePreSubmitRetryDelays,
+  recoverUnavailableChatAccounts
+} = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
 const { DrawingClient, drawingSevereFailureReason, normalizeDrawingTask } = await import("../src/channels/drawing.js");
+
+test("image edit pre-submit retries use safe defaults when unset", () => {
+  assert.deepEqual(imagePreSubmitRetryDelays(""), [5000, 15000, 30000]);
+  assert.deepEqual(imagePreSubmitRetryDelays("  "), [5000, 15000, 30000]);
+  assert.deepEqual(imagePreSubmitRetryDelays("5,10,15,20"), [5, 10, 15]);
+});
 
 after(async () => {
   await closeStorage();
@@ -606,7 +622,9 @@ test("改图任务遇到共享车位故障时返回正式提示并保留账号�
   });
 
   const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let submitCount = 0;
   ChatplusClient.prototype.createImageTask = async () => {
+    submitCount += 1;
     const error = new Error("自动换车失败：GPT 自动找车失败：用户认证失败，请重新登录");
     error.code = "CHAT_CAR_POOL_UNAVAILABLE";
     error.carPoolUnavailable = true;
@@ -627,15 +645,183 @@ test("改图任务遇到共享车位故障时返回正式提示并保留账号�
         assert.equal(error.message, "上游共享车位暂时不可用，任务未能提交。请稍后重试。");
         assert.equal(error.task.responseJson.failureType, undefined);
         assert.equal(error.task.attempts[0].carPoolUnavailable, true);
+        assert.equal(error.task.attempts.length, 4);
+        assert.equal(error.task.raw.preSubmitRetryCount, 3);
         return true;
       }
     );
+    assert.equal(submitCount, 4);
 
     const stored = await loadConfig();
     const account = stored.accounts.find((item) => item.id === "account-car-pool-task");
     assert.equal(account.status, "error");
     assert.equal(account.meta.abilities.chatplus.status, "error");
     assert.match(account.meta.abilities.chatplus.message, /上游共享车位暂时不可用/);
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+  }
+});
+
+async function saveChatImageRetryTestAccount(id, name) {
+  const config = await loadConfig();
+  await saveConfig({
+    ...config,
+    defaultChannel: "shareai",
+    accounts: [{
+      id,
+      channelId: "shareai",
+      name,
+      username: `${id}@example.com`,
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", balance: 0, message: "绘图积分不足" },
+          chatplus: { status: "ok", message: "聊天账号可用" }
+        }
+      }
+    }]
+  });
+}
+
+test("改图任务提交前共享车位恢复后只创建一个上游任务", async () => {
+  await saveChatImageRetryTestAccount("account-car-pool-recovered", "共享车位恢复账号");
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let callCount = 0;
+  let upstreamTaskCount = 0;
+  let result = null;
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    callCount += 1;
+    if (callCount < 3) {
+      const error = new Error("共享车位临时不可用");
+      error.code = "CHAT_CAR_POOL_UNAVAILABLE";
+      error.carPoolUnavailable = true;
+      error.authScope = "car";
+      throw error;
+    }
+    upstreamTaskCount += 1;
+    const submitted = {
+      externalId: "conversation-recovered-once",
+      status: "waiting_upstream",
+      imageCount: 0,
+      imageUrls: [],
+      raw: { waitingUpstream: true }
+    };
+    await input.onSubmitted(submitted);
+    return submitted;
+  };
+
+  try {
+    result = await createImageTask({
+      input: { channel: "chatplus", prompt: "共享车位恢复测试" },
+      files: [{ filename: "source.png", mimetype: "image/png" }],
+      wait: true
+    });
+    assert.equal(result.status, "waiting_upstream");
+    assert.equal(result.externalId, "conversation-recovered-once");
+    assert.equal(result.attempts.length, 2);
+    assert.equal(result.raw.preSubmitRetryCount, 2);
+    assert.equal(callCount, 3);
+    assert.equal(upstreamTaskCount, 1);
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+    if (result) {
+      await upsertTask({ ...result, status: "cancelled", completedAt: new Date().toISOString() });
+    }
+  }
+});
+
+test("改图请求已经开始发送但未确认时绝不自动重发", async () => {
+  await saveChatImageRetryTestAccount("account-image-submit-uncertain", "提交状态待确认账号");
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let callCount = 0;
+  ChatplusClient.prototype.createImageTask = async () => {
+    callCount += 1;
+    const error = new Error("生成请求已发出，但上游响应中断");
+    error.code = "CHAT_CAR_POOL_UNAVAILABLE";
+    error.carPoolUnavailable = true;
+    error.authScope = "car";
+    error.imageSubmissionAttempted = true;
+    error.imageSubmissionConfirmed = false;
+    throw error;
+  };
+
+  try {
+    await assert.rejects(createImageTask({
+      input: { channel: "chatplus", prompt: "禁止重复提交测试" },
+      files: [{ filename: "source.png", mimetype: "image/png" }],
+      wait: true
+    }));
+    assert.equal(callCount, 1);
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+  }
+});
+
+test("改图拿到上游任务编号后发生异常时保持查询且绝不重发", async () => {
+  await saveChatImageRetryTestAccount("account-image-submitted-recovery", "已提交恢复账号");
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let callCount = 0;
+  let result = null;
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    callCount += 1;
+    await input.onSubmitted({
+      externalId: "conversation-already-submitted",
+      status: "waiting_upstream",
+      imageCount: 0,
+      imageUrls: [],
+      raw: { waitingUpstream: true }
+    });
+    const error = new Error("已提交后连接中断");
+    error.code = "CHAT_CAR_POOL_UNAVAILABLE";
+    error.carPoolUnavailable = true;
+    error.authScope = "car";
+    throw error;
+  };
+
+  try {
+    result = await createImageTask({
+      input: { channel: "chatplus", prompt: "已提交恢复测试" },
+      files: [{ filename: "source.png", mimetype: "image/png" }],
+      wait: true
+    });
+    assert.equal(result.status, "waiting_upstream");
+    assert.equal(result.externalId, "conversation-already-submitted");
+    assert.equal(callCount, 1);
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+    if (result) {
+      await upsertTask({ ...result, status: "cancelled", completedAt: new Date().toISOString() });
+    }
+  }
+});
+
+test("改图明确额度不足时绝不自动重发", async () => {
+  await saveChatImageRetryTestAccount("account-image-quota-empty-no-retry", "生图额度不足账号");
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  let callCount = 0;
+  ChatplusClient.prototype.createImageTask = async () => {
+    callCount += 1;
+    const error = new Error("当前车位生图使用次数已达上限");
+    error.status = 429;
+    error.imageCarQuotaExhausted = true;
+    error.quotaEmpty = true;
+    error.quotaConfirmedByUpstream = true;
+    throw error;
+  };
+
+  try {
+    await assert.rejects(createImageTask({
+      input: { channel: "chatplus", prompt: "额度不足不重试测试" },
+      files: [{ filename: "source.png", mimetype: "image/png" }],
+      wait: true
+    }));
+    assert.equal(callCount, 1);
   } finally {
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
   }

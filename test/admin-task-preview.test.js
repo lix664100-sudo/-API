@@ -193,6 +193,8 @@ test("全部、生图和对话记录均可在一屏查看，耗时靠前且窄�
   assert.match(adminHtml, /size: "small"/);
   assert.doesNotMatch(adminHtml, /scroll: \{ x: isAll \?/);
   assert.match(adminHtml, /title: "状态 \/ 耗时"[\s\S]*?taskStatusSummaryCell\(row\)/);
+  assert.match(adminHtml, /waiting_upstream: \["processing", "已提交，等待图片"\]/);
+  assert.match(adminHtml, /已提交上游，等待图片/);
   assert.match(adminHtml, /title: "模型 \/ 渠道"[\s\S]*?responsive: \["lg"\]/);
   assert.match(adminHtml, /title: "预计 TOKEN"[\s\S]*?responsive: \["md"\]/);
   assert.match(adminHtml, /\.task-copy-full[\s\S]*max-height: 320px/);

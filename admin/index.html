@@ -5199,7 +5199,7 @@
           cancelled: ["default", "已取消"],
           queued: ["processing", "排队中"],
           processing: ["processing", "处理中"],
-          waiting_upstream: ["processing", "等待上游"],
+          waiting_upstream: ["processing", "已提交，等待图片"],
           interrupted: ["warning", "结果待确认"],
           activation_required: ["warning", "未激活"],
           activation_failed: ["error", "激活失败"],
@@ -10747,7 +10747,7 @@
             stageText = activeStage
               || (row?.raw?.imageMirrorPending
                 ? `保存图片${mirrorRetry > 0 ? `（已重试 ${mirrorRetry} 次）` : "中"}`
-                : "等待上游返回结果");
+                : "已提交上游，等待图片");
           } else if (status === "interrupted" && row?.raw?.imageMirrorGaveUp) {
             stageText = `保存失败（已重试 ${mirrorRetry} 次）`;
           }
