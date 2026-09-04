@@ -34,9 +34,7 @@ const ACCOUNT_CHECK_TIMEOUT_SEC = 20;
 const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 300;
 const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
 const RESULT_CHANNEL_READY_GRACE_MS = 1_500;
-const IMAGE_TASK_LIST_CACHE_MS = 2_000;
-const IMAGE_TASK_LIST_CACHE_TTL_MS = 10 * 60 * 1000;
-const MAX_IMAGE_TASK_LIST_CACHES = 100;
+const IMAGE_RESULT_PROBE_TIMEOUT_SEC = 8;
 const CONVERSATION_READ_HEADERS = Object.freeze({
   "cache-control": "no-cache",
   pragma: "no-cache"
@@ -57,6 +55,7 @@ const IMAGE_SLOW_RESULT_THRESHOLD_MS = 60 * 1000;
 const IMAGE_SLOW_RESULT_WINDOW_MS = 30 * 60 * 1000;
 const IMAGE_SLOW_RESULT_COOLDOWN_MS = 10 * 60 * 1000;
 const IMAGE_SLOW_RESULT_LIMIT = 2;
+const ACTIVE_IMAGE_CAR_LEASE_TTL_MS = 35 * 60 * 1000;
 const GEMINI_REQUEST_PATH = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
 const GEMINI_UPLOAD_PREFLIGHT_PATH = "/_/BardChatUi/data/batchexecute";
 const GEMINI_UPLOAD_PREFLIGHT_RPC_ID = "ESY5D";
@@ -105,7 +104,66 @@ const GROK_STATSIG_FINGERPRINT = "3bab9506b851eb851eb840e8f5c28f5c28f80e8f5c28f5
 const badCarUntil = new Map();
 const recentImageCarSuccessAt = new Map();
 const slowImageCarStats = new Map();
-const imageTaskListCaches = new Map();
+const activeImageCarLeases = new Map();
+const imageConversationCarLeases = new Map();
+
+function imageCarLeaseKey(account = {}, selected = {}) {
+  const accountId = String(account.id || account.username || "").trim().toLowerCase();
+  const carId = String(selected.carId || "").trim();
+  const carType = String(selected.carType || "chatgpt").trim();
+  return accountId && carId ? `${accountId}:${carType}:${carId}` : "";
+}
+
+function releaseImageCarLease(lease) {
+  if (!lease?.key || activeImageCarLeases.get(lease.key)?.token !== lease.token) return false;
+  activeImageCarLeases.delete(lease.key);
+  if (
+    lease.conversationId
+    && imageConversationCarLeases.get(lease.conversationId)?.token === lease.token
+  ) {
+    imageConversationCarLeases.delete(lease.conversationId);
+  }
+  return true;
+}
+
+function pruneImageCarLeases(now = Date.now()) {
+  for (const lease of activeImageCarLeases.values()) {
+    if (lease.expiresAt <= now) releaseImageCarLease(lease);
+  }
+}
+
+function reserveImageCar(account, selected) {
+  pruneImageCarLeases();
+  const key = imageCarLeaseKey(account, selected);
+  if (!key || activeImageCarLeases.has(key)) return null;
+  const lease = {
+    key,
+    token: randomUUID(),
+    conversationId: "",
+    expiresAt: Date.now() + ACTIVE_IMAGE_CAR_LEASE_TTL_MS
+  };
+  activeImageCarLeases.set(key, lease);
+  return lease;
+}
+
+function bindImageCarLease(lease, conversationId) {
+  const normalizedConversationId = String(conversationId || "").trim();
+  if (!lease?.key || !normalizedConversationId) return;
+  lease.conversationId = normalizedConversationId;
+  imageConversationCarLeases.set(normalizedConversationId, lease);
+}
+
+function releaseConversationImageCar(conversationId) {
+  const normalizedConversationId = String(conversationId || "").trim();
+  if (!normalizedConversationId) return false;
+  return releaseImageCarLease(imageConversationCarLeases.get(normalizedConversationId));
+}
+
+function imageCarIsLeased(account, selected) {
+  pruneImageCarLeases();
+  const key = imageCarLeaseKey(account, selected);
+  return Boolean(key && activeImageCarLeases.has(key));
+}
 
 function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
@@ -753,7 +811,15 @@ function hasAsyncImageTaskMarker(value, seen = new Set()) {
 
 function imageTaskFailure(task = {}) {
   const status = String(task.status || task.task_status || task.state || "").trim().toLowerCase();
-  if (!["failed", "failure", "error", "cancelled", "canceled"].includes(status)) return null;
+  const finishReason = String(
+    task.finish_details?.reason
+      || task.finishDetails?.reason
+      || task.result?.finish_details?.reason
+      || task.result?.finishDetails?.reason
+      || ""
+  ).trim().toLowerCase();
+  const cancelledByClient = ["client_stopped", "user_cancelled", "user_canceled"].includes(finishReason);
+  if (!cancelledByClient && !["failed", "failure", "error", "cancelled", "canceled"].includes(status)) return null;
   const message = String(
     task.error_message
       || task.errorMessage
@@ -763,21 +829,13 @@ function imageTaskFailure(task = {}) {
       || ""
   ).trim();
   return {
-    status: ["cancelled", "canceled"].includes(status) ? "cancelled" : "failed",
-    message: message || (["cancelled", "canceled"].includes(status) ? "上游已取消任务。" : "上游明确返回任务失败。")
+    status: cancelledByClient || ["cancelled", "canceled"].includes(status) ? "cancelled" : "failed",
+    message: message || (cancelledByClient
+      ? `上游已取消任务（${finishReason}）。`
+      : ["cancelled", "canceled"].includes(status)
+        ? "上游已取消任务。"
+        : "上游明确返回任务失败。")
   };
-}
-
-function pruneImageTaskListCaches(now = Date.now()) {
-  for (const [key, entry] of imageTaskListCaches) {
-    if (!entry.promise && now - entry.updatedAt > IMAGE_TASK_LIST_CACHE_TTL_MS) imageTaskListCaches.delete(key);
-  }
-  if (imageTaskListCaches.size <= MAX_IMAGE_TASK_LIST_CACHES) return;
-  const excess = [...imageTaskListCaches.entries()]
-    .filter(([, entry]) => !entry.promise)
-    .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
-    .slice(0, imageTaskListCaches.size - MAX_IMAGE_TASK_LIST_CACHES);
-  for (const [key] of excess) imageTaskListCaches.delete(key);
 }
 
 function parseJsonLines(text) {
@@ -3154,48 +3212,25 @@ export class ChatplusClient {
     return normalizedTaskId;
   }
 
-  async imageGenerationTasks(options = {}) {
-    pruneImageTaskListCaches();
-    const key = this.conversationUpdateConnectionKey();
-    const now = Date.now();
-    let cache = imageTaskListCaches.get(key);
-    if (cache?.promise) return cache.promise;
-    if (options.fresh !== true && cache?.expiresAt > now) return cache.tasks;
-
-    cache = cache || { tasks: [], expiresAt: 0, updatedAt: now, promise: null };
-    const request = (async () => {
-      const tasks = [];
-      const seenCursors = new Set();
-      let cursor = "";
-      for (let page = 0; page < 5; page += 1) {
-        const suffix = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
-        const payload = await this.json(`/backend-api/tasks${suffix}`, {
-          timeoutSec: options.timeoutSec
-        });
-        const pageTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
-        tasks.push(...pageTasks);
-        const nextCursor = String(payload?.cursor || "").trim();
-        if (!nextCursor || seenCursors.has(nextCursor)) break;
-        seenCursors.add(nextCursor);
-        cursor = nextCursor;
-      }
-      return tasks;
-    })();
-    cache.promise = request;
-    cache.updatedAt = now;
-    imageTaskListCaches.set(key, cache);
-    try {
-      cache.tasks = await request;
-      cache.expiresAt = Date.now() + IMAGE_TASK_LIST_CACHE_MS;
-      return cache.tasks;
-    } catch (error) {
-      imageTaskListCaches.delete(key);
-      throw error;
-    } finally {
-      cache.promise = null;
-      cache.updatedAt = Date.now();
-      pruneImageTaskListCaches();
+  async findImageGenerationTask(conversationId, options = {}) {
+    const normalizedConversationId = String(conversationId || "").trim();
+    if (!normalizedConversationId) return null;
+    const seenCursors = new Set();
+    let cursor = "";
+    for (let page = 0; page < 5; page += 1) {
+      const suffix = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+      const payload = await this.json(`/backend-api/tasks${suffix}`, {
+        timeoutSec: options.timeoutSec
+      });
+      const tasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+      const task = tasks.find((item) => imageTaskMatchesConversation(item, normalizedConversationId));
+      if (task) return task;
+      const nextCursor = String(payload?.cursor || "").trim();
+      if (!nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
     }
+    return null;
   }
 
   async imageGenerationTaskState(conversationId, options = {}) {
@@ -3227,8 +3262,7 @@ export class ChatplusClient {
 
     if (!task) {
       try {
-        const tasks = await this.imageGenerationTasks(options);
-        task = tasks.find((item) => imageTaskMatchesConversation(item, normalizedConversationId)) || null;
+        task = await this.findImageGenerationTask(normalizedConversationId, options);
         if (task) taskId = this.rememberImageTaskId(normalizedConversationId, imageTaskIdFrom(task, normalizedConversationId));
       } catch {
         return taskId ? { taskId, task: null, imageUrls: [], failure: null } : null;
@@ -3241,11 +3275,13 @@ export class ChatplusClient {
       task.image_gen_message || task.messages || task,
       { generatedOnly: true }
     );
+    const failure = imageTaskFailure(task);
+    if (imageUrls.length || failure) releaseConversationImageCar(normalizedConversationId);
     return {
       taskId,
       task,
       imageUrls,
-      failure: imageTaskFailure(task)
+      failure
     };
   }
 
@@ -3884,6 +3920,10 @@ export class ChatplusClient {
     const candidates = rankedCars(cars, selectionStrategy, selectionContext)
       .map((car) => ({ car, carId: concreteCarId(car, selectionContext) }))
       .filter((item) => !ignoredCarIds.has(item.carId))
+      .filter((item) => options.imageGeneration !== true || !imageCarIsLeased(this.account, {
+        carId: item.carId,
+        carType: route.carType
+      }))
       .filter((item) => (
         recheckProCars && (item.car.isPro || item.car.isUltra)
           ? true
@@ -4053,6 +4093,7 @@ export class ChatplusClient {
     const timeoutSec = Number(input.checkTimeoutSec || 0);
     const requestOptions = {
       ...(timeoutSec > 0 ? { timeoutSec } : {}),
+      ...(input.imageGeneration === true ? { imageGeneration: true } : {}),
       ...(input.taskStageRecorder ? { taskStageRecorder: input.taskStageRecorder } : {})
     };
     const errors = [];
@@ -4940,6 +4981,7 @@ export class ChatplusClient {
     const unconfirmedCars = [];
     let carPoolErrorCount = 0;
     let authKickAttempts = 0;
+    let leasedCarsSkipped = input.imageGeneration === true ? ignoredCarIds.size : 0;
     let lastError = null;
     let lastUpstreamText = "";
     const runSubmitStep = input.concurrentSubmit === true
@@ -4949,6 +4991,8 @@ export class ChatplusClient {
       let selected = null;
       let activeRoute = null;
       let preparedSession = null;
+      let imageCarLease = null;
+      let confirmedConversationId = "";
       const imageSubmissionState = { started: false };
       const requestInput = { ...input, imageSubmissionState };
       try {
@@ -4962,20 +5006,34 @@ export class ChatplusClient {
         activeRoute = route;
         const submitClient = input.concurrentSubmit === true ? this.createSubmitClient(session) : this;
         selected = session.selected;
+        if (requestInput.imageGeneration === true) {
+          imageCarLease = reserveImageCar(this.account, selected);
+          if (!imageCarLease) {
+            const error = new Error(`车位 ${selected?.carId || ""} 正在生成图片，已选择其他车位。`);
+            error.imageCarBusy = true;
+            throw error;
+          }
+        }
         if (route.key === "grok") {
           const conversation = await runSubmitStep(() => submitClient.sendGrokConversation(prompt, requestInput, route, selected));
+          confirmedConversationId = conversation.conversationId || "";
+          bindImageCarLease(imageCarLease, confirmedConversationId);
           this.rememberReusableChatSession(requestInput, session, submitClient);
           return {
             ...conversation,
+            _imageCarLease: imageCarLease,
             submitSessionSnapshot: submitClient.sessionSnapshot(),
             stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
           };
         }
         if (route.key === "gemini") {
           const conversation = await runSubmitStep(() => submitClient.sendGeminiConversation(prompt, requestInput, route, selected));
+          confirmedConversationId = conversation.conversationId || "";
+          bindImageCarLease(imageCarLease, confirmedConversationId);
           this.rememberReusableChatSession(requestInput, session, submitClient);
           return {
             ...conversation,
+            _imageCarLease: imageCarLease,
             submitSessionSnapshot: submitClient.sessionSnapshot(),
             stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
           };
@@ -5093,6 +5151,8 @@ export class ChatplusClient {
           return { events, conversationId };
         })).finally(unsubscribeConversationUpdates);
         const { events, conversationId } = submission;
+        confirmedConversationId = conversationId;
+        bindImageCarLease(imageCarLease, conversationId);
         if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.confirmed = true;
         const upstreamTaskId = requestInput.imageGeneration === true
           ? submitClient.rememberImageTaskId(conversationId, imageTaskIdFrom(events, conversationId))
@@ -5110,10 +5170,24 @@ export class ChatplusClient {
           upstreamTaskId,
           resultChannelReady,
           resultChannelError,
+          _imageCarLease: imageCarLease,
           submitSessionSnapshot: submitClient.sessionSnapshot(),
           stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
         };
       } catch (error) {
+        if (imageCarLease && !confirmedConversationId) releaseImageCarLease(imageCarLease);
+        if (
+          requestInput.imageGeneration === true
+          && !selected
+          && leasedCarsSkipped > 0
+          && /暂时没有可用的?.*(?:车辆|车位)/.test(String(error?.message || ""))
+        ) {
+          const busyError = new Error("当前可用生图车位都在处理任务，请等待已有任务完成后再试。");
+          busyError.code = "IMAGE_CAR_BUSY";
+          busyError.status = 429;
+          busyError.busy = true;
+          throw busyError;
+        }
         if (activeRoute?.model) error.upstreamModel ||= activeRoute.model;
         lastError = error;
         lastUpstreamText = String(error?.upstreamText || error?.body || lastUpstreamText).trim();
@@ -5124,6 +5198,17 @@ export class ChatplusClient {
           errors.push(message);
           if (carScopedFailure) carPoolErrorCount += 1;
         };
+        if (selected && error.imageCarBusy === true) {
+          ignoredCarIds.add(selected.carId);
+          leasedCarsSkipped += 1;
+          const sessionKey = this.chatSessionKey(activeRoute || {});
+          const cachedSession = this.concurrentChatSessions.get(sessionKey)?.session;
+          if (cachedSession?.selected?.carId === selected.carId) {
+            this.concurrentChatSessions.delete(sessionKey);
+          }
+          recordCarError(error.message || "当前车位正在生成图片");
+          continue;
+        }
         if (imageSubmissionState.started) {
           error.imageSubmissionAttempted = true;
           if (imageSubmissionState.confirmed) error.imageSubmissionConfirmed = true;
@@ -5265,7 +5350,11 @@ export class ChatplusClient {
 
   async withImageQuotaFallback(prompt, input, work) {
     if (input.imageGeneration === true) {
-      const ignoredCarIds = new Set();
+      const ignoredCarIds = new Set(
+        (Array.isArray(input.excludedImageCarIds) ? input.excludedImageCarIds : [])
+          .map((carId) => String(carId || "").trim())
+          .filter(Boolean)
+      );
       const quotaErrors = [];
       const temporaryRestrictionErrors = [];
       let lastUpstreamModel = "";
@@ -5275,8 +5364,13 @@ export class ChatplusClient {
         try {
           conversation = await this.sendConversation(prompt, input, ignoredCarIds);
           lastUpstreamModel = conversation.upstreamModel || conversation.route?.model || lastUpstreamModel;
-          return await work(conversation);
+          const result = await work(conversation);
+          if (Array.isArray(result?.imageUrls) && result.imageUrls.length) {
+            releaseImageCarLease(conversation._imageCarLease);
+          }
+          return result;
         } catch (error) {
+          if (conversation?._imageCarLease) releaseImageCarLease(conversation._imageCarLease);
           if (conversation) error.upstreamModel ||= conversation.upstreamModel || conversation.route?.model || "";
           if (conversation?.selected && (
             error.imageCarQuotaExhausted === true
@@ -5431,6 +5525,10 @@ export class ChatplusClient {
 
     const timeoutMs = Math.max(5, Number(timeoutSec || this.config.waitTimeoutSec || DEFAULT_CHAT_HTTP_TIMEOUT_SEC)) * 1000;
     const deadline = Date.now() + timeoutMs;
+    const probeTimeoutSec = () => Math.min(
+      IMAGE_RESULT_PROBE_TIMEOUT_SEC,
+      Math.max(1, Math.ceil((deadline - Date.now()) / 1000))
+    );
     let nextTaskProbeAt = 0;
     let nextStreamStatusProbeAt = 0;
     while (Date.now() < deadline) {
@@ -5457,33 +5555,34 @@ export class ChatplusClient {
             throw error;
           }
         }
+        const shouldProbeImageTasks = shouldCheckImageTasks || Date.now() >= nextTaskProbeAt;
+        if (shouldProbeImageTasks) {
+          nextTaskProbeAt = Date.now() + (shouldCheckImageTasks ? 2000 : 3000);
+          try {
+            const imageTaskState = await this.imageGenerationTaskState(conversationId, {
+              upstreamTaskId: options.upstreamTaskId || this.imageTaskIds.get(conversationId),
+              timeoutSec: probeTimeoutSec()
+            });
+            shouldCheckImageTasks ||= Boolean(imageTaskState?.taskId);
+            if (imageTaskState?.imageUrls.length) return imageTaskState.imageUrls;
+            if (imageTaskState?.failure) {
+              const error = new Error(imageTaskState.failure.message);
+              error.upstreamExplicitFailure = true;
+              error.upstreamStatus = imageTaskState.failure.status;
+              throw error;
+            }
+          } catch (error) {
+            if (error.imageCarQuotaExhausted || error.imageQuotaExhausted || error.upstreamExplicitFailure) throw error;
+          }
+        }
         let detail = await this.conversationDetail(conversationId, {
-          timeoutSec: Math.min(
-            30,
-            Math.max(5, Math.ceil((deadline - Date.now()) / 1000))
-          )
+          timeoutSec: probeTimeoutSec()
         });
         this.rememberImageTaskId(conversationId, imageTaskIdFrom(detail, conversationId));
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
         throwIfCurrentImageResultFailed(detail);
         shouldCheckImageTasks ||= hasAsyncImageTaskMarker(detail);
-        const shouldProbeImageTasks = shouldCheckImageTasks || Date.now() >= nextTaskProbeAt;
-        if (shouldProbeImageTasks) {
-          nextTaskProbeAt = Date.now() + (shouldCheckImageTasks ? 2000 : 3000);
-          const imageTaskState = await this.imageGenerationTaskState(conversationId, {
-            upstreamTaskId: options.upstreamTaskId || this.imageTaskIds.get(conversationId),
-            timeoutSec: Math.min(30, Math.max(5, Math.ceil((deadline - Date.now()) / 1000)))
-          });
-          shouldCheckImageTasks ||= Boolean(imageTaskState?.taskId);
-          if (imageTaskState?.imageUrls.length) return imageTaskState.imageUrls;
-          if (imageTaskState?.failure) {
-            const error = new Error(imageTaskState.failure.message);
-            error.upstreamExplicitFailure = true;
-            error.upstreamStatus = imageTaskState.failure.status;
-            throw error;
-          }
-        }
         const forceStreamStatus = detail?.async_status === null
           || detail?.async_status === undefined
             ? Date.now() >= nextStreamStatusProbeAt
@@ -5493,10 +5592,7 @@ export class ChatplusClient {
           conversationId,
           detail,
           {
-            timeoutSec: Math.min(
-              30,
-              Math.max(5, Math.ceil((deadline - Date.now()) / 1000))
-            ),
+            timeoutSec: probeTimeoutSec(),
             ...(forceStreamStatus ? { force: true } : {})
           }
         );
@@ -5739,9 +5835,21 @@ export class ChatplusClient {
           resultChannelUpdateCount: pushedUpdates.length,
           ...(resultChannelError ? { resultChannelError } : {}),
           ...(upstreamTaskId ? { upstreamTaskId } : {})
-        }
+      }
       : detail;
+    if (imageTaskState?.failure) {
+      releaseConversationImageCar(externalId);
+      return {
+        externalId,
+        status: imageTaskState.failure.status,
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: imageTaskState.failure.message,
+        raw: rawDetail
+      };
+    }
     if (imageUrls.length) {
+      releaseConversationImageCar(externalId);
       await this.rememberImageSuccessfulCar({
         carId: context.carId || this.carId,
         carType: context.carType || this.carType
@@ -5757,6 +5865,7 @@ export class ChatplusClient {
     }
     const currentCancelledContent = currentImageTaskCancelledContent(resultState);
     if (currentCancelledContent) {
+      releaseConversationImageCar(externalId);
       return {
         externalId,
         status: "cancelled",
@@ -5773,6 +5882,7 @@ export class ChatplusClient {
         carId: context.carId || this.carId,
         carType: context.carType || this.carType
       }, quotaError);
+      releaseConversationImageCar(externalId);
       return {
         externalId,
         status: "failed",
@@ -5788,6 +5898,7 @@ export class ChatplusClient {
     }
     const currentFailureContent = currentImageTaskFailureContent(resultState);
     if (currentFailureContent) {
+      releaseConversationImageCar(externalId);
       return {
         externalId,
         status: "failed",
@@ -5800,6 +5911,7 @@ export class ChatplusClient {
     if (geminiTask) {
       const content = extractGeminiHistoryText(detail.payloads);
       if (isUpstreamImageTaskCancelledMessage(content)) {
+        releaseConversationImageCar(externalId);
         return {
           externalId,
           status: "cancelled",
@@ -5815,6 +5927,7 @@ export class ChatplusClient {
           carId: context.carId || this.carId,
           carType: context.carType || this.carType
         }, restrictionError);
+        releaseConversationImageCar(externalId);
         return {
           externalId,
           status: "failed",
@@ -5829,6 +5942,7 @@ export class ChatplusClient {
         };
       }
       if (isImageGenerationLimitMessage(content)) {
+        releaseConversationImageCar(externalId);
         return {
           externalId,
           status: "failed",
@@ -5839,6 +5953,7 @@ export class ChatplusClient {
         };
       }
       if (isTerminalImageFailureMessage(content)) {
+        releaseConversationImageCar(externalId);
         return {
           externalId,
           status: "failed",
@@ -5864,6 +5979,7 @@ export class ChatplusClient {
     const content = responseState.content;
     const intermediateResponse = isChatImageIntermediateResponse(content);
     if (isUpstreamImageTaskCancelledMessage(content)) {
+      releaseConversationImageCar(externalId);
       return {
         externalId,
         status: "cancelled",
@@ -5880,6 +5996,7 @@ export class ChatplusClient {
         carId: context.carId || this.carId,
         carType: context.carType || this.carType
       }, quotaError);
+      releaseConversationImageCar(externalId);
       return {
         externalId,
         status: "failed",
@@ -5900,6 +6017,7 @@ export class ChatplusClient {
         carId: context.carId || this.carId,
         carType: context.carType || this.carType
       }, restrictionError);
+      releaseConversationImageCar(externalId);
       return {
         externalId,
         status: "failed",
@@ -5914,6 +6032,7 @@ export class ChatplusClient {
       };
     }
     if (!intermediateResponse && !responseState.inProgress && isTerminalImageFailureMessage(content)) {
+      releaseConversationImageCar(externalId);
       return {
         externalId,
         status: "failed",
@@ -5924,6 +6043,7 @@ export class ChatplusClient {
       };
     }
     if (!intermediateResponse && content && !responseState.inProgress) {
+      releaseConversationImageCar(externalId);
       return {
         externalId,
         status: "failed",
@@ -5935,6 +6055,7 @@ export class ChatplusClient {
     }
     const explicitState = explicitConversationState(resultState);
     if (explicitState) {
+      releaseConversationImageCar(externalId);
       return {
         externalId,
         status: explicitState.status,

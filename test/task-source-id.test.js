@@ -953,6 +953,7 @@ test("chatplus image wait treats search tool output as an intermediate response"
     imageReadCount += 1;
     return imageReadCount === 1 ? [] : [resultUrl];
   };
+  client.imageGenerationTaskState = async () => null;
   client.json = async () => {
     detailReadCount += 1;
     return {

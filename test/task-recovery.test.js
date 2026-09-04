@@ -3352,7 +3352,7 @@ test("聊天生图没有上游编号时不能算已提交", async () => {
   }
 });
 
-test("聊天生图并发提交会共用一次已准备好的账号会话", async () => {
+test("聊天生图并发提交会为每个进行中的任务选择不同车位", async () => {
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
     channel: { id: "shareai:chatplus", settings: { baseUrl: "https://www.chatplus.cc" } },
@@ -3376,10 +3376,10 @@ test("聊天生图并发提交会共用一次已准备好的账号会话", async
     }
   };
 
-  client.fetchCars = async () => [{
-    id: "car-shared-session",
+  client.fetchCars = async () => ["one", "two", "three"].map((suffix, index) => ({
+    id: `car-separated-session-${suffix}`,
     status: 1,
-    count: 0,
+    count: index,
     cooldown: 0,
     desc: "ok",
     label: "ok",
@@ -3387,7 +3387,7 @@ test("聊天生图并发提交会共用一次已准备好的账号会话", async
     isPro: false,
     isVirtual: false,
     realCarIDs: []
-  }];
+  }));
   client.enterCar = async (carId, carType) => {
     enterCarCount += 1;
     client.carId = carId;
@@ -3407,7 +3407,7 @@ test("聊天生图并发提交会共用一次已准备好的账号会话", async
   ChatplusClient.prototype.http = async function (pathName, options = {}) {
     if (pathName === "/backend-api/files") {
       assert.equal(this.cookies.includes("portal=ok"), true);
-      assert.equal(this.cookies.includes("car=car-shared-session"), true);
+      assert.equal(this.cookies.some((cookie) => cookie.startsWith("car=car-separated-session-")), true);
       assert.equal(this.cookies.some((cookie) => cookie.startsWith("upload=")), false);
       const fileName = options.body?.file_name || "source.png";
       this.cookies = [...this.cookies, `upload=${fileName}`];
@@ -3455,12 +3455,13 @@ test("聊天生图并发提交会共用一次已准备好的账号会话", async
     ChatplusClient.prototype.http = originalHttp;
   }
 
-  assert.equal(enterCarCount, 1);
-  assert.equal(initCount, 1);
+  assert.equal(enterCarCount, 3);
+  assert.equal(initCount, 3);
   assert.equal(client.cookies.some((cookie) => cookie.startsWith("upload=")), false);
   assert.equal(maxSubmitSteps > 1, true);
   assert.deepEqual(results.map((result) => result.status), ["waiting_upstream", "waiting_upstream", "waiting_upstream"]);
   assert.equal(new Set(results.map((result) => result.externalId)).size, 3);
+  assert.equal(new Set(results.map((result) => result.raw.selectedCarId)).size, 3);
 });
 
 test("聊天生图满载时立即拒绝，释放名额后才能重新提交", async () => {

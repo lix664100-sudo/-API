@@ -558,6 +558,133 @@ test("生图工具实时返回请重试时立即结束等待", async () => {
   assert.equal(detailReads, 1);
 });
 
+test("等待生图时优先读取后台任务，不被尚未更新的会话记录拖慢", async () => {
+  const resultUrl = "https://files.example.test/generated-fast.png";
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://chatplus.example.test" } },
+    account: { id: "account-task-first", username: "task-first@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  const calls = [];
+  testClient.conversationDetail = async () => {
+    calls.push("conversation");
+    return { async_status: "pending" };
+  };
+  testClient.imageGenerationTaskState = async () => {
+    calls.push("task");
+    return {
+      taskId: "upstream-task-fast",
+      task: { status: "completed" },
+      imageUrls: [resultUrl],
+      failure: null
+    };
+  };
+  testClient.imageUrlsFrom = async () => [];
+
+  const imageUrls = await testClient.waitForConversationImages(
+    [{ task_id: "upstream-task-fast", async_status: "pending" }],
+    "conversation-task-first",
+    30,
+    { upstreamTaskId: "upstream-task-fast" }
+  );
+
+  assert.deepEqual(imageUrls, [resultUrl]);
+  assert.deepEqual(calls, ["task"]);
+});
+
+test("后台任务返回 client_stopped 时立即识别为上游取消", async () => {
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://chatplus.example.test" } },
+    account: { id: "account-client-stopped", username: "client-stopped@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  testClient.json = async (path) => {
+    assert.equal(path, "/backend-api/task/upstream-task-client-stopped");
+    return {
+      task: {
+        id: "upstream-task-client-stopped",
+        conversation_id: "conversation-client-stopped",
+        status: "completed",
+        finish_details: { reason: "client_stopped" }
+      }
+    };
+  };
+  testClient.imageUrlsFrom = async () => [];
+
+  const state = await testClient.imageGenerationTaskState("conversation-client-stopped", {
+    upstreamTaskId: "upstream-task-client-stopped",
+    fresh: true,
+    timeoutSec: 5
+  });
+
+  assert.deepEqual(state.failure, {
+    status: "cancelled",
+    message: "上游已取消任务（client_stopped）。"
+  });
+
+  testClient.loginPortal = async () => {};
+  testClient.ensureConversationUpdates = async () => null;
+  testClient.conversationDetail = async () => ({ async_status: "pending", mapping: {} });
+  testClient.refreshCompletedConversation = async (_conversationId, detail) => detail;
+  const refreshed = await testClient.getTask("conversation-client-stopped", {
+    imageTask: true,
+    upstreamTaskId: "upstream-task-client-stopped",
+    timeoutSec: 5
+  });
+
+  assert.equal(refreshed.status, "cancelled");
+  assert.equal(refreshed.errorMessage, "上游已取消任务（client_stopped）。");
+});
+
+test("已提交的任务返回 client_stopped 后不会换车重复生成", async () => {
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://chatplus.example.test" } },
+    account: { id: "account-no-resubmit", username: "no-resubmit@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let submissionCount = 0;
+  testClient.sendConversation = async () => {
+    submissionCount += 1;
+    return {
+      conversationId: "conversation-no-resubmit",
+      events: [{ task_id: "upstream-task-no-resubmit", async_status: "pending" }],
+      selected: { carId: "car-no-resubmit", carType: "chatgpt" },
+      route: { key: "gpt", model: "gpt-image-test" },
+      upstreamModel: "gpt-image-test",
+      upstreamTaskId: "upstream-task-no-resubmit",
+      submissionConfirmed: true
+    };
+  };
+  testClient.captureImageTaskRegistration = async () => null;
+  testClient.imageUrlsFrom = async () => [];
+  testClient.imageGenerationTaskState = async () => ({
+    taskId: "upstream-task-no-resubmit",
+    task: {
+      status: "completed",
+      finish_details: { reason: "client_stopped" }
+    },
+    imageUrls: [],
+    failure: {
+      status: "cancelled",
+      message: "上游已取消任务（client_stopped）。"
+    }
+  });
+
+  await assert.rejects(
+    () => testClient.createImageTask({
+      prompt: "do not resubmit",
+      files: [{ filename: "source.png" }],
+      waitForImages: true
+    }),
+    (error) => error?.upstreamStatus === "cancelled"
+      && error?.imageSubmissionConfirmed === true
+  );
+  assert.equal(submissionCount, 1);
+});
+
 test("上游会话重新登录后仍为空时只重试一次", async () => {
   const testClient = new ChatplusClient({
     config: { waitTimeoutSec: 30 },

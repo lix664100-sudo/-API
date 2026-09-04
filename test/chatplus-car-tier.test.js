@@ -822,10 +822,28 @@ test("a car without a conversation id stays paused even after a shorter upstream
   client.uploadChatImages = async () => [];
 
   try {
-    await client.sendConversation("生成图片", {
+    const firstTask = await client.sendConversation("生成图片", {
       imageGeneration: true,
       requireConversationId: true
     });
+    const completedUrl = "https://example.test/fallback-completed.png";
+    client.imageGenerationTaskState = async () => null;
+    client.loginPortal = async () => {};
+    client.conversationDetail = async (conversationId) => ({
+      conversation_id: conversationId,
+      current_node: "completed-image",
+      mapping: {
+        "completed-image": {
+          message: {
+            author: { role: "tool" },
+            content: { parts: [{ type: "image_url", image_url: completedUrl }] }
+          }
+        }
+      }
+    });
+    client.refreshCompletedConversation = async (_conversationId, detail) => detail;
+    const completed = await client.getTask(firstTask.conversationId, { imageTask: true });
+    assert.equal(completed.status, "success");
     await new Promise((resolve) => setTimeout(resolve, 240));
     await client.sendConversation("再次生成图片", {
       imageGeneration: true,
@@ -1003,6 +1021,105 @@ test("concurrent GPT tasks stagger their starts but overlap on the same car", as
   assert.equal(maxActive, 3);
   assert.ok(startedAt[1] - startedAt[0] >= 1900);
   assert.ok(startedAt[2] - startedAt[1] >= 1900);
+});
+
+test("concurrent image tasks do not reuse a car that is still generating", async () => {
+  const selectedCars = [];
+  let conversationIndex = 0;
+  const server = createServer((request, response) => {
+    const selectedCar = String(request.headers.cookie || "").match(/car=([^;]+)/)?.[1] || "unknown";
+    if (request.method === "POST" && request.url === "/backend-api/conversation") {
+      selectedCars.push(selectedCar);
+      conversationIndex += 1;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(`data: {"conversation_id":"conversation-${selectedCar}-${conversationIndex}"}\n\ndata: [DONE]\n\n`);
+      return;
+    }
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end("{}");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const client = clientForGpt({
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    accountId: "account-distinct-active-cars"
+  });
+  client.fetchCars = async () => [
+    car({ id: "active-car-one", imageRemaining: 10, count: 0 }),
+    car({ id: "active-car-two", imageRemaining: 10, count: 1 })
+  ];
+  client.enterCar = async (carId, carType) => {
+    client.portalLoggedIn = true;
+    client.carId = carId;
+    client.carType = carType;
+    client.cookies = [`car=${carId}`];
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.captureImageTaskRegistration = async () => null;
+
+  try {
+    const results = await Promise.all([
+      client.createTextTask({
+        prompt: "first active image",
+        concurrentSubmit: true,
+        waitForImages: false
+      }),
+      client.createTextTask({
+        prompt: "second active image",
+        concurrentSubmit: true,
+        waitForImages: false
+      })
+    ]);
+
+    assert.deepEqual(new Set(selectedCars), new Set(["active-car-one", "active-car-two"]));
+    assert.deepEqual(
+      new Set(results.map((result) => result.raw.selectedCarId)),
+      new Set(["active-car-one", "active-car-two"])
+    );
+
+    const busyStartedAt = Date.now();
+    await assert.rejects(
+      () => client.createTextTask({
+        prompt: "all cars are already active",
+        concurrentSubmit: true,
+        waitForImages: false
+      }),
+      (error) => error?.code === "IMAGE_CAR_BUSY" && error?.status === 429
+    );
+    assert.ok(Date.now() - busyStartedAt < 1000);
+
+    const firstResult = results.find((result) => result.raw.selectedCarId === "active-car-one");
+    const completedUrl = "https://example.test/completed-active-car-one.png";
+    client.imageGenerationTaskState = async () => null;
+    client.conversationDetail = async (conversationId) => ({
+      conversation_id: conversationId,
+      current_node: "completed-image",
+      mapping: {
+        "completed-image": {
+          message: {
+            author: { role: "tool" },
+            status: "finished_successfully",
+            content: {
+              content_type: "multimodal_text",
+              parts: [{ type: "image_url", image_url: completedUrl }]
+            }
+          }
+        }
+      }
+    });
+    client.refreshCompletedConversation = async (_conversationId, detail) => detail;
+    const completed = await client.getTask(firstResult.externalId, { imageTask: true });
+    assert.equal(completed.status, "success");
+
+    const thirdResult = await client.createTextTask({
+      prompt: "reuse the completed car",
+      concurrentSubmit: true,
+      waitForImages: false
+    });
+    assert.equal(thirdResult.raw.selectedCarId, "active-car-one");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("GPT conversation busy responses briefly freeze the car and switch without a 24 hour lock", async () => {

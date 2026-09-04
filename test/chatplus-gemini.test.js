@@ -1003,12 +1003,14 @@ test("Gemini 上游返回 500 后当前任务换车再提交一次", async () =>
   ]);
 });
 
-test("Gemini 多个并发任务遇到同一失效车位时只换一次车", async () => {
+test("Gemini 多个并发任务分别避开占用和失效车位", async () => {
   const testClient = client();
   const enteredCars = [];
   const cooldowns = [];
   let expiredSubmissions = 0;
   let healthySubmissions = 0;
+  const expiredSubmittedCars = [];
+  const healthySubmittedCars = [];
   let releaseExpiredSubmissions;
   const allExpiredSubmissionsStarted = new Promise((resolve) => {
     releaseExpiredSubmissions = resolve;
@@ -1019,10 +1021,10 @@ test("Gemini 多个并发任务遇到同一失效车位时只换一次车", asyn
     testClient.portalLoggedIn = true;
   };
   testClient.fetchCars = async () => [
-    {
-      id: "shared-expired-car",
+    ...[1, 2, 3].map((index) => ({
+      id: `expired-car-${index}`,
       status: 1,
-      count: 0,
+      count: index - 1,
       cooldown: 0,
       desc: "expired",
       label: "expired",
@@ -1034,11 +1036,11 @@ test("Gemini 多个并发任务遇到同一失效车位时只换一次车", asyn
       isSuper: false,
       isVirtual: false,
       realCarIDs: []
-    },
-    {
-      id: "shared-healthy-car",
+    })),
+    ...[1, 2, 3].map((index) => ({
+      id: `healthy-car-${index}`,
       status: 1,
-      count: 1,
+      count: index + 2,
       cooldown: 0,
       desc: "healthy",
       label: "healthy",
@@ -1050,7 +1052,7 @@ test("Gemini 多个并发任务遇到同一失效车位时只换一次车", asyn
       isSuper: false,
       isVirtual: false,
       realCarIDs: []
-    }
+    }))
   ];
   testClient.enterCar = async (carId, carType) => {
     enteredCars.push(carId);
@@ -1071,8 +1073,9 @@ test("Gemini 多个并发任务遇到同一失效车位时只换一次车", asyn
   testClient.createSubmitClient = () => testClient;
   testClient.sendGeminiConversation = async (_prompt, input, route, selected) => {
     input.imageSubmissionState.started = true;
-    if (selected.carId === "shared-expired-car") {
+    if (selected.carId.startsWith("expired-car-")) {
       expiredSubmissions += 1;
+      expiredSubmittedCars.push(selected.carId);
       if (expiredSubmissions === 3) releaseExpiredSubmissions();
       await allExpiredSubmissionsStarted;
       const error = new Error("请求失败，请重试");
@@ -1082,6 +1085,7 @@ test("Gemini 多个并发任务遇到同一失效车位时只换一次车", asyn
     }
 
     healthySubmissions += 1;
+    healthySubmittedCars.push(selected.carId);
     input.imageSubmissionState.confirmed = true;
     return {
       events: [],
@@ -1105,10 +1109,12 @@ test("Gemini 多个并发任务遇到同一失效车位时只换一次车", asyn
 
   assert.equal(expiredSubmissions, 3);
   assert.equal(healthySubmissions, 3);
-  assert.deepEqual(enteredCars, ["shared-expired-car", "shared-healthy-car"]);
+  assert.equal(new Set(expiredSubmittedCars).size, 3);
+  assert.equal(new Set(healthySubmittedCars).size, 3);
+  assert.equal(new Set(enteredCars).size, 6);
   assert.deepEqual(results.map((result) => result.status), ["success", "success", "success"]);
   assert.equal(new Set(results.map((result) => result.externalId)).size, 3);
-  assert.equal(cooldowns.every((cooldown) => cooldown.carId === "shared-expired-car"), true);
+  assert.equal(cooldowns.every((cooldown) => cooldown.carId.startsWith("expired-car-")), true);
 });
 
 test("Gemini 参考图上传前发现车位失效时会先换车，不会误记为已经提交", async () => {

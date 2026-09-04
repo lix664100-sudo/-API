@@ -792,6 +792,14 @@ async function durableTaskSlotState(slot, target = {}, input = {}) {
   };
 }
 
+async function submittedImageCarIdsForTarget(target = {}, input = {}) {
+  if (target?.channel?.type !== "chatplus") return [];
+  const state = await durableTaskSlotState("chatImage", target, input);
+  return [...new Set(state.tasks
+    .map((task) => String(task.raw?.selectedCarId || "").trim())
+    .filter(Boolean))];
+}
+
 async function taskSlotOccupancy(slot, target = {}, input = {}) {
   const key = taskSlotKey(slot, target, input);
   const durableState = await durableTaskSlotState(slot, target, input);
@@ -5204,11 +5212,13 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
             latestTask = taskState;
           };
           const chatplusConcurrentSubmit = channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false;
+          const excludedImageCarIds = await submittedImageCarIdsForTarget(target, input);
           let result = await client.createTextTask({
             ...imageInputForTarget(target, input),
             onSubmitted,
             onStage,
             ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
+            ...(excludedImageCarIds.length ? { excludedImageCarIds } : {}),
             waitForImages: options.waitForChatplusImages === true
           });
           taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
@@ -5402,11 +5412,13 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
             latestTask = taskState;
           };
           const chatplusConcurrentSubmit = channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false;
+          const excludedImageCarIds = await submittedImageCarIdsForTarget(target, input);
           let result = await submitImageTask(client, {
             ...imageInputForTarget(target, input),
             onSubmitted,
             onStage,
             ...(channel.type === "chatplus" ? { concurrentSubmit: chatplusConcurrentSubmit } : {}),
+            ...(excludedImageCarIds.length ? { excludedImageCarIds } : {}),
             waitForImages: options.waitForChatplusImages === true
           }, files);
           taskState = await persistSubmittedTask(taskState, result, channel, account, attempts);
