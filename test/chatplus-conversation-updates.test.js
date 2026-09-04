@@ -146,6 +146,151 @@ test("查询同一车位的多个任务会复用已进入的车位会话", async
   assert.equal(enterCount, 0);
 });
 
+test("上游会话首次返回空内容时重新登录并读回生成图片", async () => {
+  const resultUrl = "https://images.example.test/recovered.png";
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://chatplus.example.test" } },
+    account: { id: "account-empty-image", username: "image@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  testClient.portalLoggedIn = true;
+  testClient.carId = "car-empty-image";
+  testClient.carType = "chatgpt";
+  testClient.ensureConversationUpdates = async () => null;
+  let detailReads = 0;
+  testClient.conversationDetail = async (conversationId) => {
+    detailReads += 1;
+    return detailReads === 1
+      ? null
+      : { conversation_id: conversationId, imageUrls: [resultUrl], mapping: {} };
+  };
+  testClient.imageGenerationTaskState = async () => null;
+  testClient.imageUrlsFrom = async (value) => value?.imageUrls || [];
+  testClient.refreshCompletedConversation = async (_conversationId, detail) => detail;
+  testClient.createSubmitClient = () => testClient;
+  let loginCount = 0;
+  let enterCount = 0;
+  testClient.performPortalLogin = async () => {
+    loginCount += 1;
+    testClient.portalLoggedIn = true;
+  };
+  testClient.performEnterCar = async () => {
+    enterCount += 1;
+  };
+
+  const task = await testClient.getTask("conversation-empty-image", {
+    carId: "car-empty-image",
+    carType: "chatgpt",
+    imageTask: true
+  });
+
+  assert.equal(task.status, "success");
+  assert.deepEqual(task.imageUrls, [resultUrl]);
+  assert.equal(detailReads, 2);
+  assert.equal(loginCount, 1);
+  assert.equal(enterCount, 1);
+});
+
+test("上游会话首次返回空内容时重新登录并读回额度提示", async () => {
+  const quotaText = "You've hit the Plus plan limit for image generations requests. You can create more images when the limit resets in 19 hours.";
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://chatplus.example.test" } },
+    account: { id: "account-empty-quota", username: "quota@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  testClient.portalLoggedIn = true;
+  testClient.carId = "car-empty-quota";
+  testClient.carType = "chatgpt";
+  testClient.ensureConversationUpdates = async () => null;
+  let detailReads = 0;
+  testClient.conversationDetail = async (conversationId) => {
+    detailReads += 1;
+    if (detailReads === 1) return null;
+    return {
+      conversation_id: conversationId,
+      current_node: "assistant-result",
+      mapping: {
+        "assistant-result": {
+          parent: null,
+          message: {
+            author: { role: "assistant" },
+            status: "finished_successfully",
+            end_turn: true,
+            content: { content_type: "text", parts: [quotaText] }
+          }
+        }
+      }
+    };
+  };
+  testClient.imageGenerationTaskState = async () => null;
+  testClient.imageUrlsFrom = async () => [];
+  testClient.refreshCompletedConversation = async (_conversationId, detail) => detail;
+  testClient.createSubmitClient = () => testClient;
+  let loginCount = 0;
+  let enterCount = 0;
+  testClient.performPortalLogin = async () => {
+    loginCount += 1;
+    testClient.portalLoggedIn = true;
+  };
+  testClient.performEnterCar = async () => {
+    enterCount += 1;
+  };
+
+  const task = await testClient.getTask("conversation-empty-quota", {
+    carId: "car-empty-quota",
+    carType: "chatgpt",
+    imageTask: true
+  });
+
+  assert.equal(task.status, "failed");
+  assert.equal(task.raw.imageCarQuotaExhausted, true);
+  assert.equal(detailReads, 2);
+  assert.equal(loginCount, 1);
+  assert.equal(enterCount, 1);
+});
+
+test("上游会话重新登录后仍为空时只重试一次", async () => {
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://chatplus.example.test" } },
+    account: { id: "account-still-empty", username: "empty@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  testClient.portalLoggedIn = true;
+  testClient.carId = "car-still-empty";
+  testClient.carType = "chatgpt";
+  testClient.ensureConversationUpdates = async () => null;
+  let detailReads = 0;
+  testClient.conversationDetail = async () => {
+    detailReads += 1;
+    return null;
+  };
+  testClient.createSubmitClient = () => testClient;
+  let loginCount = 0;
+  let enterCount = 0;
+  testClient.performPortalLogin = async () => {
+    loginCount += 1;
+    testClient.portalLoggedIn = true;
+  };
+  testClient.performEnterCar = async () => {
+    enterCount += 1;
+  };
+
+  await assert.rejects(
+    () => testClient.getTask("conversation-still-empty", {
+      carId: "car-still-empty",
+      carType: "chatgpt",
+      imageTask: true
+    }),
+    (error) => error?.code === "UPSTREAM_TASK_STATE_UNAVAILABLE"
+  );
+  assert.equal(detailReads, 2);
+  assert.equal(loginCount, 1);
+  assert.equal(enterCount, 1);
+});
+
 async function waitUntil(predicate, timeoutMs = 2000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

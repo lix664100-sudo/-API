@@ -2098,12 +2098,38 @@ async function persistTaskStageStart(task, stage, channel, account) {
   return nextTask;
 }
 
-async function mirrorTaskImageUrls(imageUrls, config, downloadImage, validateDownload) {
+async function mirrorTaskImageUrls(imageUrls, config, downloadImage, validateDownload, onPhase) {
   return mirrorImageUrls(imageUrls, config, {
     downloadImage,
     attempts: 1,
-    validateDownload
+    validateDownload,
+    onPhase
   });
+}
+
+function createImageSavePhaseReporter(readTask, writeTask, channel, account) {
+  return async (phase) => {
+    try {
+      if (!phase) {
+        const current = readTask();
+        if (!current?.raw?.activeStage) return;
+        const cleared = { ...current, raw: clearActiveTaskStage(current.raw) };
+        await upsertTask(cleared);
+        writeTask(cleared);
+        return;
+      }
+      const nextTask = await persistTaskStageStart(readTask(), {
+        id: `stage-image-save-${phase.key}`,
+        key: phase.key,
+        label: phase.label,
+        status: "processing",
+        startedAt: new Date().toISOString()
+      }, channel, account);
+      writeTask(nextTask);
+    } catch (error) {
+      console.error("保存图片子阶段状态更新失败：", error);
+    }
+  };
 }
 
 async function mirrorTaskImages(result, config, client = null, options = {}) {
@@ -2136,24 +2162,26 @@ async function mirrorTaskImages(result, config, client = null, options = {}) {
       }
     : null;
   try {
-    mirroredUrls = await mirrorTaskImageUrls(imageUrls, config, downloadImage, validateDownload);
+    mirroredUrls = await mirrorTaskImageUrls(imageUrls, config, downloadImage, validateDownload, options.onImagePhase);
   } catch (error) {
+    await options.onImagePhase?.(null);
     error.taskStageTiming = completedTaskStage("result_save", "保存图片", startedAt, "failed", error);
     throw error;
   }
+  await options.onImagePhase?.(null);
   const saveTiming = completedTaskStage("result_save", "保存图片", startedAt);
   return {
     ...result,
     imageCount: mirroredUrls.length,
     imageUrls: mirroredUrls,
-    raw: mergeTaskRaw(result.raw, {
+    raw: clearActiveTaskStage(mergeTaskRaw(result.raw, {
       originalImageUrls: imageUrls,
       imageMirrorPending: false,
       imageMirrorRecoveredAt: new Date().toISOString(),
       resultSaveError: "",
       resultSaveErrorCode: "",
       stageTimings: [saveTiming]
-    })
+    }))
   };
 }
 
@@ -2684,6 +2712,7 @@ async function refreshTaskOnce(taskId, options = {}) {
       );
     }
     try {
+      let phaseTaskState = task;
       const result = await mirrorTaskImages({
         externalId,
         status: "success",
@@ -2699,7 +2728,13 @@ async function refreshTaskOnce(taskId, options = {}) {
           imageMirrorPending: false
         }
       }, config, client, {
-        inputImageHashes: task.raw?.inputImageHashes
+        inputImageHashes: task.raw?.inputImageHashes,
+        onImagePhase: createImageSavePhaseReporter(
+          () => phaseTaskState,
+          (next) => { phaseTaskState = next; },
+          channel,
+          account
+        )
       });
       const nextTask = mergeRefreshedTask(task, result, channel, account);
       await upsertTask(nextTask);
@@ -2794,8 +2829,15 @@ async function refreshTaskOnce(taskId, options = {}) {
 
   let result;
   try {
+    let phaseTaskState = task;
     result = await mirrorTaskImages(refreshInput, config, client, {
-      inputImageHashes: task.raw?.inputImageHashes
+      inputImageHashes: task.raw?.inputImageHashes,
+      onImagePhase: createImageSavePhaseReporter(
+        () => phaseTaskState,
+        (next) => { phaseTaskState = next; },
+        channel,
+        account
+      )
     });
   } catch (error) {
     const replacementUrls = usableImageResultUrls(refreshInput.imageUrls);
@@ -5082,7 +5124,13 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
             result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
           }
           result = await mirrorTaskImages(result, config, client, {
-            inputImageHashes: taskState.raw?.inputImageHashes
+            inputImageHashes: taskState.raw?.inputImageHashes,
+            onImagePhase: createImageSavePhaseReporter(
+              () => taskState,
+              (next) => { taskState = next; latestTask = next; },
+              channel,
+              account
+            )
           });
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
@@ -5274,7 +5322,13 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
             result = await waitForUpstreamTask(client, result, drawingSubmitWaitTimeoutSec(config));
           }
           result = await mirrorTaskImages(result, config, client, {
-            inputImageHashes: taskState.raw?.inputImageHashes
+            inputImageHashes: taskState.raw?.inputImageHashes,
+            onImagePhase: createImageSavePhaseReporter(
+              () => taskState,
+              (next) => { taskState = next; latestTask = next; },
+              channel,
+              account
+            )
           });
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
@@ -5459,7 +5513,14 @@ async function runChatCompletionTask(task, input, reserved = null, options = {})
           const result = await mirrorTaskImages({
             ...upstreamResult,
             usage: upstreamResult.usage || estimateChatTokenUsage(input, upstreamResult.content)
-          }, config, client);
+          }, config, client, {
+            onImagePhase: createImageSavePhaseReporter(
+              () => taskState,
+              (next) => { taskState = next; latestTask = next; },
+              channel,
+              account
+            )
+          });
           const responseJson = chatCompletionResponseJson({ result, channel });
           const finishedTask = await finishChatTask(taskState, result, channel, account, attempts, responseJson, chatStageTimings);
           return { result, channel, account, task: finishedTask, responseJson };

@@ -242,13 +242,24 @@ export async function runAutoCleanupResultImages(config = {}, options = {}) {
   return cleanupResultImages(config, { mode: "expired", retentionDays: settings.retentionDays });
 }
 
+async function notifyImageSavePhase(options, key, label) {
+  if (typeof options?.onPhase !== "function") return;
+  try {
+    await options.onPhase({ key, label });
+  } catch {
+    // 阶段上报失败不影响图片保存本身。
+  }
+}
+
 export async function mirrorImageUrl(url, config = {}, options = {}) {
   const source = String(url || "").trim();
   if (!source || isLocalResultUrl(source, config)) return source;
+  await notifyImageSavePhase(options, "image_download", "下载图片");
   const { buffer, contentType } = await downloadImageWithRetry(source, options);
   if (typeof options.validateDownload === "function") {
     await options.validateDownload({ buffer, contentType, source });
   }
+  await notifyImageSavePhase(options, "image_upload", "保存文件");
   await mkdir(resultImageDir, { recursive: true });
   const filename = `${Date.now()}-${randomUUID()}${extFromContentType(contentType)}`;
   await writeFile(path.join(resultImageDir, filename), buffer);

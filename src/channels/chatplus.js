@@ -5434,6 +5434,10 @@ export class ChatplusClient {
       }
       return payload;
     };
+    const shouldReconnectAfterReadError = (error) => (
+      isAuthSessionError(error)
+      || error?.code === "UPSTREAM_TASK_STATE_UNAVAILABLE"
+    );
     const restoreConversationSession = async (reset = false) => {
       if (taskCarId) {
         return this.sessionLock(async () => {
@@ -5495,7 +5499,7 @@ export class ChatplusClient {
       try {
         detail = await readWith(await restoreConversationSession(context.forceReconnect === true));
       } catch (directError) {
-        if (!isAuthSessionError(directError)) throw directError;
+        if (!shouldReconnectAfterReadError(directError)) throw directError;
         detail = await readWith(await restoreConversationSession(true));
       }
     } else {
@@ -5503,7 +5507,7 @@ export class ChatplusClient {
       try {
         detail = await readWith(this);
       } catch (directError) {
-        const resetAfterDirectRead = isAuthSessionError(directError);
+        const resetAfterDirectRead = shouldReconnectAfterReadError(directError);
         detail = await readWith(await restoreConversationSession(resetAfterDirectRead));
       }
     }

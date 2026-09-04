@@ -10735,12 +10735,22 @@
 
         function taskStatusSummaryCell(row) {
           const duration = taskDuration(row, nowTick);
+          const status = String(row?.status || "");
           const activeStage = String(row?.raw?.activeStage?.label || "").trim();
-          const stageText = String(row?.status || "") === "queued"
-            ? "等待空闲名额"
-            : ["processing", "pending", "unknown"].includes(String(row?.status || ""))
-              ? activeStage
-              : "";
+          const mirrorRetry = Number(row?.raw?.imageMirrorRetryCount || 0);
+          let stageText = "";
+          if (status === "queued") {
+            stageText = "等待空闲名额";
+          } else if (["processing", "pending", "unknown"].includes(status)) {
+            stageText = activeStage;
+          } else if (status === "waiting_upstream") {
+            stageText = activeStage
+              || (row?.raw?.imageMirrorPending
+                ? `保存图片${mirrorRetry > 0 ? `（已重试 ${mirrorRetry} 次）` : "中"}`
+                : "等待上游返回结果");
+          } else if (status === "interrupted" && row?.raw?.imageMirrorGaveUp) {
+            stageText = `保存失败（已重试 ${mirrorRetry} 次）`;
+          }
           return h("div", { className: "task-status-summary" }, [
             h("div", { className: "task-status-tags", key: "tags" }, [
               taskStatusTag(row),
