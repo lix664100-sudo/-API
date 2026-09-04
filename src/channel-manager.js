@@ -58,6 +58,7 @@ const activeSubmittedTaskIds = new Set();
 const activeAccountAuthTasks = new Map();
 const activeChatplusAccountWork = new Map();
 const activeTaskRefreshes = new Map();
+const taskRefreshSessions = new Map();
 const activeChatQuotaProbes = new Set();
 const clientCache = new Map();
 const accountRecoveryTasks = new Map();
@@ -75,7 +76,9 @@ const DRAWING_FAILURE_LIMIT = 3;
 const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
 const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
 const FAST_QUOTA_REFRESH_TIMEOUT_MS = 5000;
-const FAST_TASK_REFRESH_TIMEOUT_SEC = 30;
+const FAST_TASK_REFRESH_TIMEOUT_SEC = 8;
+const TASK_REFRESH_SESSION_TTL_MS = 30 * 60 * 1000;
+const MAX_TASK_REFRESH_SESSIONS = 5000;
 const UPSTREAM_RESULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_TIMEOUT_MS = 30 * 60 * 1000;
 const IMAGE_MIRROR_RECOVERY_MAX_ATTEMPTS = 20;
@@ -94,6 +97,65 @@ let routingReservationQueue = Promise.resolve();
 subscribeChatplusConversationUpdates(({ conversationId, payload, fingerprint }) => (
   storeChatplusConversationUpdate(conversationId, fingerprint, payload)
 ));
+
+// These snapshots contain account cookies. Keep them only in this process so
+// polling a submitted task does not repeat the portal login and car switch.
+function cloneTaskRefreshSession(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const cookies = Array.isArray(snapshot.cookies)
+    ? snapshot.cookies.filter((item) => typeof item === "string").map((item) => item.slice(0, 16_384))
+    : [];
+  if (!cookies.length) return null;
+  return {
+    baseUrl: String(snapshot.baseUrl || "").slice(0, 2_000),
+    cookies,
+    portalLoggedIn: snapshot.portalLoggedIn === true,
+    carId: String(snapshot.carId || "").slice(0, 500),
+    carType: String(snapshot.carType || "chatgpt").slice(0, 100),
+    defaultModel: String(snapshot.defaultModel || "").slice(0, 500),
+    geminiSession: snapshot.geminiSession && typeof snapshot.geminiSession === "object"
+      ? { ...snapshot.geminiSession }
+      : {}
+  };
+}
+
+function pruneTaskRefreshSessions(now = Date.now()) {
+  for (const [taskId, entry] of taskRefreshSessions) {
+    if (!entry || entry.expiresAt <= now) taskRefreshSessions.delete(taskId);
+  }
+}
+
+function rememberTaskRefreshSession(taskId, snapshot) {
+  const key = String(taskId || "").trim();
+  const copy = cloneTaskRefreshSession(snapshot);
+  if (!key || !copy) return;
+  pruneTaskRefreshSessions();
+  taskRefreshSessions.delete(key);
+  while (taskRefreshSessions.size >= MAX_TASK_REFRESH_SESSIONS) {
+    const oldestTaskId = taskRefreshSessions.keys().next().value;
+    if (!oldestTaskId) break;
+    taskRefreshSessions.delete(oldestTaskId);
+  }
+  taskRefreshSessions.set(key, {
+    snapshot: copy,
+    expiresAt: Date.now() + TASK_REFRESH_SESSION_TTL_MS
+  });
+}
+
+function taskRefreshSession(taskId) {
+  const key = String(taskId || "").trim();
+  const entry = taskRefreshSessions.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    taskRefreshSessions.delete(key);
+    return null;
+  }
+  return cloneTaskRefreshSession(entry.snapshot);
+}
+
+function forgetTaskRefreshSession(taskId) {
+  taskRefreshSessions.delete(String(taskId || "").trim());
+}
 
 function normalizeSourceTaskId(value) {
   const text = String(Array.isArray(value) ? value[0] : value || "").trim();
@@ -2763,6 +2825,7 @@ async function refreshTaskOnce(taskId, options = {}) {
   const persistedUpdates = channel.type === "chatplus"
     ? await listChatplusConversationUpdates(externalId)
     : [];
+  const sessionSnapshot = channel.type === "chatplus" ? taskRefreshSession(task.id) : null;
   try {
     refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
       carId: task.raw?.selectedCarId,
@@ -2771,7 +2834,9 @@ async function refreshTaskOnce(taskId, options = {}) {
       upstreamTaskId: task.raw?.upstreamTaskId,
       persistedUpdates,
       timeoutSec: FAST_TASK_REFRESH_TIMEOUT_SEC,
-      forceReconnect
+      forceReconnect,
+      sessionSnapshot,
+      onSessionSnapshot: (snapshot) => rememberTaskRefreshSession(task.id, snapshot)
     }), {
       parallel: channel.type === "chatplus" && Boolean(task.raw?.selectedCarId)
     });
@@ -2859,6 +2924,7 @@ async function refreshTaskOnce(taskId, options = {}) {
   const nextTask = mergeRefreshedTask(mergeBaseTask, result, channel, account);
   await upsertTask(nextTask);
   if (isFinishedTask(nextTask.status)) {
+    forgetTaskRefreshSession(nextTask.id);
     await recordTaskStat(nextTask);
     await updateAccountAfterTask(account, channel, nextTask);
   }
@@ -2889,7 +2955,8 @@ function fastTaskRefreshEligible(task = {}) {
 
 const fastTaskRefresher = createFastTaskRefresher({
   refresh: (taskId) => refreshTask(taskId),
-  shouldContinue: fastTaskRefreshEligible
+  shouldContinue: fastTaskRefreshEligible,
+  initialDelayMs: 2000
 });
 
 function scheduleFastTaskRefresh(task) {
@@ -4893,11 +4960,13 @@ async function failQueuedTask(task, error, attempts = [], stageTimings = []) {
     }))
   };
   await upsertTask(failedTask);
+  forgetTaskRefreshSession(failedTask.id);
   await recordTaskStat(failedTask);
   return failedTask;
 }
 
 async function finishQueuedTask(task, result, channel, account, attempts) {
+  rememberTaskRefreshSession(task.id, result?.refreshSessionSnapshot);
   const status = result.status || task.status;
   const wrapped = wrapTask({ result, channel, account, attempts, requestJson: task.requestJson, requestMeta: task.requestMeta });
   const nextTask = {
@@ -4921,7 +4990,10 @@ async function finishQueuedTask(task, result, channel, account, attempts) {
     };
   }
   await upsertTask(nextTask);
-  if (isFinishedTask(nextTask.status)) await recordTaskStat(nextTask);
+  if (isFinishedTask(nextTask.status)) {
+    forgetTaskRefreshSession(nextTask.id);
+    await recordTaskStat(nextTask);
+  }
   await updateAccountAfterTask(account, channel, nextTask);
   scheduleDrawingQuotaRefresh(account, channel);
   scheduleFastTaskRefresh(nextTask);
@@ -4932,6 +5004,7 @@ async function persistSubmittedTask(task, result, channel, account, attempts) {
   if (!savedTaskExternalId(result)) return task;
   const upstreamCompleted = result?.status === "success";
   if (isFinishedTask(result?.status) && !upstreamCompleted) return task;
+  rememberTaskRefreshSession(task.id, result?.refreshSessionSnapshot);
   const submittedTask = mergeRefreshedTask(task, {
     ...result,
     status: upstreamCompleted ? "processing" : result.status || "processing"

@@ -33,6 +33,7 @@ const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
 const ACCOUNT_CHECK_TIMEOUT_SEC = 20;
 const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 300;
 const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
+const RESULT_CHANNEL_READY_GRACE_MS = 1_500;
 const IMAGE_TASK_LIST_CACHE_MS = 2_000;
 const IMAGE_TASK_LIST_CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_IMAGE_TASK_LIST_CACHES = 100;
@@ -1324,11 +1325,22 @@ function resultChannelMetadata(conversation = {}, route = {}) {
   };
 }
 
+// The session contains cookies, so keep it only in memory and never serialize it with a task record.
+function attachRefreshSession(result, snapshot) {
+  if (!result || !snapshot) return result;
+  Object.defineProperty(result, "refreshSessionSnapshot", {
+    value: snapshot,
+    enumerable: false,
+    configurable: true
+  });
+  return result;
+}
+
 function submittedImageTask(conversation, input, prompt, taskType, sourceImageCount = 0) {
   const { events = [], conversationId, model, upstreamModel, route, selected } = conversation;
   const imageUrls = Array.isArray(conversation.imageUrls) ? conversation.imageUrls.filter(Boolean) : [];
   const upstreamText = String(conversation.directContent || "").trim();
-  return {
+  return attachRefreshSession({
     externalId: conversationId,
     status: "processing",
     prompt,
@@ -1357,7 +1369,7 @@ function submittedImageTask(conversation, input, prompt, taskType, sourceImageCo
       } : {}),
       ...(upstreamText ? { upstreamText } : {})
     }
-  };
+  }, conversation.submitSessionSnapshot);
 }
 
 async function notifyImageSubmitted(input, result) {
@@ -4896,14 +4908,24 @@ export class ChatplusClient {
           : () => {};
         let resultChannelReady = false;
         let resultChannelError = "";
+        let resultChannelConnection = null;
         if (requestInput.imageGeneration === true) {
-          void submitClient.ensureConversationUpdates({ timeoutSec: DEFAULT_CONNECT_TIMEOUT_SEC })
+          resultChannelConnection = submitClient.ensureConversationUpdates({ timeoutSec: DEFAULT_CONNECT_TIMEOUT_SEC })
             .then(() => {
               resultChannelReady = true;
             })
             .catch((error) => {
               resultChannelError = String(error?.message || "结果通道连接失败。");
             });
+          // Give the live result channel a short head start. It remains best-effort:
+          // a slow socket must not hold up submitting the image task itself.
+          await Promise.race([
+            resultChannelConnection,
+            new Promise((resolve) => {
+              const timer = setTimeout(resolve, RESULT_CHANNEL_READY_GRACE_MS);
+              timer.unref?.();
+            })
+          ]);
         }
 
         const submission = await this.runConversationSubmit(selected, async () => measureTaskStage(requestInput.taskStageRecorder, {
@@ -5493,9 +5515,31 @@ export class ChatplusClient {
     const readWith = async (reader) => {
       taskReader = reader;
       beginConversationUpdates(reader);
-      return readDetail(reader);
+      try {
+        return await readDetail(reader);
+      } finally {
+        // The next in-process poll can reuse this session without persisting it.
+        try {
+          const snapshot = reader?.sessionSnapshot?.();
+          if (snapshot && typeof context.onSessionSnapshot === "function") {
+            context.onSessionSnapshot(snapshot);
+          }
+        } catch {
+          // Saving a fresh snapshot is an optimization, not part of reading a result.
+        }
+      }
     };
-    if (taskCarId) {
+    const sessionSnapshot = context.sessionSnapshot && typeof context.sessionSnapshot === "object"
+      ? context.sessionSnapshot
+      : null;
+    if (sessionSnapshot && context.forceReconnect !== true) {
+      try {
+        detail = await readWith(this.createSubmitClient({ snapshot: sessionSnapshot }));
+      } catch (snapshotError) {
+        if (!shouldReconnectAfterReadError(snapshotError)) throw snapshotError;
+        detail = await readWith(await restoreConversationSession(true));
+      }
+    } else if (taskCarId) {
       try {
         detail = await readWith(await restoreConversationSession(context.forceReconnect === true));
       } catch (directError) {
@@ -5833,7 +5877,7 @@ export class ChatplusClient {
         : null;
       if (imageUrls.length) await this.rememberImageSuccessfulCar(selected);
 
-      return {
+      return attachRefreshSession({
         externalId: conversationId,
         status: imageUrls.length ? "success" : "waiting_upstream",
         prompt,
@@ -5864,7 +5908,7 @@ export class ChatplusClient {
           ...geminiRouteMetadata(route),
           stageTimings: taskStageSnapshot(taskStageRecorder)
         }
-      };
+      }, result.submitSessionSnapshot);
     });
   }
 
@@ -5937,7 +5981,7 @@ export class ChatplusClient {
         : null;
       if (imageUrls.length) await this.rememberImageSuccessfulCar(selected);
 
-      return {
+      return attachRefreshSession({
         externalId: conversationId,
         status: imageUrls.length ? "success" : "waiting_upstream",
         prompt,
@@ -5969,7 +6013,7 @@ export class ChatplusClient {
           ...geminiRouteMetadata(route),
           stageTimings: taskStageSnapshot(taskStageRecorder)
         }
-      };
+      }, result.submitSessionSnapshot);
     });
   }
 

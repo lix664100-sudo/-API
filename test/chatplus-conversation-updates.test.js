@@ -146,6 +146,138 @@ test("查询同一车位的多个任务会复用已进入的车位会话", async
   assert.equal(enterCount, 0);
 });
 
+test("查询任务复用提交时会话，不重复排队进入车位", async () => {
+  const snapshot = {
+    baseUrl: "https://chatplus.example.test",
+    cookies: ["session=submitted"],
+    portalLoggedIn: true,
+    carId: "car-submitted",
+    carType: "chatgpt",
+    defaultModel: "gpt-image-test",
+    geminiSession: {}
+  };
+  const refreshedSnapshot = { ...snapshot, cookies: ["session=refreshed"] };
+  const reader = {
+    ensureConversationUpdates: async () => null,
+    conversationDetail: async (conversationId) => ({
+      conversation_id: conversationId,
+      imageUrls: ["https://images.example.test/submitted-session.png"],
+      mapping: {}
+    }),
+    imageUrlsFrom: async (value) => value?.imageUrls || [],
+    sessionSnapshot: () => refreshedSnapshot
+  };
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: snapshot.baseUrl } },
+    account: { id: "account-submitted-session", username: "submitted@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let lockCount = 0;
+  let receivedSnapshot = null;
+  const savedSnapshots = [];
+  testClient.sessionLock = async (work) => {
+    lockCount += 1;
+    return work();
+  };
+  testClient.createSubmitClient = ({ snapshot: value }) => {
+    receivedSnapshot = value;
+    return reader;
+  };
+  testClient.performPortalLogin = async () => assert.fail("不应重新登录");
+  testClient.performEnterCar = async () => assert.fail("不应重新进入车位");
+  testClient.rememberImageSuccessfulCar = async () => {};
+
+  const task = await testClient.getTask("conversation-submitted-session", {
+    carId: snapshot.carId,
+    carType: snapshot.carType,
+    imageTask: true,
+    sessionSnapshot: snapshot,
+    onSessionSnapshot: (value) => savedSnapshots.push(value)
+  });
+
+  assert.equal(task.status, "success");
+  assert.equal(lockCount, 0);
+  assert.deepEqual(receivedSnapshot, snapshot);
+  assert.deepEqual(savedSnapshots, [refreshedSnapshot]);
+  assert.equal(JSON.stringify(task).includes("session=refreshed"), false);
+});
+
+test("提交时会话失效后自动恢复并重新查询", async () => {
+  const snapshot = {
+    baseUrl: "https://chatplus.example.test",
+    cookies: ["session=expired"],
+    portalLoggedIn: true,
+    carId: "car-recover-session",
+    carType: "chatgpt",
+    defaultModel: "gpt-image-test",
+    geminiSession: {}
+  };
+  const recoveredSnapshot = { ...snapshot, cookies: ["session=recovered"] };
+  const expiredReader = {
+    ensureConversationUpdates: async () => null,
+    conversationDetail: async () => {
+      const error = new Error("401 session expired");
+      error.status = 401;
+      throw error;
+    },
+    sessionSnapshot: () => snapshot
+  };
+  const recoveredReader = {
+    ensureConversationUpdates: async () => null,
+    conversationDetail: async (conversationId) => ({
+      conversation_id: conversationId,
+      imageUrls: ["https://images.example.test/recovered-session.png"],
+      mapping: {}
+    }),
+    imageUrlsFrom: async (value) => value?.imageUrls || [],
+    sessionSnapshot: () => recoveredSnapshot
+  };
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: snapshot.baseUrl } },
+    account: { id: "account-recover-session", username: "recover@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let lockCount = 0;
+  let enterCount = 0;
+  let createClientCount = 0;
+  const savedSnapshots = [];
+  testClient.sessionLock = async (work) => {
+    lockCount += 1;
+    return work();
+  };
+  testClient.invalidateSharedPortalSession = () => {};
+  testClient.resetSession = () => {
+    testClient.portalLoggedIn = false;
+    testClient.carId = "";
+  };
+  testClient.performPortalLogin = async () => {
+    testClient.portalLoggedIn = true;
+  };
+  testClient.performEnterCar = async () => {
+    enterCount += 1;
+  };
+  testClient.createSubmitClient = () => {
+    createClientCount += 1;
+    return createClientCount === 1 ? expiredReader : recoveredReader;
+  };
+  testClient.rememberImageSuccessfulCar = async () => {};
+
+  const task = await testClient.getTask("conversation-recover-session", {
+    carId: snapshot.carId,
+    carType: snapshot.carType,
+    imageTask: true,
+    sessionSnapshot: snapshot,
+    onSessionSnapshot: (value) => savedSnapshots.push(value)
+  });
+
+  assert.equal(task.status, "success");
+  assert.equal(lockCount, 1);
+  assert.equal(enterCount, 1);
+  assert.deepEqual(savedSnapshots, [snapshot, recoveredSnapshot]);
+});
+
 test("上游会话首次返回空内容时重新登录并读回生成图片", async () => {
   const resultUrl = "https://images.example.test/recovered.png";
   const testClient = new ChatplusClient({
@@ -429,7 +561,7 @@ test("结果通道在提交前启动，但连接慢时不阻塞上游编号", as
     }),
     new Promise((_, reject) => setTimeout(
       () => reject(new Error("提交被结果通道阻塞")),
-      200
+      2500
     ))
   ]);
 
