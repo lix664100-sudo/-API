@@ -3352,7 +3352,7 @@ test("聊天生图没有上游编号时不能算已提交", async () => {
   }
 });
 
-test("聊天生图并发提交会为每个进行中的任务选择不同车位", async () => {
+test("同一账号的聊天生图按顺序提交，并为进行中的任务选择不同车位", async () => {
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
     channel: { id: "shareai:chatplus", settings: { baseUrl: "https://www.chatplus.cc" } },
@@ -3458,7 +3458,7 @@ test("聊天生图并发提交会为每个进行中的任务选择不同车位",
   assert.equal(enterCarCount, 3);
   assert.equal(initCount, 3);
   assert.equal(client.cookies.some((cookie) => cookie.startsWith("upload=")), false);
-  assert.equal(maxSubmitSteps > 1, true);
+  assert.equal(maxSubmitSteps, 1, "同一账号进入车位、上传和提交不能同时进行");
   assert.deepEqual(results.map((result) => result.status), ["waiting_upstream", "waiting_upstream", "waiting_upstream"]);
   assert.equal(new Set(results.map((result) => result.externalId)).size, 3);
   assert.equal(new Set(results.map((result) => result.raw.selectedCarId)).size, 3);

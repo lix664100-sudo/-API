@@ -134,7 +134,9 @@ test("聊天账号被反复挤下线时快速失败，不再无限重试换车",
   let prepareCalls = 0;
   client.prepareChatSession = async () => {
     prepareCalls += 1;
-    throw new Error("您已在其他设备登陆");
+    const error = new Error("您已在其他设备登陆");
+    error.authScope = "car";
+    throw error;
   };
 
   await assert.rejects(
@@ -147,7 +149,45 @@ test("聊天账号被反复挤下线时快速失败，不再无限重试换车",
       return true;
     }
   );
-  assert.equal(prepareCalls, 3, "连续三次被挤下线后应该立即停止，而不是继续换车");
+  assert.equal(prepareCalls, 2, "连续两次被挤下线后应该立即停止，而不是继续换车");
+});
+
+test("GPT 生图提交时反复被挤下线会停止换车，不误报车位失效", async () => {
+  const { client } = makeChatClient();
+  let requestCount = 0;
+  client.ensureConversationUpdates = async () => null;
+  client.prepareChatSession = async (_input, ignoredCarIds) => {
+    const carId = `submit-kick-car-${requestCount + 1}`;
+    ignoredCarIds.add(carId);
+    return {
+      route: { key: "gpt", model: "gpt-test" },
+      init: { default_model_slug: "gpt-test" },
+      selected: { carId, carType: "chatgpt" }
+    };
+  };
+  client.uploadChatImages = async () => [];
+  client.http = async () => {
+    requestCount += 1;
+    return {
+      status: 403,
+      headers: {},
+      body: JSON.stringify({ detail: { message: "您的账号在其他设备登录，请重新登录" } })
+    };
+  };
+
+  await assert.rejects(
+    client.sendConversation("重新登录测试", {
+      imageGeneration: true,
+      requireConversationId: true
+    }),
+    (error) => {
+      assert.equal(error.code, "ACCOUNT_SESSION_CONTENDED");
+      assert.equal(error.status, 409);
+      assert.doesNotMatch(error.message, /没有创建对话/);
+      return true;
+    }
+  );
+  assert.equal(requestCount, 2, "连续两次明确被挤下线后应停止，不再继续换车");
 });
 
 test("相同图片重复上传直接命中缓存，重置会话后重新上传", async () => {

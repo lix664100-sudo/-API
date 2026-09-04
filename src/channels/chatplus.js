@@ -41,7 +41,7 @@ const CONVERSATION_READ_HEADERS = Object.freeze({
   pragma: "no-cache"
 });
 const MAX_CHAT_CAR_ATTEMPTS = 8;
-const AUTH_KICK_FAST_FAIL_LIMIT = 3;
+const AUTH_KICK_FAST_FAIL_LIMIT = 2;
 const CHAT_IMAGE_UPLOAD_CACHE_TTL_MS = 10 * 60 * 1000;
 const CHAT_IMAGE_UPLOAD_CACHE_MAX = 200;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
@@ -57,6 +57,8 @@ const IMAGE_SLOW_RESULT_WINDOW_MS = 30 * 60 * 1000;
 const IMAGE_SLOW_RESULT_COOLDOWN_MS = 10 * 60 * 1000;
 const IMAGE_SLOW_RESULT_LIMIT = 2;
 const ACTIVE_IMAGE_CAR_LEASE_TTL_MS = 35 * 60 * 1000;
+const IMAGE_SUBMISSION_LOCKED = Symbol("imageSubmissionLocked");
+const accountImageSubmissionWorks = new Map();
 const GEMINI_REQUEST_PATH = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
 const GEMINI_UPLOAD_PREFLIGHT_PATH = "/_/BardChatUi/data/batchexecute";
 const GEMINI_UPLOAD_PREFLIGHT_RPC_ID = "ESY5D";
@@ -471,10 +473,9 @@ function isExplicitAuthSessionError(error) {
   return /\b401\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|聊天记录.{0,12}(?:删除|已删除)|换车继续聊|unauthorized|session expired/i.test(text);
 }
 
-// 只有"账号被挤下线"这类账号级别的故障才触发快速失败；
-// 共享车位自己的认证失败(401/403)仍然按车位故障处理，不能冒充账号掉线。
+// 普通的 401/403 仍属于单个车位故障，可以换车；但上游明确说
+// "其他设备登录" 时，即使它同时标成车位错误，也说明账号会话正被挤掉。
 function isAccountKickError(error) {
-  if (error?.authScope === "car" || error?.carPoolUnavailable === true) return false;
   const text = `${error?.message || ""} ${error?.body || ""} ${error?.upstreamText || ""}`;
   return /其他设备登|在其他设备|被挤下线|挤下线/.test(text);
 }
@@ -3552,6 +3553,18 @@ export class ChatplusClient {
     return this.runAccountWork(work, this.chatRouteForInput(input).key);
   }
 
+  async runImageSubmissionWork(work) {
+    const key = this.portalSessionPoolKey();
+    const previous = accountImageSubmissionWorks.get(key) || Promise.resolve();
+    const current = previous.catch(() => {}).then(work);
+    accountImageSubmissionWorks.set(key, current);
+    try {
+      return await current;
+    } finally {
+      if (accountImageSubmissionWorks.get(key) === current) accountImageSubmissionWorks.delete(key);
+    }
+  }
+
   async runConversationSubmit(selected = {}, work) {
     const carId = String(selected.carId || "").trim();
     const carType = String(selected.carType || "chatgpt").trim();
@@ -4978,6 +4991,17 @@ export class ChatplusClient {
   }
 
   async sendConversation(prompt, input = {}, ignoredCarIds = new Set()) {
+    if (
+      input.imageGeneration === true
+      && input.concurrentSubmit === true
+      && input[IMAGE_SUBMISSION_LOCKED] !== true
+      && this.chatRouteForInput(input).key === "gpt"
+    ) {
+      return this.runImageSubmissionWork(() => this.sendConversation(prompt, {
+        ...input,
+        [IMAGE_SUBMISSION_LOCKED]: true
+      }, ignoredCarIds));
+    }
     const errors = [];
     const imageCarQuotaErrors = [];
     const unconfirmedCars = [];
@@ -5225,6 +5249,16 @@ export class ChatplusClient {
         if (isConfirmedChatUsageLimitError(error)) {
           error.quotaModel = activeRoute?.key || "";
           throw error;
+        }
+        if (selected && isAccountKickError(error)) {
+          authKickAttempts += 1;
+          if (authKickAttempts >= AUTH_KICK_FAST_FAIL_LIMIT) {
+            throw accountSessionContentionError(errors);
+          }
+          await this.rememberAuthFailedCar(selected, error);
+          await this.invalidatePreparedChatSession(preparedSession);
+          recordCarError(error.message || "账号被其他登录挤下线");
+          continue;
         }
         if (selected && error.conversationBusy === true) {
           recordCarError("上游提示对话过快或已有任务正在处理，车位已短暂冻结并自动切换。");

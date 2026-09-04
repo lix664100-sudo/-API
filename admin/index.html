@@ -11878,7 +11878,7 @@
                             h("li", null, [h(Typography.Text, { code: true }, "accountId"), " 指定后只使用这个账号，不会自动换成其他账号；不填写时才会自动分配可用账号。"]),
                             h("li", null, ["图片修改可传 ", h(Typography.Text, { code: true }, "ratio_label"), " 和 ", h(Typography.Text, { code: true }, "image_count"), "；也兼容 ratio 和 n。"]),
                             h("li", null, ["使用 ", h(Typography.Text, { code: true }, "GET /v1/models"), " 查询模型；错误信息可从 ", h(Typography.Text, { code: true }, "error.message"), " 读取。"]),
-                            h("li", null, ["图片修改默认立即返回任务编号，再按任务编号查询结果；需要等待最终图片时，在地址后加 ", h(Typography.Text, { code: true }, "?wait=1"), "。"])
+                            h("li", null, ["图片修改默认等待最终图片；在地址后加 ", h(Typography.Text, { code: true }, "?wait=0"), " 可先创建任务，再按任务编号查询结果。"])
                           ])
                         ]),
                         h("div", { className: "api-doc-section" }, [

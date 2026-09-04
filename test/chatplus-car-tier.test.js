@@ -1023,6 +1023,90 @@ test("concurrent GPT tasks stagger their starts but overlap on the same car", as
   assert.ok(startedAt[2] - startedAt[1] >= 1900);
 });
 
+test("同一 GPT 账号会排队登录上传和提交，但首单等图时不会挡住第二单", async () => {
+  const client = clientForGpt({ accountId: "account-image-submit-lock" });
+  client.createSubmitClient = () => client;
+  let sessionIndex = 0;
+  let submissionIndex = 0;
+  let releaseFirstResult;
+  let reportFirstResultWait;
+  let reportSecondSubmitted;
+  const stages = [];
+  const firstResultWait = new Promise((resolve) => { reportFirstResultWait = resolve; });
+  const holdFirstResult = new Promise((resolve) => { releaseFirstResult = resolve; });
+  const secondSubmitted = new Promise((resolve) => { reportSecondSubmitted = resolve; });
+
+  client.prepareReusableChatSession = async () => {
+    const current = ++sessionIndex;
+    stages.push(`prepare-${current}`);
+    return {
+      route: { key: "gpt", model: "gpt-image-test", carType: "chatgpt" },
+      init: { default_model_slug: "gpt-image-test" },
+      selected: { carId: `submission-lock-car-${current}`, carType: "chatgpt" },
+      revision: client.sessionRevision,
+      snapshot: client.sessionSnapshot()
+    };
+  };
+  client.uploadChatImages = async () => {
+    stages.push(`upload-${sessionIndex}`);
+    return [];
+  };
+  client.buildConversationBody = () => ({ body: {}, messageId: `submission-lock-message-${sessionIndex}` });
+  client.http = async (pathName) => {
+    assert.equal(pathName, "/backend-api/conversation");
+    const current = ++submissionIndex;
+    stages.push(`submit-${current}`);
+    if (current === 2) reportSecondSubmitted();
+    return {
+      status: 200,
+      headers: {},
+      body: `data: {"conversation_id":"submission-lock-conversation-${current}"}\n\ndata: [DONE]\n\n`
+    };
+  };
+  client.waitForConversationImages = async (_events, conversationId) => {
+    stages.push(`wait-${conversationId}`);
+    if (conversationId.endsWith("-1")) {
+      reportFirstResultWait();
+      await holdFirstResult;
+    }
+    return [`https://example.test/${conversationId}.png`];
+  };
+
+  const first = client.createImageTask({
+    prompt: "第一张图",
+    files: [{ filename: "first.png" }],
+    concurrentSubmit: true,
+    waitForImages: true
+  });
+  await firstResultWait;
+
+  const second = client.createImageTask({
+    prompt: "第二张图",
+    files: [{ filename: "second.png" }],
+    concurrentSubmit: true,
+    waitForImages: true
+  });
+  const submittedWhileFirstWaits = await Promise.race([
+    secondSubmitted.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 500))
+  ]);
+
+  assert.equal(submittedWhileFirstWaits, true);
+  assert.deepEqual(stages.slice(0, 6), [
+    "prepare-1",
+    "upload-1",
+    "submit-1",
+    "wait-submission-lock-conversation-1",
+    "prepare-2",
+    "upload-2"
+  ]);
+
+  releaseFirstResult();
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(firstResult.status, "success");
+  assert.equal(secondResult.status, "success");
+});
+
 test("concurrent image tasks do not reuse a car that is still generating", async () => {
   const selectedCars = [];
   let conversationIndex = 0;
