@@ -423,7 +423,7 @@ test("上游会话首次返回空内容时重新登录并读回额度提示", as
         "assistant-result": {
           parent: null,
           message: {
-            author: { role: "assistant" },
+            author: { role: "tool" },
             status: "finished_successfully",
             end_turn: true,
             content: { content_type: "text", parts: [quotaText] }
@@ -457,6 +457,105 @@ test("上游会话首次返回空内容时重新登录并读回额度提示", as
   assert.equal(detailReads, 2);
   assert.equal(loginCount, 1);
   assert.equal(enterCount, 1);
+});
+
+test("生图工具实时返回额度用完时立即结束且不换车重发", async () => {
+  const quotaText = "You've hit the Plus plan limit for image generations requests. You can create more images when the limit resets in 15 hours.";
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://chatplus.example.test" } },
+    account: { id: "account-live-quota", username: "live-quota@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let submissionCount = 0;
+  let detailReads = 0;
+  const failedCars = [];
+  testClient.sendConversation = async () => {
+    submissionCount += 1;
+    return {
+      selected: { carId: "car-live-quota", carType: "chatgpt" },
+      route: { key: "gpt", model: "gpt-image-test" },
+      upstreamModel: "gpt-image-test",
+      submissionConfirmed: true
+    };
+  };
+  testClient.rememberImageFailedCar = async (car) => {
+    failedCars.push(car.carId);
+  };
+  testClient.conversationDetail = async () => {
+    detailReads += 1;
+    return {
+      current_node: "image-tool-result",
+      mapping: {
+        "image-tool-result": {
+          parent: null,
+          message: {
+            author: { role: "tool" },
+            status: "finished_successfully",
+            content: { content_type: "text", parts: [quotaText] }
+          }
+        }
+      }
+    };
+  };
+  testClient.imageUrlsFrom = async () => [];
+  testClient.imageGenerationTaskState = async () => null;
+  testClient.refreshCompletedConversation = async (_conversationId, detail) => detail;
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => testClient.withImageQuotaFallback("生成图片", { imageGeneration: true }, async () => (
+      testClient.waitForConversationImages([], "conversation-live-quota", 30)
+    )),
+    (error) => error?.imageCarQuotaExhausted === true
+      && error?.imageSubmissionAttempted === true
+      && error?.imageSubmissionConfirmed === true
+  );
+
+  assert.ok(Date.now() - startedAt < 1000);
+  assert.equal(detailReads, 1);
+  assert.equal(submissionCount, 1);
+  assert.deepEqual(failedCars, ["car-live-quota"]);
+});
+
+test("生图工具实时返回请重试时立即结束等待", async () => {
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://chatplus.example.test" } },
+    account: { id: "account-live-failure", username: "live-failure@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let detailReads = 0;
+  testClient.conversationDetail = async () => {
+    detailReads += 1;
+    return {
+      current_node: "image-tool-result",
+      mapping: {
+        "image-tool-result": {
+          parent: null,
+          message: {
+            author: { role: "tool" },
+            status: "finished_successfully",
+            content: { content_type: "text", parts: ["Something went wrong. Please retry."] }
+          }
+        }
+      }
+    };
+  };
+  testClient.imageUrlsFrom = async () => [];
+  testClient.imageGenerationTaskState = async () => null;
+  testClient.refreshCompletedConversation = async (_conversationId, detail) => detail;
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => testClient.waitForConversationImages([], "conversation-live-failure", 30),
+    (error) => error?.upstreamExplicitFailure === true
+      && error?.upstreamStatus === "failed"
+      && error?.message === "Something went wrong. Please retry."
+  );
+
+  assert.ok(Date.now() - startedAt < 1000);
+  assert.equal(detailReads, 1);
 });
 
 test("上游会话重新登录后仍为空时只重试一次", async () => {

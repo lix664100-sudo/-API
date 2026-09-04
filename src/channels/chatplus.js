@@ -1824,11 +1824,105 @@ function imageGenerationLimitContent(content) {
   return candidates.find((candidate) => isImageGenerationLimitMessage(candidate)) || "";
 }
 
+function currentImageResultMessageTexts(value, output = []) {
+  if (!value) return output;
+  if (Array.isArray(value)) {
+    value.forEach((item) => currentImageResultMessageTexts(item, output));
+    return output;
+  }
+  if (typeof value !== "object") return output;
+
+  const addMessage = (message) => {
+    if (!message || typeof message !== "object") return;
+    const role = messageRole(message);
+    if (role !== "assistant" && role !== "tool") return;
+    const text = textFromAssistantContent(message.content);
+    if (text) output.push(text);
+  };
+
+  const currentNode = String(value.current_node || "").trim();
+  if (currentNode) addMessage(value.mapping?.[currentNode]?.message);
+
+  const update = value.update_content || value.updateContent;
+  if (update && typeof update === "object") {
+    addMessage(update.message);
+    if (Array.isArray(update.messages)) update.messages.forEach(addMessage);
+  }
+
+  if (value.update_type || value.updateType) addMessage(value.message);
+  return output;
+}
+
+function currentImageResultContent(value, matches) {
+  return currentImageResultMessageTexts(value)
+    .find((candidate) => matches(candidate)) || "";
+}
+
+function currentImageGenerationLimitContent(value) {
+  return currentImageResultContent(value, isImageGenerationLimitMessage);
+}
+
+function isGenericImageGenerationFailureMessage(content) {
+  const text = String(content || "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  return /(?:something went wrong|an error occurred|there was an error).{0,80}(?:try again|retry)?/i.test(text)
+    || /(?:出了点问题|出错了|发生(?:了)?错误|生成失败).{0,80}(?:请?(?:重试|再试)|try again|retry)/i.test(text);
+}
+
+function currentImageTaskCancelledContent(value) {
+  return currentImageResultContent(value, isUpstreamImageTaskCancelledMessage);
+}
+
+function currentImageTaskFailureContent(value) {
+  return currentImageResultContent(value, isGenericImageGenerationFailureMessage);
+}
+
 function throwIfImageGenerationLimit(content, options = {}) {
   const limitContent = imageGenerationLimitContent(content);
   if (!limitContent) return;
   const error = options.car ? imageCarQuotaError(limitContent) : imageQuotaError();
   throw error;
+}
+
+function submittedImageCarQuotaError(content) {
+  const error = imageCarQuotaError(content);
+  error.imageSubmissionAttempted = true;
+  error.imageSubmissionConfirmed = true;
+  error.upstreamExplicitFailure = true;
+  error.upstreamStatus = "failed";
+  return error;
+}
+
+function upstreamImageTaskCancelledError(content) {
+  const error = new Error(content || "上游已取消任务。");
+  error.code = "UPSTREAM_TASK_CANCELLED";
+  error.status = 400;
+  error.imageTaskCancelled = true;
+  error.upstreamExplicitFailure = true;
+  error.upstreamStatus = "cancelled";
+  error.upstreamText = String(content || "").trim();
+  return error;
+}
+
+function upstreamImageTaskFailureError(content) {
+  const error = new Error(content || "上游明确返回图片生成失败。");
+  error.code = "upstream_text_response";
+  error.status = 400;
+  error.upstreamExplicitFailure = true;
+  error.upstreamStatus = "failed";
+  error.upstreamText = String(content || "").trim();
+  return error;
+}
+
+function throwIfCurrentImageResultFailed(value) {
+  const quotaContent = currentImageGenerationLimitContent(value);
+  if (quotaContent) throw submittedImageCarQuotaError(quotaContent);
+
+  const cancelledContent = currentImageTaskCancelledContent(value);
+  if (cancelledContent) throw upstreamImageTaskCancelledError(cancelledContent);
+
+  const failureContent = currentImageTaskFailureContent(value);
+  if (failureContent) throw upstreamImageTaskFailureError(failureContent);
 }
 
 function imageQuotaResetAt(imageLimit = {}) {
@@ -5188,9 +5282,12 @@ export class ChatplusClient {
             error.imageCarQuotaExhausted === true
             || error.imageCarTemporaryUnavailable === true
           )) {
-            ignoredCarIds.add(conversation.selected.carId);
             await this.rememberImageFailedCar(conversation.selected, error);
             lastQuotaModel = conversation.route?.key || lastQuotaModel;
+            if (error.imageSubmissionAttempted === true || error.imageSubmissionConfirmed === true) {
+              throw error;
+            }
+            ignoredCarIds.add(conversation.selected.carId);
             if (error.imageCarTemporaryUnavailable === true) {
               temporaryRestrictionErrors.push(error);
             } else {
@@ -5345,6 +5442,7 @@ export class ChatplusClient {
           shouldCheckImageTasks ||= hasAsyncImageTaskMarker(pushedUpdates);
           imageUrls = await this.imageUrlsFrom(pushedUpdates, { generatedOnly: true });
           if (imageUrls.length) return imageUrls;
+          throwIfCurrentImageResultFailed(pushedUpdates);
           const pushedState = imageAssistantResponseState(pushedUpdates);
           if (!pushedState.inProgress) {
             throwIfTemporaryImageCarRestriction(pushedState.content);
@@ -5368,6 +5466,7 @@ export class ChatplusClient {
         this.rememberImageTaskId(conversationId, imageTaskIdFrom(detail, conversationId));
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
+        throwIfCurrentImageResultFailed(detail);
         shouldCheckImageTasks ||= hasAsyncImageTaskMarker(detail);
         const shouldProbeImageTasks = shouldCheckImageTasks || Date.now() >= nextTaskProbeAt;
         if (shouldProbeImageTasks) {
@@ -5403,6 +5502,7 @@ export class ChatplusClient {
         );
         imageUrls = await this.imageUrlsFrom(detail, { generatedOnly: true });
         if (imageUrls.length) return imageUrls;
+        throwIfCurrentImageResultFailed(detail);
         const responseState = imageAssistantResponseState(detail);
         const content = responseState.content;
         const intermediateResponse = isChatImageIntermediateResponse(content);
@@ -5652,6 +5752,48 @@ export class ChatplusClient {
         imageCount: imageUrls.length,
         imageUrls,
         errorMessage: "",
+        raw: rawDetail
+      };
+    }
+    const currentCancelledContent = currentImageTaskCancelledContent(resultState);
+    if (currentCancelledContent) {
+      return {
+        externalId,
+        status: "cancelled",
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: currentCancelledContent,
+        raw: rawDetail
+      };
+    }
+    const currentQuotaContent = currentImageGenerationLimitContent(resultState);
+    if (currentQuotaContent) {
+      const quotaError = imageCarQuotaError(currentQuotaContent);
+      await this.rememberImageFailedCar({
+        carId: context.carId || this.carId,
+        carType: context.carType || this.carType
+      }, quotaError);
+      return {
+        externalId,
+        status: "failed",
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: "当前车位图片生成次数已用完，系统已暂停使用该车位。",
+        raw: {
+          ...rawDetail,
+          imageCarQuotaExhausted: true,
+          imageCarCooldownUntil: quotaError.quotaResetAt || ""
+        }
+      };
+    }
+    const currentFailureContent = currentImageTaskFailureContent(resultState);
+    if (currentFailureContent) {
+      return {
+        externalId,
+        status: "failed",
+        imageCount: 0,
+        imageUrls: [],
+        errorMessage: currentFailureContent,
         raw: rawDetail
       };
     }
