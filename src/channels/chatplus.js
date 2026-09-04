@@ -122,41 +122,63 @@ function imageCarLeaseKey(account = {}, selected = {}) {
 }
 
 function releaseImageCarLease(lease) {
-  if (!lease?.key || activeImageCarLeases.get(lease.key)?.token !== lease.token) return false;
-  activeImageCarLeases.delete(lease.key);
-  if (
-    lease.conversationId
-    && imageConversationCarLeases.get(lease.conversationId)?.token === lease.token
-  ) {
-    imageConversationCarLeases.delete(lease.conversationId);
+  const active = lease?.key ? activeImageCarLeases.get(lease.key) : null;
+  if (!active || active.token !== lease.token || lease.released === true) return false;
+  lease.released = true;
+  if (lease.conversationId) {
+    active.conversationIds.delete(lease.conversationId);
+    if (imageConversationCarLeases.get(lease.conversationId) === lease) {
+      imageConversationCarLeases.delete(lease.conversationId);
+    }
   }
+  active.holderCount -= 1;
+  if (active.holderCount <= 0) activeImageCarLeases.delete(lease.key);
   return true;
 }
 
 function pruneImageCarLeases(now = Date.now()) {
-  for (const lease of activeImageCarLeases.values()) {
-    if (lease.expiresAt <= now) releaseImageCarLease(lease);
+  for (const active of activeImageCarLeases.values()) {
+    if (active.expiresAt > now) continue;
+    activeImageCarLeases.delete(active.key);
+    for (const conversationId of active.conversationIds) {
+      imageConversationCarLeases.delete(conversationId);
+    }
   }
 }
 
-function reserveImageCar(account, selected) {
+function reserveImageCar(account, selected, allowShared = false) {
   pruneImageCarLeases();
   const key = imageCarLeaseKey(account, selected);
-  if (!key || activeImageCarLeases.has(key)) return null;
+  if (!key) return null;
+  let active = activeImageCarLeases.get(key);
+  if (active && !allowShared) return null;
+  if (!active) {
+    active = {
+      key,
+      token: randomUUID(),
+      holderCount: 0,
+      conversationIds: new Set(),
+      expiresAt: Date.now() + ACTIVE_IMAGE_CAR_LEASE_TTL_MS
+    };
+    activeImageCarLeases.set(key, active);
+  }
+  active.holderCount += 1;
   const lease = {
     key,
-    token: randomUUID(),
+    token: active.token,
     conversationId: "",
-    expiresAt: Date.now() + ACTIVE_IMAGE_CAR_LEASE_TTL_MS
+    released: false
   };
-  activeImageCarLeases.set(key, lease);
   return lease;
 }
 
 function bindImageCarLease(lease, conversationId) {
   const normalizedConversationId = String(conversationId || "").trim();
   if (!lease?.key || !normalizedConversationId) return;
+  const active = activeImageCarLeases.get(lease.key);
+  if (!active || active.token !== lease.token || lease.released === true) return;
   lease.conversationId = normalizedConversationId;
+  active.conversationIds.add(normalizedConversationId);
   imageConversationCarLeases.set(normalizedConversationId, lease);
 }
 
@@ -3655,12 +3677,18 @@ export class ChatplusClient {
   }
 
   async prepareReusableChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
-    if (input.imageGeneration === true) {
+    const route = this.chatRouteForInput(input);
+    if (input.imageGeneration === true && route.key !== "gpt") {
       const session = await this.prepareChatSession(input, ignoredCarIds, maxAttempts);
       return this.cloneChatSession(this.preparedChatSession(session));
     }
-    const route = this.chatRouteForInput(input);
     const key = this.chatSessionKey(route);
+    const cloneCachedSession = (session) => {
+      const cloned = this.cloneChatSession(session);
+      if (input.imageGeneration !== true) return cloned;
+      cloned.imageCarLease = reserveImageCar(this.account, cloned.selected, true);
+      return cloned.imageCarLease ? cloned : null;
+    };
     const cached = this.concurrentChatSessions.get(key);
     if (cached?.session && cached.session.revision === this.sessionRevision) {
       const cachedCarId = cached.session.selected?.carId;
@@ -3674,7 +3702,7 @@ export class ChatplusClient {
           label: "复用已登录车位",
           carId: cachedCarId,
           carType: cached.session.selected?.carType
-        }, async () => this.cloneChatSession(cached.session));
+        }, async () => cloneCachedSession(cached.session));
       }
       this.concurrentChatSessions.delete(key);
     } else if (cached?.session) {
@@ -3693,7 +3721,7 @@ export class ChatplusClient {
         && !isBadCar(this.account?.id, session.selected?.carType, cachedCarId)
       ) {
         if (cachedCarId) ignoredCarIds.add(cachedCarId);
-        return this.cloneChatSession(session);
+        return cloneCachedSession(session);
       }
       this.concurrentChatSessions.delete(key);
     } else if (cached?.promise) {
@@ -3710,7 +3738,8 @@ export class ChatplusClient {
         session.revision === this.sessionRevision
         && this.concurrentChatSessions.get(key)?.promise === promise
       ) {
-        this.concurrentChatSessions.set(key, { session });
+        const { imageCarLease: _imageCarLease, ...reusableSession } = session;
+        this.concurrentChatSessions.set(key, { session: this.cloneChatSession(reusableSession) });
       }
       return this.cloneChatSession(session);
     } catch (error) {
@@ -5336,6 +5365,13 @@ export class ChatplusClient {
           throw error;
         }
         if (selected && isCarSessionContentionError(error)) {
+          if (requestInput.imageGeneration === true && requestInput.concurrentSubmit === true) {
+            error.code = "CHAT_IMAGE_SESSION_CONFLICT";
+            error.status = 409;
+            error.noRetry = true;
+            error.message = "当前聊天生图会话发生登录冲突，请稍后重试。";
+            throw error;
+          }
           await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
           recordCarError("当前车位会话被上游拒绝，已自动换车。");

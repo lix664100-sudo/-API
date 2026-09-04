@@ -3352,7 +3352,7 @@ test("聊天生图没有上游编号时不能算已提交", async () => {
   }
 });
 
-test("同一账号的聊天生图只串行切换会话，上传和提交可以并行，并选择不同车位", async () => {
+test("同一账号的聊天生图复用一个车位，上传和提交可以并行", async () => {
   let sessionTail = Promise.resolve();
   const sessionLock = (work) => {
     const current = sessionTail.catch(() => {}).then(work);
@@ -3461,13 +3461,13 @@ test("同一账号的聊天生图只串行切换会话，上传和提交可以�
     ChatplusClient.prototype.http = originalHttp;
   }
 
-  assert.equal(enterCarCount, 3);
-  assert.equal(initCount, 3);
+  assert.equal(enterCarCount, 1);
+  assert.equal(initCount, 1);
   assert.equal(client.cookies.some((cookie) => cookie.startsWith("upload=")), false);
-  assert.equal(maxSubmitSteps, 3, "不同车位的上传和提交应当并行进行");
+  assert.equal(maxSubmitSteps, 3, "同一车位的独立上传和提交应当并行进行");
   assert.deepEqual(results.map((result) => result.status), ["waiting_upstream", "waiting_upstream", "waiting_upstream"]);
   assert.equal(new Set(results.map((result) => result.externalId)).size, 3);
-  assert.equal(new Set(results.map((result) => result.raw.selectedCarId)).size, 3);
+  assert.equal(new Set(results.map((result) => result.raw.selectedCarId)).size, 1);
 });
 
 test("聊天生图满载时立即拒绝，释放名额后才能重新提交", async () => {

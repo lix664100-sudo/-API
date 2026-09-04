@@ -1176,9 +1176,10 @@ test("同一 GPT 账号首单等图时不会挡住第二单提交", async () => 
   assert.equal(secondResult.status, "success");
 });
 
-test("concurrent image tasks do not reuse a car that is still generating", async () => {
+test("同一账号的并发聊天生图复用同一个已登录车位", async () => {
   const selectedCars = [];
   let conversationIndex = 0;
+  let carEntries = 0;
   const server = createServer((request, response) => {
     const selectedCar = String(request.headers.cookie || "").match(/car=([^;]+)/)?.[1] || "unknown";
     if (request.method === "POST" && request.url === "/backend-api/conversation") {
@@ -1203,6 +1204,7 @@ test("concurrent image tasks do not reuse a car that is still generating", async
     car({ id: "active-car-two", imageRemaining: 10, count: 1 })
   ];
   client.enterCar = async (carId, carType) => {
+    carEntries += 1;
     client.portalLoggedIn = true;
     client.carId = carId;
     client.carType = carType;
@@ -1225,22 +1227,17 @@ test("concurrent image tasks do not reuse a car that is still generating", async
       })
     ]);
 
-    assert.deepEqual(new Set(selectedCars), new Set(["active-car-one", "active-car-two"]));
-    assert.deepEqual(
-      new Set(results.map((result) => result.raw.selectedCarId)),
-      new Set(["active-car-one", "active-car-two"])
-    );
+    assert.deepEqual(selectedCars, ["active-car-one", "active-car-one"]);
+    assert.deepEqual(results.map((result) => result.raw.selectedCarId), ["active-car-one", "active-car-one"]);
+    assert.equal(carEntries, 1);
 
-    const busyStartedAt = Date.now();
-    await assert.rejects(
-      () => client.createTextTask({
-        prompt: "all cars are already active",
-        concurrentSubmit: true,
-        waitForImages: false
-      }),
-      (error) => error?.code === "IMAGE_CAR_BUSY" && error?.status === 429
-    );
-    assert.ok(Date.now() - busyStartedAt < 1000);
+    const additionalResult = await client.createTextTask({
+      prompt: "reuse active image session",
+      concurrentSubmit: true,
+      waitForImages: false
+    });
+    assert.equal(additionalResult.raw.selectedCarId, "active-car-one");
+    assert.equal(carEntries, 1);
 
     const firstResult = results.find((result) => result.raw.selectedCarId === "active-car-one");
     const completedUrl = "https://example.test/completed-active-car-one.png";
@@ -1274,6 +1271,40 @@ test("concurrent image tasks do not reuse a car that is still generating", async
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("并发聊天生图发生登录冲突时停止换车", async () => {
+  const client = clientForGpt({ accountId: "account-image-session-conflict" });
+  client.createSubmitClient = () => client;
+  let prepareCount = 0;
+  client.prepareReusableChatSession = async () => {
+    prepareCount += 1;
+    return {
+      route: { key: "gpt", model: "gpt-image-test", carType: "chatgpt" },
+      init: { default_model_slug: "gpt-image-test" },
+      selected: { carId: `conflict-car-${prepareCount}`, carType: "chatgpt" },
+      revision: client.sessionRevision,
+      snapshot: client.sessionSnapshot()
+    };
+  };
+  client.uploadChatImages = async () => [];
+  client.buildConversationBody = () => ({ body: {}, messageId: "conflict-message" });
+  client.http = async () => ({
+    status: 403,
+    headers: {},
+    body: "您的账号在其他设备登录，请重新登录"
+  });
+
+  await assert.rejects(
+    () => client.createImageTask({
+      prompt: "登录冲突测试",
+      files: [{ filename: "source.png" }],
+      concurrentSubmit: true,
+      waitForImages: false
+    }),
+    (error) => error?.code === "CHAT_IMAGE_SESSION_CONFLICT" && error?.status === 409
+  );
+  assert.equal(prepareCount, 1);
 });
 
 test("GPT conversation busy responses briefly freeze the car and switch without a 24 hour lock", async () => {
