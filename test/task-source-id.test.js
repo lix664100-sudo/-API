@@ -416,6 +416,48 @@ test("chatplus 只返回当前对话分支中用户可见的生成图", async ()
   assert.deepEqual(imageUrls, ["https://one.example.test/files/file_final.png"]);
 });
 
+test("chatplus 能取回当前分支中被隐藏的生图工具结果", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-hidden-image-account", username: "hidden-image@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  client.imageDownloadUrl = async (fileId) => `https://one.example.test/files/${fileId}.png`;
+
+  const imageUrls = await client.imageUrlsFrom({
+    current_node: "finalText",
+    mapping: {
+      user: {
+        parent: null,
+        message: { author: { role: "user" }, content: { parts: ["生成一张图片"] } }
+      },
+      hiddenImageTool: {
+        parent: "user",
+        message: {
+          author: { role: "tool" },
+          metadata: { is_visually_hidden_from_conversation: true, image_gen_title: "图片" },
+          content: { content_type: "multimodal_text", parts: [{ asset_pointer: "sediment://file_generated" }] }
+        }
+      },
+      finalText: {
+        parent: "hiddenImageTool",
+        message: { author: { role: "assistant" }, content: { content_type: "text", parts: ["已完成"] } }
+      },
+      otherBranch: {
+        parent: "user",
+        message: {
+          author: { role: "tool" },
+          metadata: { image_gen_title: "旧图片" },
+          content: { content_type: "multimodal_text", parts: [{ asset_pointer: "sediment://file_old" }] }
+        }
+      }
+    }
+  }, { generatedOnly: true });
+
+  assert.deepEqual(imageUrls, ["https://one.example.test/files/file_generated.png"]);
+});
+
 test("chatplus image wait treats prompt JSON as an intermediate response", async () => {
   const promptEnvelope = JSON.stringify({ prompt: "整理后的绘图提示词" });
   const resultUrl = "https://one.example.test/generated-after-prompt.png";

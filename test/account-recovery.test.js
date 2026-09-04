@@ -315,6 +315,37 @@ test("共享车位全部认证失败时不会冒充账号掉线", async () => {
   assert.equal(selectedCount, 2);
 });
 
+test("车位提示其他设备登录时不会误报主账号被挤下线", async () => {
+  const client = new ChatplusClient({
+    config: {},
+    channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
+    account: { id: "account-car-session-contention", username: "car-session@example.com", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let selectedCount = 0;
+  client.selectCar = async () => ({
+    carId: `contended-car-${++selectedCount}`,
+    carType: "chatgpt",
+    strategy: "image"
+  });
+  client.enterCar = async () => {
+    const error = new Error("您的账号在其他设备登录，请重新登录");
+    error.status = 403;
+    throw error;
+  };
+
+  await assert.rejects(
+    client.prepareChatSession({ model: "gpt" }, new Set(), 3),
+    (error) => {
+      assert.equal(error.code, "CHAT_CAR_POOL_UNAVAILABLE");
+      assert.equal(error.authScope, "car");
+      assert.doesNotMatch(error.message, /账号被其他登录占用|被挤下线/);
+      return true;
+    }
+  );
+  assert.equal(selectedCount, 3);
+});
+
 test("上传原图时共享车位认证失败也不会冒充账号掉线", async () => {
   const client = new ChatplusClient({
     config: {},

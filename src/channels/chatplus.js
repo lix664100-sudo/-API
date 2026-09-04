@@ -41,7 +41,6 @@ const CONVERSATION_READ_HEADERS = Object.freeze({
   pragma: "no-cache"
 });
 const MAX_CHAT_CAR_ATTEMPTS = 8;
-const AUTH_KICK_FAST_FAIL_LIMIT = 2;
 const CHAT_IMAGE_UPLOAD_CACHE_TTL_MS = 10 * 60 * 1000;
 const CHAT_IMAGE_UPLOAD_CACHE_MAX = 200;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
@@ -473,9 +472,9 @@ function isExplicitAuthSessionError(error) {
   return /\b401\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|聊天记录.{0,12}(?:删除|已删除)|换车继续聊|unauthorized|session expired/i.test(text);
 }
 
-// 普通的 401/403 仍属于单个车位故障，可以换车；但上游明确说
-// "其他设备登录" 时，即使它同时标成车位错误，也说明账号会话正被挤掉。
-function isAccountKickError(error) {
+// ShareAI 的车位服务也会把自己的会话冲突表述为“其他设备登录”。
+// 已经进入车位后，这只能说明当前车位不可用，不能据此判定主账号掉线。
+function isCarSessionContentionError(error) {
   const text = `${error?.message || ""} ${error?.body || ""} ${error?.upstreamText || ""}`;
   return /其他设备登|在其他设备|被挤下线|挤下线/.test(text);
 }
@@ -484,18 +483,6 @@ function tagCarPoolUnavailable(error) {
   error.code ||= "CHAT_CAR_POOL_UNAVAILABLE";
   error.carPoolUnavailable = true;
   error.authScope = "car";
-  return error;
-}
-
-function accountSessionContentionError(attemptMessages = []) {
-  const error = new Error(
-    `账号被其他登录占用，连续 ${Math.max(attemptMessages.length, AUTH_KICK_FAST_FAIL_LIMIT)} 次被挤下线，已停止自动重试。请检查该账号是否在其他设备或系统登录，或稍后再试。`
-  );
-  error.code = "ACCOUNT_SESSION_CONTENDED";
-  error.status = 409;
-  error.authScope = "account";
-  error.noRetry = true;
-  error.carAttempts = [...attemptMessages];
   return error;
 }
 
@@ -2080,7 +2067,7 @@ function collectFinalAssistantText(value, output = []) {
   return output;
 }
 
-function currentConversationBranchMessages(value) {
+function currentConversationBranchMessages(value, options = {}) {
   const mapping = value?.mapping;
   let nodeId = String(value?.current_node || "").trim();
   if (!nodeId || !mapping || typeof mapping !== "object") return [];
@@ -2093,7 +2080,7 @@ function currentConversationBranchMessages(value) {
     const message = node.message;
     const hidden = node.metadata?.is_visually_hidden_from_conversation === true
       || message?.metadata?.is_visually_hidden_from_conversation === true;
-    if (message && !hidden) messages.push(message);
+    if (message && (options.includeHidden === true || !hidden)) messages.push(message);
     nodeId = String(node.parent || "").trim();
   }
   return messages;
@@ -2106,6 +2093,20 @@ function scanForVisibleGeneratedImageRefs(value, baseUrl) {
   for (const message of branchMessages) {
     const role = messageRole(message);
     if (role === "assistant" || role === "tool") {
+      scanForImageRefs(message.content || message.parts || message, baseUrl, output);
+    }
+  }
+  if (output.urls.size || output.fileIds.size) return output;
+
+  // The upstream can hide its finished image-tool message while keeping it on
+  // the active branch. It is still the result of this task, unlike an asset on
+  // another branch or a user-uploaded source image.
+  for (const message of currentConversationBranchMessages(value, { includeHidden: true })) {
+    const metadata = message?.metadata || message?.message?.metadata || {};
+    if (
+      messageRole(message) === "tool"
+      && (metadata.async_source === "image_gen" || Boolean(metadata.image_gen_title))
+    ) {
       scanForImageRefs(message.content || message.parts || message, baseUrl, output);
     }
   }
@@ -4114,7 +4115,6 @@ export class ChatplusClient {
     const errors = [];
     let subscriptionMissingAttempts = 0;
     let subscriptionExpiredAttempts = 0;
-    let authKickAttempts = 0;
     let recheckProCars = input.recheckProCars === true;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       let selected;
@@ -4167,12 +4167,6 @@ export class ChatplusClient {
           || isAuthSessionError(error)
           || isCarPlanMismatchError(error);
         if (retryableCarError) {
-          if (isAccountKickError(error)) {
-            authKickAttempts += 1;
-            if (authKickAttempts >= AUTH_KICK_FAST_FAIL_LIMIT) {
-              throw accountSessionContentionError(errors);
-            }
-          }
           await this.rememberProCarsUnavailable(error);
           await this.rememberAuthFailedCar(selected, error);
           await this.sessionLock(async () => {
@@ -4184,7 +4178,10 @@ export class ChatplusClient {
           error.noRetry = true;
           throw error;
         }
-        errors.push(`${selected.carId}：${error.message || "进入失败"}`);
+        const message = isCarSessionContentionError(error)
+          ? "当前车位会话被上游拒绝，已自动换车。"
+          : error.message || "进入失败";
+        errors.push(`${selected.carId}：${message}`);
       }
     }
     const error = new Error(`${route.name} 自动找车失败：${errors.join("；")}`);
@@ -5006,7 +5003,6 @@ export class ChatplusClient {
     const imageCarQuotaErrors = [];
     const unconfirmedCars = [];
     let carPoolErrorCount = 0;
-    let authKickAttempts = 0;
     let leasedCarsSkipped = input.imageGeneration === true ? ignoredCarIds.size : 0;
     let lastError = null;
     let lastUpstreamText = "";
@@ -5250,14 +5246,10 @@ export class ChatplusClient {
           error.quotaModel = activeRoute?.key || "";
           throw error;
         }
-        if (selected && isAccountKickError(error)) {
-          authKickAttempts += 1;
-          if (authKickAttempts >= AUTH_KICK_FAST_FAIL_LIMIT) {
-            throw accountSessionContentionError(errors);
-          }
+        if (selected && isCarSessionContentionError(error)) {
           await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
-          recordCarError(error.message || "账号被其他登录挤下线");
+          recordCarError("当前车位会话被上游拒绝，已自动换车。");
           continue;
         }
         if (selected && error.conversationBusy === true) {
@@ -5350,12 +5342,6 @@ export class ChatplusClient {
         }
         const retryableCarError = selected && (isAuthSessionError(error) || isCarPlanMismatchError(error));
         if (retryableCarError) {
-          if (isAccountKickError(error)) {
-            authKickAttempts += 1;
-            if (authKickAttempts >= AUTH_KICK_FAST_FAIL_LIMIT) {
-              throw accountSessionContentionError(errors);
-            }
-          }
           await this.rememberProCarsUnavailable(error);
           await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
@@ -5363,14 +5349,6 @@ export class ChatplusClient {
           continue;
         }
         if (Number(error.status || error.statusCode || 0) === 400) throw error;
-        if (isAccountKickError(error)) {
-          authKickAttempts += 1;
-          if (authKickAttempts >= AUTH_KICK_FAST_FAIL_LIMIT) {
-            throw accountSessionContentionError(errors);
-          }
-          await this.rememberAuthFailedCar(selected, error);
-          await this.invalidatePreparedChatSession(preparedSession);
-        }
         recordCarError(error.message || "调用失败");
       }
     }

@@ -129,7 +129,7 @@ test("共享会话失效后下一个客户端重新登录并刷新共享池", as
   assert.equal(adoptPortalSession(key)?.shareSession, "SESS-B");
 });
 
-test("聊天账号被反复挤下线时快速失败，不再无限重试换车", async () => {
+test("聊天车位反复提示其他设备登录时按车位故障结束", async () => {
   const { client } = makeChatClient();
   let prepareCalls = 0;
   client.prepareChatSession = async () => {
@@ -142,17 +142,16 @@ test("聊天账号被反复挤下线时快速失败，不再无限重试换车",
   await assert.rejects(
     client.sendConversation("你好", {}),
     (error) => {
-      assert.equal(error.code, "ACCOUNT_SESSION_CONTENDED");
-      assert.equal(error.status, 409);
-      assert.equal(error.noRetry, true);
-      assert.match(error.message, /连续/);
+      assert.equal(error.code, "CHAT_CAR_POOL_UNAVAILABLE");
+      assert.equal(error.authScope, "car");
+      assert.doesNotMatch(error.message, /账号被其他登录占用|被挤下线/);
       return true;
     }
   );
-  assert.equal(prepareCalls, 2, "连续两次被挤下线后应该立即停止，而不是继续换车");
+  assert.equal(prepareCalls, 8, "应在有限的车位尝试后结束");
 });
 
-test("GPT 生图提交时反复被挤下线会停止换车，不误报车位失效", async () => {
+test("GPT 生图车位反复提示其他设备登录时不会误报主账号掉线", async () => {
   const { client } = makeChatClient();
   let requestCount = 0;
   client.ensureConversationUpdates = async () => null;
@@ -181,13 +180,14 @@ test("GPT 生图提交时反复被挤下线会停止换车，不误报车位失�
       requireConversationId: true
     }),
     (error) => {
-      assert.equal(error.code, "ACCOUNT_SESSION_CONTENDED");
-      assert.equal(error.status, 409);
+      assert.equal(error.code, "CHAT_CAR_POOL_UNAVAILABLE");
+      assert.equal(error.authScope, "car");
+      assert.doesNotMatch(error.message, /账号被其他登录占用|被挤下线/);
       assert.doesNotMatch(error.message, /没有创建对话/);
       return true;
     }
   );
-  assert.equal(requestCount, 2, "连续两次明确被挤下线后应停止，不再继续换车");
+  assert.equal(requestCount, 8, "应在有限的车位尝试后结束");
 });
 
 test("相同图片重复上传直接命中缓存，重置会话后重新上传", async () => {
