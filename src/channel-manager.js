@@ -77,6 +77,7 @@ const DRAWING_COOLDOWN_MS = 30 * 60 * 1000;
 const DRAWING_SUBMIT_WAIT_TIMEOUT_SEC = 180;
 const FAST_QUOTA_REFRESH_TIMEOUT_MS = 5000;
 const FAST_TASK_REFRESH_TIMEOUT_SEC = 8;
+const FAST_TASK_REFRESH_DEADLINE_MS = 30 * 1000;
 const TASK_REFRESH_SESSION_TTL_MS = 30 * 60 * 1000;
 const MAX_TASK_REFRESH_SESSIONS = 5000;
 const UPSTREAM_RESULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
@@ -1858,6 +1859,24 @@ function taskSourceTaskId(task = {}) {
   return task.sourceTaskId || task.requestMeta?.sourceTaskId || sourceTaskIdFrom(task.requestJson);
 }
 
+async function refreshTaskWithDeadline(work) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error("读取上游结果超时，系统会继续自动查询。");
+      error.code = "UPSTREAM_TASK_REFRESH_TIMEOUT";
+      error.status = 504;
+      reject(error);
+    }, FAST_TASK_REFRESH_DEADLINE_MS);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([work(), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function interruptExpiredUpstreamWait(task) {
   const interruptedAt = new Date().toISOString();
   const message = "连续 30 分钟未能确认生成结果，任务已停止自动查询；不计入失败，可手动重新查询。";
@@ -2827,7 +2846,7 @@ async function refreshTaskOnce(taskId, options = {}) {
     : [];
   const sessionSnapshot = channel.type === "chatplus" ? taskRefreshSession(task.id) : null;
   try {
-    refreshedResult = await runChatplusAccountWork(channel, account, () => client.getTask(externalId, {
+    refreshedResult = await runChatplusAccountWork(channel, account, () => refreshTaskWithDeadline(() => client.getTask(externalId, {
       carId: task.raw?.selectedCarId,
       carType: task.raw?.selectedCarType,
       imageTask: task.taskType === "text2img" || task.taskType === "img2img",
@@ -2837,7 +2856,7 @@ async function refreshTaskOnce(taskId, options = {}) {
       forceReconnect,
       sessionSnapshot,
       onSessionSnapshot: (snapshot) => rememberTaskRefreshSession(task.id, snapshot)
-    }), {
+    })), {
       parallel: channel.type === "chatplus" && Boolean(task.raw?.selectedCarId)
     });
     refreshReadSucceeded = true;
@@ -2956,7 +2975,8 @@ function fastTaskRefreshEligible(task = {}) {
 const fastTaskRefresher = createFastTaskRefresher({
   refresh: (taskId) => refreshTask(taskId),
   shouldContinue: fastTaskRefreshEligible,
-  initialDelayMs: 2000
+  initialDelayMs: 2000,
+  maxAttempts: 360
 });
 
 function scheduleFastTaskRefresh(task) {
@@ -5030,6 +5050,7 @@ async function persistSubmittedTask(task, result, channel, account, attempts) {
   );
   await upsertTask(submittedTask);
   activeSubmittedTaskIds.add(submittedTask.id);
+  scheduleFastTaskRefresh(submittedTask);
   return submittedTask;
 }
 
@@ -5703,7 +5724,7 @@ export async function queueTextTask(input = {}, requestMeta = {}) {
   runInBackground(async () => {
     try {
       await runQueuedTextTask(task, input, reserved, {
-        waitForChatplusImages: true
+        waitForChatplusImages: false
       });
     } finally {
       scheduledImageTasks.delete(task.id);
@@ -5761,7 +5782,7 @@ export async function queueImageTask({ input = {}, file, files: inputFiles, requ
   runInBackground(async () => {
     try {
       await runQueuedImageTask(task, input, files, reserved, {
-        waitForChatplusImages: true
+        waitForChatplusImages: false
       });
     } finally {
       scheduledImageTasks.delete(task.id);

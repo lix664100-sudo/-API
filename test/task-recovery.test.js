@@ -3216,6 +3216,92 @@ test("聊天生图异步提交拿到编号后不等待图片", async () => {
   assert.equal(result.externalId, "conversation-submit-only");
 });
 
+test("后台聊天生图提交后立即改由后台查询结果", async () => {
+  const originalConfig = await loadConfig();
+  await saveConfig({
+    ...originalConfig,
+    defaultChannel: "shareai",
+    accounts: [{
+      id: "account-background-chat-image",
+      channelId: "shareai",
+      name: "后台查询测试账号",
+      username: "background-chat-image@example.com",
+      password: "test",
+      enabled: true,
+      status: "ok",
+      meta: {
+        abilities: {
+          drawing: { status: "quota_empty", balance: 0, message: "跳过绘图站" },
+          chatplus: { status: "ok", balance: 20, message: "聊天站可用" }
+        }
+      }
+    }]
+  });
+
+  const originalCreateImageTask = ChatplusClient.prototype.createImageTask;
+  const originalGetTask = ChatplusClient.prototype.getTask;
+  let receivedWaitForImages = null;
+  ChatplusClient.prototype.createImageTask = async (input) => {
+    receivedWaitForImages = input.waitForImages;
+    await input.onSubmitted?.({
+      externalId: "conversation-background-chat-image",
+      status: "processing",
+      taskType: "img2img",
+      prompt: input.prompt,
+      imageCount: 0,
+      imageUrls: [],
+      raw: {
+        conversationId: "conversation-background-chat-image",
+        selectedCarId: "car-background-chat-image",
+        selectedCarType: "chatgpt"
+      }
+    });
+    return {
+      externalId: "conversation-background-chat-image",
+      status: "waiting_upstream",
+      taskType: "img2img",
+      prompt: input.prompt,
+      imageCount: 0,
+      imageUrls: [],
+      raw: {
+        conversationId: "conversation-background-chat-image",
+        selectedCarId: "car-background-chat-image",
+        selectedCarType: "chatgpt"
+      }
+    };
+  };
+  ChatplusClient.prototype.getTask = async (externalId) => ({
+    externalId,
+    status: "failed",
+    taskType: "img2img",
+    imageCount: 0,
+    imageUrls: [],
+    errorMessage: "当前车位图片生成次数已用完，系统已暂停使用该车位。",
+    raw: { conversationId: externalId, imageCarQuotaExhausted: true }
+  });
+
+  let queued = null;
+  try {
+    queued = await queueImageTask({
+      input: { channel: "chatplus", prompt: "后台查询测试" },
+      files: [{ filename: "source.png", mimetype: "image/png", buffer: Buffer.from("image") }]
+    });
+
+    for (let attempt = 0; attempt < 160; attempt += 1) {
+      const task = await getTask(queued.id);
+      if (task?.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    assert.equal(receivedWaitForImages, false);
+    assert.equal((await getTask(queued.id)).status, "failed");
+  } finally {
+    ChatplusClient.prototype.createImageTask = originalCreateImageTask;
+    ChatplusClient.prototype.getTask = originalGetTask;
+    await saveConfig(originalConfig);
+  }
+});
+
 test("聊天生图没有上游编号时不能算已提交", async () => {
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
