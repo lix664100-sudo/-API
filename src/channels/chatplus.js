@@ -404,7 +404,7 @@ function slowImageCarCooldown(accountId, carType, carId, now = Date.now()) {
 
 function isAuthSessionError(error) {
   const text = `${error?.message || ""} ${error?.body || ""} ${error?.status || error?.statusCode || ""}`;
-  return /\b(401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|unauthorized|forbidden|session expired/i.test(text);
+  return /\b(?:301|302|303|307|308|401|403)\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|unauthorized|forbidden|session expired/i.test(text);
 }
 
 function isExplicitAuthSessionError(error) {

@@ -278,6 +278,82 @@ test("提交时会话失效后自动恢复并重新查询", async () => {
   assert.deepEqual(savedSnapshots, [snapshot, recoveredSnapshot]);
 });
 
+test("上游返回 302 时自动恢复会话并读回生成图片", async () => {
+  const snapshot = {
+    baseUrl: "https://chatplus.example.test",
+    cookies: ["session=expired"],
+    portalLoggedIn: true,
+    carId: "car-recover-redirect",
+    carType: "chatgpt",
+    defaultModel: "gpt-image-test",
+    geminiSession: {}
+  };
+  const recoveredSnapshot = { ...snapshot, cookies: ["session=recovered"] };
+  const expiredReader = {
+    ensureConversationUpdates: async () => null,
+    conversationDetail: async () => {
+      const error = new Error("聊天站请求失败：302");
+      error.status = 302;
+      throw error;
+    },
+    sessionSnapshot: () => snapshot
+  };
+  const recoveredReader = {
+    ensureConversationUpdates: async () => null,
+    conversationDetail: async (conversationId) => ({
+      conversation_id: conversationId,
+      imageUrls: ["https://images.example.test/recovered-redirect.png"],
+      mapping: {}
+    }),
+    imageUrlsFrom: async (value) => value?.imageUrls || [],
+    sessionSnapshot: () => recoveredSnapshot
+  };
+  const testClient = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: snapshot.baseUrl } },
+    account: { id: "account-recover-redirect", username: "redirect@example.test", password: "test" },
+    sessionLock: async (work) => work()
+  });
+  let lockCount = 0;
+  let enterCount = 0;
+  let createClientCount = 0;
+  const savedSnapshots = [];
+  testClient.sessionLock = async (work) => {
+    lockCount += 1;
+    return work();
+  };
+  testClient.invalidateSharedPortalSession = () => {};
+  testClient.resetSession = () => {
+    testClient.portalLoggedIn = false;
+    testClient.carId = "";
+  };
+  testClient.performPortalLogin = async () => {
+    testClient.portalLoggedIn = true;
+  };
+  testClient.performEnterCar = async () => {
+    enterCount += 1;
+  };
+  testClient.createSubmitClient = () => {
+    createClientCount += 1;
+    return createClientCount === 1 ? expiredReader : recoveredReader;
+  };
+  testClient.rememberImageSuccessfulCar = async () => {};
+
+  const task = await testClient.getTask("conversation-recover-redirect", {
+    carId: snapshot.carId,
+    carType: snapshot.carType,
+    imageTask: true,
+    sessionSnapshot: snapshot,
+    onSessionSnapshot: (value) => savedSnapshots.push(value)
+  });
+
+  assert.equal(task.status, "success");
+  assert.deepEqual(task.imageUrls, ["https://images.example.test/recovered-redirect.png"]);
+  assert.equal(lockCount, 1);
+  assert.equal(enterCount, 1);
+  assert.deepEqual(savedSnapshots, [snapshot, recoveredSnapshot]);
+});
+
 test("上游会话首次返回空内容时重新登录并读回生成图片", async () => {
   const resultUrl = "https://images.example.test/recovered.png";
   const testClient = new ChatplusClient({
