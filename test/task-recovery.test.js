@@ -3352,12 +3352,18 @@ test("聊天生图没有上游编号时不能算已提交", async () => {
   }
 });
 
-test("同一账号的聊天生图按顺序提交，并为进行中的任务选择不同车位", async () => {
+test("同一账号的聊天生图只串行切换会话，上传和提交可以并行，并选择不同车位", async () => {
+  let sessionTail = Promise.resolve();
+  const sessionLock = (work) => {
+    const current = sessionTail.catch(() => {}).then(work);
+    sessionTail = current;
+    return current;
+  };
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
     channel: { id: "shareai:chatplus", settings: { baseUrl: "https://www.chatplus.cc" } },
     account: { id: "account-shared-session", username: "shared-session@example.com" },
-    sessionLock: async (work) => work()
+    sessionLock
   });
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   let enterCarCount = 0;
@@ -3458,7 +3464,7 @@ test("同一账号的聊天生图按顺序提交，并为进行中的任务选�
   assert.equal(enterCarCount, 3);
   assert.equal(initCount, 3);
   assert.equal(client.cookies.some((cookie) => cookie.startsWith("upload=")), false);
-  assert.equal(maxSubmitSteps, 1, "同一账号进入车位、上传和提交不能同时进行");
+  assert.equal(maxSubmitSteps, 3, "不同车位的上传和提交应当并行进行");
   assert.deepEqual(results.map((result) => result.status), ["waiting_upstream", "waiting_upstream", "waiting_upstream"]);
   assert.equal(new Set(results.map((result) => result.externalId)).size, 3);
   assert.equal(new Set(results.map((result) => result.raw.selectedCarId)).size, 3);

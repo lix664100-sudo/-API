@@ -1075,6 +1075,9 @@ async function persistImageCarCooldown(channel, account, cooldown = {}) {
           cooldownUntil,
           reason: String(cooldown.reason || "image_failure"),
           message: String(cooldown.message || "").replace(/\s+/g, " ").trim().slice(0, 300),
+          ...(Number(cooldown.failureCount || 0) > 0
+            ? { failureCount: Math.max(1, Math.round(Number(cooldown.failureCount))) }
+            : {}),
           updatedAt: new Date().toISOString()
         };
       } else {
@@ -1093,6 +1096,9 @@ async function persistImageCarCooldown(channel, account, cooldown = {}) {
         cooldownUntil,
         reason: String(cooldown.reason || "image_failure"),
         message: String(cooldown.message || "").replace(/\s+/g, " ").trim().slice(0, 300),
+        ...(Number(cooldown.failureCount || 0) > 0
+          ? { failureCount: Math.max(1, Math.round(Number(cooldown.failureCount))) }
+          : {}),
         updatedAt: new Date().toISOString()
       };
     } else {

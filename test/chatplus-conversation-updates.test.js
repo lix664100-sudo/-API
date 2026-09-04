@@ -558,7 +558,7 @@ test("生图工具实时返回请重试时立即结束等待", async () => {
   assert.equal(detailReads, 1);
 });
 
-test("等待生图时优先读取后台任务，不被尚未更新的会话记录拖慢", async () => {
+test("等待生图时先读取当前会话，再立即检查已知后台任务", async () => {
   const resultUrl = "https://files.example.test/generated-fast.png";
   const testClient = new ChatplusClient({
     config: { waitTimeoutSec: 30 },
@@ -590,7 +590,7 @@ test("等待生图时优先读取后台任务，不被尚未更新的会话记�
   );
 
   assert.deepEqual(imageUrls, [resultUrl]);
-  assert.deepEqual(calls, ["task"]);
+  assert.deepEqual(calls, ["conversation", "task"]);
 });
 
 test("后台任务返回 client_stopped 时立即识别为上游取消", async () => {

@@ -26,6 +26,15 @@ function car(overrides = {}) {
   };
 }
 
+function serialSessionLock() {
+  let tail = Promise.resolve();
+  return (work) => {
+    const current = tail.catch(() => {}).then(work);
+    tail = current;
+    return current;
+  };
+}
+
 function clientForGpt(options = {}) {
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
@@ -52,7 +61,7 @@ function clientForGpt(options = {}) {
       password: "test",
       ...(options.account || {})
     },
-    sessionLock: async (work) => work(),
+    sessionLock: options.sessionLock || (async (work) => work()),
     onProCarsUnavailable: options.onProCarsUnavailable,
     onProCarsAvailable: options.onProCarsAvailable,
     onImageCarCooldown: options.onImageCarCooldown
@@ -621,6 +630,66 @@ test("saved image car cooldowns are restored after a client restart", async () =
   assert.equal(selected.carId, "restored-fallback-car");
 });
 
+test("repeated car authentication failures use 1h, 6h, then 24h cooldowns and reset after success", async () => {
+  const cooldowns = [];
+  const selected = { carId: "auth-backoff-car", carType: "chatgpt" };
+  const client = clientForGpt({
+    accountId: "account-auth-backoff",
+    onImageCarCooldown: async (cooldown) => cooldowns.push(cooldown)
+  });
+  const authError = new Error("用户认证失败，请重新登录");
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const startedAt = Date.now();
+    await client.rememberAuthFailedCar(selected, authError);
+    const durationMs = Date.parse(cooldowns.at(-1).cooldownUntil) - startedAt;
+    const expectedMs = [60 * 60 * 1000, 6 * 60 * 60 * 1000, 24 * 60 * 60 * 1000][attempt];
+    assert.ok(durationMs >= expectedMs - 1000 && durationMs <= expectedMs + 1000);
+    assert.equal(cooldowns.at(-1).failureCount, attempt + 1);
+  }
+
+  await client.rememberImageSuccessfulCar(selected);
+  await client.rememberAuthFailedCar(selected, authError);
+  assert.equal(cooldowns.at(-1).failureCount, 1);
+});
+
+test("saved authentication failure count continues its backoff after restart", async () => {
+  const cooldowns = [];
+  const carId = "persisted-auth-backoff-car";
+  const client = clientForGpt({
+    accountId: "account-restored-auth-backoff",
+    account: {
+      meta: {
+        abilities: {
+          chatplus: {
+            meta: {
+              imageCarCooldowns: {
+                [`chatgpt:${carId}`]: {
+                  carId,
+                  carType: "chatgpt",
+                  cooldownUntil: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+                  failureCount: 2
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    onImageCarCooldown: async (cooldown) => cooldowns.push(cooldown)
+  });
+
+  const startedAt = Date.now();
+  await client.rememberAuthFailedCar(
+    { carId, carType: "chatgpt" },
+    new Error("用户认证失败，请重新登录")
+  );
+
+  assert.equal(cooldowns[0].failureCount, 3);
+  const durationMs = Date.parse(cooldowns[0].cooldownUntil) - startedAt;
+  assert.ok(durationMs >= 24 * 60 * 60 * 1000 - 1000);
+});
+
 test("legacy permanent PRO restriction is retried after the update", async () => {
   const client = new ChatplusClient({
     config: { waitTimeoutSec: 300 },
@@ -936,7 +1005,7 @@ test("image tasks record each processing stage and car attempt", async () => {
     });
 
     const keys = result.raw.stageTimings.map((stage) => stage.key);
-    assert.deepEqual(keys, ["car_enter", "car_init", "source_upload", "upstream_generation"]);
+    assert.deepEqual(keys, ["car_enter", "car_init", "source_upload", "car_submit_queue", "upstream_generation"]);
     assert.deepEqual(reported.map((stage) => stage.id), result.raw.stageTimings.map((stage) => stage.id));
     assert.equal(result.raw.stageTimings[0].carId, "timed-car");
     assert.equal(result.status, "waiting_upstream");
@@ -1023,7 +1092,7 @@ test("concurrent GPT tasks stagger their starts but overlap on the same car", as
   assert.ok(startedAt[2] - startedAt[1] >= 1900);
 });
 
-test("同一 GPT 账号会排队登录上传和提交，但首单等图时不会挡住第二单", async () => {
+test("同一 GPT 账号首单等图时不会挡住第二单提交", async () => {
   const client = clientForGpt({ accountId: "account-image-submit-lock" });
   client.createSubmitClient = () => client;
   let sessionIndex = 0;
@@ -1126,7 +1195,8 @@ test("concurrent image tasks do not reuse a car that is still generating", async
   const address = server.address();
   const client = clientForGpt({
     baseUrl: `http://127.0.0.1:${address.port}`,
-    accountId: "account-distinct-active-cars"
+    accountId: "account-distinct-active-cars",
+    sessionLock: serialSessionLock()
   });
   client.fetchCars = async () => [
     car({ id: "active-car-one", imageRemaining: 10, count: 0 }),

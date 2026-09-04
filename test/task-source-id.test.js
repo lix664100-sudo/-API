@@ -1140,6 +1140,59 @@ test("chatplus image wait discovers a task when the initial response is empty", 
   assert.deepEqual(imageUrls, [resultUrl]);
 });
 
+test("chatplus image wait checks the current conversation before the task list", async () => {
+  const resultUrl = "https://one.example.test/generated-from-conversation-first.png";
+  const calls = [];
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-conversation-first", username: "conversation-first@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  const detail = { resultUrl };
+  client.conversationDetail = async (_conversationId, options) => {
+    calls.push(["conversation", options.timeoutSec]);
+    return detail;
+  };
+  client.imageUrlsFrom = async (value) => (value === detail ? [resultUrl] : []);
+  client.imageGenerationTaskState = async () => {
+    calls.push(["tasks"]);
+    throw new Error("task list should not be read when the conversation already has the image");
+  };
+
+  const imageUrls = await client.waitForConversationImages([], "conversation-first-result", 30);
+
+  assert.deepEqual(imageUrls, [resultUrl]);
+  assert.deepEqual(calls, [["conversation", 4]]);
+});
+
+test("chatplus image wait limits its fallback task search to one short page", async () => {
+  const resultUrl = "https://one.example.test/generated-from-short-fallback.png";
+  const calls = [];
+  const client = new ChatplusClient({
+    config: { waitTimeoutSec: 30 },
+    channel: { id: "shareai:chatplus", type: "chatplus", settings: { baseUrl: "https://one.example.test" } },
+    account: { id: "chat-short-task-fallback", username: "short-task-fallback@example.test", password: "password" },
+    sessionLock: async (work) => work()
+  });
+  const detail = { async_status: "pending", mapping: {} };
+  client.conversationDetail = async (_conversationId, options) => {
+    calls.push(["conversation", options.timeoutSec]);
+    return detail;
+  };
+  client.refreshCompletedConversation = async (_conversationId, value) => value;
+  client.imageUrlsFrom = async () => [];
+  client.imageGenerationTaskState = async (_conversationId, options) => {
+    calls.push(["tasks", options.timeoutSec, options.maxPages]);
+    return { taskId: "short-fallback-task", imageUrls: [resultUrl], failure: null };
+  };
+
+  const imageUrls = await client.waitForConversationImages([], "conversation-short-fallback", 30);
+
+  assert.deepEqual(imageUrls, [resultUrl]);
+  assert.deepEqual(calls, [["conversation", 4], ["tasks", 4, 1]]);
+});
+
 test("chatplus image task refresh checks task list when async status is empty", async () => {
   const conversationId = "conversation-empty-async-status";
   const upstreamTaskId = "upstream-task-empty-async-status";
