@@ -3604,11 +3604,58 @@ export class ChatplusClient {
     return this.runAccountWork(work, this.chatRouteForInput(input).key);
   }
 
-  async runConversationSubmit(selected = {}, work, taskStageRecorder = null) {
+  async runConversationSubmit(selected = {}, work, taskStageRecorder = null, options = {}) {
     const carId = String(selected.carId || "").trim();
     const carType = String(selected.carType || "chatgpt").trim();
     const key = `${carType}:${carId}`;
     const previous = this.conversationSubmitWorks.get(key) || Promise.resolve();
+    if (options.serializeWork === true) {
+      let resolveStarted;
+      let rejectStarted;
+      const started = new Promise((resolve, reject) => {
+        resolveStarted = resolve;
+        rejectStarted = reject;
+      });
+      const current = previous.catch(() => {}).then(async () => {
+        try {
+          if (isBadCar(this.account?.id, carType, carId)) {
+            const error = new Error(`车位 ${carId} 正在临时冻结，已切换其他车位。`);
+            error.code = "IMAGE_CAR_COOLDOWN";
+            error.carCooldown = true;
+            throw error;
+          }
+          const waitMs = Math.max(
+            0,
+            (this.conversationSubmitStartedAt.get(key) || 0) + CONVERSATION_SUBMIT_MIN_INTERVAL_MS - Date.now()
+          );
+          if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+          if (isBadCar(this.account?.id, carType, carId)) {
+            const error = new Error(`车位 ${carId} 正在临时冻结，已切换其他车位。`);
+            error.code = "IMAGE_CAR_COOLDOWN";
+            error.carCooldown = true;
+            throw error;
+          }
+          this.conversationSubmitStartedAt.set(key, Date.now());
+          resolveStarted();
+          return await work();
+        } catch (error) {
+          rejectStarted(error);
+          throw error;
+        }
+      });
+      this.conversationSubmitWorks.set(key, current);
+      try {
+        await measureTaskStage(taskStageRecorder, {
+          key: "car_submit_queue",
+          label: "等待车位提交",
+          carId,
+          carType
+        }, async () => started);
+        return await current;
+      } finally {
+        if (this.conversationSubmitWorks.get(key) === current) this.conversationSubmitWorks.delete(key);
+      }
+    }
     const start = previous.catch(() => {}).then(async () => {
       if (isBadCar(this.account?.id, carType, carId)) {
         const error = new Error(`车位 ${carId} 正在临时冻结，已切换其他车位。`);
@@ -5177,126 +5224,155 @@ export class ChatplusClient {
             stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
           };
         }
-        const model = route.model || init?.default_model_slug || submitClient.defaultModel || this.defaultModel;
-        const sourceFiles = requestInput.files || [];
-        const imageAssets = sourceFiles.length
-          ? await measureTaskStage(requestInput.taskStageRecorder, {
-              key: "source_upload",
-              label: "上传原图"
-            }, async () => runSubmitStep(() => submitClient.uploadChatImages(sourceFiles, {
-              taskStageRecorder: requestInput.taskStageRecorder
-            })))
-          : [];
-        const { body, messageId } = submitClient.buildConversationBody(prompt, model, imageAssets);
-        let resolvePushedConversationId;
-        const pushedConversationId = new Promise((resolve) => {
-          resolvePushedConversationId = resolve;
-        });
-        const unsubscribeConversationUpdates = requestInput.imageGeneration === true
-          ? subscribeChatplusConversationUpdates(({ conversationId, payload }) => {
-              if (JSON.stringify(payload).includes(messageId)) resolvePushedConversationId(conversationId);
-            })
-          : () => {};
-        let resultChannelReady = false;
-        let resultChannelError = "";
-        let resultChannelConnection = null;
-        if (requestInput.imageGeneration === true) {
-          resultChannelConnection = submitClient.ensureConversationUpdates({ timeoutSec: DEFAULT_CONNECT_TIMEOUT_SEC })
-            .then(() => {
-              resultChannelReady = true;
-            })
-            .catch((error) => {
-              resultChannelError = String(error?.message || "结果通道连接失败。");
-            });
-          // Give the live result channel a short head start. It remains best-effort:
-          // a slow socket must not hold up submitting the image task itself.
-          await Promise.race([
-            resultChannelConnection,
-            new Promise((resolve) => {
-              const timer = setTimeout(resolve, RESULT_CHANNEL_READY_GRACE_MS);
-              timer.unref?.();
-            })
-          ]);
-        }
-
-        const submission = await this.runConversationSubmit(selected, async () => measureTaskStage(requestInput.taskStageRecorder, {
-          key: "upstream_generation",
-          label: "等待上游处理",
-          carId: selected?.carId,
-          carType: selected?.carType
-        }, async () => {
-          if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.started = true;
-          const response = await runSubmitStep(() => submitClient.http("/backend-api/conversation", {
-            method: "POST",
-            body,
-            headers: {
-              accept: "text/event-stream",
-              referer: `${this.baseUrl}/`
-            }
-          }));
-          if (response.status < 200 || response.status >= 300) {
-            const error = conversationSubmitError(response);
-            if (isConversationBusyText(response.body)) {
-              error.code = "UPSTREAM_CONVERSATION_BUSY";
-              error.conversationBusy = true;
-              await this.rememberConversationBusyCar(selected, error);
-            }
-            throw error;
+        const serializeImageSubmit = requestInput.imageGeneration === true && requestInput.concurrentSubmit === true;
+        const submission = await this.runConversationSubmit(selected, async () => {
+          let activeSession = session;
+          if (serializeImageSubmit) {
+            const cachedSession = this.concurrentChatSessions.get(this.chatSessionKey(route))?.session;
+            if (
+              cachedSession?.revision === this.sessionRevision
+              && cachedSession.selected?.carId === selected?.carId
+            ) activeSession = this.cloneChatSession(cachedSession);
           }
-          if (isChatUsageLimitMessage(response.body)) {
-            const usage = chatUsageLimitFromText(response.body) || {};
-            throw chatUsageLimitError(
-              `当前 GPT 账号的使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`,
-              usage
-            );
-          }
-
-          const events = parseSse(response.body);
-          let conversationId = "";
-          for (const event of events) {
-            if (event.conversation_id) conversationId = event.conversation_id;
-          }
-          const imageLimitContent = imageGenerationLimitContent(events);
-          if (!conversationId && requestInput.imageGeneration === true && imageLimitContent) {
-            conversationId = await Promise.race([
-              pushedConversationId,
+          const activeSubmitClient = requestInput.concurrentSubmit === true
+            ? this.createSubmitClient(activeSession)
+            : submitClient;
+          const model = route.model || init?.default_model_slug || activeSubmitClient.defaultModel || this.defaultModel;
+          const sourceFiles = requestInput.files || [];
+          const imageAssets = sourceFiles.length
+            ? await measureTaskStage(requestInput.taskStageRecorder, {
+                key: "source_upload",
+                label: "上传原图"
+              }, async () => runSubmitStep(() => activeSubmitClient.uploadChatImages(sourceFiles, {
+                taskStageRecorder: requestInput.taskStageRecorder
+              })))
+            : [];
+          const { body, messageId } = activeSubmitClient.buildConversationBody(prompt, model, imageAssets);
+          let resolvePushedConversationId;
+          const pushedConversationId = new Promise((resolve) => {
+            resolvePushedConversationId = resolve;
+          });
+          const unsubscribeConversationUpdates = requestInput.imageGeneration === true
+            ? subscribeChatplusConversationUpdates(({ conversationId, payload }) => {
+                if (JSON.stringify(payload).includes(messageId)) resolvePushedConversationId(conversationId);
+              })
+            : () => {};
+          let resultChannelReady = false;
+          let resultChannelError = "";
+          if (requestInput.imageGeneration === true) {
+            const resultChannelConnection = activeSubmitClient.ensureConversationUpdates({ timeoutSec: DEFAULT_CONNECT_TIMEOUT_SEC })
+              .then(() => {
+                resultChannelReady = true;
+              })
+              .catch((error) => {
+                resultChannelError = String(error?.message || "结果通道连接失败。");
+              });
+            // Give the live result channel a short head start. It remains best-effort:
+            // a slow socket must not hold up submitting the image task itself.
+            await Promise.race([
+              resultChannelConnection,
               new Promise((resolve) => {
-                const timer = setTimeout(() => resolve(""), 3000);
+                const timer = setTimeout(resolve, RESULT_CHANNEL_READY_GRACE_MS);
                 timer.unref?.();
               })
             ]);
           }
-          if (imageLimitContent && !conversationId) {
-            const error = requestInput.imageGeneration === true
-              ? imageCarQuotaError(imageLimitContent)
-              : imageQuotaError();
-            error.upstreamText = imageLimitContent;
-            throw error;
-          }
-          if (!conversationId) {
-            const error = conversationNotCreatedError(
-              selected,
-              "GPT 没有返回对话编号",
-              response.body
-            );
-            if (isConversationBusyText(response.body)) {
-              error.code = "UPSTREAM_CONVERSATION_BUSY";
-              error.conversationBusy = true;
-              error.message = "当前车位上游提示对话过快或已有任务正在处理。";
-              await this.rememberConversationBusyCar(selected, error);
+
+          const result = await measureTaskStage(requestInput.taskStageRecorder, {
+            key: "upstream_generation",
+            label: "等待上游处理",
+            carId: selected?.carId,
+            carType: selected?.carType
+          }, async () => {
+            if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.started = true;
+            const response = await runSubmitStep(() => activeSubmitClient.http("/backend-api/conversation", {
+              method: "POST",
+              body,
+              headers: {
+                accept: "text/event-stream",
+                referer: `${this.baseUrl}/`
+              }
+            }));
+            if (response.status < 200 || response.status >= 300) {
+              const error = conversationSubmitError(response);
+              if (isConversationBusyText(response.body)) {
+                error.code = "UPSTREAM_CONVERSATION_BUSY";
+                error.conversationBusy = true;
+                await this.rememberConversationBusyCar(selected, error);
+              }
+              throw error;
             }
-            throw error;
-          }
-          return { events, conversationId };
-        }), requestInput.taskStageRecorder).finally(unsubscribeConversationUpdates);
-        const { events, conversationId } = submission;
+            if (isChatUsageLimitMessage(response.body)) {
+              const usage = chatUsageLimitFromText(response.body) || {};
+              throw chatUsageLimitError(
+                `当前 GPT 账号的使用次数已用完${usage.quotaResetAt ? `，请等待 ${usage.quotaResetAt.replace("T", " ").replace("+08:00", "")} 刷新` : ""}。`,
+                usage
+              );
+            }
+
+            const events = parseSse(response.body);
+            let conversationId = "";
+            for (const event of events) {
+              if (event.conversation_id) conversationId = event.conversation_id;
+            }
+            const imageLimitContent = imageGenerationLimitContent(events);
+            if (!conversationId && requestInput.imageGeneration === true && imageLimitContent) {
+              conversationId = await Promise.race([
+                pushedConversationId,
+                new Promise((resolve) => {
+                  const timer = setTimeout(() => resolve(""), 3000);
+                  timer.unref?.();
+                })
+              ]);
+            }
+            if (imageLimitContent && !conversationId) {
+              const error = requestInput.imageGeneration === true
+                ? imageCarQuotaError(imageLimitContent)
+                : imageQuotaError();
+              error.upstreamText = imageLimitContent;
+              throw error;
+            }
+            if (!conversationId) {
+              const error = conversationNotCreatedError(
+                selected,
+                "GPT 没有返回对话编号",
+                response.body
+              );
+              if (isConversationBusyText(response.body)) {
+                error.code = "UPSTREAM_CONVERSATION_BUSY";
+                error.conversationBusy = true;
+                error.message = "当前车位上游提示对话过快或已有任务正在处理。";
+                await this.rememberConversationBusyCar(selected, error);
+              }
+              throw error;
+            }
+            return { events, conversationId };
+          }).finally(unsubscribeConversationUpdates);
+          this.rememberReusableChatSession(requestInput, activeSession, activeSubmitClient);
+          return {
+            ...result,
+            messageId,
+            model,
+            resultChannelReady,
+            resultChannelError,
+            submitSessionSnapshot: activeSubmitClient.sessionSnapshot()
+          };
+        }, requestInput.taskStageRecorder, { serializeWork: serializeImageSubmit });
+        const {
+          events,
+          conversationId,
+          messageId,
+          model,
+          resultChannelReady,
+          resultChannelError,
+          submitSessionSnapshot
+        } = submission;
         confirmedConversationId = conversationId;
         bindImageCarLease(imageCarLease, conversationId);
         if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.confirmed = true;
         const upstreamTaskId = requestInput.imageGeneration === true
-          ? submitClient.rememberImageTaskId(conversationId, imageTaskIdFrom(events, conversationId))
+          ? this.rememberImageTaskId(conversationId, imageTaskIdFrom(events, conversationId))
           : "";
-        this.rememberReusableChatSession(requestInput, session, submitClient);
         return {
           events,
           conversationId,
@@ -5310,7 +5386,7 @@ export class ChatplusClient {
           resultChannelReady,
           resultChannelError,
           _imageCarLease: imageCarLease,
-          submitSessionSnapshot: submitClient.sessionSnapshot(),
+          submitSessionSnapshot,
           stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
         };
       } catch (error) {
@@ -5364,14 +5440,19 @@ export class ChatplusClient {
           error.quotaModel = activeRoute?.key || "";
           throw error;
         }
+        if (
+          selected
+          && requestInput.imageGeneration === true
+          && requestInput.concurrentSubmit === true
+          && isExplicitAuthSessionError(error)
+        ) {
+          error.code = "CHAT_IMAGE_SESSION_CONFLICT";
+          error.status = 409;
+          error.noRetry = true;
+          error.message = "当前聊天生图会话发生登录冲突，请稍后重试。";
+          throw error;
+        }
         if (selected && isCarSessionContentionError(error)) {
-          if (requestInput.imageGeneration === true && requestInput.concurrentSubmit === true) {
-            error.code = "CHAT_IMAGE_SESSION_CONFLICT";
-            error.status = 409;
-            error.noRetry = true;
-            error.message = "当前聊天生图会话发生登录冲突，请稍后重试。";
-            throw error;
-          }
           await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
           recordCarError("当前车位会话被上游拒绝，已自动换车。");

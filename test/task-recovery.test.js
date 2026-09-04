@@ -3352,7 +3352,7 @@ test("聊天生图没有上游编号时不能算已提交", async () => {
   }
 });
 
-test("同一账号的聊天生图复用一个车位，上传和提交可以并行", async () => {
+test("同一账号的聊天生图复用一个车位，上传和提交顺序执行", async () => {
   let sessionTail = Promise.resolve();
   const sessionLock = (work) => {
     const current = sessionTail.catch(() => {}).then(work);
@@ -3464,7 +3464,7 @@ test("同一账号的聊天生图复用一个车位，上传和提交可以并�
   assert.equal(enterCarCount, 1);
   assert.equal(initCount, 1);
   assert.equal(client.cookies.some((cookie) => cookie.startsWith("upload=")), false);
-  assert.equal(maxSubmitSteps, 3, "同一车位的独立上传和提交应当并行进行");
+  assert.equal(maxSubmitSteps, 1, "同一车位的上传和提交应当顺序执行，避免登录状态互相覆盖");
   assert.deepEqual(results.map((result) => result.status), ["waiting_upstream", "waiting_upstream", "waiting_upstream"]);
   assert.equal(new Set(results.map((result) => result.externalId)).size, 3);
   assert.equal(new Set(results.map((result) => result.raw.selectedCarId)).size, 1);
