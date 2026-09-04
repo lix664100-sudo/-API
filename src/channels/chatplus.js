@@ -33,6 +33,7 @@ const CURL_COMMAND = process.platform === "win32" ? "curl.exe" : "curl";
 const ACCOUNT_CHECK_TIMEOUT_SEC = 20;
 const DEFAULT_CHAT_HTTP_TIMEOUT_SEC = 300;
 const DEFAULT_CONNECT_TIMEOUT_SEC = 20;
+const DEFAULT_PORTAL_LOGIN_TIMEOUT_SEC = 8;
 const RESULT_CHANNEL_READY_GRACE_MS = 1_500;
 const IMAGE_RESULT_PROBE_TIMEOUT_SEC = 8;
 const CONVERSATION_READ_HEADERS = Object.freeze({
@@ -3710,6 +3711,7 @@ export class ChatplusClient {
       label: "登录账号"
     }, async () => {
       this.assertConfigured();
+      const timeoutSec = Math.max(1, Number(options.timeoutSec || DEFAULT_PORTAL_LOGIN_TIMEOUT_SEC));
       if (options.forceFreshPortalLogin !== true && this.tryAdoptSharedPortalSession()) {
         return { adoptedSharedSession: true };
       }
@@ -3719,7 +3721,7 @@ export class ChatplusClient {
           configuredUrls: [this.baseUrl, this.configuredBaseUrl],
           proxyUrl: proxyUrlFor(this.account),
           directoryUrl: this.config?.shareAiDirectoryUrl,
-          directoryTimeoutMs: Number(options.timeoutSec || DEFAULT_CONNECT_TIMEOUT_SEC) * 1000,
+          directoryTimeoutMs: timeoutSec * 1000,
           fetchImpl: this.fetchImpl,
           proxyAgentFactory: this.proxyAgentFactory,
           directoryLoader: this.portalDirectoryLoader,
@@ -3729,7 +3731,7 @@ export class ChatplusClient {
             this.portalLoggedIn = false;
             const response = await this.http("/frontend-api/login", {
               method: "POST",
-              timeoutSec: options.timeoutSec,
+              timeoutSec,
               followRedirect: true,
               body: {
                 userToken: this.account.username,

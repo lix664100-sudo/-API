@@ -333,6 +333,17 @@ test("两个改图入口都会在读取图片前占住并发名额", () => {
   }
 });
 
+test("改图接口默认异步返回，只有 wait=1 才等待最终结果", () => {
+  const routeStart = serverSource.indexOf('app.post("/v1/images/edits"');
+  const routeEnd = serverSource.indexOf("\n});", routeStart);
+  const routeSource = serverSource.slice(routeStart, routeEnd);
+
+  assert.match(routeSource, /const waitForResult = request\.query\?\.wait === "1"/);
+  assert.match(routeSource, /wait: waitForResult/);
+  assert.match(routeSource, /if \(!waitForResult \|\|/);
+  assert.match(serverSource, /async function reserveImageRequestAdmission[\s\S]+verifyReady: request\.query\?\.wait === "1"/);
+});
+
 test("任务渠道按首次提交和全部成功渠道显示，并自动去重", () => {
   const { taskSubmissionRouteText, taskGenerationRouteText } = loadTaskRouteHelpers();
   const row = {

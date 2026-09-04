@@ -185,6 +185,37 @@ test("已选入口后来断线时会跳过它并重新读取官方线路", async
   assert.deepEqual(attempts, ["https://recovered.example.test"]);
 });
 
+test("线路冷却期间不会在下一次任务中重复尝试失效入口", async () => {
+  const configuredUrls = [
+    "https://one.aishare.io",
+    "https://one.aishare.icu",
+    "https://one.likeky.com"
+  ];
+  const options = {
+    configuredUrls,
+    proxyUrl: "http://cooldown-proxy.example.test:8080",
+    directoryUrl: "https://directory-cooldown.example.test/",
+    directoryLoader: async () => directoryHtml,
+    attempt: async () => {
+      throw new Error("连接失败");
+    }
+  };
+
+  await assert.rejects(useAvailableShareAiPortal(options), /没有可用的登录入口/);
+  const retryAttempts = [];
+  await assert.rejects(
+    useAvailableShareAiPortal({
+      ...options,
+      attempt: async (url) => {
+        retryAttempts.push(url);
+        throw new Error("连接失败");
+      }
+    }),
+    /没有可用的登录入口/
+  );
+  assert.deepEqual(retryAttempts, []);
+});
+
 test("绘图登录失败后自动切换，后续继续使用已选入口", async () => {
   const loginUrls = [];
   const config = {

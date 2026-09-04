@@ -397,7 +397,7 @@ function imageAdmissionInput(request, requestMeta = {}, parsedInput = null) {
 async function reserveImageRequestAdmission(request, requestMeta = {}, parsedInput = null) {
   const admission = await reserveImageTaskAdmission(
     imageAdmissionInput(request, requestMeta, parsedInput),
-    { verifyReady: true }
+    { verifyReady: request.query?.wait === "1" }
   );
   return attachImageAdmissionToRequest(admission, request);
 }
@@ -1565,9 +1565,10 @@ app.post("/v1/images/edits", { preHandler: requireApiKey }, async (request, repl
     requestMeta = mergeInputSourceTaskId(requestMeta, input);
     if (!files.length) throw badRequest(`请上传 1 到 ${MAX_INPUT_IMAGE_COUNT} 张源图，字段名用 image。`);
     await reserveBeforeImageRead(input);
-    const task = await createImageTask({ input, files, wait: request.query?.wait !== "0", requestMeta, admission });
+    const waitForResult = request.query?.wait === "1";
+    const task = await createImageTask({ input, files, wait: waitForResult, requestMeta, admission });
     admissionTransferred = true;
-    if (!["success", "failed", "cancelled", "interrupted"].includes(String(task.status || "").toLowerCase())) {
+    if (!waitForResult || !["success", "failed", "cancelled", "interrupted"].includes(String(task.status || "").toLowerCase())) {
       reply.code(202);
     }
     return imageEditResponse(task);

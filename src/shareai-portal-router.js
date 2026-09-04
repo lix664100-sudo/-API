@@ -237,9 +237,8 @@ function orderedCandidates(routeKey, configuredUrls, discoveredUrls) {
   ]);
 }
 
-function candidatesOutsideCooldown(routeKey, candidates, retryCooled) {
-  const available = candidates.filter((url) => !portalOnCooldown(routeKey, url));
-  return available.length || !retryCooled ? available : candidates;
+function candidatesOutsideCooldown(routeKey, candidates) {
+  return candidates.filter((url) => !portalOnCooldown(routeKey, url));
 }
 
 function compactFailureMessage(value) {
@@ -294,11 +293,10 @@ export async function useAvailableShareAiPortal(options = {}) {
   const attempts = [];
   const attempted = new Set();
 
-  const tryCandidates = async (values, retryCooled = false) => {
+  const tryCandidates = async (values) => {
     const candidates = candidatesOutsideCooldown(
       routeKey,
-      orderedCandidates(routeKey, configuredUrls, values),
-      retryCooled
+      orderedCandidates(routeKey, configuredUrls, values)
     );
     for (const url of candidates) {
       if (attempted.has(url)) continue;
@@ -321,7 +319,7 @@ export async function useAvailableShareAiPortal(options = {}) {
   if (initial) return initial;
 
   const discovered = await discoverPortalUrls(options, cached.length > 0);
-  const recovered = await tryCandidates(discovered, true);
+  const recovered = await tryCandidates(discovered);
   if (recovered) return recovered;
 
   throw portalsUnavailableError(attempts);
