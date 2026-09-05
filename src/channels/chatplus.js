@@ -3725,7 +3725,7 @@ export class ChatplusClient {
 
   async prepareReusableChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
     const route = this.chatRouteForInput(input);
-    if (input.imageGeneration === true && route.key !== "gpt") {
+    if (input.imageGeneration === true) {
       const session = await this.prepareChatSession(input, ignoredCarIds, maxAttempts);
       return this.cloneChatSession(this.preparedChatSession(session));
     }
@@ -3798,6 +3798,7 @@ export class ChatplusClient {
   rememberReusableChatSession(input = {}, session = {}, submitClient = this) {
     if (
       input.concurrentSubmit !== true
+      || input.imageGeneration === true
       || !session?.route
       || !session?.selected
     ) return;

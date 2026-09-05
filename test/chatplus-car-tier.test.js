@@ -1014,7 +1014,7 @@ test("image tasks record each processing stage and car attempt", async () => {
   }
 });
 
-test("a successful concurrent submission refreshes the reusable login session", async () => {
+test("a successful concurrent image submission does not publish a reusable login session", async () => {
   const server = createServer((_request, response) => {
     response.writeHead(200, {
       "content-type": "text/event-stream",
@@ -1051,9 +1051,9 @@ test("a successful concurrent submission refreshes the reusable login session", 
     });
     const reused = await client.prepareReusableChatSession({ preferImageCar: true }, new Set(), 1);
 
-    assert.equal(carListReads, 1);
-    assert.equal(carEntries, 1);
-    assert.equal(reused.snapshot.cookies.includes("session=fresh"), true);
+    assert.equal(carListReads, 2);
+    assert.equal(carEntries, 2);
+    assert.equal(reused.snapshot.cookies.includes("session=fresh"), false);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
@@ -1176,7 +1176,7 @@ test("同一 GPT 账号首单等图时不会挡住第二单提交", async () => 
   assert.equal(secondResult.status, "success");
 });
 
-test("同一账号的并发聊天生图复用同一个已登录车位", async () => {
+test("同一账号的并发聊天生图分配不同车位", async () => {
   const selectedCars = [];
   let conversationIndex = 0;
   let carEntries = 0;
@@ -1227,17 +1227,19 @@ test("同一账号的并发聊天生图复用同一个已登录车位", async ()
       })
     ]);
 
-    assert.deepEqual(selectedCars, ["active-car-one", "active-car-one"]);
-    assert.deepEqual(results.map((result) => result.raw.selectedCarId), ["active-car-one", "active-car-one"]);
-    assert.equal(carEntries, 1);
+    assert.deepEqual(selectedCars, ["active-car-one", "active-car-two"]);
+    assert.deepEqual(results.map((result) => result.raw.selectedCarId), ["active-car-one", "active-car-two"]);
+    assert.equal(carEntries, 2);
 
-    const additionalResult = await client.createTextTask({
-      prompt: "reuse active image session",
-      concurrentSubmit: true,
-      waitForImages: false
-    });
-    assert.equal(additionalResult.raw.selectedCarId, "active-car-one");
-    assert.equal(carEntries, 1);
+    await assert.rejects(
+      client.createTextTask({
+        prompt: "no third active image car",
+        concurrentSubmit: true,
+        waitForImages: false
+      }),
+      /当前可用生图车位都在处理任务/
+    );
+    assert.equal(carEntries, 2);
 
     const firstResult = results.find((result) => result.raw.selectedCarId === "active-car-one");
     const completedUrl = "https://example.test/completed-active-car-one.png";

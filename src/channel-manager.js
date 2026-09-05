@@ -5257,7 +5257,8 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
           return finishQueuedTask(taskState, result, channel, account, attempts);
         }, {
           taskType: "text2img",
-          parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
+          // ShareAI chat image sessions are account-scoped upstream; serialize one account.
+          parallel: false,
           noQueue: options.noChatplusQueue,
           slot: targetTaskSlot(target, "text2img"),
           modelKey: targetChatModelKey(target, input),
@@ -5525,7 +5526,8 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
             return finishQueuedTask(taskState, result, channel, account, attempts);
           }, {
             taskType: "img2img",
-            parallel: options.chatplusConcurrentSubmit !== false && options.noChatplusQueue !== true,
+            // ShareAI chat image sessions are account-scoped upstream; serialize one account.
+            parallel: false,
             noQueue: options.noChatplusQueue,
             slot: targetTaskSlot(target, "img2img"),
             modelKey: targetChatModelKey(target, input),
