@@ -5,7 +5,7 @@ import { normalizeProxyUrl, safeProxyEndpoint } from "./proxy.js";
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const minimumProxyTimeoutMs = 5_000;
-const maximumProxyTimeoutMs = 30_000;
+const minimumRouteTimeoutMs = 1_000;
 
 function proxyExpired(expiresAt, now = Date.now()) {
   if (!expiresAt) return false;
@@ -95,6 +95,7 @@ function commandOptions(cwd, timeoutMs, maxBuffer, env = process.env) {
 }
 
 function commandErrorText(error) {
+  if (error?.killed || error?.signal) return "连接代码仓库超时。";
   return String(error?.stderr || error?.message || "");
 }
 
@@ -125,20 +126,27 @@ export async function inspectGitUpdateState(options = {}) {
     const local = await execute("git rev-parse HEAD", localOptions);
     const upstream = await execute('git rev-parse --abbrev-ref --symbolic-full-name "@{u}"', localOptions);
     const proxies = accountGitProxies(config, { random, now });
+    const directEnv = { ...baseEnv };
+    const routeCount = proxies.length ? 3 : 2;
+    const routeTimeoutMs = Math.max(minimumRouteTimeoutMs, Math.floor(timeoutMs / routeCount));
     let gitEnv = null;
-    let lastFetchError = null;
+    let firstDirectError = null;
+    let lastProxyError = null;
 
-    if (proxies.length) {
-      const directTimeoutMs = Math.max(
-        minimumProxyTimeoutMs,
-        Math.min(maximumProxyTimeoutMs, Math.floor(timeoutMs / 3))
-      );
-      const proxyBudgetMs = Math.max(minimumProxyTimeoutMs, timeoutMs - directTimeoutMs);
+    try {
+      await fetch(commandOptions(cwd, routeTimeoutMs, maxBuffer, directEnv));
+      gitEnv = directEnv;
+    } catch (error) {
+      firstDirectError = error;
+    }
+
+    if (!gitEnv && proxies.length) {
+      const proxyBudgetMs = routeTimeoutMs;
       const maximumAttempts = Math.max(1, Math.floor(proxyBudgetMs / minimumProxyTimeoutMs));
       const candidates = proxies.slice(0, maximumAttempts);
       const proxyTimeoutMs = Math.max(
-        minimumProxyTimeoutMs,
-        Math.min(maximumProxyTimeoutMs, Math.floor(proxyBudgetMs / candidates.length))
+        minimumRouteTimeoutMs,
+        Math.floor(proxyBudgetMs / candidates.length)
       );
       for (const proxy of candidates) {
         const candidateEnv = gitProxyEnvironment(proxy.url, baseEnv);
@@ -147,37 +155,34 @@ export async function inspectGitUpdateState(options = {}) {
           gitEnv = candidateEnv;
           break;
         } catch (error) {
-          lastFetchError = error;
+          lastProxyError = error;
         }
       }
-      if (!gitEnv) {
-        try {
-          await fetch(commandOptions(cwd, directTimeoutMs, maxBuffer, baseEnv));
-          gitEnv = { ...baseEnv };
-        } catch (directError) {
-          const proxyError = redactGitProxyCredentials(
-            commandErrorText(lastFetchError),
-            gitProxyEnvironment(candidates.at(-1)?.url, baseEnv)
-          );
-          return {
-            checked: false,
-            message: "账号代理和服务器直连都无法连接代码仓库，未执行更新。",
-            stderr: [
-              proxyError ? `账号代理：${proxyError}` : "",
-              commandErrorText(directError) ? `服务器直连：${commandErrorText(directError)}` : ""
-            ].filter(Boolean).join("\n")
-          };
-        }
-      }
-    } else {
+    }
+
+    if (!gitEnv) {
       try {
-        await fetch(localOptions);
-        gitEnv = { ...baseEnv };
-      } catch (error) {
+        await fetch(commandOptions(cwd, routeTimeoutMs, maxBuffer, directEnv));
+        gitEnv = directEnv;
+      } catch (finalDirectError) {
+        const proxyError = redactGitProxyCredentials(
+          commandErrorText(lastProxyError),
+          gitProxyEnvironment(proxies.at(-1)?.url, baseEnv)
+        );
         return {
           checked: false,
-          message: "无法连接代码仓库，未执行更新。",
-          stderr: commandErrorText(error)
+          message: proxies.length
+            ? "账号代理和服务器直连都无法连接代码仓库，未执行更新。"
+            : "无法连接代码仓库，已自动重试，未执行更新。",
+          stderr: [
+            commandErrorText(firstDirectError)
+              ? `服务器直连（首次）：${commandErrorText(firstDirectError)}`
+              : "",
+            proxyError ? `账号代理：${proxyError}` : "",
+            commandErrorText(finalDirectError)
+              ? `服务器直连（重试）：${commandErrorText(finalDirectError)}`
+              : ""
+          ].filter(Boolean).join("\n")
         };
       }
     }

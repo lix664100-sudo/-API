@@ -49,11 +49,19 @@ test("账号 Git 代理会排除停用、过期和无效配置，并去掉重复
   assert.equal(proxies[1].url, activeProxyB);
 });
 
-test("Git 检查遇到坏代理会自动换下一条", async () => {
-  const fetchProxyHosts = [];
+test("服务器直连失败后，Git 检查遇到坏代理会自动换下一条", async () => {
+  const attempts = [];
+  const timeouts = [];
   const fetch = async (options) => {
     const proxyUrl = options.env.GIT_CONFIG_VALUE_0;
-    fetchProxyHosts.push(new URL(proxyUrl).hostname);
+    const route = proxyUrl ? new URL(proxyUrl).hostname : "direct";
+    attempts.push(route);
+    timeouts.push(options.timeout);
+    if (!proxyUrl) {
+      const error = new Error("direct failed");
+      error.stderr = "direct failed";
+      throw error;
+    }
     if (proxyUrl.includes("proxy-a.example.test")) {
       const error = new Error("first proxy failed");
       error.stderr = "first proxy failed";
@@ -68,24 +76,28 @@ test("Git 检查遇到坏代理会自动换下一条", async () => {
     fetch,
     baseEnv: { TEST_ENV: "kept" },
     random: () => 0.999,
-    now: Date.parse("2026-07-27T00:00:00+08:00")
+    now: Date.parse("2026-07-27T00:00:00+08:00"),
+    timeoutMs: 180_000
   });
 
-  assert.deepEqual(fetchProxyHosts, ["proxy-a.example.test", "proxy-b.example.test"]);
+  assert.deepEqual(attempts, ["direct", "proxy-a.example.test", "proxy-b.example.test"]);
+  assert.deepEqual(timeouts, [60_000, 30_000, 30_000]);
   assert.equal(result.checked, true);
   assert.equal(result.upToDate, false);
   assert.equal(result.gitEnv.TEST_ENV, "kept");
   assert.equal(new URL(result.gitEnv.GIT_CONFIG_VALUE_0).hostname, "proxy-b.example.test");
 });
 
-test("所有账号代理失败后会尝试服务器直连", async () => {
+test("首次直连和所有账号代理失败后会再次尝试服务器直连", async () => {
   const attempts = [];
   const fetch = async (options) => {
     const proxyUrl = options.env.GIT_CONFIG_VALUE_0;
     attempts.push(proxyUrl ? new URL(proxyUrl).hostname : "direct");
-    if (proxyUrl) {
+    if (attempts.length < 4) {
       const error = new Error("proxy failed");
-      error.stderr = `无法连接 ${options.env.GIT_CONFIG_VALUE_0}`;
+      error.stderr = proxyUrl
+        ? `无法连接 ${options.env.GIT_CONFIG_VALUE_0}`
+        : "服务器直连失败";
       throw error;
     }
   };
@@ -100,7 +112,7 @@ test("所有账号代理失败后会尝试服务器直连", async () => {
     now: Date.parse("2026-07-27T00:00:00+08:00")
   });
 
-  assert.deepEqual(attempts, ["proxy-a.example.test", "proxy-b.example.test", "direct"]);
+  assert.deepEqual(attempts, ["direct", "proxy-a.example.test", "proxy-b.example.test", "direct"]);
   assert.equal(result.checked, true);
   assert.equal(result.gitEnv.TEST_ENV, "direct-fallback");
   assert.equal(result.gitEnv.GIT_CONFIG_VALUE_0, undefined);
@@ -128,7 +140,8 @@ test("代理和服务器直连都失败时停止更新并隐藏代理密码", as
   assert.equal(result.message, "账号代理和服务器直连都无法连接代码仓库，未执行更新。");
   assert.doesNotMatch(result.stderr, /password-a|password-b/);
   assert.match(result.stderr, /\[账号代理\]/);
-  assert.match(result.stderr, /服务器直连失败/);
+  assert.match(result.stderr, /服务器直连（首次）：服务器直连失败/);
+  assert.match(result.stderr, /服务器直连（重试）：服务器直连失败/);
 });
 
 test("没有可用账号代理时保留原来的直连检查", async () => {
@@ -146,6 +159,32 @@ test("没有可用账号代理时保留原来的直连检查", async () => {
   assert.equal(result.checked, true);
   assert.equal(fetchEnv.TEST_ENV, "direct");
   assert.equal(fetchEnv.GIT_CONFIG_VALUE_0, undefined);
+});
+
+test("没有可用账号代理时，直连超时会自动重试并显示明确原因", async () => {
+  const timeouts = [];
+  const fetch = async (options) => {
+    timeouts.push(options.timeout);
+    const error = new Error("Command failed: git fetch --quiet");
+    error.killed = true;
+    error.signal = "SIGTERM";
+    throw error;
+  };
+
+  const result = await inspectGitUpdateState({
+    cwd: "/test/repo",
+    config: updateConfig([]),
+    execute: async (command) => successfulLocalCommand(command),
+    fetch,
+    timeoutMs: 180_000
+  });
+
+  assert.deepEqual(timeouts, [90_000, 90_000]);
+  assert.equal(result.checked, false);
+  assert.equal(result.message, "无法连接代码仓库，已自动重试，未执行更新。");
+  assert.match(result.stderr, /服务器直连（首次）：连接代码仓库超时。/);
+  assert.match(result.stderr, /服务器直连（重试）：连接代码仓库超时。/);
+  assert.doesNotMatch(result.stderr, /Command failed/);
 });
 
 test("正式更新输出不会泄露代理密码", () => {
