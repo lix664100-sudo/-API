@@ -658,10 +658,10 @@ test("账号忙碌时保留真正占用账号的任务信息", () => {
   );
 });
 
-test("并发面板明确显示聊天与生图共用一个名额", () => {
+test("并发面板明确显示 GPT 生图与其他聊天任务的容量", () => {
   assert.match(adminHtml, /queued: \["processing", "排队中"\]/);
   assert.match(adminHtml, /\{ label: "排队中", value: "queued" \}/);
-  assert.match(adminHtml, /聊天任务共用 1/);
-  assert.match(adminHtml, /聊天 \+ 聊天生图总并发/);
-  assert.match(adminHtml, /忙时立即返回，不排队/);
+  assert.match(adminHtml, /GPT 生图最多 2/);
+  assert.match(adminHtml, /GPT 生图并发/);
+  assert.match(adminHtml, /普通聊天及其他聊天生图/);
 });

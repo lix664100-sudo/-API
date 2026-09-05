@@ -4668,6 +4668,50 @@ export class ChatplusClient {
     };
   }
 
+  async prepareGptImageSubmission(body) {
+    const { websocket_request_id: _websocketRequestId, ...messageBody } = body;
+    const submitBody = {
+      ...messageBody,
+      parent_message_id: "client-created-root",
+      enable_message_followups: true,
+      supports_buffering: true,
+      supported_encodings: ["v1"],
+      system_hints: []
+    };
+    const { messages: _messages, ...prepareBody } = submitBody;
+    const prepared = await this.json("/backend-api/f/conversation/prepare", {
+      method: "POST",
+      body: { ...prepareBody, client_prepare_state: "none" }
+    });
+    const requireToken = (value, stage) => {
+      if (typeof value === "string" && value.trim()) return value;
+      const error = new Error(`生图提交准备失败：${stage}没有返回有效凭据。`);
+      error.code = "CHAT_IMAGE_PREPARATION_FAILED";
+      error.noRetry = true;
+      throw error;
+    };
+    const conduitToken = requireToken(prepared?.conduit_token, "任务准备");
+    const requirements = await this.json("/backend-api/sentinel/chat-requirements/prepare", {
+      method: "POST",
+      body: {}
+    });
+    const prepareToken = requireToken(requirements?.prepare_token, "提交校验");
+    const finalized = await this.json("/backend-api/sentinel/chat-requirements/finalize", {
+      method: "POST",
+      body: { prepare_token: prepareToken }
+    });
+    const requirementsToken = requireToken(finalized?.token, "提交校验确认");
+    // Keep credentials on this request, not on the reusable account session.
+    return {
+      path: "/backend-api/f/conversation",
+      body: { ...submitBody, client_prepare_state: "success" },
+      headers: {
+        "x-conduit-token": conduitToken,
+        "OpenAI-Sentinel-Chat-Requirements-Token": requirementsToken
+      }
+    };
+  }
+
   async uploadChatImage(file, options = {}) {
     const buffer = await file.toBuffer();
     const mimetype = file.mimetype || "image/png";
@@ -5321,6 +5365,15 @@ export class ChatplusClient {
   }
 
   async sendConversation(prompt, input = {}, ignoredCarIds = new Set()) {
+    const submit = () => this.submitConversation(prompt, input, ignoredCarIds);
+    // Switching cars before an upload is confirmed invalidates its file permission.
+    // Release the account queue once submitted; image generation waits outside it.
+    return this.chatRouteForInput(input).key === "gpt"
+      ? this.runAccountWork(submit, "gpt-conversation-submit")
+      : submit();
+  }
+
+  async submitConversation(prompt, input = {}, ignoredCarIds = new Set()) {
     const errors = [];
     const carAttempts = [];
     const imageCarQuotaErrors = [];
@@ -5406,6 +5459,12 @@ export class ChatplusClient {
               })))
             : [];
           const { body, messageId } = activeSubmitClient.buildConversationBody(prompt, model, imageAssets);
+          const submissionRequest = requestInput.imageGeneration === true
+            ? await measureTaskStage(requestInput.taskStageRecorder, {
+                key: "submission_prepare",
+                label: "准备生图提交"
+              }, async () => runSubmitStep(() => activeSubmitClient.prepareGptImageSubmission(body)))
+            : { path: "/backend-api/conversation", body, headers: {} };
           let resolvePushedConversationId;
           const pushedConversationId = new Promise((resolve) => {
             resolvePushedConversationId = resolve;
@@ -5443,12 +5502,13 @@ export class ChatplusClient {
             carType: selected?.carType
           }, async () => {
             if (requestInput.imageSubmissionState) requestInput.imageSubmissionState.started = true;
-            const response = await runSubmitStep(() => activeSubmitClient.http("/backend-api/conversation", {
+            const response = await runSubmitStep(() => activeSubmitClient.http(submissionRequest.path, {
               method: "POST",
-              body,
+              body: submissionRequest.body,
               headers: {
                 accept: "text/event-stream",
-                referer: `${this.baseUrl}/`
+                referer: `${activeSubmitClient.baseUrl}/`,
+                ...submissionRequest.headers
               }
             }));
             if (response.status < 200 || response.status >= 300) {

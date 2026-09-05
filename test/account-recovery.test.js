@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { after, test } from "node:test";
+import { after, mock, test } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -21,6 +21,10 @@ const {
   recoverUnavailableChatAccounts
 } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
+// Keep recovery fixtures independent of the separately tested submission protocol.
+mock.method(ChatplusClient.prototype, "prepareGptImageSubmission", async (body) => ({
+  path: "/backend-api/conversation", body, headers: {}
+}));
 const { DrawingClient, drawingSevereFailureReason, normalizeDrawingTask } = await import("../src/channels/drawing.js");
 
 test("image edit pre-submit retries use safe defaults when unset", () => {

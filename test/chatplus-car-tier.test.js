@@ -1,9 +1,14 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 
 const { ChatplusClient, normalizeImageCarCooldown } = await import("../src/channels/chatplus.js");
 const { recordChatplusConversationUpdate } = await import("../src/chatplus-conversation-updates.js");
+
+// Protocol coverage lives in chatplus-image-submit; these fixtures isolate car behavior.
+mock.method(ChatplusClient.prototype, "prepareGptImageSubmission", async (body) => ({
+  path: "/backend-api/conversation", body, headers: {}
+}));
 
 function car(overrides = {}) {
   return {
@@ -1155,7 +1160,7 @@ test("image tasks record each processing stage and car attempt", async () => {
     });
 
     const keys = result.raw.stageTimings.map((stage) => stage.key);
-    assert.deepEqual(keys, ["car_enter", "car_init", "car_submit_queue", "source_upload", "upstream_generation"]);
+    assert.deepEqual(keys, ["car_enter", "car_init", "car_submit_queue", "source_upload", "submission_prepare", "upstream_generation"]);
     assert.deepEqual(reported.map((stage) => stage.id), result.raw.stageTimings.map((stage) => stage.id));
     assert.equal(result.raw.stageTimings[0].carId, "timed-car");
     assert.equal(result.status, "waiting_upstream");

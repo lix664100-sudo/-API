@@ -266,7 +266,7 @@ async function loadRuntimeConfig() {
 }
 
 function taskSlotLimit(slot, target = {}, input = {}) {
-  if (chatplusUsesSharedAccountSlot(slot, target)) return 1;
+  if (chatplusUsesSharedAccountSlot(slot, target) && !isGptImageSlot(slot, target, input)) return 1;
   const accountLimit = Number(target?.account?.concurrency?.[slot]);
   const configured = Number.isFinite(accountLimit) && accountLimit > 0
     ? accountLimit
@@ -332,6 +332,11 @@ function activeCountForAccountSlot(slot, accountId) {
 
 function chatplusUsesSharedAccountSlot(slot, target = {}) {
   return target?.channel?.type === "chatplus" && ["chat", "chatImage"].includes(slot);
+}
+
+function isGptImageSlot(slot, target, input) {
+  return slot === "chatImage" && target?.channel?.type === "chatplus"
+    && targetChatModelKey(target, input) === "gpt";
 }
 
 function activeCountForChatplusAccount(accountId) {
@@ -404,7 +409,7 @@ function runtimeTargets(config, taskType, channelType, availableOnly = false, mo
 
 function runtimeSlotCapacity(config, taskType, channelType, slot, availableOnly = false, modelKey = "") {
   return runtimeTargets(config, taskType, channelType, availableOnly, modelKey)
-    .reduce((total, target) => total + taskSlotLimit(slot, target), 0);
+    .reduce((total, target) => total + taskSlotLimit(slot, target, modelKey ? { model: modelKey } : {}), 0);
 }
 
 function runtimeAccountConcurrency(config, availableOnly = false) {
@@ -837,8 +842,16 @@ async function reservableTaskSlotState(slot, target = {}, input = {}) {
     && ["chat", "chatImage"].includes(storedTaskSlot(task))
     && taskHoldsDurableSlot(task)
   );
+  let count = activeCountForChatplusAccount(accountId);
+  if (isGptImageSlot(slot, target, input)) {
+    const activeGptImages = activeTaskCounts.get(taskSlotKey(slot, target, input)) || 0;
+    const otherTaskActive = count > activeGptImages || holdingTasks.some(task =>
+      storedTaskSlot(task) !== "chatImage" || storedTaskChatModelKey(task) !== "gpt"
+    );
+    if (otherTaskActive) count = Math.max(count, taskSlotLimit(slot, target, input));
+  }
   return {
-    count: activeCountForChatplusAccount(accountId),
+    count,
     durableState: {
       total: holdingTasks.length,
       active: holdingTasks.filter((task) => activeSubmittedTaskIds.has(task.id)).length,

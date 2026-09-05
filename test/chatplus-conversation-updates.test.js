@@ -845,6 +845,9 @@ test("结果通道在提交前启动，但连接慢时不阻塞上游编号", as
     events.push("result-channel");
     return new Promise(() => {});
   };
+  client.prepareGptImageSubmission = async (body) => ({
+    path: "/backend-api/conversation", body, headers: {}
+  });
   client.http = async (pathName) => {
     assert.equal(pathName, "/backend-api/conversation");
     events.push("submit");

@@ -114,7 +114,7 @@ test("runtime capacity only counts accounts whose channel enables the model", as
 
   const runtime = await getRuntimeStatus();
   assert.equal(runtime.concurrency.drawingImage, 6);
-  assert.equal(runtime.models.gpt.categories.image.configured, 9);
+  assert.equal(runtime.models.gpt.categories.image.configured, 12);
   assert.equal(runtime.models.gpt.categories.chat.configured, 3);
   assert.equal(runtime.models.gemini.categories.image.configured, 7);
   assert.equal(runtime.models.gemini.categories.chat.configured, 1);
@@ -203,19 +203,21 @@ test("drawing image usage reduces the available image concurrency for both GPT a
   }
 });
 
-test("account image concurrency is fixed to one shared slot", async () => {
+test("GPT image concurrency can use two slots while a third request is rejected", async () => {
   const config = await loadConfig();
   const next = modelConfig(config);
   next.accounts[0].concurrency = { chat: 2, drawingImage: 2, chatImage: 2 };
   await saveConfig(next);
 
   const first = await reserveImageTaskAdmission({ model: "gpt", prompt: "first" });
+  const second = await reserveImageTaskAdmission({ model: "gpt", prompt: "second" });
   try {
     await assert.rejects(
-      reserveImageTaskAdmission({ model: "gpt", prompt: "second" }),
+      reserveImageTaskAdmission({ model: "gpt", prompt: "third" }),
       (error) => error.status === 429 && error.code === "CONCURRENCY_LIMIT"
     );
   } finally {
+    second.release();
     first.release();
   }
 });

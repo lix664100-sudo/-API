@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { after, test } from "node:test";
+import { after, mock, test } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,10 @@ process.env.DATA_DIR = dataDir;
 const { closeStorage, getTask, listTasks, listTaskStats, loadConfig, saveConfig, upsertTask } = await import("../src/storage.js");
 const { createImageTask, getRuntimeStatus, imageTaskClientView, inspectUpstreamTask, queueImageTask, queueTextTask, refreshProcessingTasks, refreshTask, reserveImageTaskAdmission } = await import("../src/channel-manager.js");
 const { ChatplusClient } = await import("../src/channels/chatplus.js");
+// Keep recovery fixtures independent of the separately tested submission protocol.
+mock.method(ChatplusClient.prototype, "prepareGptImageSubmission", async (body) => ({
+  path: "/backend-api/conversation", body, headers: {}
+}));
 const { DrawingClient } = await import("../src/channels/drawing.js");
 
 after(async () => {
@@ -3492,6 +3496,7 @@ test("聊天生图满载时立即拒绝，释放名额后才能重新提交", as
       password: "test",
       enabled: true,
       status: "ok",
+      concurrency: { chat: 1, drawingImage: 5, chatImage: 1 },
       meta: {
         abilities: {
           drawing: { status: "quota_empty", balance: 0, message: "跳过绘图站" },

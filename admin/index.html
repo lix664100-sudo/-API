@@ -10267,7 +10267,8 @@
             items.push(h("strong", { key: "drawing" }, `绘图站 ${numberValue(concurrency.drawingImage)}`));
           }
           if (channelAbilityEnabled(rowChannel, "chatplus")) {
-            items.push(h(items.length ? "span" : "strong", { key: "chatplus" }, "聊天 + 聊天生图 共用 1"));
+            items.push(h(items.length ? "span" : "strong", { key: "chatplus" }, `GPT 生图 ${Number(concurrency.chatImage) || 1}`));
+            items.push(h("span", { key: "other-chat" }, "聊天及其他生图 1"));
           }
           return h("div", { className: "account-usage" }, items.length ? items : "-");
         }
@@ -11201,8 +11202,8 @@
                   ]),
                   h("div", { className: "capacity-subtitle" }, "可用数量只统计状态正常的账号；任务完成或停止后会自动释放名额")
                 ]),
-                h(Tooltip, { title: "同一个 ChatPlus 账号的普通聊天和聊天生图共用一个名额；忙时立即返回，不排队。" },
-                  h(Tag, { color: "blue" }, "聊天任务共用 1")
+                h(Tooltip, { title: "GPT 生图按账号设置，最多 2 路；普通聊天及其他聊天生图最多 1 路。" },
+                  h(Tag, { color: "blue" }, "GPT 生图最多 2")
                 )
               ]),
               h("div", { className: "capacity-grid" }, [
@@ -12398,7 +12399,7 @@
             h("div", { className: "form-grid" }, [
               accountModalChatEnabled
                 ? h(Form.Item, {
-                    label: "聊天 + 聊天生图总并发",
+                    label: "普通聊天及其他聊天生图",
                     name: ["concurrency", "chat"],
                     extra: "固定为 1；账号忙时立即返回，不排队。"
                   }, h(InputNumber, { min: 1, max: 1, disabled: true, style: { width: "100%" } }))
@@ -12410,12 +12411,18 @@
                     rules: [{ required: true, message: "请输入绘图站并发" }]
                   }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
                 : null,
-              null
+              accountModalChatEnabled
+                ? h(Form.Item, {
+                    label: "GPT 生图并发",
+                    name: ["concurrency", "chatImage"],
+                    rules: [{ required: true, message: "请输入 GPT 生图并发" }]
+                  }, h(InputNumber, { min: 1, max: 2, precision: 0, style: { width: "100%" } }))
+                : null
             ]),
             h(Alert, {
               type: "info",
               showIcon: true,
-              message: "普通聊天和聊天生图共用一个名额，忙时立即返回，不排队；绘图站并发单独计算。",
+              message: "GPT 生图最多同时处理 2 张；普通聊天及其他聊天生图最多 1 路；绘图站并发单独计算。",
               style: { marginBottom: 0 }
             })
           ])),
