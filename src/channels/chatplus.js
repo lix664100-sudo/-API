@@ -5448,10 +5448,10 @@ export class ChatplusClient {
           && requestInput.concurrentSubmit === true
           && isExplicitAuthSessionError(error)
         ) {
+          await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
           if (!confirmedConversationId && !imageSubmissionState.confirmed && imageSessionRecoveryAttempts < 1) {
             imageSessionRecoveryAttempts += 1;
-            ignoredCarIds.delete(selected.carId);
             continue;
           }
           error.code = "CHAT_IMAGE_SESSION_CONFLICT";

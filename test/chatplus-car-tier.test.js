@@ -1295,10 +1295,11 @@ test("并发聊天生图首次登录冲突时清理旧会话并重试一次", as
         });
         client.portalLoggedIn = true;
         client.cookies = [`fresh=session-${prepareCount}`];
+        const carId = prepareCount === 1 ? "conflict-car-a" : "healthy-car-b";
         return {
           route: { key: "gpt", model: "gpt-image-test", carType: "chatgpt" },
           init: { default_model_slug: "gpt-image-test" },
-          selected: { carId: "conflict-car", carType: "chatgpt" },
+          selected: { carId, carType: "chatgpt" },
           revision: client.sessionRevision,
           snapshot: client.sessionSnapshot()
         };
@@ -1343,16 +1344,16 @@ test("并发聊天生图连续两次登录冲突后立即失败", async () => {
   const client = clientForGpt({ accountId: "account-repeated-image-session-conflict" });
   client.createSubmitClient = () => client;
   let prepareCount = 0;
-  client.prepareReusableChatSession = async () => {
-    prepareCount += 1;
-    return {
-      route: { key: "gpt", model: "gpt-image-test", carType: "chatgpt" },
-      init: { default_model_slug: "gpt-image-test" },
-      selected: { carId: "conflict-car", carType: "chatgpt" },
-      revision: client.sessionRevision,
-      snapshot: client.sessionSnapshot()
-    };
-  };
+      client.prepareReusableChatSession = async () => {
+        prepareCount += 1;
+        return {
+          route: { key: "gpt", model: "gpt-image-test", carType: "chatgpt" },
+          init: { default_model_slug: "gpt-image-test" },
+          selected: { carId: `conflict-car-${prepareCount}`, carType: "chatgpt" },
+          revision: client.sessionRevision,
+          snapshot: client.sessionSnapshot()
+        };
+      };
   client.uploadChatImages = async () => [];
   client.buildConversationBody = () => ({ body: {}, messageId: "conflict-message" });
   client.http = async () => ({
