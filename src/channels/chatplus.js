@@ -5176,6 +5176,7 @@ export class ChatplusClient {
     const unconfirmedCars = [];
     let carPoolErrorCount = 0;
     let leasedCarsSkipped = input.imageGeneration === true ? ignoredCarIds.size : 0;
+    let imageSessionRecoveryAttempts = 0;
     let lastError = null;
     let lastUpstreamText = "";
     const runSubmitStep = input.concurrentSubmit === true
@@ -5447,6 +5448,12 @@ export class ChatplusClient {
           && requestInput.concurrentSubmit === true
           && isExplicitAuthSessionError(error)
         ) {
+          await this.invalidatePreparedChatSession(preparedSession);
+          if (!confirmedConversationId && !imageSubmissionState.confirmed && imageSessionRecoveryAttempts < 1) {
+            imageSessionRecoveryAttempts += 1;
+            ignoredCarIds.delete(selected.carId);
+            continue;
+          }
           error.code = "CHAT_IMAGE_SESSION_CONFLICT";
           error.status = 409;
           error.noRetry = true;

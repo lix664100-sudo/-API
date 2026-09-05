@@ -1275,7 +1275,7 @@ test("同一账号的并发聊天生图分配不同车位", async () => {
   }
 });
 
-test("并发聊天生图发生登录冲突时停止换车", async (t) => {
+test("并发聊天生图首次登录冲突时清理旧会话并重试一次", async (t) => {
   for (const upstreamMessage of [
     "您的账号在其他设备登录，请重新登录",
     "认证失败，请重新登陆"
@@ -1283,37 +1283,95 @@ test("并发聊天生图发生登录冲突时停止换车", async (t) => {
     await t.test(upstreamMessage, async () => {
       const client = clientForGpt({ accountId: `account-image-session-conflict-${upstreamMessage.length}` });
       client.createSubmitClient = () => client;
+      client.portalLoggedIn = true;
+      client.cookies = ["stale=session"];
       let prepareCount = 0;
+      const preparedStates = [];
       client.prepareReusableChatSession = async () => {
         prepareCount += 1;
+        preparedStates.push({
+          portalLoggedIn: client.portalLoggedIn,
+          cookies: [...client.cookies]
+        });
+        client.portalLoggedIn = true;
+        client.cookies = [`fresh=session-${prepareCount}`];
         return {
           route: { key: "gpt", model: "gpt-image-test", carType: "chatgpt" },
           init: { default_model_slug: "gpt-image-test" },
-          selected: { carId: `conflict-car-${prepareCount}`, carType: "chatgpt" },
+          selected: { carId: "conflict-car", carType: "chatgpt" },
           revision: client.sessionRevision,
           snapshot: client.sessionSnapshot()
         };
       };
       client.uploadChatImages = async () => [];
       client.buildConversationBody = () => ({ body: {}, messageId: "conflict-message" });
-      client.http = async () => ({
-        status: 403,
-        headers: {},
-        body: upstreamMessage
+      client.captureImageTaskRegistration = async () => null;
+      let submitCount = 0;
+      client.http = async () => {
+        submitCount += 1;
+        if (submitCount === 1) {
+          return {
+            status: 403,
+            headers: {},
+            body: upstreamMessage
+          };
+        }
+        return {
+          status: 200,
+          headers: {},
+          body: 'data: {"conversation_id":"conversation-after-session-recovery"}\n\ndata: [DONE]\n\n'
+        };
+      };
+
+      const result = await client.createImageTask({
+        prompt: "登录冲突测试",
+        files: [{ filename: "source.png" }],
+        concurrentSubmit: true,
+        waitForImages: false
       });
 
-      await assert.rejects(
-        () => client.createImageTask({
-          prompt: "登录冲突测试",
-          files: [{ filename: "source.png" }],
-          concurrentSubmit: true,
-          waitForImages: false
-        }),
-        (error) => error?.code === "CHAT_IMAGE_SESSION_CONFLICT" && error?.status === 409
-      );
-      assert.equal(prepareCount, 1);
+      assert.equal(result.externalId, "conversation-after-session-recovery");
+      assert.equal(prepareCount, 2);
+      assert.equal(submitCount, 2);
+      assert.deepEqual(preparedStates[1], { portalLoggedIn: false, cookies: [] });
+      assert.equal(client.sessionRevision, 1);
     });
   }
+});
+
+test("并发聊天生图连续两次登录冲突后立即失败", async () => {
+  const client = clientForGpt({ accountId: "account-repeated-image-session-conflict" });
+  client.createSubmitClient = () => client;
+  let prepareCount = 0;
+  client.prepareReusableChatSession = async () => {
+    prepareCount += 1;
+    return {
+      route: { key: "gpt", model: "gpt-image-test", carType: "chatgpt" },
+      init: { default_model_slug: "gpt-image-test" },
+      selected: { carId: "conflict-car", carType: "chatgpt" },
+      revision: client.sessionRevision,
+      snapshot: client.sessionSnapshot()
+    };
+  };
+  client.uploadChatImages = async () => [];
+  client.buildConversationBody = () => ({ body: {}, messageId: "conflict-message" });
+  client.http = async () => ({
+    status: 403,
+    headers: {},
+    body: "您的账号在其他设备登录，请重新登录"
+  });
+
+  await assert.rejects(
+    () => client.createImageTask({
+      prompt: "连续登录冲突测试",
+      files: [{ filename: "source.png" }],
+      concurrentSubmit: true,
+      waitForImages: false
+    }),
+    (error) => error?.code === "CHAT_IMAGE_SESSION_CONFLICT" && error?.status === 409
+  );
+  assert.equal(prepareCount, 2);
+  assert.equal(client.sessionRevision, 2);
 });
 
 test("GPT conversation busy responses briefly freeze the car and switch without a 24 hour lock", async () => {
