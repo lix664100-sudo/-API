@@ -67,6 +67,13 @@ test("账号页面明确显示上游取消的生图车位", () => {
   );
 });
 
+test("账号页面明确显示导致账号掉线的冻结车位", () => {
+  assert.equal(
+    carFreezeReason({ reason: "car_session_contention" }),
+    "该车位导致账号掉线，已暂停 2 小时"
+  );
+});
+
 test("旧记录中的短暂繁忙不会误显示为长时间冻结", () => {
   const now = Date.parse("2026-08-25T18:07:00+08:00");
   const account = {

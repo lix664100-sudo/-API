@@ -44,6 +44,7 @@ const MAX_CHAT_CAR_ATTEMPTS = 8;
 const CHAT_IMAGE_UPLOAD_CACHE_TTL_MS = 10 * 60 * 1000;
 const CHAT_IMAGE_UPLOAD_CACHE_MAX = 200;
 const BAD_CAR_TTL_MS = 15 * 60 * 1000;
+const CAR_SESSION_CONTENTION_COOLDOWN_MS = 2 * 60 * 60 * 1000;
 const IMAGE_AUTH_FAILURE_WINDOW_MS = 24 * 60 * 60 * 1000;
 const IMAGE_AUTH_FAILURE_COOLDOWNS_MS = [
   60 * 60 * 1000,
@@ -4112,6 +4113,14 @@ export class ChatplusClient {
 
   async rememberAuthFailedCar(selected, error = null) {
     const text = `${error?.message || ""} ${error?.body || ""}`;
+    if (isCarSessionContentionError(error)) {
+      return this.rememberCarCooldown(
+        selected,
+        Date.now() + CAR_SESSION_CONTENTION_COOLDOWN_MS,
+        "car_session_contention",
+        error?.message || "车位会话被上游拒绝"
+      );
+    }
     const reason = isChatSubscriptionExpiredText(text)
       ? "subscription_expired"
       : isChatSubscriptionMissingText(text)
@@ -5450,6 +5459,10 @@ export class ChatplusClient {
         ) {
           await this.rememberAuthFailedCar(selected, error);
           await this.invalidatePreparedChatSession(preparedSession);
+          if (isCarSessionContentionError(error)) {
+            recordCarError("当前车位会话被上游拒绝，已冻结 2 小时并自动换车。");
+            continue;
+          }
           if (!confirmedConversationId && !imageSubmissionState.confirmed && imageSessionRecoveryAttempts < 1) {
             imageSessionRecoveryAttempts += 1;
             continue;
