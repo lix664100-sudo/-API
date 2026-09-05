@@ -1169,7 +1169,7 @@ test("image tasks record each processing stage and car attempt", async () => {
   }
 });
 
-test("聊天生图成功或遇到 IP 限制后都继续复用原车位", async () => {
+test("聊天生图成功或遇到登录冲突后都继续复用原车位", async () => {
   let conversationIndex = 0;
   const server = createServer((_request, response) => {
     conversationIndex += 1;
@@ -1232,10 +1232,9 @@ test("聊天生图成功或遇到 IP 限制后都继续复用原车位", async (
 
     assert.equal(first.raw.selectedCarId, "fresh-session-car");
     assert.equal(third.raw.selectedCarId, "fresh-session-car");
-    assert.equal(carListReads, 1);
-    assert.equal(carEntries, 1);
-    assert.ok(third.raw.stageTimings.some((stage) => stage.key === "session_reuse"));
-    assert.equal(third.raw.stageTimings.some((stage) => stage.key === "car_enter"), false);
+    assert.equal(carListReads, 2);
+    assert.equal(carEntries, 2);
+    assert.equal(third.raw.stageTimings.some((stage) => stage.key === "car_enter"), true);
     assert.equal(client.cookies.includes("session=fresh"), true);
   } finally {
     await new Promise((resolve) => server.close(resolve));
@@ -1458,7 +1457,7 @@ test("同一账号的并发聊天生图分配不同车位", async () => {
   }
 });
 
-test("聊天生图遇到伪登录冲突时保留车位并立即失败", async (t) => {
+test("聊天生图遇到登录冲突时刷新会话，普通认证失败仍按 IP 限制处理", async (t) => {
   for (const upstreamMessage of [
     "您的账号在其他设备登录，请重新登录",
     "认证失败，请重新登陆"
@@ -1507,26 +1506,46 @@ test("聊天生图遇到伪登录冲突时保留车位并立即失败", async (t
         };
       };
 
-      await assert.rejects(
-        client.createImageTask({
+      if (upstreamMessage.includes("其他设备登录")) {
+        const result = await client.createImageTask({
           prompt: "登录冲突测试",
           files: [{ filename: "source.png" }],
           concurrentSubmit: true,
           waitForImages: false
-        }),
-        (error) => {
-          assert.equal(error.code, "CHAT_IMAGE_IP_RESTRICTED");
-          assert.equal(error.ipRestricted, true);
-          assert.equal(error.selectedCarId, "conflict-car-a");
-          assert.match(error.message, /保留原车位/);
-          return true;
-        }
-      );
+        });
 
-      assert.equal(prepareCount, 1);
-      assert.equal(submitCount, 1);
-      assert.deepEqual(preparedStates, [{ portalLoggedIn: true, cookies: ["stale=session"] }]);
-      assert.equal(client.sessionRevision, 0);
+        assert.equal(result.externalId, "conversation-after-session-recovery");
+        assert.equal(result.status, "waiting_upstream");
+        assert.equal(result.raw.selectedCarId, "healthy-car-b");
+        assert.equal(prepareCount, 2);
+        assert.equal(submitCount, 2);
+        assert.deepEqual(preparedStates, [
+          { portalLoggedIn: true, cookies: ["stale=session"] },
+          { portalLoggedIn: false, cookies: [] }
+        ]);
+        assert.equal(client.sessionRevision, 1);
+      } else {
+        await assert.rejects(
+          client.createImageTask({
+            prompt: "登录冲突测试",
+            files: [{ filename: "source.png" }],
+            concurrentSubmit: true,
+            waitForImages: false
+          }),
+          (error) => {
+            assert.equal(error.code, "CHAT_IMAGE_IP_RESTRICTED");
+            assert.equal(error.ipRestricted, true);
+            assert.equal(error.selectedCarId, "conflict-car-a");
+            assert.match(error.message, /保留原车位/);
+            return true;
+          }
+        );
+
+        assert.equal(prepareCount, 1);
+        assert.equal(submitCount, 1);
+        assert.deepEqual(preparedStates, [{ portalLoggedIn: true, cookies: ["stale=session"] }]);
+        assert.equal(client.sessionRevision, 0);
+      }
     });
   }
 });

@@ -5382,6 +5382,7 @@ export class ChatplusClient {
     let leasedCarsSkipped = input.imageGeneration === true ? ignoredCarIds.size : 0;
     let lastError = null;
     let lastUpstreamText = "";
+    let imageAuthRecoveryAttempted = false;
     const runSubmitStep = input.concurrentSubmit === true
       ? async (work) => work()
       : async (work) => this.sessionLock(work);
@@ -5670,6 +5671,22 @@ export class ChatplusClient {
         if (isConfirmedChatUsageLimitError(error)) {
           error.quotaModel = activeRoute?.key || "";
           throw error;
+        }
+        // A final image submit can reject an unconfirmed session after the preparation calls succeeded.
+        // Refresh the portal session once before treating the same message as an IP restriction.
+        if (
+          requestInput.imageGeneration === true
+          && imageSubmissionState.started
+          && !imageSubmissionState.confirmed
+          && !confirmedConversationId
+          && !imageAuthRecoveryAttempted
+          && isCarSessionContentionError(error)
+        ) {
+          imageAuthRecoveryAttempted = true;
+          await this.invalidatePreparedChatSession(preparedSession);
+          imageSubmissionState.started = false;
+          imageSubmissionState.confirmed = false;
+          continue;
         }
         if (requestInput.imageGeneration === true && isChatImageIpRestrictionError(error)) {
           throw chatImageIpRestrictionError(error, selected || preparedSession?.selected);

@@ -1713,7 +1713,7 @@ test("GPT 聊天生图被普通 403 拒绝时按 IP 限制快速失败", async (
   assert.equal(prepareCount, 1);
 });
 
-test("GPT 聊天生图返回 403 登录提示时保留当前车位", async () => {
+test("GPT 聊天生图最终提交返回登录提示时重新登录并换车", async () => {
   const client = new ChatplusClient({
     config: {},
     channel: { id: "shareai:chatplus", settings: { defaultChatModel: "gpt" } },
@@ -1739,6 +1739,12 @@ test("GPT 聊天生图返回 403 登录提示时保留当前车位", async () =>
     };
   };
   client.uploadChatImages = async () => [];
+  client.ensureConversationUpdates = async () => null;
+  client.prepareGptImageSubmission = async () => ({
+    path: "/backend-api/f/conversation",
+    body: {},
+    headers: {}
+  });
   client.http = async () => {
     requestCount += 1;
     if (requestCount === 1) {
@@ -1755,22 +1761,16 @@ test("GPT 聊天生图返回 403 登录提示时保留当前车位", async () =>
     };
   };
 
-  await assert.rejects(
-    client.sendConversation("403 登录提示测试", {
-      imageGeneration: true,
-      requireConversationId: true
-    }),
-    (error) => {
-      assert.equal(error.code, "CHAT_IMAGE_IP_RESTRICTED");
-      assert.equal(error.ipRestricted, true);
-      assert.equal(error.selectedCarId, "expired-login-car");
-      return true;
-    }
-  );
+  const result = await client.sendConversation("403 登录提示测试", {
+    imageGeneration: true,
+    requireConversationId: true
+  });
 
-  assert.equal(requestCount, 1);
-  assert.equal(resetCount, 0);
-  assert.deepEqual(selectedCars, ["expired-login-car"]);
+  assert.equal(result.conversationId, "conversation-after-relogin");
+  assert.equal(result.submissionConfirmed, true);
+  assert.equal(requestCount, 2);
+  assert.equal(resetCount, 1);
+  assert.deepEqual(selectedCars, ["expired-login-car", "healthy-login-car"]);
 });
 
 test("GPT 聊天生图外层 403 包含聊天记录 401 时会换车", async () => {

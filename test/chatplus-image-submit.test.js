@@ -80,6 +80,54 @@ test("GPT image submission prepares credentials and retains the uploaded attachm
   assert.equal(submit.headers["OpenAI-Sentinel-Chat-Requirements-Token"], "image-flow-requirements");
 });
 
+test("GPT image submission refreshes the session once after an unconfirmed other-device rejection", async () => {
+  let finalSubmitCount = 0;
+  const selectedCars = [];
+  const { client, calls } = submissionClient("image-session-recovery", async path => {
+    if (path === "/backend-api/f/conversation") {
+      finalSubmitCount += 1;
+      if (finalSubmitCount === 1) {
+        return response({ detail: { message: "您的账号在其他设备登录，请重新登录" } }, 409);
+      }
+    }
+  });
+  let resetCount = 0;
+  let loginCount = 0;
+  const resetSession = client.resetSession.bind(client);
+  client.resetSession = () => {
+    resetCount += 1;
+    resetSession();
+  };
+  client.performPortalLogin = async () => {
+    loginCount += 1;
+    client.portalLoggedIn = true;
+  };
+  client.prepareChatSession = async (_input, ignoredCarIds) => {
+    if (!client.portalLoggedIn) await client.performPortalLogin();
+    const carId = ignoredCarIds.has("recovery-car-1") ? "recovery-car-2" : "recovery-car-1";
+    ignoredCarIds.add(carId);
+    selectedCars.push(carId);
+    return {
+      route: { key: "gpt", model: "gpt-5-6-thinking" },
+      init: {},
+      selected: { carId, carType: "chatgpt" }
+    };
+  };
+
+  const result = await client.sendConversation("Change the background", {
+    imageGeneration: true,
+    files: [{}]
+  });
+
+  assert.equal(result.conversationId, "image-session-recovery-conversation");
+  assert.equal(result.submissionConfirmed, true);
+  assert.equal(finalSubmitCount, 2);
+  assert.equal(resetCount, 1);
+  assert.equal(loginCount, 2);
+  assert.deepEqual(selectedCars, ["recovery-car-1", "recovery-car-2"]);
+  assert.equal(calls.filter(call => call.path === "/backend-api/f/conversation").length, 2);
+});
+
 test("ordinary chat continues to use its existing submission flow", async () => {
   const { client, calls } = submissionClient("ordinary-chat");
   await client.sendConversation("Hello");

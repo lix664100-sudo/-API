@@ -582,7 +582,7 @@ function normalizeConcurrency(value = {}) {
   return {
     chat: 1,
     drawingImage: Math.min(20, Math.max(1, Number(value.drawingImage || defaultConcurrency.drawingImage))),
-    chatImage: Number(value.chatImage) >= 2 ? 2 : 1
+    chatImage: 1
   };
 }
 

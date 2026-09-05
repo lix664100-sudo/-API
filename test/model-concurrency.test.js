@@ -114,7 +114,7 @@ test("runtime capacity only counts accounts whose channel enables the model", as
 
   const runtime = await getRuntimeStatus();
   assert.equal(runtime.concurrency.drawingImage, 6);
-  assert.equal(runtime.models.gpt.categories.image.configured, 12);
+  assert.equal(runtime.models.gpt.categories.image.configured, 9);
   assert.equal(runtime.models.gpt.categories.chat.configured, 3);
   assert.equal(runtime.models.gemini.categories.image.configured, 7);
   assert.equal(runtime.models.gemini.categories.chat.configured, 1);
@@ -203,22 +203,51 @@ test("drawing image usage reduces the available image concurrency for both GPT a
   }
 });
 
-test("GPT image concurrency can use two slots while a third request is rejected", async () => {
+test("Chatplus image concurrency uses one slot and rejects the second request", async () => {
   const config = await loadConfig();
   const next = modelConfig(config);
   next.accounts[0].concurrency = { chat: 2, drawingImage: 2, chatImage: 2 };
   await saveConfig(next);
 
   const first = await reserveImageTaskAdmission({ model: "gpt", prompt: "first" });
-  const second = await reserveImageTaskAdmission({ model: "gpt", prompt: "second" });
   try {
     await assert.rejects(
-      reserveImageTaskAdmission({ model: "gpt", prompt: "third" }),
+      reserveImageTaskAdmission({ model: "gpt", prompt: "second" }),
       (error) => error.status === 429 && error.code === "CONCURRENCY_LIMIT"
     );
   } finally {
-    second.release();
     first.release();
+  }
+});
+
+test("Chatplus image and drawing image can use separate slots concurrently", async () => {
+  const config = await loadConfig();
+  const next = modelConfig(config);
+  next.channels[0].settings.enabledAbilities = { drawing: true, chatplus: true };
+  next.accounts[0].concurrency = { chat: 1, drawingImage: 2, chatImage: 2 };
+  next.accounts[0].meta.abilities.drawing = { status: "ok" };
+  await saveConfig(next);
+
+  const chatImage = await reserveImageTaskAdmission({
+    channel: "chatplus",
+    model: "gpt",
+    prompt: "chat image"
+  });
+  const drawingImage = await reserveImageTaskAdmission({
+    channel: "drawing",
+    model: "gpt",
+    prompt: "drawing image"
+  });
+  try {
+    assert.equal(chatImage.target.channel.type, "chatplus");
+    assert.equal(drawingImage.target.channel.type, "drawing");
+    const runtime = await getRuntimeStatus();
+    assert.equal(runtime.running.chatImage, 1);
+    assert.equal(runtime.running.drawingImage, 1);
+    assert.equal(runtime.concurrency.drawingImage, 2);
+  } finally {
+    drawingImage.release();
+    chatImage.release();
   }
 });
 

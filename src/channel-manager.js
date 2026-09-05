@@ -255,7 +255,7 @@ function normalizeTaskConcurrency(value = {}) {
   return {
     chat: Math.min(20, Math.max(1, Number(value.chat || defaultTaskConcurrency.chat))),
     drawingImage: Math.min(20, Math.max(1, Number(value.drawingImage || defaultTaskConcurrency.drawingImage))),
-    chatImage: Math.min(20, Math.max(1, Number(value.chatImage || defaultTaskConcurrency.chatImage)))
+    chatImage: 1
   };
 }
 
@@ -266,7 +266,7 @@ async function loadRuntimeConfig() {
 }
 
 function taskSlotLimit(slot, target = {}, input = {}) {
-  if (chatplusUsesSharedAccountSlot(slot, target) && !isGptImageSlot(slot, target, input)) return 1;
+  if (chatplusUsesSharedAccountSlot(slot, target)) return 1;
   const accountLimit = Number(target?.account?.concurrency?.[slot]);
   const configured = Number.isFinite(accountLimit) && accountLimit > 0
     ? accountLimit
@@ -332,11 +332,6 @@ function activeCountForAccountSlot(slot, accountId) {
 
 function chatplusUsesSharedAccountSlot(slot, target = {}) {
   return target?.channel?.type === "chatplus" && ["chat", "chatImage"].includes(slot);
-}
-
-function isGptImageSlot(slot, target, input) {
-  return slot === "chatImage" && target?.channel?.type === "chatplus"
-    && targetChatModelKey(target, input) === "gpt";
 }
 
 function activeCountForChatplusAccount(accountId) {
@@ -842,14 +837,7 @@ async function reservableTaskSlotState(slot, target = {}, input = {}) {
     && ["chat", "chatImage"].includes(storedTaskSlot(task))
     && taskHoldsDurableSlot(task)
   );
-  let count = activeCountForChatplusAccount(accountId);
-  if (isGptImageSlot(slot, target, input)) {
-    const activeGptImages = activeTaskCounts.get(taskSlotKey(slot, target, input)) || 0;
-    const otherTaskActive = count > activeGptImages || holdingTasks.some(task =>
-      storedTaskSlot(task) !== "chatImage" || storedTaskChatModelKey(task) !== "gpt"
-    );
-    if (otherTaskActive) count = Math.max(count, taskSlotLimit(slot, target, input));
-  }
+  const count = activeCountForChatplusAccount(accountId);
   return {
     count,
     durableState: {
@@ -2927,9 +2915,7 @@ async function refreshTaskOnce(taskId, options = {}) {
       forceReconnect,
       sessionSnapshot,
       onSessionSnapshot: (snapshot) => rememberTaskRefreshSession(task.id, snapshot)
-    })), {
-      parallel: channel.type === "chatplus" && Boolean(task.raw?.selectedCarId)
-    });
+    })));
     refreshReadSucceeded = true;
   } catch (error) {
     if (storedMirrorError) {
@@ -5571,8 +5557,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
             return finishQueuedTask(taskState, result, channel, account, attempts);
           }, {
             taskType: "img2img",
-            // Independent ShareAI image cars can submit concurrently.
-          parallel: channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false,
+            // A ShareAI account has one upstream session, so image edits use it serially.
             noQueue: options.noChatplusQueue,
             slot: targetTaskSlot(target, "img2img"),
             modelKey: targetChatModelKey(target, input),

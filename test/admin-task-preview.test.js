@@ -658,10 +658,12 @@ test("账号忙碌时保留真正占用账号的任务信息", () => {
   );
 });
 
-test("并发面板明确显示 GPT 生图与其他聊天任务的容量", () => {
+test("并发面板明确显示聊天渠道和绘图站的独立容量", () => {
   assert.match(adminHtml, /queued: \["processing", "排队中"\]/);
   assert.match(adminHtml, /\{ label: "排队中", value: "queued" \}/);
-  assert.match(adminHtml, /GPT 生图最多 2/);
-  assert.match(adminHtml, /GPT 生图并发/);
-  assert.match(adminHtml, /普通聊天及其他聊天生图/);
+  assert.match(adminHtml, /聊天渠道每账号最多 1 路/);
+  assert.match(adminHtml, /聊天渠道并发（对话\+聊天生图）/);
+  assert.match(adminHtml, /绘图站并发单独计算/);
+  assert.doesNotMatch(adminHtml, /GPT 生图最多 2/);
+  assert.doesNotMatch(adminHtml, /GPT 生图并发/);
 });
