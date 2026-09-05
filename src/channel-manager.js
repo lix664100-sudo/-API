@@ -5258,7 +5258,7 @@ async function runQueuedTextTask(task, input, reserved = null, options = {}) {
         }, {
           taskType: "text2img",
           // Independent ShareAI image cars can submit concurrently.
-          parallel: channel.type === "chatplus" && chatplusConcurrentSubmit,
+          parallel: channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false,
           noQueue: options.noChatplusQueue,
           slot: targetTaskSlot(target, "text2img"),
           modelKey: targetChatModelKey(target, input),
@@ -5527,7 +5527,7 @@ async function runQueuedImageTask(task, input, files, reserved = null, options =
           }, {
             taskType: "img2img",
             // Independent ShareAI image cars can submit concurrently.
-            parallel: channel.type === "chatplus" && chatplusConcurrentSubmit,
+          parallel: channel.type === "chatplus" && options.chatplusConcurrentSubmit !== false,
             noQueue: options.noChatplusQueue,
             slot: targetTaskSlot(target, "img2img"),
             modelKey: targetChatModelKey(target, input),
