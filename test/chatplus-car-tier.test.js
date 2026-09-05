@@ -244,6 +244,73 @@ test("GPT 自动换车改用网页的一键换车", async () => {
   assert.equal(result.selected.carId, "idle-car");
 });
 
+test("GPT 聊天生图确认车位失效后改用网页的一键换车", async () => {
+  const client = clientForGpt({ accountId: "account-image-idle-car-switch" });
+  client.createSubmitClient = () => client;
+  const entered = [];
+  let carListReads = 0;
+  let idleSwitches = 0;
+  let submissions = 0;
+
+  client.fetchCars = async () => {
+    carListReads += 1;
+    return [car({ id: "first-image-car", imageRemaining: 10 })];
+  };
+  client.enterCar = async (carId, carType) => {
+    entered.push({ carId, carType });
+    client.carId = carId;
+    client.carType = carType;
+    client.portalLoggedIn = true;
+  };
+  client.performIdleChatCarSwitch = async () => {
+    idleSwitches += 1;
+    client.carId = "idle-image-car";
+    client.carType = "chatgpt";
+    return {
+      carId: "idle-image-car",
+      carType: "chatgpt",
+      car: car({ id: "idle-image-car", imageRemaining: 10 }),
+      candidateCount: 1,
+      strategy: "idle_server",
+      carTier: "auto"
+    };
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.uploadChatImages = async () => [];
+  client.captureImageTaskRegistration = async () => null;
+  client.buildConversationBody = () => ({ body: {}, messageId: "image-idle-switch-message" });
+  client.runConversationSubmit = async (_selected, work) => work();
+  client.http = async (pathName) => {
+    assert.equal(pathName, "/backend-api/conversation");
+    submissions += 1;
+    if (submissions === 1) {
+      return {
+        status: 404,
+        headers: {},
+        body: JSON.stringify({ detail: { message: "聊天记录已删除，请点击【换车继续聊】" } })
+      };
+    }
+    return {
+      status: 200,
+      headers: {},
+      body: 'data: {"conversation_id":"conversation-after-image-idle-switch"}\n\ndata: [DONE]\n\n'
+    };
+  };
+
+  const result = await client.createImageTask({
+    prompt: "确认失效后换车",
+    files: [{ filename: "source.png" }],
+    concurrentSubmit: true,
+    waitForImages: false
+  });
+
+  assert.deepEqual(entered, [{ carId: "first-image-car", carType: "chatgpt" }]);
+  assert.equal(carListReads, 1);
+  assert.equal(idleSwitches, 1);
+  assert.equal(submissions, 2);
+  assert.equal(result.raw.selectedCarId, "idle-image-car");
+});
+
 test("chatplus switches ordinary accounts from PRO cars to a regular car", async () => {
   const client = clientForGemini({ strategy: "speed", carTier: "auto" });
   const entered = [];
@@ -270,7 +337,7 @@ test("chatplus switches ordinary accounts from PRO cars to a regular car", async
   assert.equal(nextSession.selected.carId, "regular-car");
 });
 
-test("Plus image limit switches to the best remaining image car without saving a permanent PRO restriction", async () => {
+test("Plus image limit uses one-click car switching without saving a permanent PRO restriction", async () => {
   let requestCount = 0;
   const server = createServer((request, response) => {
     requestCount += 1;
@@ -304,6 +371,17 @@ test("Plus image limit switches to the best remaining image car without saving a
   client.enterCar = async (carId) => {
     selectedCars.push(carId);
   };
+  client.performIdleChatCarSwitch = async () => {
+    selectedCars.push("idle-limit-car");
+    return {
+      carId: "idle-limit-car",
+      carType: "chatgpt",
+      car: car({ id: "idle-limit-car", imageRemaining: 1 }),
+      candidateCount: 1,
+      strategy: "idle_server",
+      carTier: "auto"
+    };
+  };
   client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
   client.uploadChatImages = async () => [];
 
@@ -314,7 +392,7 @@ test("Plus image limit switches to the best remaining image car without saving a
     });
 
     assert.equal(result.conversationId, "conversation-regular");
-    assert.deepEqual(selectedCars, ["plus-limit-car", "pro-car"]);
+    assert.deepEqual(selectedCars, ["plus-limit-car", "idle-limit-car"]);
     assert.equal(requestCount, 2);
     assert.equal(restrictionSaved, 0);
   } finally {
@@ -424,6 +502,7 @@ test("conversation id received only from realtime updates is claimed by its mess
 test("Free image limit without a conversation id switches cars and pauses the car for 24 hours", async () => {
   const cooldowns = [];
   const enteredCars = [];
+  let idleSwitches = 0;
   let requestCount = 0;
   const client = clientForGpt({
     accountId: "account-free-image-limit",
@@ -436,6 +515,17 @@ test("Free image limit without a conversation id switches cars and pauses the ca
   ];
   client.enterCar = async (carId) => {
     enteredCars.push(carId);
+  };
+  client.performIdleChatCarSwitch = async () => {
+    idleSwitches += 1;
+    return {
+      carId: "free-limit-fallback",
+      carType: "chatgpt",
+      car: car({ id: "free-limit-fallback", imageRemaining: 1 }),
+      candidateCount: 1,
+      strategy: "idle_server",
+      carTier: "auto"
+    };
   };
   client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
   client.uploadChatImages = async () => [];
@@ -457,7 +547,8 @@ test("Free image limit without a conversation id switches cars and pauses the ca
   });
 
   assert.equal(result.conversationId, "conversation-free-fallback");
-  assert.deepEqual(enteredCars, ["free-limit-car", "free-limit-fallback"]);
+  assert.deepEqual(enteredCars, ["free-limit-car"]);
+  assert.equal(idleSwitches, 1);
   assert.equal(cooldowns.length, 1);
   assert.equal(cooldowns[0].carId, "free-limit-car");
   const expectedDelay = 24 * 60 * 60 * 1000;
@@ -935,6 +1026,17 @@ test("a car without a conversation id stays paused even after a shorter upstream
   client.enterCar = async (carId) => {
     selectedCars.push(carId);
   };
+  client.performIdleChatCarSwitch = async () => {
+    selectedCars.push("fallback-car");
+    return {
+      carId: "fallback-car",
+      carType: "chatgpt",
+      car: car({ id: "fallback-car", imageRemaining: 1 }),
+      candidateCount: 1,
+      strategy: "idle_server",
+      carTier: "auto"
+    };
+  };
   client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
   client.uploadChatImages = async () => [];
 
@@ -1062,13 +1164,20 @@ test("image tasks record each processing stage and car attempt", async () => {
   }
 });
 
-test("a successful concurrent image submission does not publish a reusable login session", async () => {
+test("聊天生图成功或遇到 IP 限制后都继续复用原车位", async () => {
+  let conversationIndex = 0;
   const server = createServer((_request, response) => {
+    conversationIndex += 1;
+    if (conversationIndex === 2) {
+      response.writeHead(403, { "content-type": "application/json" });
+      response.end(JSON.stringify({ detail: { message: "您的账号在其他设备登录，请重新登录" } }));
+      return;
+    }
     response.writeHead(200, {
       "content-type": "text/event-stream",
       "set-cookie": "session=fresh; Path=/"
     });
-    response.end("data: {\"conversation_id\":\"conversation-fresh-session\"}\n\ndata: [DONE]\n\n");
+    response.end(`data: {"conversation_id":"conversation-fresh-session-${conversationIndex}"}\n\ndata: [DONE]\n\n`);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -1076,6 +1185,7 @@ test("a successful concurrent image submission does not publish a reusable login
     baseUrl: `http://127.0.0.1:${address.port}`,
     accountId: "account-fresh-session"
   });
+  client.createSubmitClient = () => client;
   let carListReads = 0;
   let carEntries = 0;
   client.fetchCars = async () => {
@@ -1090,18 +1200,38 @@ test("a successful concurrent image submission does not publish a reusable login
     client.cookies = ["session=initial"];
   };
   client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.captureImageTaskRegistration = async () => null;
+  client.waitForConversationImages = async (_events, conversationId) => [
+    `https://example.test/${conversationId}.png`
+  ];
 
   try {
-    await client.createTextTask({
-      prompt: "刷新登录状态",
+    const first = await client.createTextTask({
+      prompt: "第一次生图",
       concurrentSubmit: true,
-      waitForImages: false
+      waitForImages: true
     });
-    const reused = await client.prepareReusableChatSession({ preferImageCar: true }, new Set(), 1);
+    await assert.rejects(
+      client.createTextTask({
+        prompt: "IP 限制时不换车",
+        concurrentSubmit: true,
+        waitForImages: true
+      }),
+      (error) => error.code === "CHAT_IMAGE_IP_RESTRICTED"
+    );
+    const third = await client.createTextTask({
+      prompt: "第三次继续复用",
+      concurrentSubmit: true,
+      waitForImages: true
+    });
 
-    assert.equal(carListReads, 2);
-    assert.equal(carEntries, 2);
-    assert.equal(reused.snapshot.cookies.includes("session=fresh"), false);
+    assert.equal(first.raw.selectedCarId, "fresh-session-car");
+    assert.equal(third.raw.selectedCarId, "fresh-session-car");
+    assert.equal(carListReads, 1);
+    assert.equal(carEntries, 1);
+    assert.ok(third.raw.stageTimings.some((stage) => stage.key === "session_reuse"));
+    assert.equal(third.raw.stageTimings.some((stage) => stage.key === "car_enter"), false);
+    assert.equal(client.cookies.includes("session=fresh"), true);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
@@ -1323,7 +1453,7 @@ test("同一账号的并发聊天生图分配不同车位", async () => {
   }
 });
 
-test("并发聊天生图首次登录冲突时清理旧会话并重试一次", async (t) => {
+test("聊天生图遇到伪登录冲突时保留车位并立即失败", async (t) => {
   for (const upstreamMessage of [
     "您的账号在其他设备登录，请重新登录",
     "认证失败，请重新登陆"
@@ -1372,23 +1502,31 @@ test("并发聊天生图首次登录冲突时清理旧会话并重试一次", as
         };
       };
 
-      const result = await client.createImageTask({
-        prompt: "登录冲突测试",
-        files: [{ filename: "source.png" }],
-        concurrentSubmit: true,
-        waitForImages: false
-      });
+      await assert.rejects(
+        client.createImageTask({
+          prompt: "登录冲突测试",
+          files: [{ filename: "source.png" }],
+          concurrentSubmit: true,
+          waitForImages: false
+        }),
+        (error) => {
+          assert.equal(error.code, "CHAT_IMAGE_IP_RESTRICTED");
+          assert.equal(error.ipRestricted, true);
+          assert.equal(error.selectedCarId, "conflict-car-a");
+          assert.match(error.message, /保留原车位/);
+          return true;
+        }
+      );
 
-      assert.equal(result.externalId, "conversation-after-session-recovery");
-      assert.equal(prepareCount, 2);
-      assert.equal(submitCount, 2);
-      assert.deepEqual(preparedStates[1], { portalLoggedIn: false, cookies: [] });
-      assert.equal(client.sessionRevision, 1);
+      assert.equal(prepareCount, 1);
+      assert.equal(submitCount, 1);
+      assert.deepEqual(preparedStates, [{ portalLoggedIn: true, cookies: ["stale=session"] }]);
+      assert.equal(client.sessionRevision, 0);
     });
   }
 });
 
-test("并发聊天生图遇到车位登录冲突时冻结两小时并换车", async () => {
+test("聊天生图遇到普通 403 时不冻结也不换车", async () => {
   const cooldowns = [];
   const client = clientForGpt({
     accountId: "account-repeated-image-session-conflict",
@@ -1408,45 +1546,32 @@ test("并发聊天生图遇到车位登录冲突时冻结两小时并换车", as
   };
   client.uploadChatImages = async () => [];
   client.buildConversationBody = () => ({ body: {}, messageId: "conflict-message" });
-  client.http = async () => {
-    if (prepareCount < 3) {
-      return {
-        status: 403,
-        headers: {},
-        body: "您的账号在其他设备登录，请重新登录"
-      };
-    }
-    return {
-      status: 200,
-      headers: {},
-      body: 'data: {"conversation_id":"conversation-after-car-switch"}\n\ndata: [DONE]\n\n'
-    };
-  };
-
-  const startedAt = Date.now();
-  const result = await client.createImageTask({
-    prompt: "连续登录冲突测试",
-    files: [{ filename: "source.png" }],
-    concurrentSubmit: true,
-    waitForImages: false
+  client.http = async () => ({
+    status: 403,
+    headers: {},
+    body: "上游拒绝访问"
   });
 
-  assert.equal(result.externalId, "conversation-after-car-switch");
-  assert.equal(prepareCount, 3);
-  assert.equal(client.sessionRevision, 2);
-  assert.deepEqual(result.raw.carAttempts.map((attempt) => attempt.carId), ["conflict-car-1", "conflict-car-2"]);
-  assert.match(result.raw.carAttempts[0].message, /冻结 2 小时/);
-  assert.match(result.raw.carAttempts[0].upstreamText, /其他设备登录/);
-  assert.deepEqual(cooldowns.map((cooldown) => cooldown.carId), ["conflict-car-1", "conflict-car-2"]);
-  for (const cooldown of cooldowns) {
-    assert.equal(cooldown.reason, "car_session_contention");
-    const durationMs = Date.parse(cooldown.cooldownUntil) - startedAt;
-    assert.ok(durationMs >= 2 * 60 * 60 * 1000 - 1000);
-    assert.ok(durationMs <= 2 * 60 * 60 * 1000 + 1000);
-  }
+  await assert.rejects(
+    client.createImageTask({
+      prompt: "普通 403 测试",
+      files: [{ filename: "source.png" }],
+      concurrentSubmit: true,
+      waitForImages: false
+    }),
+    (error) => {
+      assert.equal(error.code, "CHAT_IMAGE_IP_RESTRICTED");
+      assert.equal(error.ipRestricted, true);
+      return true;
+    }
+  );
+
+  assert.equal(prepareCount, 1);
+  assert.equal(client.sessionRevision, 0);
+  assert.deepEqual(cooldowns, []);
 });
 
-test("GPT conversation busy responses briefly freeze the car and switch without a 24 hour lock", async () => {
+test("GPT 聊天生图提示对话过快时保留当前车位并立即失败", async () => {
   const cooldowns = [];
   const requestedCars = [];
   const server = createServer((request, response) => {
@@ -1480,20 +1605,23 @@ test("GPT conversation busy responses briefly freeze the car and switch without 
   };
   client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
 
-  const startedAt = Date.now();
   try {
-    const result = await client.createTextTask({
-      prompt: "对话拥挤后自动换车",
-      concurrentSubmit: true,
-      waitForImages: false
-    });
+    await assert.rejects(
+      client.createTextTask({
+        prompt: "对话过快不换车",
+        concurrentSubmit: true,
+        waitForImages: false
+      }),
+      (error) => {
+        assert.equal(error.code, "CHAT_IMAGE_IP_RESTRICTED");
+        assert.equal(error.ipRestricted, true);
+        assert.equal(error.selectedCarId, "busy-conversation-car");
+        return true;
+      }
+    );
 
-    assert.equal(result.externalId, "conversation-after-busy-car");
-    assert.deepEqual(requestedCars, ["busy-conversation-car", "healthy-conversation-car"]);
-    assert.equal(cooldowns.length, 1);
-    assert.equal(cooldowns[0].reason, "conversation_busy");
-    const freezeMs = Date.parse(cooldowns[0].cooldownUntil) - startedAt;
-    assert.ok(freezeMs >= 20_000 && freezeMs <= 35_000);
+    assert.deepEqual(requestedCars, ["busy-conversation-car"]);
+    assert.deepEqual(cooldowns, []);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

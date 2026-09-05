@@ -151,7 +151,7 @@ test("聊天车位反复提示其他设备登录时按车位故障结束", async
   assert.equal(prepareCalls, 8, "应在有限的车位尝试后结束");
 });
 
-test("GPT 生图车位反复提示其他设备登录时不会误报主账号掉线", async () => {
+test("GPT 生图提示其他设备登录时按 IP 限制立即失败并保留车位", async () => {
   const { client } = makeChatClient();
   let requestCount = 0;
   client.ensureConversationUpdates = async () => null;
@@ -180,14 +180,16 @@ test("GPT 生图车位反复提示其他设备登录时不会误报主账号掉�
       requireConversationId: true
     }),
     (error) => {
-      assert.equal(error.code, "CHAT_CAR_POOL_UNAVAILABLE");
-      assert.equal(error.authScope, "car");
+      assert.equal(error.code, "CHAT_IMAGE_IP_RESTRICTED");
+      assert.equal(error.status, 503);
+      assert.equal(error.selectedCarId, "submit-kick-car-1");
+      assert.match(error.upstreamText, /其他设备登录/);
       assert.doesNotMatch(error.message, /账号被其他登录占用|被挤下线/);
       assert.doesNotMatch(error.message, /没有创建对话/);
       return true;
     }
   );
-  assert.equal(requestCount, 8, "应在有限的车位尝试后结束");
+  assert.equal(requestCount, 1, "IP 限制时应立即失败，不能连续换车");
 });
 
 test("相同图片重复上传直接命中缓存，重置会话后重新上传", async () => {

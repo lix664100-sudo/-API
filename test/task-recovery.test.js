@@ -3352,7 +3352,7 @@ test("聊天生图没有上游编号时不能算已提交", async () => {
   }
 });
 
-test("同一账号的聊天生图分配不同车位并允许并行上传提交", async () => {
+test("同一账号的聊天生图依次提交时复用同一车位", async () => {
   let sessionTail = Promise.resolve();
   const sessionLock = (work) => {
     const current = sessionTail.catch(() => {}).then(work);
@@ -3414,9 +3414,7 @@ test("同一账号的聊天生图分配不同车位并允许并行上传提交",
     if (pathName === "/backend-api/files") {
       assert.equal(this.cookies.includes("portal=ok"), true);
       assert.equal(this.cookies.some((cookie) => cookie.startsWith("car=car-separated-session-")), true);
-      assert.equal(this.cookies.some((cookie) => cookie.startsWith("upload=")), false);
       const fileName = options.body?.file_name || "source.png";
-      this.cookies = [...this.cookies, `upload=${fileName}`];
       return trackSubmitStep(async () => ({
         status: 200,
         headers: {},
@@ -3434,8 +3432,6 @@ test("同一账号的聊天生图分配不同车位并允许并行上传提交",
     }
     if (pathName !== "/backend-api/conversation") throw new Error(`unexpected request: ${pathName}`);
     return trackSubmitStep(async () => {
-      const uploadCookies = this.cookies.filter((cookie) => cookie.startsWith("upload="));
-      assert.equal(uploadCookies.length, 1);
       conversationIndex += 1;
       return {
         status: 200,
@@ -3444,30 +3440,42 @@ test("同一账号的聊天生图分配不同车位并允许并行上传提交",
       };
     });
   };
+  client.ensureConversationUpdates = async () => null;
+  client.conversationDetail = async () => ({ status: "finished_successfully" });
+  client.imageUrlsFrom = async () => ["https://example.test/generated.png"];
 
-  let results = [];
+  const results = [];
   try {
-    results = await Promise.all(["red", "blue", "black"].map((color) => client.createImageTask({
-      prompt: `change background to ${color}`,
-      files: [{
-        filename: `${color}.png`,
-        mimetype: "image/png",
-        toBuffer: async () => Buffer.from("image")
-      }],
-      concurrentSubmit: true,
-      waitForImages: false
-    })));
+    for (const color of ["red", "blue", "black"]) {
+      const result = await client.createImageTask({
+        prompt: `change background to ${color}`,
+        files: [{
+          filename: `${color}.png`,
+          mimetype: "image/png",
+          toBuffer: async () => Buffer.from("image")
+        }],
+        concurrentSubmit: true,
+        waitForImages: false
+      });
+      results.push(result);
+      const completed = await client.getTask(result.externalId, { imageTask: true });
+      assert.equal(completed.status, "success");
+    }
   } finally {
     ChatplusClient.prototype.http = originalHttp;
   }
 
-  assert.equal(enterCarCount, 3);
-  assert.equal(initCount, 3);
+  assert.equal(enterCarCount, 1);
+  assert.equal(initCount, 1);
   assert.equal(client.cookies.some((cookie) => cookie.startsWith("upload=")), false);
-  assert.equal(maxSubmitSteps, 3, "不同车位的独立会话应允许并行上传和提交");
+  assert.equal(maxSubmitSteps, 1, "聊天生图总体并发为 1 时应依次上传和提交");
   assert.deepEqual(results.map((result) => result.status), ["waiting_upstream", "waiting_upstream", "waiting_upstream"]);
   assert.equal(new Set(results.map((result) => result.externalId)).size, 3);
-  assert.equal(new Set(results.map((result) => result.raw.selectedCarId)).size, 3);
+  assert.deepEqual(results.map((result) => result.raw.selectedCarId), [
+    "car-separated-session-one",
+    "car-separated-session-one",
+    "car-separated-session-one"
+  ]);
 });
 
 test("聊天生图满载时立即拒绝，释放名额后才能重新提交", async () => {

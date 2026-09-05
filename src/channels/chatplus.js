@@ -513,11 +513,44 @@ function isExplicitAuthSessionError(error) {
   return /\b401\b|身份验证失败|请重新登录|重新登陆|未登录|未登陆|登录.{0,8}(?:失效|过期)|会话.{0,8}(?:失效|过期)|其他设备登|聊天记录.{0,12}(?:删除|已删除)|换车继续聊|unauthorized|session expired/i.test(text);
 }
 
-// ShareAI 的车位服务也会把自己的会话冲突表述为“其他设备登录”。
-// 已经进入车位后，这只能说明当前车位不可用，不能据此判定主账号掉线。
+// ShareAI 会用登录、密码或请求过快等提示掩盖 IP 限制。
 function isCarSessionContentionError(error) {
   const text = `${error?.message || ""} ${error?.body || ""} ${error?.upstreamText || ""}`;
   return /其他设备登|在其他设备|被挤下线|挤下线/.test(text);
+}
+
+function isChatImageIpRestrictionError(error) {
+  if (
+    isChatRecordDeletedError(error)
+    || isConfirmedChatUsageLimitError(error)
+    || error?.imageCarQuotaExhausted === true
+    || error?.imageCarTemporaryUnavailable === true
+    || isChatSubscriptionMissingText(`${error?.message || ""} ${error?.body || ""}`)
+    || isChatSubscriptionExpiredText(`${error?.message || ""} ${error?.body || ""}`)
+    || isCarPlanMismatchError(error)
+  ) return false;
+  const status = Number(error?.status || error?.statusCode || 0);
+  const text = `${error?.message || ""} ${error?.body || ""} ${error?.upstreamText || ""}`;
+  return error?.portalAccountRejected === true
+    || error?.conversationBusy === true
+    || status === 403
+    || isCarSessionContentionError(error)
+    || /认证失败|密码.{0,8}(?:错误|不正确|无效)|账号.{0,8}(?:错误|不存在)/.test(text);
+}
+
+function chatImageIpRestrictionError(error, selected = {}) {
+  const upstreamText = String(error?.upstreamText || error?.body || error?.message || "").trim();
+  error.code = "CHAT_IMAGE_IP_RESTRICTED";
+  error.status = 503;
+  error.noRetry = true;
+  error.ipRestricted = true;
+  error.upstreamExplicitFailure = true;
+  error.upstreamStatus = "failed";
+  error.upstreamText = upstreamText;
+  error.selectedCarId ||= String(selected?.carId || "").trim();
+  error.selectedCarType ||= String(selected?.carType || "").trim();
+  error.message = "上游限制了当前 IP，系统已保留原车位，不会自动换车，请稍后重试。";
+  return error;
 }
 
 function tagCarPoolUnavailable(error) {
@@ -3726,10 +3759,6 @@ export class ChatplusClient {
 
   async prepareReusableChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
     const route = this.chatRouteForInput(input);
-    if (input.imageGeneration === true) {
-      const session = await this.prepareChatSession(input, ignoredCarIds, maxAttempts);
-      return this.cloneChatSession(this.preparedChatSession(session));
-    }
     if (input.useIdleCarSwitch === true && route.key === "gpt") {
       const session = await this.prepareChatSession(input, ignoredCarIds, maxAttempts);
       return this.cloneChatSession(this.preparedChatSession(session));
@@ -3738,7 +3767,7 @@ export class ChatplusClient {
     const cloneCachedSession = (session) => {
       const cloned = this.cloneChatSession(session);
       if (input.imageGeneration !== true) return cloned;
-      cloned.imageCarLease = reserveImageCar(this.account, cloned.selected, true);
+      cloned.imageCarLease = reserveImageCar(this.account, cloned.selected);
       return cloned.imageCarLease ? cloned : null;
     };
     const cached = this.concurrentChatSessions.get(key);
@@ -3749,12 +3778,15 @@ export class ChatplusClient {
         && !isBadCar(this.account?.id, cached.session.selected?.carType, cachedCarId)
       ) {
         if (cachedCarId) ignoredCarIds.add(cachedCarId);
-        return measureTaskStage(input.taskStageRecorder, {
-          key: "session_reuse",
-          label: "复用已登录车位",
-          carId: cachedCarId,
-          carType: cached.session.selected?.carType
-        }, async () => cloneCachedSession(cached.session));
+        const cloned = cloneCachedSession(cached.session);
+        if (cloned) {
+          return measureTaskStage(input.taskStageRecorder, {
+            key: "session_reuse",
+            label: "复用已登录车位",
+            carId: cachedCarId,
+            carType: cached.session.selected?.carType
+          }, async () => cloned);
+        }
       }
       this.concurrentChatSessions.delete(key);
     } else if (cached?.session) {
@@ -3773,7 +3805,8 @@ export class ChatplusClient {
         && !isBadCar(this.account?.id, session.selected?.carType, cachedCarId)
       ) {
         if (cachedCarId) ignoredCarIds.add(cachedCarId);
-        return cloneCachedSession(session);
+        const cloned = cloneCachedSession(session);
+        if (cloned) return cloned;
       }
       this.concurrentChatSessions.delete(key);
     } else if (cached?.promise) {
@@ -3803,7 +3836,6 @@ export class ChatplusClient {
   rememberReusableChatSession(input = {}, session = {}, submitClient = this) {
     if (
       input.concurrentSubmit !== true
-      || input.imageGeneration === true
       || !session?.route
       || !session?.selected
     ) return;
@@ -4321,7 +4353,6 @@ export class ChatplusClient {
     let subscriptionExpiredAttempts = 0;
     let recheckProCars = input.recheckProCars === true;
     const useIdleCarSwitch = input.useIdleCarSwitch === true
-      && input.imageGeneration !== true
       && route.key === "gpt";
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       let selected;
@@ -4402,8 +4433,7 @@ export class ChatplusClient {
           await measureTaskStage(input.taskStageRecorder, {
             key: "session_lock_wait",
             label: "等待账号会话",
-            carId: selected.carId,
-            carType: selected.carType
+            ...(selected ? { carId: selected.carId, carType: selected.carType } : {})
           }, async () => lockStarted);
           await prepareLockedSession;
           sessionClient = this.createSubmitClient({ snapshot });
@@ -4447,6 +4477,9 @@ export class ChatplusClient {
         };
       } catch (error) {
         if (imageCarLease) releaseImageCarLease(imageCarLease);
+        if (input.imageGeneration === true && isChatImageIpRestrictionError(error)) {
+          throw chatImageIpRestrictionError(error, selected);
+        }
         const subscriptionText = `${error?.message || ""} ${error?.body || ""}`;
         const subscriptionExpired = isChatSubscriptionExpiredText(subscriptionText);
         const subscriptionMissing = !subscriptionExpired && isChatSubscriptionMissingText(subscriptionText);
@@ -4459,7 +4492,7 @@ export class ChatplusClient {
           || subscriptionExpired
           || isAuthSessionError(error)
           || isCarPlanMismatchError(error);
-        if (retryableCarError) {
+        if (retryableCarError && selected) {
           await measureTaskStage(input.taskStageRecorder, {
             key: "car_recovery",
             label: "隔离故障车位",
@@ -4481,7 +4514,7 @@ export class ChatplusClient {
         const message = isCarSessionContentionError(error)
           ? "当前车位会话被上游拒绝，已自动换车。"
           : error.message || "进入失败";
-        errors.push(`${selected.carId}：${message}`);
+        errors.push(`${selected?.carId || "一键换车"}：${message}`);
       }
     }
     const error = new Error(`${route.name} 自动找车失败：${errors.join("；")}`);
@@ -5294,7 +5327,6 @@ export class ChatplusClient {
     const unconfirmedCars = [];
     let carPoolErrorCount = 0;
     let leasedCarsSkipped = input.imageGeneration === true ? ignoredCarIds.size : 0;
-    let imageSessionRecoveryAttempts = 0;
     let lastError = null;
     let lastUpstreamText = "";
     const runSubmitStep = input.concurrentSubmit === true
@@ -5424,7 +5456,9 @@ export class ChatplusClient {
               if (isConversationBusyText(response.body)) {
                 error.code = "UPSTREAM_CONVERSATION_BUSY";
                 error.conversationBusy = true;
-                await this.rememberConversationBusyCar(selected, error);
+                if (requestInput.imageGeneration !== true) {
+                  await this.rememberConversationBusyCar(selected, error);
+                }
               }
               throw error;
             }
@@ -5468,7 +5502,9 @@ export class ChatplusClient {
                 error.code = "UPSTREAM_CONVERSATION_BUSY";
                 error.conversationBusy = true;
                 error.message = "当前车位上游提示对话过快或已有任务正在处理。";
-                await this.rememberConversationBusyCar(selected, error);
+                if (requestInput.imageGeneration !== true) {
+                  await this.rememberConversationBusyCar(selected, error);
+                }
               }
               throw error;
             }
@@ -5575,27 +5611,8 @@ export class ChatplusClient {
           error.quotaModel = activeRoute?.key || "";
           throw error;
         }
-        if (
-          selected
-          && requestInput.imageGeneration === true
-          && requestInput.concurrentSubmit === true
-          && isExplicitAuthSessionError(error)
-        ) {
-          await this.rememberAuthFailedCar(selected, error);
-          await this.invalidatePreparedChatSession(preparedSession);
-          if (isCarSessionContentionError(error)) {
-            recordCarError("当前车位会话被上游拒绝，已冻结 2 小时并自动换车。");
-            continue;
-          }
-          if (!confirmedConversationId && !imageSubmissionState.confirmed && imageSessionRecoveryAttempts < 1) {
-            imageSessionRecoveryAttempts += 1;
-            continue;
-          }
-          error.code = "CHAT_IMAGE_SESSION_CONFLICT";
-          error.status = 409;
-          error.noRetry = true;
-          error.message = "当前聊天生图会话发生登录冲突，请稍后重试。";
-          throw error;
+        if (requestInput.imageGeneration === true && isChatImageIpRestrictionError(error)) {
+          throw chatImageIpRestrictionError(error, selected || preparedSession?.selected);
         }
         if (selected && isCarSessionContentionError(error)) {
           await this.rememberAuthFailedCar(selected, error);
