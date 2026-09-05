@@ -196,6 +196,54 @@ test("chatplus retries another car when upstream rejects an Ultra-only car", asy
   assert.equal(session.selected.carId, "pro-car");
 });
 
+test("GPT 自动换车改用网页的一键换车", async () => {
+  const client = clientForGpt({ accountId: "account-idle-car-switch" });
+  const entered = [];
+  let idleSwitches = 0;
+  let submissions = 0;
+
+  client.fetchCars = async () => [car({ id: "first-car", imageRemaining: 10 })];
+  client.enterCar = async (carId, carType) => {
+    entered.push({ carId, carType });
+    client.carId = carId;
+    client.carType = carType;
+    client.portalLoggedIn = true;
+  };
+  client.performIdleChatCarSwitch = async () => {
+    idleSwitches += 1;
+    client.carId = "idle-car";
+    client.carType = "chatgpt";
+    return {
+      carId: "idle-car",
+      carType: "chatgpt",
+      car: car({ id: "idle-car", imageRemaining: 10 }),
+      candidateCount: 1,
+      strategy: "idle_server",
+      carTier: "auto"
+    };
+  };
+  client.loadInit = async () => ({ default_model_slug: "gpt-image-test" });
+  client.buildConversationBody = () => ({ body: {}, messageId: "idle-switch-message" });
+  client.runConversationSubmit = async (_selected, work) => work();
+  client.http = async (pathName) => {
+    assert.equal(pathName, "/backend-api/conversation");
+    submissions += 1;
+    if (submissions === 1) return { status: 502, headers: {}, body: "first car unavailable" };
+    return {
+      status: 200,
+      headers: {},
+      body: 'data: {"conversation_id":"conversation-after-idle-switch"}\n\ndata: [DONE]\n\n'
+    };
+  };
+
+  const result = await client.sendConversation("自动换车", {}, new Set());
+
+  assert.deepEqual(entered, [{ carId: "first-car", carType: "chatgpt" }]);
+  assert.equal(idleSwitches, 1);
+  assert.equal(submissions, 2);
+  assert.equal(result.selected.carId, "idle-car");
+});
+
 test("chatplus switches ordinary accounts from PRO cars to a regular car", async () => {
   const client = clientForGemini({ strategy: "speed", carTier: "auto" });
   const entered = [];
@@ -1386,6 +1434,9 @@ test("并发聊天生图遇到车位登录冲突时冻结两小时并换车", as
   assert.equal(result.externalId, "conversation-after-car-switch");
   assert.equal(prepareCount, 3);
   assert.equal(client.sessionRevision, 2);
+  assert.deepEqual(result.raw.carAttempts.map((attempt) => attempt.carId), ["conflict-car-1", "conflict-car-2"]);
+  assert.match(result.raw.carAttempts[0].message, /冻结 2 小时/);
+  assert.match(result.raw.carAttempts[0].upstreamText, /其他设备登录/);
   assert.deepEqual(cooldowns.map((cooldown) => cooldown.carId), ["conflict-car-1", "conflict-car-2"]);
   for (const cooldown of cooldowns) {
     assert.equal(cooldown.reason, "car_session_contention");

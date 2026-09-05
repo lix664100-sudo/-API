@@ -47,7 +47,7 @@ import {
 } from "./quota-protection.js";
 
 const CHAT_COOLDOWN_MS = 30 * 60 * 1000;
-const defaultTaskConcurrency = { chat: 3, drawingImage: 2, chatImage: 2 };
+const defaultTaskConcurrency = { chat: 1, drawingImage: 2, chatImage: 1 };
 const scheduledChatTasks = new Set();
 const scheduledImageTasks = new Set();
 const activeTaskCounts = new Map();
@@ -266,6 +266,7 @@ async function loadRuntimeConfig() {
 }
 
 function taskSlotLimit(slot, target = {}, input = {}) {
+  if (chatplusUsesSharedAccountSlot(slot, target)) return 1;
   const accountLimit = Number(target?.account?.concurrency?.[slot]);
   const configured = Number.isFinite(accountLimit) && accountLimit > 0
     ? accountLimit
@@ -327,6 +328,15 @@ function activeCountForAccountSlot(slot, accountId) {
     }
   }
   return total;
+}
+
+function chatplusUsesSharedAccountSlot(slot, target = {}) {
+  return target?.channel?.type === "chatplus" && ["chat", "chatImage"].includes(slot);
+}
+
+function activeCountForChatplusAccount(accountId) {
+  return activeCountForAccountSlot("chat", accountId)
+    + activeCountForAccountSlot("chatImage", accountId);
 }
 
 function taskConcurrencyTotal(value = {}) {
@@ -765,9 +775,10 @@ function updateActiveRoutingLoad(slot, target, input, difference) {
 
 function taskSlotBusyLabel(slot, target = {}) {
   const accountName = String(target?.account?.name || target?.account?.username || "").trim();
+  const label = chatplusUsesSharedAccountSlot(slot, target) ? "聊天或聊天生图" : taskSlotLabel(slot);
   return !accountName
-    ? taskSlotLabel(slot)
-    : `${accountName}的${taskSlotLabel(slot)}`;
+    ? label
+    : `${accountName}的${label}`;
 }
 
 function targetTaskSlot(target, taskType = "text2img") {
@@ -812,10 +823,32 @@ async function submittedImageCarIdsForTarget(target = {}, input = {}) {
     .filter(Boolean))];
 }
 
+async function reservableTaskSlotState(slot, target = {}, input = {}) {
+  if (!chatplusUsesSharedAccountSlot(slot, target)) {
+    const durableState = await durableTaskSlotState(slot, target, input);
+    const count = activeTaskCounts.get(taskSlotKey(slot, target, input)) || 0;
+    return { durableState, count };
+  }
+
+  const accountId = String(target?.account?.id || "").trim();
+  const tasks = await listActiveTasks();
+  const holdingTasks = tasks.filter((task) =>
+    String(task.accountId || "") === accountId
+    && ["chat", "chatImage"].includes(storedTaskSlot(task))
+    && taskHoldsDurableSlot(task)
+  );
+  return {
+    count: activeCountForChatplusAccount(accountId),
+    durableState: {
+      total: holdingTasks.length,
+      active: holdingTasks.filter((task) => activeSubmittedTaskIds.has(task.id)).length,
+      tasks: holdingTasks
+    }
+  };
+}
+
 async function taskSlotOccupancy(slot, target = {}, input = {}) {
-  const key = taskSlotKey(slot, target, input);
-  const durableState = await durableTaskSlotState(slot, target, input);
-  const count = activeTaskCounts.get(key) || 0;
+  const { durableState, count } = await reservableTaskSlotState(slot, target, input);
   return count + durableState.total - Math.min(durableState.active, count);
 }
 
@@ -861,11 +894,10 @@ function busyTaskError(slot, target = {}, blockingTask = null) {
 
 async function tryReserveTaskSlot(slot, target = {}, input = {}) {
   const key = taskSlotKey(slot, target, input);
-  const durableState = await durableTaskSlotState(slot, target, input);
-  const count = activeTaskCounts.get(key) || 0;
-  const occupied = count + durableState.total - Math.min(durableState.active, count);
+  const { durableState, count: occupiedCount } = await reservableTaskSlotState(slot, target, input);
+  const occupied = occupiedCount + durableState.total - Math.min(durableState.active, occupiedCount);
   if (occupied >= taskSlotLimit(slot, target, input)) return null;
-  activeTaskCounts.set(key, count + 1);
+  activeTaskCounts.set(key, (activeTaskCounts.get(key) || 0) + 1);
   const routingLoad = requestedRoutingLoad(slot, input);
   updateActiveRoutingLoad(slot, target, input, routingLoad);
   const drawingModelKey = slot === "drawingImage" ? targetImageModelKey(target, input) : "";
@@ -3416,7 +3448,7 @@ function sameTarget(left, right) {
 
 async function targetBusyAttempt(target, taskType, input = {}) {
   const slot = targetTaskSlot(target, taskType);
-  const durableState = await durableTaskSlotState(slot, target, input);
+  const { durableState } = await reservableTaskSlotState(slot, target, input);
   const error = busyTaskError(slot, target, durableState.tasks[0] || null);
   return {
     channelId: target.channel.id,
@@ -5923,12 +5955,8 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
     });
   }
 
-  const reserved = await tryReserveFirstAvailableTarget(targets, "chat", { input });
-  const ordered = reserved?.orderedTargets?.length
-    ? reserved.orderedTargets
-    : await orderTargetsByRoutingUsage(targets, "chat", input);
-  const target = reserved?.target || ordered[0] || targets[0];
-  const waitingForSlot = !reserved;
+  const reserved = await reserveFirstAvailableTarget(targets, "chat", { input });
+  const target = reserved.target;
   const task = queuedTask({
     input,
     target,
@@ -5936,9 +5964,9 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
     prompt: cleanChatPrompt(input),
     imageCount: chatImageCount(input),
     inputImageUrls: taskInputPreviewUrls(input, taskOptions.inputImageUrls),
-    raw: { endpoint: "/v1/chat/completions", waitingForSlot },
+    raw: { endpoint: "/v1/chat/completions", waitingForSlot: false },
     requestMeta,
-    status: waitingForSlot ? "queued" : "processing"
+    status: "processing"
   });
   try {
     await upsertTask(task);
@@ -5949,7 +5977,7 @@ export async function queueChatCompletion(input = {}, requestMeta = {}, taskOpti
   scheduledChatTasks.add(task.id);
   runInBackground(async () => {
     try {
-      await runChatCompletionTask(task, input, reserved, { waitForSlot: waitingForSlot });
+      await runChatCompletionTask(task, input, reserved);
     } finally {
       scheduledChatTasks.delete(task.id);
       reserved?.release();
@@ -6617,12 +6645,8 @@ export async function createChatCompletion(input = {}, requestMeta = {}, taskOpt
     });
   }
 
-  const reserved = await tryReserveFirstAvailableTarget(targets, "chat", { input });
-  const ordered = reserved?.orderedTargets?.length
-    ? reserved.orderedTargets
-    : await orderTargetsByRoutingUsage(targets, "chat", input);
-  const target = reserved?.target || ordered[0] || targets[0];
-  const waitingForSlot = !reserved;
+  const reserved = await reserveFirstAvailableTarget(targets, "chat", { input });
+  const target = reserved.target;
   const task = queuedTask({
     input,
     target,
@@ -6630,9 +6654,9 @@ export async function createChatCompletion(input = {}, requestMeta = {}, taskOpt
     prompt: cleanChatPrompt(input),
     imageCount: chatImageCount(input),
     inputImageUrls: taskInputPreviewUrls(input, taskOptions.inputImageUrls),
-    raw: { endpoint: "/v1/chat/completions", waitingForSlot },
+    raw: { endpoint: "/v1/chat/completions", waitingForSlot: false },
     requestMeta,
-    status: waitingForSlot ? "queued" : "processing"
+    status: "processing"
   });
   try {
     await upsertTask(task);
@@ -6642,7 +6666,7 @@ export async function createChatCompletion(input = {}, requestMeta = {}, taskOpt
   }
   scheduledChatTasks.add(task.id);
   try {
-    const result = await runChatCompletionTask(task, input, reserved, { waitForSlot: waitingForSlot });
+    const result = await runChatCompletionTask(task, input, reserved);
     return chatCompletionResponse(result);
   } finally {
     scheduledChatTasks.delete(task.id);

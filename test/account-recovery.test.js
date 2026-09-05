@@ -2273,7 +2273,7 @@ test("套餐续费后后台会自动恢复过期账号", async () => {
   }
 });
 
-test("同一聊天账号的对话和生图等待接口可以并行处理", async () => {
+test("同一聊天账号的对话和生图等待接口共用一个名额", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -2336,19 +2336,22 @@ test("同一聊天账号的对话和生图等待接口可以并行处理", async
   };
 
   try {
-    await Promise.all([
+    const outcomes = await Promise.all([
       createChatCompletion({
         channel: "chatplus",
         messages: [{ role: "user", content: "测试对话" }]
-      }),
+      }).then(() => ({ ok: true }), (error) => ({ ok: false, error })),
       createImageTask({
         input: { channel: "chatplus", prompt: "测试改图" },
         files: [{ filename: "test.png", mimetype: "image/png" }],
         wait: true
-      })
+      }).then(() => ({ ok: true }), (error) => ({ ok: false, error }))
     ]);
 
-    assert.equal(maxActiveRequests, 2);
+    assert.equal(outcomes.filter((item) => item.ok).length, 1);
+    assert.equal(outcomes.filter((item) => !item.ok).length, 1);
+    assert.equal(outcomes.find((item) => !item.ok).error.status, 429);
+    assert.equal(maxActiveRequests, 1);
   } finally {
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
@@ -2427,7 +2430,7 @@ test("绘图额度不足且聊天生图并发已满时直接提示并发上限",
   }
 });
 
-test("聊天生图等待接口按配置并发提交，超过配置才提示上限", async () => {
+test("聊天生图等待接口同账号只允许一个并发", async () => {
   const config = await loadConfig();
   await saveConfig({
     ...config,
@@ -2486,7 +2489,7 @@ test("聊天生图等待接口按配置并发提交，超过配置才提示上�
     activeCount += 1;
     maxActiveCount = Math.max(maxActiveCount, activeCount);
     concurrentSubmitFlags.push(input.concurrentSubmit === true);
-    if (activeCount === 4) markAllTasksStarted();
+    if (activeCount === 1) markAllTasksStarted();
     try {
       await holdActiveTasks;
       return {
@@ -2506,31 +2509,24 @@ test("聊天生图等待接口按配置并发提交，超过配置才提示上�
   };
 
   const file = { filename: "test.png", mimetype: "image/png" };
-  const activeTasks = Array.from({ length: 4 }, (_item, index) => createImageTask({
-    input: { prompt: `聊天生图并发-${index + 1}` },
+  const activeTasks = [createImageTask({
+    input: { prompt: "聊天生图占用" },
     files: [file],
     wait: true
-  }));
+  })];
   await allTasksStarted;
-  assert.equal(maxActiveCount, 4);
-  assert.deepEqual(concurrentSubmitFlags, [true, true, true, true]);
+  assert.equal(maxActiveCount, 1);
+  assert.deepEqual(concurrentSubmitFlags, [true]);
 
   const startedAt = Date.now();
   try {
-    await assert.rejects(
-      createImageTask({
-        input: { prompt: "超过聊天生图并发的新任务" },
-        files: [file],
-        wait: true
-      }),
-      (error) => {
-        assert.equal(error?.status, 429);
-        assert.match(error?.message || "", /^并发上限/);
-        assert.match(error?.message || "", /任务正在处理中/);
-        assert.ok(Date.now() - startedAt < 1000);
-        return true;
-      }
-    );
+    const rejected = await Promise.all(Array.from({ length: 3 }, (_item, index) => createImageTask({
+      input: { prompt: `超过聊天生图并发-${index + 1}` },
+      files: [file],
+      wait: true
+    }).then(() => ({ ok: true }), (error) => ({ ok: false, error }))));
+    assert.ok(rejected.every((item) => !item.ok && item.error?.status === 429));
+    assert.ok(Date.now() - startedAt < 1000);
     assert.equal(drawingCheckCount, 0);
   } finally {
     releaseActiveTasks();
@@ -2764,7 +2760,7 @@ test("同一账号绘图上游连续失败三次后冷却三十分钟", async ()
     assert.ok(Date.parse(drawing.cooldownUntil) - Date.now() > 29 * 60 * 1000);
     assert.equal(account.meta.abilities.chatplus.status, "ok");
     assert.equal(runtime.available.drawingImage, 0);
-    assert.equal(runtime.available.chatImage, 2);
+    assert.equal(runtime.available.chatImage, 1);
     await assert.rejects(
       createTextTask({ channel: "drawing", prompt: "冷却期间不能再调用" }, true),
       (error) => error?.status === 503

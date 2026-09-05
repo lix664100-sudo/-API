@@ -55,9 +55,9 @@ const defaultImageStorage = {
 };
 
 const defaultConcurrency = {
-  chat: 3,
+  chat: 1,
   drawingImage: 2,
-  chatImage: 2
+  chatImage: 1
 };
 
 const defaultChatModels = [
@@ -580,9 +580,9 @@ function normalizeImageStorage(value = {}) {
 
 function normalizeConcurrency(value = {}) {
   return {
-    chat: Math.min(20, Math.max(1, Number(value.chat || defaultConcurrency.chat))),
+    chat: 1,
     drawingImage: Math.min(20, Math.max(1, Number(value.drawingImage || defaultConcurrency.drawingImage))),
-    chatImage: Math.min(20, Math.max(1, Number(value.chatImage || defaultConcurrency.chatImage)))
+    chatImage: 1
   };
 }
 

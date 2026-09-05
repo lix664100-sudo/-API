@@ -114,10 +114,10 @@ test("runtime capacity only counts accounts whose channel enables the model", as
 
   const runtime = await getRuntimeStatus();
   assert.equal(runtime.concurrency.drawingImage, 6);
-  assert.equal(runtime.models.gpt.categories.image.configured, 15);
-  assert.equal(runtime.models.gpt.categories.chat.configured, 9);
-  assert.equal(runtime.models.gemini.categories.image.configured, 9);
-  assert.equal(runtime.models.gemini.categories.chat.configured, 3);
+  assert.equal(runtime.models.gpt.categories.image.configured, 9);
+  assert.equal(runtime.models.gpt.categories.chat.configured, 3);
+  assert.equal(runtime.models.gemini.categories.image.configured, 7);
+  assert.equal(runtime.models.gemini.categories.chat.configured, 1);
 
   const gemini = await reserveImageTaskAdmission({
     channel: "gemini-channel",
@@ -131,47 +131,43 @@ test("runtime capacity only counts accounts whose channel enables the model", as
   }
 });
 
-test("GPT and Gemini use separate image concurrency slots", async () => {
+test("GPT and Gemini share one ChatPlus account image slot", async () => {
   const config = await loadConfig();
   await saveConfig(modelConfig(config));
 
   const gpt = await reserveImageTaskAdmission({ model: "gpt", prompt: "gpt" });
-  const gemini = await reserveImageTaskAdmission({ model: "gemini", prompt: "gemini" });
   try {
     const runtime = await getRuntimeStatus();
     assert.equal(runtime.models.gpt.categories.image.running, 1);
-    assert.equal(runtime.models.gemini.categories.image.running, 1);
-    assert.equal(runtime.categories.image.running, 2);
+    assert.equal(runtime.models.gemini.categories.image.running, 0);
+    assert.equal(runtime.categories.image.running, 1);
 
     await assert.rejects(
-      reserveImageTaskAdmission({ model: "gpt", prompt: "second gpt" }),
+      reserveImageTaskAdmission({ model: "gemini", prompt: "gemini" }),
       (error) => error.status === 429 && error.code === "CONCURRENCY_LIMIT"
     );
   } finally {
     gpt.release();
-    gemini.release();
   }
 });
 
-test("Grok uses its own image concurrency slot", async () => {
+test("Grok shares the ChatPlus account image slot", async () => {
   const config = await loadConfig();
   await saveConfig(modelConfig(config));
 
   const gpt = await reserveImageTaskAdmission({ model: "gpt", prompt: "gpt" });
-  const grok = await reserveImageTaskAdmission({ model: "grok", prompt: "grok" });
   try {
     const runtime = await getRuntimeStatus();
     assert.equal(runtime.models.gpt.categories.image.running, 1);
-    assert.equal(runtime.models.grok.categories.image.running, 1);
+    assert.equal(runtime.models.grok.categories.image.running, 0);
     assert.equal(runtime.models.grok.categories.image.configured, 1);
 
     await assert.rejects(
-      reserveImageTaskAdmission({ model: "grok", prompt: "second grok" }),
+      reserveImageTaskAdmission({ model: "grok", prompt: "grok" }),
       (error) => error.status === 429 && error.code === "CONCURRENCY_LIMIT"
     );
   } finally {
     gpt.release();
-    grok.release();
   }
 });
 
@@ -207,26 +203,24 @@ test("drawing image usage reduces the available image concurrency for both GPT a
   }
 });
 
-test("account image concurrency overrides the legacy global setting", async () => {
+test("account image concurrency is fixed to one shared slot", async () => {
   const config = await loadConfig();
   const next = modelConfig(config);
   next.accounts[0].concurrency = { chat: 2, drawingImage: 2, chatImage: 2 };
   await saveConfig(next);
 
   const first = await reserveImageTaskAdmission({ model: "gpt", prompt: "first" });
-  const second = await reserveImageTaskAdmission({ model: "gpt", prompt: "second" });
   try {
     await assert.rejects(
-      reserveImageTaskAdmission({ model: "gpt", prompt: "third" }),
+      reserveImageTaskAdmission({ model: "gpt", prompt: "second" }),
       (error) => error.status === 429 && error.code === "CONCURRENCY_LIMIT"
     );
   } finally {
     first.release();
-    second.release();
   }
 });
 
-test("Chatplus account queues GPT and Gemini independently", async () => {
+test("Chatplus account serializes GPT and Gemini work", async () => {
   const client = new ChatplusClient({
     config: {},
     channel: {
@@ -252,7 +246,7 @@ test("Chatplus account queues GPT and Gemini independently", async () => {
   });
 
   await Promise.all([run("gpt"), run("gemini")]);
-  assert.equal(peak, 2);
+  assert.equal(peak, 1);
 
   active = 0;
   peak = 0;

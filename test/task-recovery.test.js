@@ -3534,25 +3534,25 @@ test("聊天生图满载时立即拒绝，释放名额后才能重新提交", as
       && task.status === "waiting_upstream"
     );
 
-    await Promise.all(Array.from({ length: 5 }, (_item, index) => queueImageTask({
-      input: { channel: "chatplus", prompt: `job-${index + 1}` },
+    await Promise.all([queueImageTask({
+      input: { channel: "chatplus", prompt: "job-1" },
       files: [{
-        filename: `source-${index + 1}.png`,
+        filename: "source-1.png",
         mimetype: "image/png",
-        previewUrl: `/uploads/previews/source-${index + 1}.png`,
+        previewUrl: "/uploads/previews/source-1.png",
         buffer: Buffer.from("x")
       }]
-    })));
+    })]);
 
     let tasks = [];
     for (let attempt = 0; attempt < 30; attempt += 1) {
       tasks = await listTasks();
-      if (ownWaitingTasks(tasks).length >= 5) break;
+      if (ownWaitingTasks(tasks).length >= 1) break;
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
 
-    assert.equal(submittedJobs.length, 5);
-    assert.equal(ownWaitingTasks(tasks).length, 5);
+    assert.equal(submittedJobs.length, 1);
+    assert.equal(ownWaitingTasks(tasks).length, 1);
     assert.deepEqual(
       tasks.find((task) => task.prompt === "job-1")?.inputImageUrls,
       ["/uploads/previews/source-1.png"]
@@ -3599,7 +3599,7 @@ test("聊天生图满载时立即拒绝，释放名额后才能重新提交", as
     }
 
     assert.equal(submittedJobs.includes("job-6"), true);
-    assert.equal(ownWaitingTasks(tasks).length, 5);
+    assert.equal(ownWaitingTasks(tasks).length, 1);
   } finally {
     ChatplusClient.prototype.createImageTask = originalCreateImageTask;
   }

@@ -45,7 +45,7 @@ function loadTaskTimingHelpers() {
   assert.ok(start >= 0 && end > start, "任务耗时辅助逻辑必须存在");
 
   const context = {};
-  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskStageTimings, taskStageSummary };`, context);
+  vm.runInNewContext(`${adminHtml.slice(start, end)}\nthis.helpers = { taskStageTimings, taskStageSummary, taskCarSwitches };`, context);
   return context.helpers;
 }
 
@@ -409,9 +409,15 @@ test("旧任务和未提交任务也有明确的渠道状态", () => {
 });
 
 test("任务耗时会合并重复记录并准确计算换车次数", () => {
-  const { taskStageSummary } = loadTaskTimingHelpers();
+  const { taskStageSummary, taskCarSwitches } = loadTaskTimingHelpers();
   const row = {
     raw: {
+      carAttempts: [{
+        carId: "car-a",
+        carType: "chatgpt",
+        message: "当前车位会话被上游拒绝，已冻结 2 小时并自动换车。",
+        upstreamText: "您的账号在其他设备登录，请重新登录"
+      }],
       stageTimings: [
         { id: "enter-a", key: "car_enter", label: "进入车位", carId: "car-a", durationMs: 1500, status: "failed" },
         { id: "enter-b", key: "car_enter", label: "进入车位", carId: "car-b", durationMs: 2500, status: "success" },
@@ -434,6 +440,14 @@ test("任务耗时会合并重复记录并准确计算换车次数", () => {
     { key: "source_upload", label: "上传原图", durationMs: 8000, count: 1, failedCount: 0 }
   ]);
   assert.match(adminHtml, /换车 \$\{summary\.carAttempts - 1\} 次/);
+  assert.deepEqual(localValue(taskCarSwitches(row)), [{
+    carId: "car-a",
+    carType: "chatgpt",
+    message: "当前车位会话被上游拒绝，已冻结 2 小时并自动换车。",
+    upstreamText: "您的账号在其他设备登录，请重新登录"
+  }]);
+  assert.match(adminHtml, /换车记录 \$\{carSwitches\.length\} 条/);
+  assert.match(adminHtml, /上游原话：\$\{item\.upstreamText\}/);
   assert.match(adminHtml, /aria-label": "任务耗时明细"/);
 });
 
@@ -644,11 +658,10 @@ test("账号忙碌时保留真正占用账号的任务信息", () => {
   );
 });
 
-test("并发面板明确显示对话满载排队，并展示排队记录和数量", () => {
+test("并发面板明确显示聊天与生图共用一个名额", () => {
   assert.match(adminHtml, /queued: \["processing", "排队中"\]/);
   assert.match(adminHtml, /\{ label: "排队中", value: "queued" \}/);
-  assert.match(adminHtml, /对话满载排队/);
-  assert.match(adminHtml, /`排队 \$\{queued\}`/);
-  assert.match(adminHtml, /等待空闲名额/);
-  assert.doesNotMatch(adminHtml, /满载立即拒绝/);
+  assert.match(adminHtml, /聊天任务共用 1/);
+  assert.match(adminHtml, /聊天 \+ 聊天生图总并发/);
+  assert.match(adminHtml, /忙时立即返回，不排队/);
 });

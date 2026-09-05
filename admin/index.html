@@ -1456,6 +1456,36 @@
         color: #b42318;
       }
 
+      .task-car-switch-list {
+        width: min(460px, calc(100vw - 48px));
+        max-height: 280px;
+        overflow: auto;
+      }
+
+      .task-car-switch-record {
+        display: grid;
+        gap: 4px;
+        padding: 8px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .task-car-switch-record:last-child {
+        border-bottom: 0;
+      }
+
+      .task-car-switch-title {
+        color: var(--ink);
+        font-size: 12px;
+        font-weight: 720;
+      }
+
+      .task-car-switch-reason {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+        overflow-wrap: anywhere;
+      }
+
       .task-upstream-action {
         display: inline-flex;
         align-items: center;
@@ -4403,6 +4433,42 @@
         return { stages: [...grouped.values()], carAttempts };
       }
 
+      function taskCarSwitches(row) {
+        const sources = [
+          row?.raw?.carAttempts,
+          row?.responseJson?.raw?.carAttempts,
+          row?.responseJson?.carAttempts
+        ];
+        const switches = [];
+        const seen = new Set();
+        for (const source of sources) {
+          for (const entry of Array.isArray(source) ? source : []) {
+            const carId = String(entry?.carId || "").trim();
+            const carType = String(entry?.carType || "chatgpt").trim();
+            const message = String(entry?.message || entry?.reason || "当前车位不可用，已自动换车。").trim();
+            const upstreamText = String(entry?.upstreamText || "").trim();
+            const key = [carType, carId, message, upstreamText].join("::");
+            if (!carId || seen.has(key)) continue;
+            seen.add(key);
+            switches.push({ carId, carType, message, upstreamText });
+          }
+        }
+        return switches;
+      }
+
+      function taskCarSwitchDetail(switches) {
+        return h("div", { className: "task-car-switch-list" }, switches.map((item, index) => h("div", {
+          className: "task-car-switch-record",
+          key: `${item.carType}:${item.carId}:${index}`
+        }, [
+          h("div", { className: "task-car-switch-title", key: "title" }, `第 ${index + 1} 次换车：${item.carType.toUpperCase()} · ${item.carId}`),
+          h("div", { className: "task-car-switch-reason", key: "reason" }, `原因：${item.message}`),
+          item.upstreamText && item.upstreamText !== item.message
+            ? h("div", { className: "task-car-switch-reason", key: "upstream" }, `上游原话：${item.upstreamText}`)
+            : null
+        ].filter(Boolean))));
+      }
+
       function formatTaskStageDuration(ms) {
         if (!Number.isFinite(ms) || ms < 0) return "-";
         if (ms < 1000) return ms < 100 ? "少于0.1秒" : `${(ms / 1000).toFixed(1)}秒`;
@@ -4411,6 +4477,7 @@
 
       function taskTimingLine(row) {
         const summary = taskStageSummary(row);
+        const carSwitches = taskCarSwitches(row);
         if (!summary.stages.length) return null;
         const carText = summary.carAttempts > 0
           ? `车位尝试 ${summary.carAttempts} 次${summary.carAttempts > 1 ? `，换车 ${summary.carAttempts - 1} 次` : ""}`
@@ -4422,6 +4489,12 @@
         }, [
           h("span", { className: "task-timing-title", key: "title" }, "耗时明细："),
           carText ? h("span", { className: "task-timing-item is-count", key: "cars" }, carText) : null,
+          carSwitches.length ? h(Popover, {
+            key: "car-switches",
+            title: "换车记录",
+            content: taskCarSwitchDetail(carSwitches),
+            trigger: ["hover", "click"]
+          }, h("span", { className: "task-timing-item is-count" }, `换车记录 ${carSwitches.length} 条`)) : null,
           ...summary.stages.map((stage) => h("span", {
             className: `task-timing-item${stage.failedCount ? " is-failed" : ""}`,
             key: stage.key,
@@ -8852,7 +8925,7 @@
           setEditingAccount(account || null);
           accountForm.resetFields();
           const concurrency = {
-            ...(config?.concurrency || { chat: 3, drawingImage: 2, chatImage: 2 }),
+            ...(config?.concurrency || { chat: 1, drawingImage: 2, chatImage: 1 }),
             ...(account?.concurrency || {})
           };
           accountForm.setFieldsValue(account
@@ -10194,8 +10267,7 @@
             items.push(h("strong", { key: "drawing" }, `绘图站 ${numberValue(concurrency.drawingImage)}`));
           }
           if (channelAbilityEnabled(rowChannel, "chatplus")) {
-            items.push(h(items.length ? "span" : "strong", { key: "chatImage" }, `聊天生图 ${numberValue(concurrency.chatImage)}`));
-            items.push(h("span", { key: "chat" }, `对话 ${numberValue(concurrency.chat)}`));
+            items.push(h(items.length ? "span" : "strong", { key: "chatplus" }, "聊天 + 聊天生图 共用 1"));
           }
           return h("div", { className: "account-usage" }, items.length ? items : "-");
         }
@@ -11129,8 +11201,8 @@
                   ]),
                   h("div", { className: "capacity-subtitle" }, "可用数量只统计状态正常的账号；任务完成或停止后会自动释放名额")
                 ]),
-                h(Tooltip, { title: "普通对话达到并发上限后会进入排队，空闲后自动继续；生图仍按各接口原有规则处理。" },
-                  h(Tag, { color: "blue" }, "对话满载排队")
+                h(Tooltip, { title: "同一个 ChatPlus 账号的普通聊天和聊天生图共用一个名额；忙时立即返回，不排队。" },
+                  h(Tag, { color: "blue" }, "聊天任务共用 1")
                 )
               ]),
               h("div", { className: "capacity-grid" }, [
@@ -12326,10 +12398,10 @@
             h("div", { className: "form-grid" }, [
               accountModalChatEnabled
                 ? h(Form.Item, {
-                    label: "普通对话并发",
+                    label: "聊天 + 聊天生图总并发",
                     name: ["concurrency", "chat"],
-                    rules: [{ required: true, message: "请输入普通对话并发" }]
-                  }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
+                    extra: "固定为 1；账号忙时立即返回，不排队。"
+                  }, h(InputNumber, { min: 1, max: 1, disabled: true, style: { width: "100%" } }))
                 : null,
               accountModalDrawingEnabled
                 ? h(Form.Item, {
@@ -12338,18 +12410,12 @@
                     rules: [{ required: true, message: "请输入绘图站并发" }]
                   }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
                 : null,
-              accountModalChatEnabled
-                ? h(Form.Item, {
-                    label: "聊天生图并发",
-                    name: ["concurrency", "chatImage"],
-                    rules: [{ required: true, message: "请输入聊天生图并发" }]
-                  }, h(InputNumber, { min: 1, max: 20, style: { width: "100%" } }))
-                : null
+              null
             ]),
             h(Alert, {
               type: "info",
               showIcon: true,
-              message: "每个账号单独限制；首页只把该账号所属渠道已启用的模型计入对应并发。",
+              message: "普通聊天和聊天生图共用一个名额，忙时立即返回，不排队；绘图站并发单独计算。",
               style: { marginBottom: 0 }
             })
           ])),

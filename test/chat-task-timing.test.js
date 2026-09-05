@@ -73,7 +73,7 @@ function upstreamTimings(task) {
 }
 
 async function waitForTerminalTask(taskId) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     const task = await getTask(taskId);
     if (["success", "failed", "interrupted"].includes(task?.status)) return task;
     await delay(10);
@@ -104,6 +104,7 @@ test("同步和异步对话成功后都会保存耗时明细", async () => {
     const asyncTask = await waitForTerminalTask(queued.id);
     assert.equal(asyncTask.status, "success");
     assert.deepEqual(upstreamTimings(asyncTask), [timing("async-chat-stage")]);
+    await delay(20);
   } finally {
     ChatplusClient.prototype.createChatCompletion = originalCreateChatCompletion;
   }

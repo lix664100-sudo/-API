@@ -3602,7 +3602,7 @@ export class ChatplusClient {
 
   async runTaskWork(input, work) {
     if (input?.concurrentSubmit === true) return work();
-    return this.runAccountWork(work, this.chatRouteForInput(input).key);
+    return this.runAccountWork(work, "shared-chat-task");
   }
 
   async runConversationSubmit(selected = {}, work, taskStageRecorder = null, options = {}) {
@@ -3727,6 +3727,10 @@ export class ChatplusClient {
   async prepareReusableChatSession(input = {}, ignoredCarIds = new Set(), maxAttempts = 5) {
     const route = this.chatRouteForInput(input);
     if (input.imageGeneration === true) {
+      const session = await this.prepareChatSession(input, ignoredCarIds, maxAttempts);
+      return this.cloneChatSession(this.preparedChatSession(session));
+    }
+    if (input.useIdleCarSwitch === true && route.key === "gpt") {
       const session = await this.prepareChatSession(input, ignoredCarIds, maxAttempts);
       return this.cloneChatSession(this.preparedChatSession(session));
     }
@@ -3993,6 +3997,70 @@ export class ChatplusClient {
     await this.sessionLock(() => this.performEnterCar(carId, carType, options));
   }
 
+  async performIdleChatCarSwitch(options = {}, portalRetried = false) {
+    try {
+      if (!this.portalLoggedIn) await this.performPortalLogin(options);
+      const switched = await this.json("/frontend-api/getIdleCar", {
+        method: "GET",
+        timeoutSec: options.timeoutSec
+      });
+      if (!switched || typeof switched !== "object" || Number(switched.code) !== 1) {
+        const error = new Error(switched?.msg || "一键换车没有分配到可用车位。");
+        error.code = "IDLE_CAR_SWITCH_FAILED";
+        throw error;
+      }
+      const page = await this.http("/", {
+        followRedirect: true,
+        timeoutSec: options.timeoutSec,
+        headers: {
+          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "upgrade-insecure-requests": "1"
+        }
+      });
+      if (page.status >= 400) {
+        const error = new Error(`一键换车后进入聊天页面失败：${page.status}`);
+        error.status = page.status;
+        error.body = page.body;
+        throw error;
+      }
+      const config = await this.json("/frontend-api/getConfig", {
+        method: "GET",
+        timeoutSec: options.timeoutSec
+      });
+      const carId = String(config?.data?.teamId || "").trim();
+      if (Number(config?.code) !== 1 || !carId) {
+        const error = new Error(config?.msg || "一键换车后没有读到新车位编号。");
+        error.code = "IDLE_CAR_SWITCH_INVALID";
+        throw error;
+      }
+      this.carId = carId;
+      this.carType = "chatgpt";
+      return {
+        carId,
+        carType: "chatgpt",
+        car: { id: carId, carType: "chatgpt" },
+        candidateCount: 1,
+        strategy: "idle_server",
+        carTier: "auto"
+      };
+    } catch (error) {
+      if (portalRetried || !isShareAiPortalConnectionError(error)) throw error;
+      reportShareAiPortalFailure({
+        proxyUrl: proxyUrlFor(this.account),
+        url: this.baseUrl
+      });
+      this.invalidateSharedPortalSession();
+      this.resetSession();
+      await this.performPortalLogin(options);
+      return this.performIdleChatCarSwitch(options, true);
+    }
+  }
+
+  async switchToIdleChatCar(options = {}, sessionAlreadyLocked = false) {
+    if (sessionAlreadyLocked) return this.performIdleChatCarSwitch(options);
+    return this.sessionLock(() => this.performIdleChatCarSwitch(options));
+  }
+
   async login(options = {}) {
     const route = resolveChatModelRoute(this.channel?.settings || {}, "");
     const selected = await this.selectCar(route, new Set(), options);
@@ -4252,27 +4320,49 @@ export class ChatplusClient {
     let subscriptionMissingAttempts = 0;
     let subscriptionExpiredAttempts = 0;
     let recheckProCars = input.recheckProCars === true;
+    const useIdleCarSwitch = input.useIdleCarSwitch === true
+      && input.imageGeneration !== true
+      && route.key === "gpt";
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       let selected;
       let imageCarLease = null;
-      try {
-        selected = await this.selectCar(route, ignoredCarIds, {
-          ...requestOptions,
-          recheckProCars
-        });
-      } catch (error) {
-        const allPreviousFailuresWerePlanRelated = errors.length > 0
-          && subscriptionMissingAttempts + subscriptionExpiredAttempts === errors.length;
-        if (allPreviousFailuresWerePlanRelated && /暂时没有可用的?.*(?:车辆|车位)/.test(String(error?.message || ""))) break;
-        throw error;
+      let selectedProCar = false;
+      if (!useIdleCarSwitch) {
+        try {
+          selected = await this.selectCar(route, ignoredCarIds, {
+            ...requestOptions,
+            recheckProCars
+          });
+        } catch (error) {
+          const allPreviousFailuresWerePlanRelated = errors.length > 0
+            && subscriptionMissingAttempts + subscriptionExpiredAttempts === errors.length;
+          if (allPreviousFailuresWerePlanRelated && /暂时没有可用的?.*(?:车辆|车位)/.test(String(error?.message || ""))) break;
+          throw error;
+        }
+        selectedProCar = selected.car?.isPro === true || selected.car?.isUltra === true;
+        if (recheckProCars && selectedProCar) recheckProCars = false;
+        ignoredCarIds.add(selected.carId);
+        if (input.imageGeneration === true) {
+          imageCarLease = reserveImageCar(this.account, selected);
+          if (!imageCarLease) continue;
+        }
       }
-      const selectedProCar = selected.car?.isPro === true || selected.car?.isUltra === true;
-      if (recheckProCars && selectedProCar) recheckProCars = false;
-      ignoredCarIds.add(selected.carId);
-      if (input.imageGeneration === true) {
-        imageCarLease = reserveImageCar(this.account, selected);
-        if (!imageCarLease) continue;
-      }
+      const acceptIdleCar = () => {
+        if (ignoredCarIds.has(selected.carId)) {
+          const error = new Error("一键换车仍分配到刚刚失败的车位，已取消本次提交。");
+          error.code = "IDLE_CAR_SWITCH_DUPLICATE";
+          throw error;
+        }
+        ignoredCarIds.add(selected.carId);
+        if (input.imageGeneration === true) {
+          imageCarLease = reserveImageCar(this.account, selected);
+          if (!imageCarLease) {
+            const error = new Error("一键换车后的生图车位正在处理其他任务。");
+            error.code = "IMAGE_CAR_BUSY";
+            throw error;
+          }
+        }
+      };
       try {
         let sessionClient = this;
         let snapshot = null;
@@ -4282,14 +4372,23 @@ export class ChatplusClient {
           const lockStarted = new Promise((resolve) => { reportLockStarted = resolve; });
           const prepareLockedSession = this.sessionLock(async () => {
             reportLockStarted();
+            if (useIdleCarSwitch) {
+              selected = await measureTaskStage(input.taskStageRecorder, {
+                key: "car_enter",
+                label: "一键换车"
+              }, async () => this.performIdleChatCarSwitch(requestOptions));
+              acceptIdleCar();
+            }
             this.carId = selected.carId;
             this.carType = selected.carType;
-            await measureTaskStage(input.taskStageRecorder, {
-              key: "car_enter",
-              label: "进入车位",
-              carId: selected.carId,
-              carType: selected.carType
-            }, async () => this.enterCar(selected.carId, selected.carType, requestOptions, true));
+            if (!useIdleCarSwitch) {
+              await measureTaskStage(input.taskStageRecorder, {
+                key: "car_enter",
+                label: "进入车位",
+                carId: selected.carId,
+                carType: selected.carType
+              }, async () => this.enterCar(selected.carId, selected.carType, requestOptions, true));
+            }
             init = route.key === "gpt"
               ? await measureTaskStage(input.taskStageRecorder, {
                   key: "car_init",
@@ -4309,14 +4408,23 @@ export class ChatplusClient {
           await prepareLockedSession;
           sessionClient = this.createSubmitClient({ snapshot });
         } else {
+          if (useIdleCarSwitch) {
+            selected = await measureTaskStage(input.taskStageRecorder, {
+              key: "car_enter",
+              label: "一键换车"
+            }, async () => this.switchToIdleChatCar(requestOptions));
+            acceptIdleCar();
+          }
           this.carId = selected.carId;
           this.carType = selected.carType;
-          await measureTaskStage(input.taskStageRecorder, {
-            key: "car_enter",
-            label: "进入车位",
-            carId: selected.carId,
-            carType: selected.carType
-          }, async () => this.enterCar(selected.carId, selected.carType, requestOptions));
+          if (!useIdleCarSwitch) {
+            await measureTaskStage(input.taskStageRecorder, {
+              key: "car_enter",
+              label: "进入车位",
+              carId: selected.carId,
+              carType: selected.carType
+            }, async () => this.enterCar(selected.carId, selected.carType, requestOptions));
+          }
           init = route.key === "gpt"
             ? await measureTaskStage(input.taskStageRecorder, {
                 key: "car_init",
@@ -5181,6 +5289,7 @@ export class ChatplusClient {
 
   async sendConversation(prompt, input = {}, ignoredCarIds = new Set()) {
     const errors = [];
+    const carAttempts = [];
     const imageCarQuotaErrors = [];
     const unconfirmedCars = [];
     let carPoolErrorCount = 0;
@@ -5198,7 +5307,11 @@ export class ChatplusClient {
       let imageCarLease = null;
       let confirmedConversationId = "";
       const imageSubmissionState = { started: false };
-      const requestInput = { ...input, imageSubmissionState };
+      const requestInput = {
+        ...input,
+        imageSubmissionState,
+        useIdleCarSwitch: attempt > 0
+      };
       try {
         const session = input.concurrentSubmit === true
           ? await this.prepareReusableChatSession(requestInput, ignoredCarIds, 1)
@@ -5220,6 +5333,7 @@ export class ChatplusClient {
             ...conversation,
             _imageCarLease: imageCarLease,
             submitSessionSnapshot: submitClient.sessionSnapshot(),
+            carAttempts,
             stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
           };
         }
@@ -5232,6 +5346,7 @@ export class ChatplusClient {
             ...conversation,
             _imageCarLease: imageCarLease,
             submitSessionSnapshot: submitClient.sessionSnapshot(),
+            carAttempts,
             stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
           };
         }
@@ -5398,6 +5513,7 @@ export class ChatplusClient {
           resultChannelError,
           _imageCarLease: imageCarLease,
           submitSessionSnapshot,
+          carAttempts,
           stageTimings: taskStageSnapshot(requestInput.taskStageRecorder)
         };
       } catch (error) {
@@ -5423,6 +5539,14 @@ export class ChatplusClient {
           || Boolean(selected);
         const recordCarError = (message) => {
           errors.push(message);
+          if (selected?.carId) {
+            carAttempts.push({
+              carId: String(selected.carId),
+              carType: String(selected.carType || "chatgpt"),
+              message: String(message || "当前车位不可用，已自动换车。"),
+              upstreamText: String(error?.upstreamText || error?.body || error?.message || "").trim()
+            });
+          }
           if (carScopedFailure) carPoolErrorCount += 1;
         };
         if (selected && error.imageCarBusy === true) {
@@ -5526,7 +5650,7 @@ export class ChatplusClient {
             finalError.selectedCarId = carId;
             finalError.selectedCarType = String(selected.carType || "").trim();
             finalError.upstreamModel = error.upstreamModel || activeRoute?.model || "";
-            finalError.carAttempts = unconfirmedCars;
+            finalError.carAttempts = carAttempts;
             for (const key of [
               "quotaEmpty",
               "imageQuotaExhausted",
@@ -5586,6 +5710,7 @@ export class ChatplusClient {
     }
     error.upstreamModel = lastError?.upstreamModel || "";
     error.upstreamText = lastUpstreamText || String(lastError?.upstreamText || lastError?.body || "").trim();
+    error.carAttempts = carAttempts;
     throw error;
   }
 
