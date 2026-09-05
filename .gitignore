@@ -21,3 +21,4 @@ Thumbs.db
 
 # 工具辅助目录（项目笔记，非业务代码）
 .workbuddy/memory/
+.codex-tmp/
